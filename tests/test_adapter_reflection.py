@@ -172,9 +172,9 @@ async def test_run_with_trace_returns_trajectory_on_usage_limit() -> None:
     assert output.success is False
     assert trajectory.error is not None
     assert trajectory.messages, "usage-limit trajectories should capture prompts"
-    assert any(isinstance(message, ModelRequest) for message in trajectory.messages), (
-        "expected to capture the synthesized user request"
-    )
+    assert any(
+        isinstance(message, ModelRequest) for message in trajectory.messages
+    ), "expected to capture the synthesized user request"
     record = trajectory.to_reflective_record()
     assert record["messages"], "reflective record should include serialized messages"
     assert "request_limit" in (record["error"] or "")

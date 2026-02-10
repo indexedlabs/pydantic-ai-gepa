@@ -59,6 +59,7 @@ from ..skill_components import apply_candidate_to_skills
 from ..skills import SkillsFS
 from ..skills.search import SkillsSearchProvider
 from ..tool_components import (
+    _collect_registered_tool_defs,
     get_or_create_output_tool_optimizer,
     get_or_create_tool_optimizer,
     get_output_tool_optimizer,
@@ -903,33 +904,37 @@ class _BaseAgentAdapter(
     def _extract_instructions_and_tools(
         self, messages: Sequence[ModelMessage]
     ) -> tuple[str | None, list[ToolDefinition] | None, list[ToolDefinition] | None]:
-        """Return instruction text plus recorded tool definitions, if any."""
+        """Return instruction text plus recorded tool definitions, if any.
+
+        Instructions are extracted from the first ModelRequest with instructions.
+        Tool definitions are collected from the agent's registered toolsets
+        since they are no longer stored on ModelRequest messages.
+        """
         instructions_text: str | None = None
-        function_tools: list[ToolDefinition] | None = None
-        output_tools: list[ToolDefinition] | None = None
         for message in messages:
             if not isinstance(message, ModelRequest):
                 continue
-
             if instructions_text is None and isinstance(message.instructions, str):
                 instructions_text = message.instructions
-
-            params = message.model_request_parameters
-            if params is None:
-                continue
-
-            if function_tools is None and params.function_tools:
-                function_tools = list(params.function_tools)
-
-            if output_tools is None and params.output_tools:
-                output_tools = list(params.output_tools)
-
-            if (
-                instructions_text is not None
-                and function_tools is not None
-                and output_tools is not None
-            ):
                 break
+
+        # Collect function tools from the agent's registered toolsets
+        target_agent = self.agent
+        if isinstance(target_agent, WrapperAgent):
+            target_agent = target_agent.wrapped
+        function_tool_defs = _collect_registered_tool_defs(target_agent)
+        function_tools = function_tool_defs or None
+
+        # Collect output tools from the output tool optimizer if installed
+        output_tools: list[ToolDefinition] | None = None
+        output_optimizer = get_output_tool_optimizer(target_agent)
+        if output_optimizer is not None:
+            seed = output_optimizer.get_seed_components()
+            if seed:
+                # Output tool optimizer is active but doesn't expose raw ToolDefinitions;
+                # leave as None (informational only in trajectory)
+                output_tools = None
+
         return instructions_text, function_tools, output_tools
 
     def _build_synthetic_request(

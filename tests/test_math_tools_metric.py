@@ -21,11 +21,13 @@ from pydantic_evals import Case  # noqa: E402
 from pydantic_ai_gepa.types import RolloutOutput  # noqa: E402
 
 
-def _make_case() -> Case[
-    math_tools.MathProblemInput,
-    math_tools.MathProblemOutput,
-    math_tools.MathProblemMetadata,
-]:
+def _make_case() -> (
+    Case[
+        math_tools.MathProblemInput,
+        math_tools.MathProblemOutput,
+        math_tools.MathProblemMetadata,
+    ]
+):
     return Case(
         name="penalty-case",
         inputs=math_tools.MathProblemInput(problem="Compute 2 + 2."),

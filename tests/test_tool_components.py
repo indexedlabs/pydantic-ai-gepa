@@ -470,17 +470,17 @@ class TestSearchExamplesToolCapturedDuringAgentRun:
     @pytest.mark.asyncio
     async def test_search_examples_appears_in_model_request_parameters(self) -> None:
         """Verify search_examples tool appears in model_request_parameters.function_tools."""
-        from pydantic_ai import Agent, capture_run_messages
+        from pydantic_ai import Agent
         from pydantic_ai.models.test import TestModel
-        from pydantic_ai.messages import ModelRequest
         from pydantic_ai_gepa.gepa_graph.proposal.student_tools import (
             create_example_search_tool,
         )
         from pydantic_ai_gepa.gepa_graph.example_bank import InMemoryExampleBank
         from pydantic_ai_gepa.types import ExampleBankConfig
 
+        test_model = TestModel()
         agent = Agent(
-            model=TestModel(),
+            model=test_model,
             instructions="Test agent",
         )
 
@@ -492,21 +492,11 @@ class TestSearchExamplesToolCapturedDuringAgentRun:
             k=3,
         )
 
-        with capture_run_messages() as messages:
-            await agent.run("Hello", toolsets=[toolset])
+        await agent.run("Hello", toolsets=[toolset])
 
-        # Find the first ModelRequest
-        model_request = None
-        for msg in messages:
-            if isinstance(msg, ModelRequest):
-                model_request = msg
-                break
-
-        assert model_request is not None
-        assert model_request.model_request_parameters is not None
-
-        # Check that search_examples is in function_tools
-        function_tools = model_request.model_request_parameters.function_tools
+        # Tool definitions are available on TestModel after a run
+        assert test_model.last_model_request_parameters is not None
+        function_tools = test_model.last_model_request_parameters.function_tools
         tool_names = [t.name for t in function_tools]
         assert "search_examples" in tool_names
 
