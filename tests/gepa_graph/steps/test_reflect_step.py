@@ -387,6 +387,53 @@ async def test_reflect_step_rejects_when_not_improved() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reflect_step_skips_candidate_eval_on_noop_proposal() -> None:
+    class _NoopProposalGenerator(_StubProposalGenerator):
+        async def propose_texts(
+            self,
+            *,
+            candidate: CandidateProgram,
+            reflective_data: ReflectiveDataset,
+            components: Sequence[str],
+            model: Any,
+            iteration: int | None = None,
+            current_best_score: float | None = None,
+            parent_score: float | None = None,
+            model_settings: Any = None,
+            example_bank: Any = None,
+        ) -> ProposalResult:
+            self.calls += 1
+            self.last_reflective_data = reflective_data
+            return ProposalResult(texts={}, component_metadata={}, reasoning=None)
+
+    state = _make_state()
+    minibatch = await _training_examples(state)
+    evaluator = _StubEvaluator([_eval_results([0.4, 0.5])])
+    batch_sampler = _StubBatchSampler(minibatch)
+    stub_adapter = _StubAdapter()
+    adapter = cast(Adapter[str, str, dict[str, str]], stub_adapter)
+    generator = _NoopProposalGenerator({})
+    deps = _make_deps(
+        adapter=adapter,
+        evaluator=evaluator,
+        batch_sampler=batch_sampler,
+        proposal_generator=generator,
+    )
+    ctx = _ctx(state, deps)
+
+    result = await reflect_step(ctx)
+
+    assert result == "continue"
+    assert state.last_accepted is False
+    assert len(state.candidates) == 1
+    assert state.merge_scheduled == 0
+    assert state.total_evaluations == 2
+    assert stub_adapter.dataset_calls == 1
+    assert generator.calls == 1
+    assert evaluator.calls == 1
+
+
+@pytest.mark.asyncio
 async def test_reflect_step_skips_when_batch_is_perfect() -> None:
     state = _make_state()
     minibatch = await _training_examples(state)

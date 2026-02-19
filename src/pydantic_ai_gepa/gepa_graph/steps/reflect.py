@@ -185,6 +185,18 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
                 evolution_moves=reasoning.evolution_moves,
             )
 
+    if not proposal_result.texts:
+        state.last_accepted = False
+        logfire.info(
+            "ReflectStep skipping candidate evaluation due to no-op proposal",
+            parent_idx=parent_idx,
+            selector=state.config.component_selector,
+            requested_components=(
+                list(components_to_update) if components_to_update is not None else None
+            ),
+        )
+        return "continue"
+
     new_candidate = _create_candidate(
         state=state,
         parent=parent,
