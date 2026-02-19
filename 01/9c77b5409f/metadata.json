@@ -1,0 +1,34 @@
+{
+  "checkpoint_id": "019c77b5409f",
+  "created_at": "2026-02-19T21:01:33.305383+00:00",
+  "branch_name": "main",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "906680f26ddd9b0b6c1ba8d830a62071f192ff10"
+  ],
+  "entity_touches": [
+    ".mighty/loro/edges/019c77b2-e53f-73c0-b32a-978e11563973.loro",
+    ".mighty/loro/edges/019c77b4-d6a8-71d1-9d42-bbd41541ba67.loro",
+    ".mighty/loro/edges/019c77b4-d6a8-77b1-936f-bff4df02e375.loro",
+    ".mighty/loro/edges/019c77b4-d6a8-7ec1-8922-f8848473f337.loro",
+    ".mighty/loro/edges/019c77b4-d6a8-7f70-af14-c8b0ac91b9af.loro",
+    ".mighty/loro/messages/019c77b2-f062-70a2-8dbe-7775c397ad69.loro",
+    ".mighty/loro/messages/019c77b2-fe3a-7420-a4f5-9d5898ad9669.loro",
+    ".mighty/loro/messages/019c77b3-660c-7122-97c1-7ee26848cd3c.loro",
+    ".mighty/loro/messages/019c77b3-7d36-7b30-880a-fe605fcbdd8f.loro",
+    ".mighty/loro/messages/019c77b3-9e6f-7810-8b7e-883aaa2fc870.loro",
+    ".mighty/loro/messages/019c77b3-c2e5-7b53-a2d0-ed1f3401c907.loro",
+    ".mighty/loro/messages/019c77b3-cf57-7620-a9df-83197a59c3bd.loro",
+    ".mighty/loro/messages/019c77b4-f97c-7542-b480-af7c8b2872b9.loro",
+    ".mighty/loro/records/019c7707-03e7-7680-9380-73c43c05f521.loro",
+    ".mighty/loro/records/019c7707-29fc-7be2-b5d0-503bc055e36d.loro",
+    ".mighty/loro/records/019c7708-32fd-7131-ae0f-1fc73f5ae005.loro",
+    ".mighty/loro/records/019c7708-ca1d-7933-bc7d-c3df65165b7f.loro",
+    ".mighty/loro/records/019c77b2-e527-7d60-a7fb-8fbe9885a8e4.loro",
+    ".mighty/loro/records/019c77b4-d6ad-7071-9056-0b8618f7d188.loro",
+    ".mighty/loro/records/019c77b4-d6ad-7143-b70b-d038e4d1a516.loro",
+    ".mighty/loro/records/019c77b4-d6ad-7241-85e4-1b171e24edc7.loro",
+    ".mighty/loro/records/019c77b4-d6ad-7922-99d2-069aeb981388.loro",
+    ".mighty/loro/spaces/019c76fe-8692-7463-a36e-8abcc60b56af.loro"
+  ]
+}
