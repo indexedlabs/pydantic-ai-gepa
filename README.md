@@ -324,6 +324,10 @@ result = await optimize_agent(
     # Tool & Output Optimization
     optimize_tools=True,
     optimize_output_type=True,
+
+    # Skill usage
+    skills="path/to/skills",
+    skills_capabilities={SkillCapability.READ}, # Explicitly opt-in to capabilities (READ is default)
 )
 ```
 

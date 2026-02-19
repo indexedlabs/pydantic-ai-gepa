@@ -37,6 +37,7 @@ from .gepa_graph.models import (
 from .input_type import InputSpec
 from .reflection import ReflectionSampler
 from .skills import SkillsFS
+from .skills.models import SkillCapability
 from .skills.search import SkillsSearchProvider
 from .tool_components import (
     get_tool_optimizer,
@@ -143,6 +144,7 @@ async def optimize_agent(
     input_type: InputSpec[BaseModel] | None = None,
     skills: SkillsFS | str | Path | None = None,
     skills_search_backend: SkillsSearchProvider | None = None,
+    skills_capabilities: set[SkillCapability] | None = None,
     seed_candidate: Mapping[str, ComponentValue | str] | None = None,
     reflection_config: ReflectionConfig | None = None,
     candidate_selection_strategy: str = "pareto",
@@ -197,6 +199,8 @@ async def optimize_agent(
         skills_search_backend: Optional search backend for skills discovery. When provided,
             it is passed through to the student toolset so searches can be backed by
             external indexes (e.g., TurboPuffer) and incorporate per-candidate overlays.
+        skills_capabilities: Optional set of capabilities for skills tools (e.g. {SkillCapability.READ}).
+            By default, GEPA restricts to READ capabilities to avoid untrusted script execution.
 
         reflection_config: Configuration for the reflection agent (model, include_case_metadata,
             include_expected_output, example_bank). When None, reflection runs with default settings.
@@ -306,6 +310,7 @@ async def optimize_agent(
             toolset = create_skills_toolset(
                 skills_fs,
                 search_backend=skills_search_backend,
+                capabilities=skills_capabilities,
             )
             manager.record_model_request(
                 function_tools=[tool.tool_def for tool in toolset.tools.values()],
@@ -332,6 +337,7 @@ async def optimize_agent(
         input_type=input_type,
         skills_fs=skills_fs,
         skills_search_backend=skills_search_backend,
+        skills_capabilities=skills_capabilities,
         cache_manager=cache_manager,
         optimize_tools=optimize_tools,
         optimize_output_type=optimize_output_type,

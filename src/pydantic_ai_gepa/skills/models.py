@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
+from enum import Enum
+
 from pydantic import BaseModel, Field
+
+
+class SkillCapability(str, Enum):
+    """Capabilities that can be enabled for GEPA skills tools."""
+
+    READ = "read"
+    EXECUTE = "execute"
 
 
 class SkillSummary(BaseModel):
@@ -33,6 +42,7 @@ class SkillFileResult(BaseModel):
 
 
 __all__ = [
+    "SkillCapability",
     "SkillSummary",
     "SkillSearchResult",
     "SkillLoadResult",

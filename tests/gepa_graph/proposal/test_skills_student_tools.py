@@ -11,6 +11,7 @@ from pydantic_ai_gepa.skill_components import (
     apply_candidate_to_skills,
     skill_description_key,
 )
+from pydantic_ai_gepa.skills.models import SkillCapability
 from pydantic_ai_gepa.skills import SkillsFS
 from pydantic_ai_gepa.gepa_graph.models import ComponentValue
 from pydantic_ai_gepa.skills.models import SkillSearchResult
@@ -130,3 +131,25 @@ async def test_create_skills_toolset_with_custom_backend_uses_async_search() -> 
     fn = _get_tool_fn(toolset, "search_skills")
     results = await fn(query="x", top_k=3)
     assert results[0].snippet == "stub"
+
+
+
+
+def test_create_skills_toolset_capabilities_gating() -> None:
+    fs = SkillsFS()
+    fs.write_text("a/SKILL.md", "---\nname: a\ndescription: d\n---\n")
+
+    # Default is READ only
+    toolset = create_skills_toolset(fs)
+    assert "list_skills" in toolset.tools
+    assert "execute_skill_script" not in toolset.tools
+
+    # Custom capabilities (EXECUTE only)
+    toolset_exec = create_skills_toolset(fs, capabilities={SkillCapability.EXECUTE})
+    assert "list_skills" not in toolset_exec.tools
+    assert "execute_skill_script" in toolset_exec.tools
+
+    # Ensure execute throws NotImplementedError
+    exec_fn = _get_tool_fn(toolset_exec, "execute_skill_script")
+    with pytest.raises(NotImplementedError, match="explicitly disabled"):
+        exec_fn(skill_path="a", script_name="test.py", args=[])

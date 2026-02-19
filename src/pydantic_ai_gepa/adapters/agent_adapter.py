@@ -56,6 +56,7 @@ from ..input_type import BoundInputSpec, InputSpec, build_input_spec
 from ..signature_agent import SignatureAgent
 from ..skill_components import apply_candidate_to_skills
 from ..skills import SkillsFS
+from ..skills.models import SkillCapability
 from ..skills.search import SkillsSearchProvider
 from ..tool_components import (
     get_or_create_output_tool_optimizer,
@@ -606,6 +607,7 @@ class _BaseAgentAdapter(
         optimize_output_type: bool = False,
         skills_fs: SkillsFS | None = None,
         skills_search_backend: SkillsSearchProvider | None = None,
+        skills_capabilities: set[SkillCapability] | None = None,
         agent_usage_limits: _usage.UsageLimits | None = None,
         gepa_usage_limits: _usage.UsageLimits | None = None,
     ) -> None:
@@ -615,6 +617,7 @@ class _BaseAgentAdapter(
         self.cache_manager = cache_manager
         self.skills_fs = skills_fs
         self.skills_search_backend = skills_search_backend
+        self.skills_capabilities = skills_capabilities
         self._model_identifier = _derive_model_identifier(agent)
         if (
             self.cache_manager
@@ -1150,6 +1153,7 @@ class _BaseAgentAdapter(
                         skills_view,
                         search_backend=self.skills_search_backend,
                         candidate=candidate,
+                        capabilities=self.skills_capabilities,
                     )
                 )
         return toolsets_list if toolsets_list else None
@@ -1254,6 +1258,7 @@ class AgentAdapter(
         optimize_output_type: bool = False,
         skills_fs: SkillsFS | None = None,
         skills_search_backend: SkillsSearchProvider | None = None,
+        skills_capabilities: set[SkillCapability] | None = None,
         agent_usage_limits: _usage.UsageLimits | None = None,
         gepa_usage_limits: _usage.UsageLimits | None = None,
     ) -> None:
@@ -1266,6 +1271,7 @@ class AgentAdapter(
             optimize_output_type=optimize_output_type,
             skills_fs=skills_fs,
             skills_search_backend=skills_search_backend,
+            skills_capabilities=skills_capabilities,
             agent_usage_limits=agent_usage_limits,
             gepa_usage_limits=gepa_usage_limits,
         )
@@ -1334,6 +1340,7 @@ class SignatureAgentAdapter(
         optimize_output_type: bool = False,
         skills_fs: SkillsFS | None = None,
         skills_search_backend: SkillsSearchProvider | None = None,
+        skills_capabilities: set[SkillCapability] | None = None,
         agent_usage_limits: _usage.UsageLimits | None = None,
         gepa_usage_limits: _usage.UsageLimits | None = None,
     ) -> None:
@@ -1353,6 +1360,7 @@ class SignatureAgentAdapter(
             optimize_output_type=optimize_output_type,
             skills_fs=skills_fs,
             skills_search_backend=skills_search_backend,
+            skills_capabilities=skills_capabilities,
             agent_usage_limits=agent_usage_limits,
             gepa_usage_limits=gepa_usage_limits,
         )
