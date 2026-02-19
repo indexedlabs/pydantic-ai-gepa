@@ -142,19 +142,41 @@ class SkillsFS:
         *,
         include_hidden: bool = False,
         max_file_bytes: int | None = None,
+        max_files: int = 10000,
     ) -> SkillsFS:
         """Load a directory tree into an in-memory filesystem."""
         if not root.exists() or not root.is_dir():
             raise ValueError(f"root must be an existing directory: {root}")
 
         fs = cls()
+        resolved_root = root.resolve()
+        file_count = 0
+
         for path in root.rglob("*"):
             if path.is_dir():
                 continue
+
+            try:
+                resolved_path = path.resolve(strict=True)
+            except OSError:
+                continue
+
+            if not resolved_path.is_relative_to(resolved_root):
+                raise ValueError(
+                    f"Symlink escape detected: {path} points outside of skills root {root}"
+                )
+
             rel = path.relative_to(root).as_posix()
             if not include_hidden and any(part.startswith(".") for part in path.parts):
                 continue
-            content = path.read_bytes()
+
+            file_count += 1
+            if file_count > max_files:
+                raise ValueError(
+                    f"Filesystem traversal exceeded max_files limit ({max_files})"
+                )
+
+            content = resolved_path.read_bytes()
             if max_file_bytes is not None and len(content) > max_file_bytes:
                 raise ValueError(f"file too large: {rel} ({len(content)} bytes)")
             fs.write_bytes(rel, content)

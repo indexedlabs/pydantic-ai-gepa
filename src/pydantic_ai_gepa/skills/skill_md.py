@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 
 _SKILL_MD_FRONTMATTER_RE = re.compile(r"^---\s*$")
@@ -16,12 +16,14 @@ _SKILL_MD_FRONTMATTER_RE = re.compile(r"^---\s*$")
 class SkillFrontmatter(BaseModel):
     """Spec-aligned frontmatter with support for extension fields via `extras`."""
 
-    name: str
-    description: str
-    license: str | None = None
-    compatibility: str | None = None
-    metadata: dict[str, str] | None = None
-    allowed_tools: str | None = Field(default=None, alias="allowed-tools")
+    name: str = Field(pattern=r"^[a-zA-Z0-9_-]+$", max_length=128)
+    description: str = Field(max_length=1024)
+    license: str | None = Field(default=None, max_length=128)
+    compatibility: str | None = Field(default=None, max_length=128)
+    metadata: dict[str, str] | None = Field(default=None, max_length=64)
+    allowed_tools: str | None = Field(
+        default=None, alias="allowed-tools", max_length=1024
+    )
 
     extras: dict[str, Any] = Field(default_factory=dict, exclude=True)
 
@@ -67,7 +69,18 @@ def parse_skill_md(text: str) -> SkillMd:
     known: dict[str, Any] = {k: v for k, v in data.items() if k in known_keys}
     extras: dict[str, Any] = {k: v for k, v in data.items() if k not in known_keys}
 
-    frontmatter = SkillFrontmatter.model_validate(known)
+    try:
+        frontmatter = SkillFrontmatter.model_validate(known)
+    except ValidationError as e:
+        errors = []
+        for err in e.errors():
+            loc = ".".join(str(loc_part) for loc_part in err["loc"])
+            msg = err["msg"]
+            errors.append(f"  - {loc}: {msg}")
+        raise ValueError(
+            "Invalid SKILL.md frontmatter metadata:\n" + "\n".join(errors)
+        ) from None
+
     if extras:
         frontmatter.extras = dict(extras)
 

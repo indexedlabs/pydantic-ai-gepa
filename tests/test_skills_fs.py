@@ -98,3 +98,43 @@ def test_skills_fs_from_disk(tmp_path: Path) -> None:
     fs = SkillsFS.from_disk(tmp_path / "pack")
     assert fs.is_file("a/SKILL.md")
     assert fs.is_file("a/references/REF.md")
+
+
+def test_parse_skill_md_validation_errors() -> None:
+    raw = """---
+name: invalid name!
+description: Extract text and tables.
+---
+# PDF Processing
+"""
+    with pytest.raises(ValueError, match="Invalid SKILL.md frontmatter metadata:"):
+        parse_skill_md(raw)
+
+
+def test_skills_fs_symlink_escape_protection(tmp_path: Path) -> None:
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    (pack / "a").mkdir()
+    (pack / "a" / "SKILL.md").write_text("---\nname: a\ndescription: d\n---\n# A")
+
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret")
+
+    import os
+
+    os.symlink(outside, pack / "a" / "escape.txt")
+
+    with pytest.raises(ValueError, match="Symlink escape detected"):
+        SkillsFS.from_disk(pack)
+
+
+def test_skills_fs_max_files_limit(tmp_path: Path) -> None:
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    for i in range(5):
+        (pack / f"file_{i}.txt").write_text("hi")
+
+    with pytest.raises(
+        ValueError, match="Filesystem traversal exceeded max_files limit"
+    ):
+        SkillsFS.from_disk(pack, max_files=3)
