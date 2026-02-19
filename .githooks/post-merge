@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+mt_cmd=""
+if [ -x '/Users/mh/.cargo/bin/mt' ]; then
+  mt_cmd='/Users/mh/.cargo/bin/mt'
+elif command -v mt >/dev/null 2>&1; then
+  mt_cmd="mt"
+fi
+
+# Prefer keeping the cache warm; fallback to invalidation if mt isn't available or fails.
+if [ -n "$mt_cmd" ]; then
+  if "$mt_cmd" rebuild --incremental >/dev/null 2>&1; then
+    exit 0
+  fi
+fi
+
+rm -f .mighty/cache.db .mighty/cache.db-wal .mighty/cache.db-shm
+rm -rf .mighty/exports

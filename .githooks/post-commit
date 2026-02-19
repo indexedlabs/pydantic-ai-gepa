@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+mt_cmd=""
+if [ -x '/Users/mh/.cargo/bin/mt' ]; then
+  mt_cmd='/Users/mh/.cargo/bin/mt'
+elif command -v mt >/dev/null 2>&1; then
+  mt_cmd="mt"
+fi
+
+if [ -n "$mt_cmd" ]; then
+  "$mt_cmd" git-hooks --post-commit >/dev/null 2>&1 || true
+fi

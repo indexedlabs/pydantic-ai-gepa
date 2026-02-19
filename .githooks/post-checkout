@@ -1,0 +1,32 @@
+#!/bin/sh
+set -eu
+
+# post-checkout: <oldref> <newref> <flag>
+# flag=1 when switching branches; flag=0 when checking out paths.
+if [ "${3:-0}" != "1" ]; then
+  exit 0
+fi
+
+# Refresh derived SQLite cache if the .mighty/loro tree differs between refs.
+old_tree="$(git rev-parse "${1:-}:.mighty/loro" 2>/dev/null || true)"
+new_tree="$(git rev-parse "${2:-}:.mighty/loro" 2>/dev/null || true)"
+if [ -n "$old_tree" ] && [ -n "$new_tree" ] && [ "$old_tree" = "$new_tree" ]; then
+  exit 0
+fi
+
+mt_cmd=""
+if [ -x '/Users/mh/.cargo/bin/mt' ]; then
+  mt_cmd='/Users/mh/.cargo/bin/mt'
+elif command -v mt >/dev/null 2>&1; then
+  mt_cmd="mt"
+fi
+
+# Prefer keeping the cache warm; fallback to invalidation if mt isn't available or fails.
+if [ -n "$mt_cmd" ]; then
+  if "$mt_cmd" rebuild --incremental >/dev/null 2>&1; then
+    exit 0
+  fi
+fi
+
+rm -f .mighty/cache.db .mighty/cache.db-wal .mighty/cache.db-shm
+rm -rf .mighty/exports

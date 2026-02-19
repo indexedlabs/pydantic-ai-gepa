@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+msg_file="${1:-}"
+if [ -z "$msg_file" ] || [ ! -f "$msg_file" ]; then
+  exit 0
+fi
+
+mt_cmd=""
+if [ -x '/Users/mh/.cargo/bin/mt' ]; then
+  mt_cmd='/Users/mh/.cargo/bin/mt'
+elif command -v mt >/dev/null 2>&1; then
+  mt_cmd="mt"
+fi
+
+if [ -n "$mt_cmd" ]; then
+  "$mt_cmd" git-hooks --prepare-commit-msg-file "$msg_file" >/dev/null 2>&1 || true
+fi

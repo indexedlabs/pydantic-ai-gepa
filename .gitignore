@@ -210,3 +210,8 @@ __marimo__/
 .env
 optimization_results
 history
+
+.mighty/auth.json
+.mighty/agent-id
+.mighty/cache.db
+.mighty/exports
