@@ -38,7 +38,12 @@ from .input_type import InputSpec
 from .reflection import ReflectionSampler
 from .skills import SkillsFS
 from .skills.search import SkillsSearchProvider
-from .tool_components import get_tool_optimizer
+from .tool_components import (
+    get_tool_optimizer,
+    get_or_create_tool_optimizer,
+    get_or_create_output_tool_optimizer,
+)
+from .gepa_graph.proposal.student_tools import create_skills_toolset
 from .types import (
     Case,
     MetricResult,
@@ -251,8 +256,6 @@ async def optimize_agent(
     if optimize_output_type:
         # Ensure output tool optimizer is installed before seed extraction
         try:
-            from .tool_components import get_or_create_output_tool_optimizer
-
             get_or_create_output_tool_optimizer(agent)
         except Exception:
             logfire.debug(
@@ -289,8 +292,6 @@ async def optimize_agent(
         #
         # This is intentionally after seed normalization so user-provided seed candidates
         # don't have to anticipate tool:* keys (they can be hydrated later).
-        from .tool_components import get_or_create_tool_optimizer
-
         manager = get_or_create_tool_optimizer(
             agent,
             allowed_tools={
@@ -302,8 +303,6 @@ async def optimize_agent(
         )
 
         try:
-            from .gepa_graph.proposal.student_tools import create_skills_toolset
-
             toolset = create_skills_toolset(
                 skills_fs,
                 search_backend=skills_search_backend,

@@ -18,7 +18,6 @@ import logfire
 from pydantic import BaseModel
 from pydantic_ai import capture_run_messages, usage as _usage
 from pydantic_ai.agent import AgentRunResult
-from pydantic_ai.agent.wrapper import WrapperAgent
 from pydantic_ai.messages import (
     AudioUrl,
     BinaryContent,
@@ -1074,9 +1073,6 @@ class _BaseAgentAdapter(
             candidate=candidate,
         )
         final_output = run_result.output
-        target_agent = self.agent
-        if isinstance(target_agent, WrapperAgent):
-            target_agent = target_agent.wrapped
         (
             instructions_text,
             function_tools,
@@ -1131,6 +1127,32 @@ class _BaseAgentAdapter(
                 candidate_keys=sorted(candidate.keys()) if candidate else None,
             )
             return RolloutOutput.from_error(exc, kind=error_kind)
+
+    def _build_toolsets(
+        self,
+        candidate: CandidateMap | None,
+        example_bank: "InMemoryExampleBank | None",
+    ) -> list[Any] | None:
+        """Build toolsets for the agent run."""
+        toolsets_list = []
+        if example_bank is not None:
+            toolsets_list.append(
+                create_example_search_tool(
+                    bank=example_bank,
+                    instruction=example_bank.search_tool_instruction,
+                    k=example_bank.retrieval_k,
+                )
+            )
+        if self.skills_fs is not None:
+            with apply_candidate_to_skills(self.skills_fs, candidate) as skills_view:
+                toolsets_list.append(
+                    create_skills_toolset(
+                        skills_view,
+                        search_backend=self.skills_search_backend,
+                        candidate=candidate,
+                    )
+                )
+        return toolsets_list if toolsets_list else None
 
     @abstractmethod
     async def _invoke_agent(
@@ -1262,25 +1284,7 @@ class AgentAdapter(
             raise TypeError(
                 "AgentAdapter expects Case.inputs to be a string prompt for prompt-based agents"
             )
-        toolsets_list = []
-        if example_bank is not None:
-            toolsets_list.append(
-                create_example_search_tool(
-                    bank=example_bank,
-                    instruction=example_bank.search_tool_instruction,
-                    k=example_bank.retrieval_k,
-                )
-            )
-        if self.skills_fs is not None:
-            with apply_candidate_to_skills(self.skills_fs, candidate) as skills_view:
-                toolsets_list.append(
-                    create_skills_toolset(
-                        skills_view,
-                        search_backend=self.skills_search_backend,
-                        candidate=candidate,
-                    )
-                )
-        toolsets = toolsets_list if toolsets_list else None
+        toolsets = self._build_toolsets(candidate, example_bank)
         return await self.agent.run(
             prompt,
             message_history=message_history,
@@ -1364,25 +1368,7 @@ class SignatureAgentAdapter(
     ) -> AgentRunResult[Any]:
         inputs = self._validate_inputs(case.inputs)
         candidate_text = candidate_texts(candidate)
-        toolsets_list = []
-        if example_bank is not None:
-            toolsets_list.append(
-                create_example_search_tool(
-                    bank=example_bank,
-                    instruction=example_bank.search_tool_instruction,
-                    k=example_bank.retrieval_k,
-                )
-            )
-        if self.skills_fs is not None:
-            with apply_candidate_to_skills(self.skills_fs, candidate) as skills_view:
-                toolsets_list.append(
-                    create_skills_toolset(
-                        skills_view,
-                        search_backend=self.skills_search_backend,
-                        candidate=candidate,
-                    )
-                )
-        toolsets = toolsets_list if toolsets_list else None
+        toolsets = self._build_toolsets(candidate, example_bank)
         return await self._signature_agent.run_signature(
             inputs,
             message_history=message_history,
