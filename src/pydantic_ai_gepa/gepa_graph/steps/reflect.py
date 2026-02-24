@@ -29,6 +29,8 @@ from ..proposal.instruction import ProposalResult
 from ...skill_components import (
     apply_candidate_to_skills,
     materialize_skill_components_for_path,
+    skill_description_key,
+    skill_body_key,
 )
 from ...skills import OverlayFS, normalize_rel_path, parse_skill_md
 from ...skills.models import (
@@ -556,6 +558,38 @@ def _build_component_selection_toolset(
                         metadata=None,
                     ),
                 )
+
+        return sorted(set(activated))
+
+    @toolset.tool
+    def create_skill(skill_path: str, description: str, body: str) -> list[str]:
+        """Create a new skill from scratch and make its components available to edit. Use this to abstract reusable strategies."""
+        try:
+            resolved_path = normalize_rel_path(skill_path)
+        except Exception as e:
+            raise ModelRetry(f"Invalid skill_path: {e}")
+
+        desc_key = skill_description_key(resolved_path)
+        body_key_name = skill_body_key(resolved_path)
+        
+        new_components = {
+            desc_key: ComponentValue(name=desc_key, text=description, version=0, metadata=None),
+            body_key_name: ComponentValue(name=body_key_name, text=body, version=0, metadata=None)
+        }
+
+        state.activate_skill_path(resolved_path)
+
+        activated: list[str] = []
+        for program in state.candidates:
+            for key, value in new_components.items():
+                if key in program.components:
+                    continue
+                program.components[key] = value
+                activated.append(key)
+
+        if deps.seed_candidate is not None:
+            for key, value in new_components.items():
+                deps.seed_candidate.setdefault(key, value)
 
         return sorted(set(activated))
 

@@ -130,7 +130,14 @@ def apply_candidate_to_skills(
     overlay = SkillsFS()
 
     skill_dirs = set(skills_fs.iter_skill_dirs())
-    for skill_dir in skills_fs.iter_skill_dirs():
+    # Add any skill dirs that only exist in the candidate
+    for key in candidate.keys():
+        if key.startswith("skill:"):
+            parts = key.split(":")
+            if len(parts) >= 3 and parts[2] in ("description", "body", "file"):
+                skill_dirs.add(parts[1])
+
+    for skill_dir in skill_dirs:
         desc_key = skill_description_key(skill_dir)
         body_key = skill_body_key(skill_dir)
         desc = candidate.get(desc_key)
@@ -139,8 +146,19 @@ def apply_candidate_to_skills(
             continue
 
         skill_md_path = _skill_md_path(skill_dir)
-        raw = skills_fs.read_text(skill_md_path)
-        skill_md = parse_skill_md(raw)
+        if skills_fs.exists(skill_md_path):
+            raw = skills_fs.read_text(skill_md_path)
+            skill_md = parse_skill_md(raw)
+        else:
+            from .skills.skill_md import SkillFrontmatter, SkillMd
+            skill_name = skill_dir.replace("/", "-").replace("_", "-")
+            if not skill_name.replace("-", "").isalnum():
+                skill_name = "new-skill"
+            skill_md = SkillMd(
+                frontmatter=SkillFrontmatter(name=skill_name, description=""),
+                body=""
+            )
+
         updated = _apply_component_updates(skill_md, description=desc, body=body)
         overlay.write_text(skill_md_path, render_skill_md(updated))
 

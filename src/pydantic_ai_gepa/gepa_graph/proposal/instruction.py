@@ -179,6 +179,7 @@ When skills are enabled, you may also use:
 - `load_skill(skill_path)` - Read the full SKILL.md for a skill (without activating it for editing).
 - `load_skill_file(skill_path, path)` - Read a file referenced by a skill (e.g. examples) without activating.
 - `activate_skill_components(skill_path, include_examples)` - Make a skill's description/body (and optionally examples) available as components to edit.
+- `create_skill(skill_path, description, body)` - Create a new skill from scratch, immediately making its components available to edit. Use this to abstract reusable strategies out of the main instructions.
 - `list_active_skills()` - List which skills have been activated so far.
 """
 
@@ -209,6 +210,7 @@ def _skills_tools_enabled(component_toolsets: Sequence[AbstractToolset[None]]) -
         or _toolset_has_tool(toolset, "load_skill")
         or _toolset_has_tool(toolset, "load_skill_file")
         or _toolset_has_tool(toolset, "activate_skill_components")
+        or _toolset_has_tool(toolset, "create_skill")
         or _toolset_has_tool(toolset, "list_active_skills")
         for toolset in component_toolsets
     )
