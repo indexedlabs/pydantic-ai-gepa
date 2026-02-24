@@ -145,6 +145,8 @@ def _serialize_for_reflection(obj: Any) -> Any:
     """
     if obj is None:
         return None
+    if isinstance(obj, (ImageUrl, AudioUrl, VideoUrl, DocumentUrl, BinaryContent)):
+        return obj
     if isinstance(obj, BaseModel):
         return obj.model_dump(mode="json")
     if hasattr(obj, "__dataclass_fields__"):

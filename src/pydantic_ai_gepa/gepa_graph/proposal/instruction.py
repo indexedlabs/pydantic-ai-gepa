@@ -12,6 +12,14 @@ from pydantic_ai import Agent
 from pydantic_ai.models import KnownModelName, Model
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.toolsets import AbstractToolset
+from pydantic_ai.messages import (
+    AudioUrl,
+    BinaryContent,
+    DocumentUrl,
+    ImageUrl,
+    UserContent,
+    VideoUrl,
+)
 
 from pydantic_ai_gepa.inspection import InspectionAborted
 
@@ -442,9 +450,9 @@ class InstructionProposalGenerator:
         reflective_data: ReflectiveDataset,
         components: Sequence[str],
         example_bank: InMemoryExampleBank | None = None,
-    ) -> str:
+    ) -> Sequence[UserContent]:
         selection_mode = not components
-        lines = [
+        lines: list[Any] = [
             "# Creative Instruction Design Challenge",
             "",
             "Transform the student agent's performance through innovative instruction formats.",
@@ -798,7 +806,23 @@ class InstructionProposalGenerator:
                     )
                     lines.append("")
 
-        return "\n".join(lines)
+        return self._join_user_content(lines)
+
+    @staticmethod
+    def _join_user_content(content: list[Any]) -> list[UserContent]:
+        result: list[UserContent] = []
+        current_str: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                current_str.append(item)
+            else:
+                if current_str:
+                    result.append("\n".join(current_str))
+                    current_str = []
+                result.append(item)
+        if current_str:
+            result.append("\n".join(current_str))
+        return result
 
     def _build_component_metadata(
         self,
@@ -1091,17 +1115,39 @@ class InstructionProposalGenerator:
             return "null"
         return str(value).strip()
 
+    @staticmethod
+    def _format_side_info(side_info: Any) -> list[Any]:
+        items: list[Any] = []
+        
+        def _walk(obj: Any, path: str = "") -> None:
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    p = f"{path}.{k}" if path else k
+                    _walk(v, p)
+            elif isinstance(obj, list):
+                for i, v in enumerate(obj):
+                    p = f"{path}[{i}]"
+                    _walk(v, p)
+            elif isinstance(obj, (ImageUrl, AudioUrl, VideoUrl, DocumentUrl, BinaryContent)):
+                items.append(f"  - **{path}**:")
+                items.append(obj)
+            else:
+                items.append(f"  - **{path}**: {obj}")
+                
+        _walk(side_info)
+        return items
+
     def _format_trace_sections(
         self,
         records: Sequence[Mapping[str, Any]],
         *,
         label: str,
-    ) -> list[str]:
+    ) -> list[Any]:
         """Render reflective records in a readable structure."""
         if not records:
             return ["No reflective examples were provided.", ""]
 
-        lines: list[str] = []
+        lines: list[Any] = []
         for idx, record in enumerate(records, start=1):
             lines.append(f"=== start {label.lower()} {idx} ===")
             lines.append("")
@@ -1124,6 +1170,12 @@ class InstructionProposalGenerator:
 
             if summary_lines:
                 lines.extend(summary_lines)
+                lines.append("")
+
+            side_info = record.get("side_info")
+            if side_info:
+                lines.append("- **Side Info:**")
+                lines.extend(self._format_side_info(side_info))
                 lines.append("")
 
             messages = record.get("messages")

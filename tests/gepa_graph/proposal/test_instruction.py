@@ -101,7 +101,16 @@ async def test_llm_generator_updates_components() -> None:
     prompts: list[str] = []
 
     async def fake_model(messages, agent_info):
-        prompt = messages[-1].parts[0].content
+        prompt_parts = []
+        for p in messages[-1].parts:
+            if hasattr(p, "content"):
+                if isinstance(p.content, str):
+                    prompt_parts.append(p.content)
+                elif isinstance(p.content, list):
+                    for item in p.content:
+                        if isinstance(item, str):
+                            prompt_parts.append(item)
+        prompt = "".join(prompt_parts)
         prompts.append(prompt)
         content = """{
             "reasoning": {
@@ -209,7 +218,16 @@ async def test_llm_generator_uses_shared_dataset_once() -> None:
     captured_prompt: list[str] = []
 
     async def fake_model(messages, agent_info):
-        prompt = messages[-1].parts[0].content
+        prompt_parts = []
+        for p in messages[-1].parts:
+            if hasattr(p, "content"):
+                if isinstance(p.content, str):
+                    prompt_parts.append(p.content)
+                elif isinstance(p.content, list):
+                    for item in p.content:
+                        if isinstance(item, str):
+                            prompt_parts.append(item)
+        prompt = "".join(prompt_parts)
         captured_prompt.append(prompt)
         content = """{
             "reasoning": {
@@ -365,7 +383,16 @@ async def test_llm_generator_selection_mode_lists_components() -> None:
     captured_prompt: list[str] = []
 
     async def fake_model(messages, agent_info):
-        prompt = messages[-1].parts[0].content
+        prompt_parts = []
+        for p in messages[-1].parts:
+            if hasattr(p, "content"):
+                if isinstance(p.content, str):
+                    prompt_parts.append(p.content)
+                elif isinstance(p.content, list):
+                    for item in p.content:
+                        if isinstance(item, str):
+                            prompt_parts.append(item)
+        prompt = "".join(prompt_parts)
         captured_prompt.append(prompt)
         content = """{
             "reasoning": {
@@ -408,7 +435,16 @@ async def test_llm_generator_skips_components_without_records() -> None:
     )
 
     async def fake_model(messages, agent_info):
-        prompt = messages[-1].parts[0].content
+        prompt_parts = []
+        for p in messages[-1].parts:
+            if hasattr(p, "content"):
+                if isinstance(p.content, str):
+                    prompt_parts.append(p.content)
+                elif isinstance(p.content, list):
+                    for item in p.content:
+                        if isinstance(item, str):
+                            prompt_parts.append(item)
+        prompt = "".join(prompt_parts)
         # instructions should be in "Components to update" section
         assert "=== start component: `instructions` current value ===" in prompt
         # tools should NOT be in "Components to update" (no records), but IS in "given to student"
@@ -490,7 +526,16 @@ async def test_prompt_includes_output_tool_details() -> None:
 
     async def fake_model(messages, agent_info):
         nonlocal captured_prompt
-        captured_prompt = messages[-1].parts[0].content
+        prompt_parts = []
+        for p in messages[-1].parts:
+            if hasattr(p, "content"):
+                if isinstance(p.content, str):
+                    prompt_parts.append(p.content)
+                elif isinstance(p.content, list):
+                    for item in p.content:
+                        if isinstance(item, str):
+                            prompt_parts.append(item)
+        captured_prompt = "".join(prompt_parts)
         content = """{
             \"reasoning\": {
                 \"pattern_discovery\": \"OK\",
@@ -527,7 +572,16 @@ async def test_catalog_tools_fall_back_when_no_reflective_records() -> None:
 
     async def fake_model(messages, agent_info):
         nonlocal captured_prompt
-        captured_prompt = messages[-1].parts[0].content
+        prompt_parts = []
+        for p in messages[-1].parts:
+            if hasattr(p, "content"):
+                if isinstance(p.content, str):
+                    prompt_parts.append(p.content)
+                elif isinstance(p.content, list):
+                    for item in p.content:
+                        if isinstance(item, str):
+                            prompt_parts.append(item)
+        captured_prompt = "".join(prompt_parts)
         content = """{
             \"reasoning\": {
                 \"pattern_discovery\": \"OK\",
@@ -572,7 +626,16 @@ async def test_prompt_includes_stored_hypothesis_metadata() -> None:
 
     async def fake_model(messages, agent_info):
         nonlocal captured_prompt
-        captured_prompt = messages[-1].parts[0].content
+        prompt_parts = []
+        for p in messages[-1].parts:
+            if hasattr(p, "content"):
+                if isinstance(p.content, str):
+                    prompt_parts.append(p.content)
+                elif isinstance(p.content, list):
+                    for item in p.content:
+                        if isinstance(item, str):
+                            prompt_parts.append(item)
+        captured_prompt = "".join(prompt_parts)
         content = """{
             "reasoning": {
                 "pattern_discovery": "Boundary confusion",
@@ -636,7 +699,16 @@ async def test_llm_generator_handles_shared_dataset() -> None:
     prompts: list[str] = []
 
     async def fake_model(messages, agent_info):
-        prompt = messages[-1].parts[0].content
+        prompt_parts = []
+        for p in messages[-1].parts:
+            if hasattr(p, "content"):
+                if isinstance(p.content, str):
+                    prompt_parts.append(p.content)
+                elif isinstance(p.content, list):
+                    for item in p.content:
+                        if isinstance(item, str):
+                            prompt_parts.append(item)
+        prompt = "".join(prompt_parts)
         prompts.append(prompt)
         content = """{
             "reasoning": {
@@ -914,7 +986,16 @@ async def test_end_to_end_with_real_agent_and_tools() -> None:
 
     async def capture_model(messages, agent_info):
         nonlocal captured_prompt
-        captured_prompt = messages[-1].parts[0].content
+        prompt_parts = []
+        for p in messages[-1].parts:
+            if hasattr(p, "content"):
+                if isinstance(p.content, str):
+                    prompt_parts.append(p.content)
+                elif isinstance(p.content, list):
+                    for item in p.content:
+                        if isinstance(item, str):
+                            prompt_parts.append(item)
+        captured_prompt = "".join(prompt_parts)
         # Return a dummy response with updates for all components
         updated = [
             {
@@ -997,17 +1078,13 @@ The city name to get weather for.
     "function": {
       "name": "get_weather",
       "parameters": {
-        "additionalProperties": false,
+        "type": "object",
         "properties": {
           "location": {
-            "description": "The city name to get weather for.",
-            "type": "string"
+            "type": "string",
+            "description": "The city name to get weather for."
           }
-        },
-        "required": [
-          "location"
-        ],
-        "type": "object"
+        }
       },
       "description": "Get current weather for a location."
     }
