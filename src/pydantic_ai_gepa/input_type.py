@@ -5,8 +5,14 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 import html
+import json
 from dataclasses import is_dataclass, replace
 from typing import Annotated, Any, Generic, TypeVar, get_args, get_origin
+
+try:
+    import pydantic_monty
+except ImportError:
+    pydantic_monty = None
 
 from pydantic import BaseModel
 
@@ -42,6 +48,13 @@ ATTACHMENT_TYPE_TO_LABEL: dict[type, str] = {
     DocumentUrl: "document",
     BinaryContent: "binary",
 }
+
+_DEFAULT_ENCODER_SCRIPT = """
+def encode_input(data):
+    return "<input>\\n" + json_dumps(data) + "\\n</input>"
+
+encode_input(data)
+"""
 
 
 class SignatureSuffix:
@@ -96,10 +109,14 @@ def generate_system_instructions(
     return view.build_system_instructions(candidate=candidate)
 
 
-def generate_user_content(instance: BaseModel) -> Sequence[UserContent]:
+def generate_user_content(
+    instance: BaseModel,
+    *,
+    candidate: dict[str, str] | None = None,
+) -> Sequence[UserContent]:
     """Convert a structured input instance to user content."""
     view = _InputModelView(instance)
-    return view.build_user_content()
+    return view.build_user_content(candidate=candidate)
 
 
 def get_gepa_components(model_cls: type[BaseModel]) -> dict[str, str]:
@@ -150,8 +167,13 @@ class BoundInputSpec(Generic[ModelT]):
     ) -> str:
         return generate_system_instructions(instance, candidate=candidate)
 
-    def generate_user_content(self, instance: ModelT) -> Sequence[UserContent]:
-        return generate_user_content(instance)
+    def generate_user_content(
+        self,
+        instance: ModelT,
+        *,
+        candidate: dict[str, str] | None = None,
+    ) -> Sequence[UserContent]:
+        return generate_user_content(instance, candidate=candidate)
 
     def get_gepa_components(self) -> dict[str, str]:
         return get_gepa_components(self.model_cls)
@@ -436,12 +458,53 @@ class _InputModelView(_InputShared):
         # with '\n', we get proper '\n\n' separation between base and signature instructions
         return f"\n{result}" if result else result
 
-    def build_user_content(self) -> Sequence[UserContent]:
-        content_sections: list[str] = []
+    def build_user_content(
+        self,
+        *,
+        candidate: dict[str, str] | None = None,
+    ) -> Sequence[UserContent]:
+        encoder_key = f"signature:{self.model_cls.__name__}:encoder"
+        encoder_script = candidate.get(encoder_key) if candidate else None
+        
         registry = _AttachmentRegistry()
+        transformed_instance = self._replace_attachments_with_refs(self.instance, registry)
+
+        if encoder_script and pydantic_monty is not None:
+            try:
+                data_dict = transformed_instance.model_dump(mode="json")
+                
+                def host_json_dumps(obj: Any) -> str:
+                    return json.dumps(obj, indent=2)
+
+                m = pydantic_monty.Monty(
+                    encoder_script,
+                    inputs=["data"],
+                    external_functions=["json_dumps"]
+                )
+                encoded_str = m.run(
+                    inputs={"data": data_dict},
+                    external_functions={"json_dumps": host_json_dumps}
+                )
+
+                user_content: list[UserContent] = []
+                user_content.extend(registry.attachments)
+
+                if isinstance(encoded_str, str) and encoded_str:
+                    full_prompt = encoded_str
+                    for placeholder in registry.placeholders:
+                        escaped = html.escape(placeholder, quote=False)
+                        full_prompt = full_prompt.replace(escaped, placeholder)
+                    user_content.append(full_prompt)
+
+                return user_content
+            except Exception as e:
+                import logfire
+                logfire.warning("Failed to execute monty encoder script, falling back to XML", exc_info=e)
+
+        content_sections: list[str] = []
 
         for field_name, field_info in self.model_cls.model_fields.items():
-            field_value = getattr(self.instance, field_name)
+            field_value = getattr(transformed_instance, field_name)
 
             if field_value is None:
                 continue
@@ -449,11 +512,8 @@ class _InputModelView(_InputShared):
             if self._is_suffix_field(field_info):
                 continue
 
-            transformed_value = self._replace_attachments_with_refs(
-                field_value, registry
-            )
             formatted_value = self._format_field_value_xml(
-                field_name, transformed_value
+                field_name, field_value
             )
             if formatted_value:
                 content_sections.append(formatted_value)
@@ -559,6 +619,8 @@ class _InputClassView(_InputShared):
         for field_name, field_info in self.model_cls.model_fields.items():
             desc = field_info.description or f"The {field_name} input"
             components[f"signature:{self.model_cls.__name__}:{field_name}:desc"] = desc
+
+        components[f"signature:{self.model_cls.__name__}:encoder"] = _DEFAULT_ENCODER_SCRIPT
 
         return components
 

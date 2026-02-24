@@ -52,6 +52,14 @@ class ReflectionConfig:
     example_bank: ExampleBankConfig | None = None
     """Configuration for the example bank feature. None disables the feature."""
 
+    journal_file: str | None = None
+    """Optional file path to persist reflection strategies and insights across runs.
+    
+    If provided, the reflection agent will be given tools to read and append
+    entries to this file, allowing it to remember past failures and strategies
+    across completely separate GEPA executions.
+    """
+
     additional_instructions: str | None = None
     """Additional domain-specific instructions appended to the reflection agent's prompt.
 
@@ -78,6 +86,7 @@ class Trajectory(Protocol):
 
     instructions: str | None
     metric_feedback: str | None
+    metric_side_info: dict[str, Any] | None
     final_output: Any | None
 
     def to_reflective_record(self) -> dict[str, Any]: ...
@@ -89,6 +98,7 @@ class MetricResult:
 
     score: float
     feedback: str | None = None
+    side_info: dict[str, Any] | None = None
 
 
 @dataclass

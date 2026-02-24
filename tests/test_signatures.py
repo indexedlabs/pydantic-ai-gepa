@@ -242,6 +242,13 @@ def test_extract_signature_components():
             "signature:EmailSupportSignature:emails:desc": "Customer emails requiring support. Analyze for urgency, technical issues, and sentiment.",
             "signature:EmailSupportSignature:previous_interactions:desc": "Summary of previous interactions with this customer, if available.",
             "signature:EmailSupportSignature:company_policies:desc": "Relevant company policies and guidelines for customer support.",
+            "signature:EmailSupportSignature:encoder": """\
+
+def encode_input(data):
+    return "<input>\\n" + json_dumps(data) + "\\n</input>"
+
+encode_input(data)
+""",
         }
     )
 
@@ -494,6 +501,12 @@ def test_extract_seed_candidate_with_signatures():
             "signature:EmailSupportSignature:emails:desc": "Customer emails requiring support. Analyze for urgency, technical issues, and sentiment.",
             "signature:EmailSupportSignature:previous_interactions:desc": "Summary of previous interactions with this customer, if available.",
             "signature:EmailSupportSignature:company_policies:desc": "Relevant company policies and guidelines for customer support.",
+            "signature:EmailSupportSignature:encoder": """\
+def encode_input(data):
+    return "<input>\\n" + json_dumps(data) + "\\n</input>"
+
+encode_input(data)\
+""",
         }
     )
 
@@ -554,5 +567,12 @@ def test_signature_field_without_description():
             "signature:MinimalSignature:instructions": "A minimal signature.",
             "signature:MinimalSignature:input_text:desc": "The input_text input",
             "signature:MinimalSignature:config:desc": "Configuration settings",
+            "signature:MinimalSignature:encoder": """\
+
+def encode_input(data):
+    return "<input>\\n" + json_dumps(data) + "\\n</input>"
+
+encode_input(data)
+""",
         }
     )

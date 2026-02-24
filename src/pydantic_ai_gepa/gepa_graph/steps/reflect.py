@@ -112,17 +112,24 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
 
     reflection_model = _resolve_model(deps)
     components_to_update: Sequence[str] | None
-    component_toolsets: list[FunctionToolset] | None = None
+    component_toolsets: list[FunctionToolset] | None = []
+    
+    if state.config.reflection_config and state.config.reflection_config.journal_file:
+        from ..proposal.journal_tools import create_journal_toolset
+        component_toolsets.append(
+            create_journal_toolset(state.config.reflection_config.journal_file)
+        )
+
     if state.config.component_selector == "reflection":
         components_to_update = None
         components_for_dataset = list(parent.components.keys())
-        component_toolsets = [
+        component_toolsets.append(
             _build_component_selection_toolset(
                 state=state,
                 deps=deps,
                 parent_idx=parent_idx,
             )
-        ]
+        )
     else:
         selection = deps.component_selector.select(
             state,
@@ -165,7 +172,7 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
             components=components_to_update,
             model=reflection_model,
             model_settings=deps.model_settings,
-            component_toolsets=component_toolsets,
+            component_toolsets=component_toolsets if component_toolsets else None,
         )
         component_metadata = (
             proposal_result.component_metadata

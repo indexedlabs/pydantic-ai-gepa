@@ -429,6 +429,7 @@ class AgentAdapterTrajectory(Trajectory):
     usage: dict[str, Any] = field(default_factory=dict)
     case: Case[Any, Any, Any] | None = None
     metric_feedback: str | None = None
+    metric_side_info: dict[str, Any] | None = None
 
     def _extract_user_content(self, part: UserPromptPart) -> str:
         if isinstance(part.content, str):
@@ -855,6 +856,7 @@ class _BaseAgentAdapter(
 
             if trajectory is not None:
                 trajectory.metric_feedback = metric_result.feedback
+                trajectory.metric_side_info = metric_result.side_info
 
             result: dict[str, Any] = {
                 "output": output,
@@ -1212,6 +1214,8 @@ class _BaseAgentAdapter(
                         feedback_text += f" - Error: {output.error_message}"
 
             record["feedback"] = feedback_text
+            if trajectory.metric_side_info:
+                record["side_info"] = _serialize_for_reflection(trajectory.metric_side_info)
 
             # Include case metadata and expected output based on config
             case = getattr(trajectory, "case", None)

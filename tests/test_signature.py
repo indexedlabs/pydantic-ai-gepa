@@ -120,6 +120,13 @@ def test_gepa_components():
             "signature:EmailAnalysis:emails:desc": "List of email messages to analyze. Look for sentiment and key topics.",
             "signature:EmailAnalysis:context:desc": "Additional context about the email thread or conversation.",
             "signature:EmailAnalysis:suffix:desc": "The suffix input",
+            "signature:EmailAnalysis:encoder": """\
+
+def encode_input(data):
+    return "<input>\\n" + json_dumps(data) + "\\n</input>"
+
+encode_input(data)
+""",
         }
     )
 
@@ -212,6 +219,13 @@ def test_signature_without_explicit_field_description():
             "signature:SimpleSignature:instructions": "A simple signature for testing.",
             "signature:SimpleSignature:text:desc": "The text input",
             "signature:SimpleSignature:number:desc": "A number to process",
+            "signature:SimpleSignature:encoder": """\
+
+def encode_input(data):
+    return "<input>\\n" + json_dumps(data) + "\\n</input>"
+
+encode_input(data)
+""",
         }
     )
 
@@ -264,6 +278,12 @@ def test_extract_seed_candidate_with_signature():
             "signature:EmailAnalysis:emails:desc": "List of email messages to analyze. Look for sentiment and key topics.",
             "signature:EmailAnalysis:context:desc": "Additional context about the email thread or conversation.",
             "signature:EmailAnalysis:suffix:desc": "The suffix input",
+            "signature:EmailAnalysis:encoder": """\
+def encode_input(data):
+    return "<input>\\n" + json_dumps(data) + "\\n</input>"
+
+encode_input(data)\
+""",
         }
     )
 

@@ -212,6 +212,7 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         self,
         input_instance: BaseModel,
         input_spec: BoundInputSpec[BaseModel],
+        candidate: dict[str, str] | None = None,
     ) -> Sequence[_messages.UserContent]:
         """Extract user content from a structured input instance.
 
@@ -221,7 +222,7 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         Returns:
             The user content without system instructions.
         """
-        return input_spec.generate_user_content(input_instance)
+        return input_spec.generate_user_content(input_instance, candidate=candidate)
 
     def _prepare_system_instructions(
         self,
@@ -280,7 +281,9 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         if user_prompt is not None:
             run_user_prompt = user_prompt
         else:
-            run_user_prompt = self._prepare_user_content(input_instance, input_spec)
+            run_user_prompt = self._prepare_user_content(
+                input_instance, input_spec, candidate=candidate
+            )
 
         system_instructions = self._prepare_system_instructions(
             input_instance, input_spec, candidate
