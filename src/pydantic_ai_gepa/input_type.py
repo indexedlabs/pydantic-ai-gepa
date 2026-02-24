@@ -119,9 +119,9 @@ def generate_user_content(
     return view.build_user_content(candidate=candidate)
 
 
-def get_gepa_components(model_cls: type[BaseModel]) -> dict[str, str]:
+def get_gepa_components(model_cls: type[BaseModel], base_encoder_script: str | None = None) -> dict[str, str]:
     """Extract default GEPA components for a structured input model."""
-    class_view = _InputClassView(model_cls)
+    class_view = _InputClassView(model_cls, base_encoder_script=base_encoder_script)
     return class_view.get_gepa_components()
 
 
@@ -152,12 +152,13 @@ ModelT = TypeVar("ModelT", bound=BaseModel)
 class BoundInputSpec(Generic[ModelT]):
     """Normalized view over a structured input model."""
 
-    def __init__(self, model_cls: type[ModelT]) -> None:
+    def __init__(self, model_cls: type[ModelT], base_encoder_script: str | None = None) -> None:
         if not issubclass(model_cls, BaseModel):
             raise TypeError(
                 f"Input specs must be Pydantic BaseModel subclasses, got {model_cls!r}"
             )
         self.model_cls: type[ModelT] = model_cls
+        self.base_encoder_script: str | None = base_encoder_script
 
     def generate_system_instructions(
         self,
@@ -176,7 +177,7 @@ class BoundInputSpec(Generic[ModelT]):
         return generate_user_content(instance, candidate=candidate)
 
     def get_gepa_components(self) -> dict[str, str]:
-        return get_gepa_components(self.model_cls)
+        return get_gepa_components(self.model_cls, base_encoder_script=self.base_encoder_script)
 
     @contextmanager
     def apply_candidate(
@@ -190,11 +191,13 @@ class BoundInputSpec(Generic[ModelT]):
 InputSpec = type[ModelT] | BoundInputSpec[ModelT]
 
 
-def build_input_spec(input_spec: InputSpec[ModelT]) -> BoundInputSpec[ModelT]:
+def build_input_spec(input_spec: InputSpec[ModelT], base_encoder_script: str | None = None) -> BoundInputSpec[ModelT]:
     """Normalize an input specification into a BoundInputSpec."""
     if isinstance(input_spec, BoundInputSpec):
+        if base_encoder_script is not None and input_spec.base_encoder_script is None:
+            input_spec.base_encoder_script = base_encoder_script
         return input_spec
-    return BoundInputSpec(input_spec)
+    return BoundInputSpec(input_spec, base_encoder_script=base_encoder_script)
 
 
 class _InputShared:
@@ -608,6 +611,10 @@ class _InputModelView(_InputShared):
 class _InputClassView(_InputShared):
     """Operations that only need the model class."""
 
+    def __init__(self, model_cls: type[BaseModel], base_encoder_script: str | None = None) -> None:
+        super().__init__(model_cls)
+        self.base_encoder_script = base_encoder_script
+
     def get_gepa_components(self) -> dict[str, str]:
         components: dict[str, str] = {}
 
@@ -620,7 +627,11 @@ class _InputClassView(_InputShared):
             desc = field_info.description or f"The {field_name} input"
             components[f"signature:{self.model_cls.__name__}:{field_name}:desc"] = desc
 
-        components[f"signature:{self.model_cls.__name__}:encoder"] = _DEFAULT_ENCODER_SCRIPT
+        encoder_script = self.base_encoder_script
+        if encoder_script is None:
+            encoder_script = getattr(self.model_cls, "base_encoder_script", _DEFAULT_ENCODER_SCRIPT)
+
+        components[f"signature:{self.model_cls.__name__}:encoder"] = encoder_script
 
         return components
 

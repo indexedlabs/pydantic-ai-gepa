@@ -686,6 +686,7 @@ async def run_math_tools_optimization(
         reflection_config=ReflectionConfig(
             model=reflection_model,
             example_bank=ExampleBankConfig(),
+            journal_file=".gepa_cache/math_optimization_journal.jsonl",
         ),
     )
 

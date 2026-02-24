@@ -99,6 +99,7 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         append_instructions: bool = True,
         optimize_tools: bool = False,
         optimize_output_type: bool = False,
+        base_encoder_script: str | None = None,
     ):
         """Initialize the SignatureAgent wrapper.
 
@@ -110,8 +111,9 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
             optimize_tools: If True, expose and optimize tool descriptions and parameter schemas via GEPA.
             optimize_output_type: If True, expose and optimize output tool descriptions and schemas derived
                 from the agent's output_type via GEPA.
+            base_encoder_script: Optional base script to encode input values.
         """
-        bound_spec = build_input_spec(input_type)
+        bound_spec = build_input_spec(input_type, base_encoder_script=base_encoder_script)
 
         inferred_output_type = (
             output_type
