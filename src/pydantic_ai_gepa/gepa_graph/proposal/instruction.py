@@ -182,7 +182,7 @@ When skills are enabled, you may also use:
 - `list_active_skills()` - List which skills have been activated so far.
 """
 
-JOURNAL_TOOLS_INSTRUCTIONS = """## Durable Journal Tools (Context Ledger)
+JOURNAL_TOOLS_INSTRUCTIONS = """## Durable Journal Tools (Reflection Ledger)
 
 You have access to a persistent journal via the `read_journal_entries` and `append_journal_entry` tools. This journal acts as a long-term memory across independent optimization runs.
 
