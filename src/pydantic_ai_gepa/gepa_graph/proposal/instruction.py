@@ -182,6 +182,16 @@ When skills are enabled, you may also use:
 - `list_active_skills()` - List which skills have been activated so far.
 """
 
+JOURNAL_TOOLS_INSTRUCTIONS = """## Durable Journal Tools (Context Ledger)
+
+You have access to a persistent journal via the `read_journal_entries` and `append_journal_entry` tools. This journal acts as a long-term memory across independent optimization runs.
+
+**CRITICAL PROTOCOL:**
+1. **Always read first:** If the journal tools are available, you should use `read_journal_entries` to see what past iterations have learned before you make any decisions.
+2. **Incorporate insights:** Use the past strategies to inform your new proposals (e.g. avoid repeating known mistakes, apply discovered rules).
+3. **Record new discoveries:** If you identify a concrete, reusable strategy or edge-case insight from analyzing the current evaluation traces, you MUST use `append_journal_entry` to log it for future iterations before finalizing your proposal.
+"""
+
 
 def _toolset_has_tool(toolset: object, tool_name: str) -> bool:
     tools = getattr(toolset, "tools", None)
@@ -200,6 +210,14 @@ def _skills_tools_enabled(component_toolsets: Sequence[AbstractToolset[None]]) -
         or _toolset_has_tool(toolset, "load_skill_file")
         or _toolset_has_tool(toolset, "activate_skill_components")
         or _toolset_has_tool(toolset, "list_active_skills")
+        for toolset in component_toolsets
+    )
+
+
+def _journal_tools_enabled(component_toolsets: Sequence[AbstractToolset[None]]) -> bool:
+    return any(
+        _toolset_has_tool(toolset, "read_journal_entries")
+        or _toolset_has_tool(toolset, "append_journal_entry")
         for toolset in component_toolsets
     )
 
@@ -345,6 +363,10 @@ class InstructionProposalGenerator:
                 if _skills_tools_enabled(component_toolsets):
                     runtime_instructions_parts.append(
                         SKILLS_DISCOVERY_TOOLS_INSTRUCTIONS
+                    )
+                if _journal_tools_enabled(component_toolsets):
+                    runtime_instructions_parts.append(
+                        JOURNAL_TOOLS_INSTRUCTIONS
                     )
             if components is None:
                 runtime_instructions_parts.append(
@@ -1168,6 +1190,7 @@ class InstructionProposalGenerator:
 __all__ = [
     "InstructionProposalGenerator",
     "DEFAULT_AGENT_INSTRUCTIONS",
+    "JOURNAL_TOOLS_INSTRUCTIONS",
     "InstructionProposalOutput",
     "ComponentUpdate",
     "TrajectoryAnalysis",
