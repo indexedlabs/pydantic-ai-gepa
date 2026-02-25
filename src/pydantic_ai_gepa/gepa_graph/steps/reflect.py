@@ -185,7 +185,6 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
             from pathlib import Path
             import json
             spans = deps.memory_exporter.get_finished_spans()
-            print(f"DEBUG: Saving {len(spans)} reflector spans to disk")
             if spans:
                 reflector_dir = Path(f".gepa_cache/runs/{state.run_id}/candidates/{parent_idx}/reflector_traces")
                 reflector_dir.mkdir(parents=True, exist_ok=True)

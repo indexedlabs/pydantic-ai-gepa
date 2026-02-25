@@ -51,7 +51,6 @@ def create_trace_toolset(run_id: str, candidate_idx: int, reflection_model: Any 
             return read_traces()
 
         sandbox = ouros.Sandbox(python_script, external_functions=["get_traces"])
-        print(f"Executing Ouros trace analysis script:\\n{python_script}")
         try:
             result = await ouros.run_async(
                 sandbox,

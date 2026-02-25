@@ -88,8 +88,6 @@ async def _run_python_in_sandbox(
         inputs: Optional JSON-compatible mapping that will be injected as global variables when the script starts.
     """
     started = time.perf_counter()
-    import logging
-    print(f"Executing sandbox code:\\n{code}\\n")
 
     try:
         sandbox = ouros.Sandbox(code)

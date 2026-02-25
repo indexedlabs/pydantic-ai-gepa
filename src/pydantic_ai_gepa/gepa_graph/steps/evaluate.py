@@ -40,7 +40,6 @@ async def evaluate_step(ctx: StepContext[GepaState, GepaDeps, None]) -> None:
         import json
 
         spans = ctx.deps.memory_exporter.get_finished_spans()
-        print(f"DEBUG: Saving {len(spans)} evaluation spans to disk")
         if spans:
             traces_dir = Path(f".gepa_cache/runs/{state.run_id}/candidates/{candidate.idx}/traces")
             traces_dir.mkdir(parents=True, exist_ok=True)
