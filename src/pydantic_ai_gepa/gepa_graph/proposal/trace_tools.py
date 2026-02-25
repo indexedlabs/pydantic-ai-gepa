@@ -46,6 +46,54 @@ def create_trace_toolset(
         return json.loads(data)
 
     @toolset.tool
+    async def run_python_script(python_script: str) -> str:
+        """Execute a Python script to explore structured files (RLM architecture).
+        
+        The script is executed via pydantic_monty (a safe Python subset) and has access to:
+        - `read_file(path: str) -> str`: Reads a file relative to the context directory.
+        - `list_dir(path: str) -> list[str]`: Lists directory contents.
+        - `json_loads(data: str) -> Any`: Parses a JSON string into a Python object.
+        
+        Available structured files:
+        - `components.json`: Contains the candidate components.
+        - `traces/traces.jsonl`: Contains the execution traces.
+
+        The script MUST return its output by returning the value from the last expression (or by assigning to a variable that is the last expression).
+
+        Example finding a failed trace:
+        ```python
+        lines = read_file('traces/traces.jsonl').strip().split('\\n')
+        failed_trace_ids = []
+        for line in lines:
+            if not line: continue
+            data = json_loads(line)
+            if not data.get('success'):
+                failed_trace_ids.append(data.get('context', {}).get('trace_id'))
+        failed_trace_ids
+        ```
+        """
+        try:
+            import pydantic_monty
+        except ImportError:
+            return "Error: pydantic_monty is not installed. File exploration unavailable."
+
+        try:
+            m = pydantic_monty.Monty(
+                python_script,
+                external_functions=["read_file", "list_dir", "json_loads"]
+            )
+            result = m.run(
+                external_functions={
+                    "read_file": _read_file,
+                    "list_dir": _list_dir,
+                    "json_loads": _json_loads,
+                }
+            )
+            return str(result)
+        except Exception as e:
+            return f"Error executing script: {e}"
+
+    @toolset.tool
     async def analyze_trace_with_llm(trace_id: str, prompt: str) -> str:
         """Spawn a lightweight sub-agent to deeply analyze a specific trace.
         
@@ -55,85 +103,40 @@ def create_trace_toolset(
             trace_id: The `context.trace_id` from the span you want to analyze.
             prompt: The specific semantic question for the sub-agent (e.g. "Did the agent misunderstand the API tool?").
         """
-        # Maintain a persistent scratchpad dictionary across history clears to emulate a stateful REPL
-        repl_state: dict[str, Any] = {}
-
-        def _set_state(key: str, value: Any) -> str:
-            repl_state[key] = value
-            return f"Saved {key} to REPL state."
-
-        def _get_state(key: str) -> Any:
-            return repl_state.get(key)
-            
-        def _list_state() -> list[str]:
-            return list(repl_state.keys())
+        # Option 1: Maintain a persistent scratchpad dictionary across history clears
+        scratchpad: dict[str, str] = {}
 
         subagent_toolset = FunctionToolset[None]()
+        subagent_toolset.tools["run_python_script"] = run_python_script
 
         @subagent_toolset.tool
-        async def run_python_script(python_script: str) -> str:
-            """Execute a Python script to explore structured files (RLM architecture).
-            
-            The script is executed via pydantic_monty (a safe Python subset) and has access to:
-            - `read_file(path: str) -> str`: Reads a file relative to the context directory.
-            - `list_dir(path: str) -> list[str]`: Lists directory contents.
-            - `json_loads(data: str) -> Any`: Parses a JSON string into a Python object.
-            - `set_state(key: str, value: Any) -> str`: Persist a variable between script executions.
-            - `get_state(key: str) -> Any`: Retrieve a persisted variable from a previous script execution.
-            - `list_state() -> list[str]`: List keys currently persisted in state.
-            
-            Available structured files:
-            - `components.json`: Contains the candidate components.
-            - `traces/traces.jsonl`: Contains the execution traces.
+        def save_to_scratchpad(key: str, value: str) -> str:
+            """Save a string value to your persistent scratchpad."""
+            scratchpad[key] = value
+            return f"Saved to scratchpad[{key}]"
 
-            The script MUST return its output by returning the value from the last expression.
+        @subagent_toolset.tool
+        def load_from_scratchpad(key: str) -> str:
+            """Load a value from your persistent scratchpad."""
+            return scratchpad.get(key, f"Key {key} not found.")
 
-            Example persisting data:
-            ```python
-            data = json_loads(read_file('traces/traces.jsonl').split('\\n')[0])
-            set_state('first_trace', data)
-            "Saved first trace"
-            ```
-            """
-            try:
-                import pydantic_monty
-            except ImportError:
-                return "Error: pydantic_monty is not installed. File exploration unavailable."
-
-            try:
-                m = pydantic_monty.Monty(
-                    python_script,
-                    external_functions=[
-                        "read_file", "list_dir", "json_loads", 
-                        "set_state", "get_state", "list_state"
-                    ]
-                )
-                result = m.run(
-                    external_functions={
-                        "read_file": _read_file,
-                        "list_dir": _list_dir,
-                        "json_loads": _json_loads,
-                        "set_state": _set_state,
-                        "get_state": _get_state,
-                        "list_state": _list_state,
-                    }
-                )
-                return str(result)
-            except Exception as e:
-                return f"Error executing script: {e}"
+        @subagent_toolset.tool
+        def list_scratchpad() -> list[str]:
+            """List all keys currently in your persistent scratchpad."""
+            return list(scratchpad.keys())
 
         @subagent_toolset.tool
         def clear_message_history(next_context: str) -> str:
             """Clear your conversation history to free up context window space. 
             Execution will restart with `next_context` as your new starting prompt.
-            Ensure you have persisted important data using `set_state` in a python script before calling this.
+            Ensure you have saved any important findings to your scratchpad before calling this.
             """
             raise ClearMessageHistoryException(next_context)
 
         @subagent_toolset.tool
         async def spawn_agent(instructions: str) -> str:
             """Spawn a recursive sub-agent with a fresh context window to investigate a sub-problem. 
-            It has access to its own python script tool and its own isolated REPL state, and its message history 
+            It has access to its own python script tool and its own scratchpad, but its message history 
             does NOT affect your context window. It returns a string answer to your instructions.
             """
             return await _run_agent_loop(instructions, depth=1)
@@ -143,13 +146,11 @@ def create_trace_toolset(
                 f"You are a senior debugging engineer analyzing an execution trace (trace_id: {trace_id}).\n"
                 "You MUST use your `run_python_script` tool to read `traces/traces.jsonl` "
                 "(and `components.json` if needed). Do NOT guess. Write python scripts to extract context.\n"
-                "Use `set_state` inside your python scripts to persist data across script runs.\n"
-                "If your conversation gets too long, save findings to state and call `clear_message_history`."
+                "If your conversation gets too long, save findings to your scratchpad and call `clear_message_history`."
             ) if depth == 0 else (
                 f"You are a recursive sub-agent exploring a sub-problem for trace {trace_id}.\n"
-                "Use `run_python_script` to read files and maintain your own state via `set_state`.\n"
-                "Return your final answer to the parent agent.\n"
-                "If your conversation gets too long, save findings to state and call `clear_message_history`."
+                "Use `run_python_script` to read files. Return your final answer to the parent agent.\n"
+                "If your conversation gets too long, save findings to your scratchpad and call `clear_message_history`."
             )
 
             agent = Agent(
@@ -157,6 +158,7 @@ def create_trace_toolset(
                 system_prompt=system_prompt,
             )
 
+            # Execution loop to handle history clears
             while True:
                 try:
                     result = await agent.run(current_prompt, toolsets=[subagent_toolset])
@@ -164,7 +166,7 @@ def create_trace_toolset(
                 except ClearMessageHistoryException as e:
                     current_prompt = (
                         f"History cleared. You previously left yourself this note to continue:\n\n{e.next_context}\n\n"
-                        "Your REPL state is intact. You may use `get_state` in your python scripts to retrieve your saved data."
+                        "Your scratchpad is intact. You may use `load_from_scratchpad` to retrieve your saved data."
                     )
                 except Exception as e:
                     return f"Error running sub-agent: {e}"
