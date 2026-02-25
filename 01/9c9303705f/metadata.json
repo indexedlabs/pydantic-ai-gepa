@@ -1,0 +1,39 @@
+{
+  "checkpoint_id": "019c9303705f",
+  "created_at": "2026-02-25T04:16:42.139684+00:00",
+  "branch_name": "main",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "fefeb9a432cbe2d366aa14f8301adaf41d874201"
+  ],
+  "entity_touches": [
+    ".mighty/loro/edges/019c91f1-0323-7832-89fc-49ea2b475be0.loro",
+    ".mighty/loro/edges/019c91f1-033b-7733-96b5-db540e202b45.loro",
+    ".mighty/loro/edges/019c91f1-0358-70c2-80ea-2c5d9d027f23.loro",
+    ".mighty/loro/edges/019c91f1-036a-7712-9bf2-2834d3d6415e.loro",
+    ".mighty/loro/edges/019c91f1-0387-7540-b74e-6ab61a379fd8.loro",
+    ".mighty/loro/edges/019c91f1-03a1-7be0-aee7-027badffaf21.loro",
+    ".mighty/loro/edges/019c91f1-03ba-7f21-a6b0-77ee5840b6f1.loro",
+    ".mighty/loro/edges/019c91f1-03ce-7ef2-8336-bfc42422f8e3.loro",
+    ".mighty/loro/edges/019c91f1-16c8-7fd3-a262-c5fb29e9095d.loro",
+    ".mighty/loro/records/019c9181-bb58-7be1-9ff1-321cfa920595.loro",
+    ".mighty/loro/records/019c91e4-396f-7903-bc96-70a870b1a09d.loro",
+    ".mighty/loro/records/019c91e4-4eec-7250-82c5-1200c12246a5.loro",
+    ".mighty/loro/records/019c91e4-6390-7da0-bd2a-77caf8250724.loro",
+    ".mighty/loro/records/019c91e4-70a0-71a2-8b91-20bbdb5749de.loro",
+    ".mighty/loro/records/019c91f0-c822-7a33-841b-325a45c24156.loro",
+    ".mighty/loro/records/019c91f0-f171-78a3-b7cd-4a6e7713e79d.loro",
+    ".mighty/loro/records/019c91f0-f184-70b3-a6ca-6a3e77fc8da2.loro",
+    ".mighty/loro/records/019c91f0-f194-7650-8129-e21fc6d2fbe4.loro",
+    ".mighty/loro/records/019c91f0-f1a3-74f0-bdb4-41d7efbd1f1a.loro",
+    ".mighty/loro/records/019c91f0-f1b1-7741-b8fb-5503031fa024.loro",
+    ".mighty/loro/records/019c91f0-f1c0-7b81-a5f0-95cffb8c4202.loro",
+    ".mighty/loro/records/019c91f0-f1d0-7203-a3c7-55523221b295.loro",
+    ".mighty/loro/records/019c91f0-f1df-74b2-9253-900bc1a00c0f.loro",
+    ".mighty/loro/records/019c91f1-0340-7140-86f1-82d3ab0200c8.loro",
+    ".mighty/loro/records/019c91f1-036e-7b80-af3d-229b54431a57.loro",
+    ".mighty/loro/records/019c91f1-038b-7f72-b312-6a0a3428d048.loro",
+    ".mighty/loro/records/019c91f1-03a5-7583-be5f-b22d870eb539.loro",
+    ".mighty/loro/spaces/019c76fe-8692-7463-a36e-8abcc60b56af.loro"
+  ]
+}
