@@ -291,13 +291,13 @@ Each trace contains:
 ## Execution Traces Available for Analysis
 
 2 traces available from the execution: 0 succeeded, 2 failed.
-The traces are stored on disk in structured JSONL format.
-You must use the `run_trace_analysis(python_script: str)` tool to write and execute python map-reduce scripts to analyze these traces within the unbounded Ouros Data Plane.
+The traces are stored on disk as `traces/traces.jsonl`.
+You must use the `run_python_script(python_script: str)` tool to write and execute python map-reduce scripts to parse these structured files (using `read_file` and `json_loads`).
 You may also use `analyze_trace_with_llm(trace_id, prompt)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.
 
 
 ### Analysis guidance
-- Use `run_trace_analysis` to aggregate errors or find common failure modes.
+- Use `run_python_script` to aggregate errors or find common failure modes across `traces.jsonl`.
 - Use `analyze_trace_with_llm` to understand *why* a specific trace failed if the python analysis is insufficient.
 - What failure patterns repeat across runs?
 - Are components misaligned (e.g., instructions referencing tools that don't exist)?
@@ -741,13 +741,13 @@ Each trace contains:
 ## Execution Traces Available for Analysis
 
 1 traces available from the execution: 1 succeeded, 0 failed.
-The traces are stored on disk in structured JSONL format.
-You must use the `run_trace_analysis(python_script: str)` tool to write and execute python map-reduce scripts to analyze these traces within the unbounded Ouros Data Plane.
+The traces are stored on disk as `traces/traces.jsonl`.
+You must use the `run_python_script(python_script: str)` tool to write and execute python map-reduce scripts to parse these structured files (using `read_file` and `json_loads`).
 You may also use `analyze_trace_with_llm(trace_id, prompt)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.
 
 
 ### Analysis guidance
-- Use `run_trace_analysis` to aggregate errors or find common failure modes.
+- Use `run_python_script` to aggregate errors or find common failure modes across `traces.jsonl`.
 - Use `analyze_trace_with_llm` to understand *why* a specific trace failed if the python analysis is insufficient.
 - What failure patterns repeat across runs?
 - Are components misaligned (e.g., instructions referencing tools that don't exist)?
@@ -1045,13 +1045,13 @@ Each trace contains:
 ## Execution Traces Available for Analysis
 
 2 traces available from the execution: 2 succeeded, 0 failed.
-The traces are stored on disk in structured JSONL format.
-You must use the `run_trace_analysis(python_script: str)` tool to write and execute python map-reduce scripts to analyze these traces within the unbounded Ouros Data Plane.
+The traces are stored on disk as `traces/traces.jsonl`.
+You must use the `run_python_script(python_script: str)` tool to write and execute python map-reduce scripts to parse these structured files (using `read_file` and `json_loads`).
 You may also use `analyze_trace_with_llm(trace_id, prompt)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.
 
 
 ### Analysis guidance
-- Use `run_trace_analysis` to aggregate errors or find common failure modes.
+- Use `run_python_script` to aggregate errors or find common failure modes across `traces.jsonl`.
 - Use `analyze_trace_with_llm` to understand *why* a specific trace failed if the python analysis is insufficient.
 - What failure patterns repeat across runs?
 - Are components misaligned (e.g., instructions referencing tools that don't exist)?

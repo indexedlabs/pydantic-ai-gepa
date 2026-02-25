@@ -11,55 +11,77 @@ def create_trace_toolset(
     run_id: str, candidate_idx: int, reflection_model: Any = "gpt-4o-mini"
 ) -> FunctionToolset[None]:
     toolset = FunctionToolset[None]()
-    traces_dir = Path(f".gepa_cache/runs/{run_id}/candidates/{candidate_idx}/traces")
+    base_dir = Path(f".gepa_cache/runs/{run_id}/candidates/{candidate_idx}")
+    traces_dir = base_dir / "traces"
 
-    def read_traces() -> list[dict[str, Any]]:
-        traces_file = traces_dir / "traces.jsonl"
-        if not traces_file.exists():
+    def _read_file(path: str) -> str:
+        safe_path = (base_dir / path).resolve()
+        if not safe_path.is_relative_to(base_dir.resolve()):
+            return f"Error: Path {path} is outside the allowed directory."
+        if not safe_path.exists():
+            return f"Error: File {path} not found."
+        try:
+            return safe_path.read_text(encoding="utf-8")
+        except Exception as e:
+            return f"Error reading file: {e}"
+
+    def _list_dir(path: str) -> list[str]:
+        safe_path = (base_dir / path).resolve()
+        if not safe_path.is_relative_to(base_dir.resolve()):
             return []
-        traces = []
-        with open(traces_file, "r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                try:
-                    traces.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
-        return traces
+        if not safe_path.exists() or not safe_path.is_dir():
+            return []
+        try:
+            return [str(p.relative_to(base_dir)) for p in safe_path.iterdir()]
+        except Exception:
+            return []
+
+    def _json_loads(data: str) -> Any:
+        return json.loads(data)
 
     @toolset.tool
-    async def run_trace_analysis(python_script: str) -> str:
-        """Execute a Python script to analyze the execution traces using the ouros data plane.
+    async def run_python_script(python_script: str) -> str:
+        """Execute a Python script to explore structured files (RLM architecture).
+        
+        The script is executed via pydantic_monty (a safe Python subset) and has access to:
+        - `read_file(path: str) -> str`: Reads a file relative to the context directory.
+        - `list_dir(path: str) -> list[str]`: Lists directory contents.
+        - `json_loads(data: str) -> Any`: Parses a JSON string into a Python object.
+        
+        Available structured files:
+        - `components.json`: Contains the candidate components.
+        - `traces/traces.jsonl`: Contains the execution traces.
 
-        The script has access to two external functions:
-        - `get_traces()`: Returns a list of dictionaries representing the OTel spans for all evaluations.
+        The script MUST return its output by returning the value from the last expression (or by assigning to a variable that is the last expression).
 
-        Example:
+        Example finding a failed trace:
         ```python
-        traces = get_traces()
-        failed = [t for t in traces if "error" in str(t)]
-        return f"Found {len(failed)} failed traces"
+        lines = read_file('traces/traces.jsonl').strip().split('\\n')
+        failed_trace_ids = []
+        for line in lines:
+            if not line: continue
+            data = json_loads(line)
+            if not data.get('success'):
+                failed_trace_ids.append(data.get('context', {}).get('trace_id'))
+        failed_trace_ids
         ```
         """
         try:
-            import ouros
+            import pydantic_monty
         except ImportError:
-            return "Error: ouros is not installed. Trace analysis is unavailable."
+            return "Error: pydantic_monty is not installed. File exploration unavailable."
 
-        def get_traces() -> list[dict[str, Any]]:
-            return read_traces()
-
-        sandbox = ouros.Sandbox(python_script, external_functions=["get_traces"])
         try:
-            result = await ouros.run_async(
-                sandbox,
-                external_functions={"get_traces": get_traces},
-                limits=ouros.ResourceLimits(
-                    timeout_ms=10000,
-                    memory_bytes=500_000_000,
-                    instruction_count=10_000_000,
-                ),
+            m = pydantic_monty.Monty(
+                python_script,
+                external_functions=["read_file", "list_dir", "json_loads"]
+            )
+            result = m.run(
+                external_functions={
+                    "read_file": _read_file,
+                    "list_dir": _list_dir,
+                    "json_loads": _json_loads,
+                }
             )
             return str(result)
         except Exception as e:
@@ -67,43 +89,32 @@ def create_trace_toolset(
 
     @toolset.tool
     async def analyze_trace_with_llm(trace_id: str, prompt: str) -> str:
-        """Spawn a lightweight sub-agent to analyze a specific trace.
+        """Spawn a lightweight sub-agent to deeply analyze a specific trace.
+        
+        Use this when a python script isn't enough to answer semantic questions about a trace.
 
         Args:
-            trace_id: The `context.trace_id` from the span you want to analyze (find this using `run_trace_analysis`).
+            trace_id: The `context.trace_id` from the span you want to analyze.
             prompt: The specific semantic question for the sub-agent (e.g. "Did the agent misunderstand the API tool?").
         """
-        traces = read_traces()
-        target_trace = None
-        for trace in traces:
-            ctx = trace.get("context", {})
-            if str(ctx.get("trace_id", "")) == str(trace_id):
-                target_trace = trace
-                break
-
-        if not target_trace:
-            # Maybe the trace_id is formatted differently, let's just do a string search
-            for trace in traces:
-                if str(trace_id) in str(trace):
-                    target_trace = trace
-                    break
-
-        if not target_trace:
-            return f"Error: trace {trace_id} not found."
+        # Create a dedicated toolset for the sub-agent that contains the same run_python_script
+        subagent_toolset = FunctionToolset[None]()
+        subagent_toolset.tools["run_python_script"] = run_python_script
 
         agent = Agent(
             reflection_model,
-            system_prompt="You are a senior debugging engineer analyzing an execution trace.",
+            system_prompt=(
+                f"You are a senior debugging engineer analyzing an execution trace (trace_id: {trace_id}).\\n"
+                "You MUST use your `run_python_script` tool to read the file `traces/traces.jsonl` "
+                "(and `components.json` if needed) to extract the context you need. "
+                "Do NOT guess. Write python scripts to parse the JSONL and examine the exact conversation messages."
+            ),
         )
-        full_prompt = f"""Analyze the following trace to answer the question.
 
-Question: {prompt}
-
-Trace Data:
-{json.dumps(target_trace, indent=2)}"""
+        full_prompt = f"Analyze the trace to answer this question:\\n\\n{prompt}"
 
         try:
-            result = await agent.run(full_prompt)
+            result = await agent.run(full_prompt, toolsets=[subagent_toolset])
             return result.data
         except Exception as e:
             return f"Error running sub-agent: {e}"

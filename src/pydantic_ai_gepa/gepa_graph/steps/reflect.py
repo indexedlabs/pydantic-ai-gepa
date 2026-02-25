@@ -123,6 +123,13 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
             create_journal_toolset(state.config.reflection_config.journal_file)
         )
 
+    from pathlib import Path
+    import json
+    components_file = Path(f".gepa_cache/runs/{state.run_id}/candidates/{parent_idx}/components.json")
+    components_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(components_file, "w", encoding="utf-8") as f:
+        json.dump({k: v.text for k, v in parent.components.items()}, f, indent=2)
+
     from ..proposal.trace_tools import create_trace_toolset
 
     component_toolsets.append(
