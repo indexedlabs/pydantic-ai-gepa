@@ -66,24 +66,33 @@ def create_trace_toolset(
 
         # Pre-load files into the session to simulate external functions
         import base64
-        traces_content = ""
-        traces_file = traces_dir / "traces.jsonl"
-        if traces_file.exists():
-            traces_content = base64.b64encode(traces_file.read_bytes()).decode("utf-8")
-            
-        components_content = ""
-        components_file = base_dir / "components.json"
-        if components_file.exists():
-            components_content = base64.b64encode(components_file.read_bytes()).decode("utf-8")
+        import textwrap
+
+        def _build_chunked_assignment(var_name: str, file_path: Path) -> str:
+            if not file_path.exists():
+                return f"{var_name} = ''\n"
+            content = base64.b64encode(file_path.read_bytes()).decode("utf-8")
+            chunks = textwrap.wrap(content, 8000)
+            lines = [f"{var_name}_parts = []"]
+            for chunk in chunks:
+                lines.append(f"{var_name}_parts.append('{chunk}')")
+            lines.append(f"{var_name} = ''.join({var_name}_parts)")
+            return "\n".join(lines)
+
+        traces_assignment = _build_chunked_assignment("traces_content", traces_dir / "traces.jsonl")
+        components_assignment = _build_chunked_assignment("components_content", base_dir / "components.json")
             
         setup_script = f"""
 import base64
 import json
+{traces_assignment}
+{components_assignment}
+
 def read_file(path: str) -> str:
-    if 'traces.jsonl' in path:
-        return base64.b64decode('{traces_content}').decode('utf-8')
-    if 'components.json' in path:
-        return base64.b64decode('{components_content}').decode('utf-8')
+    if 'traces.jsonl' in path and traces_content:
+        return base64.b64decode(traces_content).decode('utf-8')
+    if 'components.json' in path and components_content:
+        return base64.b64decode(components_content).decode('utf-8')
     return "Error: File not found"
 
 def json_loads(data: str):
@@ -142,27 +151,20 @@ def list_dir(path: str):
             child_session_id = f"repl_{uuid.uuid4().hex[:8]}"
             child_session = mgr.create_session(child_session_id)
 
-            # Pre-load files into the session to simulate external functions
-            # without hitting the Ouros Session external function limitation.
-            import base64
-            traces_content = ""
-            traces_file = traces_dir / "traces.jsonl"
-            if traces_file.exists():
-                traces_content = base64.b64encode(traces_file.read_bytes()).decode("utf-8")
-                
-            components_content = ""
-            components_file = base_dir / "components.json"
-            if components_file.exists():
-                components_content = base64.b64encode(components_file.read_bytes()).decode("utf-8")
+            traces_assignment = _build_chunked_assignment("traces_content", traces_dir / "traces.jsonl")
+            components_assignment = _build_chunked_assignment("components_content", base_dir / "components.json")
                 
             setup_script = f"""
 import base64
 import json
+{traces_assignment}
+{components_assignment}
+
 def read_file(path: str) -> str:
-    if 'traces.jsonl' in path:
-        return base64.b64decode('{traces_content}').decode('utf-8')
-    if 'components.json' in path:
-        return base64.b64decode('{components_content}').decode('utf-8')
+    if 'traces.jsonl' in path and traces_content:
+        return base64.b64decode(traces_content).decode('utf-8')
+    if 'components.json' in path and components_content:
+        return base64.b64decode(components_content).decode('utf-8')
     return "Error: File not found"
 
 def json_loads(data: str):
