@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+import uuid
 
 from pydantic_ai import Agent, FunctionToolset
 
@@ -47,47 +48,50 @@ def create_trace_toolset(
 
     @toolset.tool
     async def run_python_script(python_script: str) -> str:
-        """Execute a Python script to explore structured files (RLM architecture).
+        """Execute a Python script across ALL traces using the stateless ouros Sandbox.
         
-        The script is executed via pydantic_monty (a safe Python subset) and has access to:
-        - `read_file(path: str) -> str`: Reads a file relative to the context directory.
-        - `list_dir(path: str) -> list[str]`: Lists directory contents.
-        - `json_loads(data: str) -> Any`: Parses a JSON string into a Python object.
-        
-        Available structured files:
-        - `components.json`: Contains the candidate components.
-        - `traces/traces.jsonl`: Contains the execution traces.
+        The script is executed via ouros.Sandbox and has access to:
+        - `get_traces() -> list[dict]`: Returns all execution traces from disk.
 
-        The script MUST return its output by returning the value from the last expression (or by assigning to a variable that is the last expression).
+        This is a global map-reduce tool. It is stateless.
 
         Example finding a failed trace:
         ```python
-        lines = read_file('traces/traces.jsonl').strip().split('\\n')
-        failed_trace_ids = []
-        for line in lines:
-            if not line: continue
-            data = json_loads(line)
-            if not data.get('success'):
-                failed_trace_ids.append(data.get('context', {}).get('trace_id'))
-        failed_trace_ids
+        traces = get_traces()
+        failed = [t['context']['trace_id'] for t in traces if not t.get('success')]
+        failed
         ```
         """
         try:
-            import pydantic_monty
+            import ouros
         except ImportError:
-            return "Error: pydantic_monty is not installed. File exploration unavailable."
+            return "Error: ouros is not installed. File exploration unavailable."
 
+        def get_traces() -> list[dict[str, Any]]:
+            traces_file = traces_dir / "traces.jsonl"
+            if not traces_file.exists():
+                return []
+            traces = []
+            with open(traces_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        traces.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+            return traces
+
+        sandbox = ouros.Sandbox(python_script, external_functions=["get_traces"])
         try:
-            m = pydantic_monty.Monty(
-                python_script,
-                external_functions=["read_file", "list_dir", "json_loads"]
-            )
-            result = m.run(
-                external_functions={
-                    "read_file": _read_file,
-                    "list_dir": _list_dir,
-                    "json_loads": _json_loads,
-                }
+            result = await ouros.run_async(
+                sandbox,
+                external_functions={"get_traces": get_traces},
+                limits=ouros.ResourceLimits(
+                    timeout_ms=10000,
+                    memory_bytes=500_000_000,
+                    instruction_count=10_000_000,
+                ),
             )
             return str(result)
         except Exception as e:
@@ -103,54 +107,86 @@ def create_trace_toolset(
             trace_id: The `context.trace_id` from the span you want to analyze.
             prompt: The specific semantic question for the sub-agent (e.g. "Did the agent misunderstand the API tool?").
         """
-        # Option 1: Maintain a persistent scratchpad dictionary across history clears
-        scratchpad: dict[str, str] = {}
-
-        subagent_toolset = FunctionToolset[None]()
-        subagent_toolset.tools["run_python_script"] = run_python_script
-
-        @subagent_toolset.tool
-        def save_to_scratchpad(key: str, value: str) -> str:
-            """Save a string value to your persistent scratchpad."""
-            scratchpad[key] = value
-            return f"Saved to scratchpad[{key}]"
-
-        @subagent_toolset.tool
-        def load_from_scratchpad(key: str) -> str:
-            """Load a value from your persistent scratchpad."""
-            return scratchpad.get(key, f"Key {key} not found.")
-
-        @subagent_toolset.tool
-        def list_scratchpad() -> list[str]:
-            """List all keys currently in your persistent scratchpad."""
-            return list(scratchpad.keys())
-
-        @subagent_toolset.tool
-        def clear_message_history(next_context: str) -> str:
-            """Clear your conversation history to free up context window space. 
-            Execution will restart with `next_context` as your new starting prompt.
-            Ensure you have saved any important findings to your scratchpad before calling this.
-            """
-            raise ClearMessageHistoryException(next_context)
-
-        @subagent_toolset.tool
-        async def spawn_agent(instructions: str) -> str:
-            """Spawn a recursive sub-agent with a fresh context window to investigate a sub-problem. 
-            It has access to its own python script tool and its own scratchpad, but its message history 
-            does NOT affect your context window. It returns a string answer to your instructions.
-            """
-            return await _run_agent_loop(instructions, depth=1)
+        try:
+            import ouros
+        except ImportError:
+            return "Error: ouros is not installed."
+        
+        mgr = ouros.SessionManager()
 
         async def _run_agent_loop(current_prompt: str, depth: int) -> str:
+            session_id = f"repl_{uuid.uuid4().hex[:8]}"
+            session = mgr.create_session(session_id)
+
+            subagent_toolset = FunctionToolset[None]()
+
+            # Because Session.execute does not support passing `external_functions` natively like Sandbox,
+            # we provide standard LLM tools for file operations that the agent can use alongside the REPL.
+            @subagent_toolset.tool
+            def read_file(path: str) -> str:
+                """Read a file relative to the context directory."""
+                return _read_file(path)
+
+            @subagent_toolset.tool
+            def list_dir(path: str) -> list[str]:
+                """List directory contents relative to the context directory."""
+                return _list_dir(path)
+
+            @subagent_toolset.tool
+            def run_python_repl(python_code: str) -> str:
+                """Execute Python code in your persistent REPL environment.
+                
+                This is a stateful Jupyter-style REPL. Variables assigned here will persist 
+                in memory for future `run_python_repl` calls within this agent loop.
+
+                The script MUST return its output by returning the value from the last expression 
+                (or by assigning to a variable that is the last expression).
+
+                Example persisting data:
+                ```python
+                import json
+                # Assuming you fetched json string via the `read_file` tool first
+                trace_data = json.loads(my_json_string)
+                first_trace_id = trace_data.get('context', {}).get('trace_id')
+                first_trace_id
+                ```
+                """
+                try:
+                    result = session.execute(python_code)
+                    if isinstance(result, dict) and 'result' in result:
+                        return str(result['result'])
+                    return str(result)
+                except Exception as e:
+                    return f"Error executing REPL code: {e}"
+
+            @subagent_toolset.tool
+            def clear_message_history(next_context: str) -> str:
+                """Clear your conversation history to free up context window space. 
+                Execution will restart with `next_context` as your new starting prompt.
+                Because your Python REPL is stateful, any variables you declared previously 
+                will still be available in memory when you call `run_python_repl` again.
+                """
+                raise ClearMessageHistoryException(next_context)
+            
+            @subagent_toolset.tool
+            async def spawn_agent(instructions: str) -> str:
+                """Spawn a recursive sub-agent with a fresh context window to investigate a sub-problem. 
+                It has access to its own isolated Python REPL session. Its message history does NOT affect 
+                your context window. It returns a string answer to your instructions.
+                """
+                return await _run_agent_loop(instructions, depth=depth + 1)
+
             system_prompt = (
                 f"You are a senior debugging engineer analyzing an execution trace (trace_id: {trace_id}).\n"
-                "You MUST use your `run_python_script` tool to read `traces/traces.jsonl` "
-                "(and `components.json` if needed). Do NOT guess. Write python scripts to extract context.\n"
-                "If your conversation gets too long, save findings to your scratchpad and call `clear_message_history`."
+                "You MUST use your `read_file` tool to read `traces/traces.jsonl` "
+                "(and `components.json` if needed). Do NOT guess. Write python code via `run_python_repl` to parse and extract context.\n"
+                "Your python environment is persistent. Variables stay in memory.\n"
+                "If your conversation gets too long, store big lists/dicts in REPL variables and call `clear_message_history`."
             ) if depth == 0 else (
                 f"You are a recursive sub-agent exploring a sub-problem for trace {trace_id}.\n"
-                "Use `run_python_script` to read files. Return your final answer to the parent agent.\n"
-                "If your conversation gets too long, save findings to your scratchpad and call `clear_message_history`."
+                "Your python environment is persistent.\n"
+                "Return your final answer to the parent agent.\n"
+                "If your conversation gets too long, store findings in REPL variables and call `clear_message_history`."
             )
 
             agent = Agent(
@@ -166,7 +202,7 @@ def create_trace_toolset(
                 except ClearMessageHistoryException as e:
                     current_prompt = (
                         f"History cleared. You previously left yourself this note to continue:\n\n{e.next_context}\n\n"
-                        "Your scratchpad is intact. You may use `load_from_scratchpad` to retrieve your saved data."
+                        "Your Python REPL state is intact. You may query the variables you defined earlier."
                     )
                 except Exception as e:
                     return f"Error running sub-agent: {e}"
