@@ -115,15 +115,19 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
     reflection_model = _resolve_model(deps)
     components_to_update: Sequence[str] | None
     component_toolsets: list[FunctionToolset] | None = []
-    
+
     if state.config.reflection_config and state.config.reflection_config.journal_file:
         from ..proposal.journal_tools import create_journal_toolset
+
         component_toolsets.append(
             create_journal_toolset(state.config.reflection_config.journal_file)
         )
 
     from ..proposal.trace_tools import create_trace_toolset
-    component_toolsets.append(create_trace_toolset(state.run_id, parent_idx, reflection_model))
+
+    component_toolsets.append(
+        create_trace_toolset(state.run_id, parent_idx, reflection_model)
+    )
 
     if state.config.component_selector == "reflection":
         components_to_update = None
@@ -179,14 +183,16 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
             model_settings=deps.model_settings,
             component_toolsets=component_toolsets if component_toolsets else None,
         )
-        
+
         # Capture and save the Reflector's own trace data (tool calls, reasoning)
         if deps.memory_exporter is not None:
             from pathlib import Path
-            import json
+
             spans = deps.memory_exporter.get_finished_spans()
             if spans:
-                reflector_dir = Path(f".gepa_cache/runs/{state.run_id}/candidates/{parent_idx}/reflector_traces")
+                reflector_dir = Path(
+                    f".gepa_cache/runs/{state.run_id}/candidates/{parent_idx}/reflector_traces"
+                )
                 reflector_dir.mkdir(parents=True, exist_ok=True)
                 reflector_file = reflector_dir / "traces.jsonl"
                 with open(reflector_file, "a", encoding="utf-8") as f:
@@ -353,10 +359,12 @@ async def _evaluate_minibatch(
     )
     if capture_traces and deps.memory_exporter is not None:
         from pathlib import Path
-        import json
+
         spans = deps.memory_exporter.get_finished_spans()
         if spans:
-            traces_dir = Path(f".gepa_cache/runs/{state.run_id}/candidates/{candidate.idx}/traces")
+            traces_dir = Path(
+                f".gepa_cache/runs/{state.run_id}/candidates/{candidate.idx}/traces"
+            )
             traces_dir.mkdir(parents=True, exist_ok=True)
             traces_file = traces_dir / "traces.jsonl"
             with open(traces_file, "a", encoding="utf-8") as f:
@@ -602,10 +610,14 @@ def _build_component_selection_toolset(
 
         desc_key = skill_description_key(resolved_path)
         body_key_name = skill_body_key(resolved_path)
-        
+
         new_components = {
-            desc_key: ComponentValue(name=desc_key, text=description, version=0, metadata=None),
-            body_key_name: ComponentValue(name=body_key_name, text=body, version=0, metadata=None)
+            desc_key: ComponentValue(
+                name=desc_key, text=description, version=0, metadata=None
+            ),
+            body_key_name: ComponentValue(
+                name=body_key_name, text=body, version=0, metadata=None
+            ),
         }
 
         state.activate_skill_path(resolved_path)

@@ -37,18 +37,19 @@ async def evaluate_step(ctx: StepContext[GepaState, GepaDeps, None]) -> None:
     # Serialize traces to disk if memory_exporter is available
     if ctx.deps.memory_exporter is not None:
         from pathlib import Path
-        import json
 
         spans = ctx.deps.memory_exporter.get_finished_spans()
         if spans:
-            traces_dir = Path(f".gepa_cache/runs/{state.run_id}/candidates/{candidate.idx}/traces")
+            traces_dir = Path(
+                f".gepa_cache/runs/{state.run_id}/candidates/{candidate.idx}/traces"
+            )
             traces_dir.mkdir(parents=True, exist_ok=True)
             traces_file = traces_dir / "traces.jsonl"
-            
+
             with open(traces_file, "a", encoding="utf-8") as f:
                 for span in spans:
                     f.write(span.to_json() + "\\n")
-                    
+
         ctx.deps.memory_exporter.clear()
 
     state.record_evaluation_errors(

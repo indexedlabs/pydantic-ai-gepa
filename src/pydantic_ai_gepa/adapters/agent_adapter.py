@@ -1217,7 +1217,9 @@ class _BaseAgentAdapter(
 
             record["feedback"] = feedback_text
             if trajectory.metric_side_info:
-                record["side_info"] = _serialize_for_reflection(trajectory.metric_side_info)
+                record["side_info"] = _serialize_for_reflection(
+                    trajectory.metric_side_info
+                )
 
             # Include case metadata and expected output based on config
             case = getattr(trajectory, "case", None)

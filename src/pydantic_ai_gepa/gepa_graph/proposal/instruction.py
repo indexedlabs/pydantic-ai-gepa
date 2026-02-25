@@ -24,7 +24,6 @@ from pydantic_ai.messages import (
 from pydantic_ai_gepa.inspection import InspectionAborted
 
 from ...adapter import (
-    ComponentReflectiveDataset,
     ReflectiveDataset,
     SharedReflectiveDataset,
 )
@@ -375,9 +374,7 @@ class InstructionProposalGenerator:
                         SKILLS_DISCOVERY_TOOLS_INSTRUCTIONS
                     )
                 if _journal_tools_enabled(component_toolsets):
-                    runtime_instructions_parts.append(
-                        JOURNAL_TOOLS_INSTRUCTIONS
-                    )
+                    runtime_instructions_parts.append(JOURNAL_TOOLS_INSTRUCTIONS)
             if components is None:
                 runtime_instructions_parts.append(
                     "Select which component(s) to update based on the traces, then include only those in `updated_components`."
@@ -702,7 +699,7 @@ class InstructionProposalGenerator:
         # Instead of serializing full traces, we provide high-level metadata and let the agent use trace analysis tools
         total_records = 0
         success_records = 0
-        
+
         if isinstance(reflective_data, SharedReflectiveDataset):
             records = reflective_data.records
             total_records = len(records)
@@ -711,9 +708,9 @@ class InstructionProposalGenerator:
             for component_records in reflective_data.records_by_component.values():
                 total_records += len(component_records)
                 success_records += sum(1 for r in component_records if r.get("success"))
-        
+
         failed_records = total_records - success_records
-        
+
         lines.extend(
             [
                 "",
@@ -726,7 +723,7 @@ class InstructionProposalGenerator:
                 "",
             ]
         )
-        
+
         lines.extend(
             [
                 "",
@@ -1103,7 +1100,7 @@ class InstructionProposalGenerator:
     @staticmethod
     def _format_side_info(side_info: Any) -> list[Any]:
         items: list[Any] = []
-        
+
         def _walk(obj: Any, path: str = "") -> None:
             if isinstance(obj, dict):
                 for k, v in obj.items():
@@ -1113,12 +1110,14 @@ class InstructionProposalGenerator:
                 for i, v in enumerate(obj):
                     p = f"{path}[{i}]"
                     _walk(v, p)
-            elif isinstance(obj, (ImageUrl, AudioUrl, VideoUrl, DocumentUrl, BinaryContent)):
+            elif isinstance(
+                obj, (ImageUrl, AudioUrl, VideoUrl, DocumentUrl, BinaryContent)
+            ):
                 items.append(f"  - **{path}**:")
                 items.append(obj)
             else:
                 items.append(f"  - **{path}**: {obj}")
-                
+
         _walk(side_info)
         return items
 

@@ -119,7 +119,9 @@ def generate_user_content(
     return view.build_user_content(candidate=candidate)
 
 
-def get_gepa_components(model_cls: type[BaseModel], base_encoder_script: str | None = None) -> dict[str, str]:
+def get_gepa_components(
+    model_cls: type[BaseModel], base_encoder_script: str | None = None
+) -> dict[str, str]:
     """Extract default GEPA components for a structured input model."""
     class_view = _InputClassView(model_cls, base_encoder_script=base_encoder_script)
     return class_view.get_gepa_components()
@@ -152,7 +154,9 @@ ModelT = TypeVar("ModelT", bound=BaseModel)
 class BoundInputSpec(Generic[ModelT]):
     """Normalized view over a structured input model."""
 
-    def __init__(self, model_cls: type[ModelT], base_encoder_script: str | None = None) -> None:
+    def __init__(
+        self, model_cls: type[ModelT], base_encoder_script: str | None = None
+    ) -> None:
         if not issubclass(model_cls, BaseModel):
             raise TypeError(
                 f"Input specs must be Pydantic BaseModel subclasses, got {model_cls!r}"
@@ -177,7 +181,9 @@ class BoundInputSpec(Generic[ModelT]):
         return generate_user_content(instance, candidate=candidate)
 
     def get_gepa_components(self) -> dict[str, str]:
-        return get_gepa_components(self.model_cls, base_encoder_script=self.base_encoder_script)
+        return get_gepa_components(
+            self.model_cls, base_encoder_script=self.base_encoder_script
+        )
 
     @contextmanager
     def apply_candidate(
@@ -191,7 +197,9 @@ class BoundInputSpec(Generic[ModelT]):
 InputSpec = type[ModelT] | BoundInputSpec[ModelT]
 
 
-def build_input_spec(input_spec: InputSpec[ModelT], base_encoder_script: str | None = None) -> BoundInputSpec[ModelT]:
+def build_input_spec(
+    input_spec: InputSpec[ModelT], base_encoder_script: str | None = None
+) -> BoundInputSpec[ModelT]:
     """Normalize an input specification into a BoundInputSpec."""
     if isinstance(input_spec, BoundInputSpec):
         if base_encoder_script is not None and input_spec.base_encoder_script is None:
@@ -468,25 +476,25 @@ class _InputModelView(_InputShared):
     ) -> Sequence[UserContent]:
         encoder_key = f"signature:{self.model_cls.__name__}:encoder"
         encoder_script = candidate.get(encoder_key) if candidate else None
-        
+
         registry = _AttachmentRegistry()
-        transformed_instance = self._replace_attachments_with_refs(self.instance, registry)
+        transformed_instance = self._replace_attachments_with_refs(
+            self.instance, registry
+        )
 
         if encoder_script and pydantic_monty is not None:
             try:
                 data_dict = transformed_instance.model_dump(mode="json")
-                
+
                 def host_json_dumps(obj: Any) -> str:
                     return json.dumps(obj, indent=2)
 
                 m = pydantic_monty.Monty(
-                    encoder_script,
-                    inputs=["data"],
-                    external_functions=["json_dumps"]
+                    encoder_script, inputs=["data"], external_functions=["json_dumps"]
                 )
                 encoded_str = m.run(
                     inputs={"data": data_dict},
-                    external_functions={"json_dumps": host_json_dumps}
+                    external_functions={"json_dumps": host_json_dumps},
                 )
 
                 user_content: list[UserContent] = []
@@ -502,7 +510,11 @@ class _InputModelView(_InputShared):
                 return user_content
             except Exception as e:
                 import logfire
-                logfire.warning("Failed to execute monty encoder script, falling back to XML", exc_info=e)
+
+                logfire.warning(
+                    "Failed to execute monty encoder script, falling back to XML",
+                    exc_info=e,
+                )
 
         content_sections: list[str] = []
 
@@ -515,9 +527,7 @@ class _InputModelView(_InputShared):
             if self._is_suffix_field(field_info):
                 continue
 
-            formatted_value = self._format_field_value_xml(
-                field_name, field_value
-            )
+            formatted_value = self._format_field_value_xml(field_name, field_value)
             if formatted_value:
                 content_sections.append(formatted_value)
 
@@ -611,7 +621,9 @@ class _InputModelView(_InputShared):
 class _InputClassView(_InputShared):
     """Operations that only need the model class."""
 
-    def __init__(self, model_cls: type[BaseModel], base_encoder_script: str | None = None) -> None:
+    def __init__(
+        self, model_cls: type[BaseModel], base_encoder_script: str | None = None
+    ) -> None:
         super().__init__(model_cls)
         self.base_encoder_script = base_encoder_script
 
@@ -629,7 +641,9 @@ class _InputClassView(_InputShared):
 
         encoder_script = self.base_encoder_script
         if encoder_script is None:
-            encoder_script = getattr(self.model_cls, "base_encoder_script", _DEFAULT_ENCODER_SCRIPT)
+            encoder_script = getattr(
+                self.model_cls, "base_encoder_script", _DEFAULT_ENCODER_SCRIPT
+            )
 
         components[f"signature:{self.model_cls.__name__}:encoder"] = encoder_script
 

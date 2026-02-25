@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from pydantic_ai._model_request_parameters import ModelRequestParameters
+from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,

@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
-import logfire
 from pydantic_graph.beta import Graph
 from pydantic_graph.beta.graph import EndMarker, GraphTask
 
@@ -51,19 +50,22 @@ async def optimize(
     if deps is None:
         from opentelemetry import trace
         from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+            InMemorySpanExporter,
+        )
 
         memory_exporter = InMemorySpanExporter()
         processor = SimpleSpanProcessor(memory_exporter)
         provider = trace.get_tracer_provider()
-        
+
         if not hasattr(provider, "add_span_processor"):
             try:
                 import logfire
+
                 provider = logfire.get_tracer_provider()
             except Exception:
                 pass
-                
+
         if hasattr(provider, "add_span_processor"):
             provider.add_span_processor(processor)
 

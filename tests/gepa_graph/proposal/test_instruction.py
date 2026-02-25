@@ -1012,13 +1012,17 @@ The city name to get weather for.
     "function": {
       "name": "get_weather",
       "parameters": {
-        "type": "object",
+        "additionalProperties": false,
         "properties": {
           "location": {
-            "type": "string",
-            "description": "The city name to get weather for."
+            "description": "The city name to get weather for.",
+            "type": "string"
           }
-        }
+        },
+        "required": [
+          "location"
+        ],
+        "type": "object"
       },
       "description": "Get current weather for a location."
     }

@@ -12,11 +12,6 @@ from pydantic_ai import Tool
 from typing_extensions import TypeAliasType
 
 import ouros
-from typing import TYPE_CHECKING, Literal, TypeAlias
-from typing_extensions import TypeAliasType
-from pydantic import BaseModel, Field
-import json
-import time
 
 if TYPE_CHECKING:
     JsonValue: TypeAlias = (
@@ -27,6 +22,7 @@ else:
         "JsonValue",
         str | bool | int | float | None | list["JsonValue"] | dict[str, "JsonValue"],
     )
+
 
 class SandboxExecutionResult(BaseModel):
     """Structured result returned by the sandbox tool."""
@@ -58,6 +54,7 @@ class SandboxExecutionResult(BaseModel):
         description="Total wall-clock time spent creating the sandbox and executing the script.",
     )
 
+
 def _summarize_answer(
     return_value: JsonValue | None,
     output_lines: list[str],
@@ -76,6 +73,7 @@ def _summarize_answer(
 
     return None, "none"
 
+
 async def _run_python_in_sandbox(
     code: str,
     *,
@@ -92,23 +90,24 @@ async def _run_python_in_sandbox(
     try:
         sandbox = ouros.Sandbox(code)
         output_lines_buffer = []
+
         def _print_callback(fd: Literal["stdout"], text: str) -> None:
             output_lines_buffer.append(text)
-            
+
         result = await ouros.run_async(
             sandbox,
             inputs=inputs if inputs else None,
             print_callback=_print_callback,
             limits=ouros.ResourceLimits(
-                timeout_ms=10000, 
-                memory_bytes=500_000_000, 
-                instruction_count=100_000_000
-            )
+                timeout_ms=10000,
+                memory_bytes=500_000_000,
+                instruction_count=100_000_000,
+            ),
         )
         sandbox_result = {
             "status": "success",
             "return_value": result,
-            "output": "".join(output_lines_buffer).splitlines()
+            "output": "".join(output_lines_buffer).splitlines(),
         }
     except Exception as exc:  # pragma: no cover - surfaced to the model instead
         elapsed = time.perf_counter() - started

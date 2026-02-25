@@ -8,7 +8,7 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import Any, Iterable, Iterator, Mapping, cast
 
-from pydantic_ai._run_context import RunContext
+from pydantic_ai import RunContext
 from pydantic_ai.agent import AbstractAgent
 from pydantic_ai.agent.wrapper import WrapperAgent
 from pydantic_ai.builtin_tools import AbstractBuiltinTool

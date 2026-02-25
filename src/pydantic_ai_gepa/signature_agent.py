@@ -113,7 +113,9 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
                 from the agent's output_type via GEPA.
             base_encoder_script: Optional base script to encode input values.
         """
-        bound_spec = build_input_spec(input_type, base_encoder_script=base_encoder_script)
+        bound_spec = build_input_spec(
+            input_type, base_encoder_script=base_encoder_script
+        )
 
         inferred_output_type = (
             output_type

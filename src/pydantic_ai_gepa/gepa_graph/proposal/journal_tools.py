@@ -3,6 +3,7 @@ from pathlib import Path
 from pydantic_ai import FunctionToolset
 import logfire
 
+
 def create_journal_toolset(journal_file: str) -> FunctionToolset[None]:
     toolset = FunctionToolset()
     journal_path = Path(journal_file)
@@ -20,7 +21,7 @@ def create_journal_toolset(journal_file: str) -> FunctionToolset[None]:
     @toolset.tool
     def append_journal_entry(insight: str, strategy: str) -> str:
         """Record a newly discovered insight or strategy to the durable journal so it can be used in future optimization runs.
-        
+
         Args:
             insight: A description of why a particular approach failed or what was learned from the execution traces.
             strategy: A concrete rule or strategy to avoid this failure in the future.

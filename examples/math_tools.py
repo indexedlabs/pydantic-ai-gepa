@@ -36,7 +36,7 @@ from pydantic_ai_gepa.types import (
     RolloutOutput,
 )
 
-logfire.configure(console=logfire.ConsoleOptions(min_log_level='info'))
+logfire.configure(console=logfire.ConsoleOptions(min_log_level="info"))
 logfire.instrument_pydantic_ai()
 logfire.instrument_httpx(capture_all=True)
 

@@ -364,21 +364,22 @@ async def optimize_agent(
 
     from opentelemetry import trace
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
 
     memory_exporter = InMemorySpanExporter()
     processor = SimpleSpanProcessor(memory_exporter)
     provider = trace.get_tracer_provider()
-    
-    # logfire configures a global tracer provider. 
+
+    # logfire configures a global tracer provider.
     # Try getting logfire's provider if default has no add_span_processor
     if not hasattr(provider, "add_span_processor"):
         try:
-            import logfire
             provider = logfire.get_tracer_provider()
         except Exception:
             pass
-            
+
     if hasattr(provider, "add_span_processor"):
         provider.add_span_processor(processor)
 

@@ -7,7 +7,7 @@ from typing import Any, Awaitable, Callable, Sequence, cast
 
 from openai import NOT_GIVEN as OPENAI_NOT_GIVEN
 
-from pydantic_ai._model_request_parameters import ModelRequestParameters
+from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import Model
 from pydantic_ai.models.openai import (

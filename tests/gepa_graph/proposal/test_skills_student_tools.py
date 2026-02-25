@@ -133,8 +133,6 @@ async def test_create_skills_toolset_with_custom_backend_uses_async_search() -> 
     assert results[0].snippet == "stub"
 
 
-
-
 def test_create_skills_toolset_capabilities_gating() -> None:
     fs = SkillsFS()
     fs.write_text("a/SKILL.md", "---\nname: a\ndescription: d\n---\n")

@@ -151,12 +151,12 @@ def apply_candidate_to_skills(
             skill_md = parse_skill_md(raw)
         else:
             from .skills.skill_md import SkillFrontmatter, SkillMd
+
             skill_name = skill_dir.replace("/", "-").replace("_", "-")
             if not skill_name.replace("-", "").isalnum():
                 skill_name = "new-skill"
             skill_md = SkillMd(
-                frontmatter=SkillFrontmatter(name=skill_name, description=""),
-                body=""
+                frontmatter=SkillFrontmatter(name=skill_name, description=""), body=""
             )
 
         updated = _apply_component_updates(skill_md, description=desc, body=body)
