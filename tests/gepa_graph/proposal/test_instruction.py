@@ -295,6 +295,12 @@ The traces are stored on disk as `traces/traces.jsonl`.
 You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts to parse these structured files.
 You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.
 
+**IMPORTANT: Prompt Caching & State Management**
+Your python REPL is stateful. Variables assigned in one script will persist to the next.
+To leverage LLM prompt caching efficiently, you should build up state in your Python REPL rather than returning huge strings (like full traces) to your context window.
+If your context window becomes bloated, use the `clear_message_history` tool. This wipes your message history to free up tokens, but your Python REPL variables remain intact!
+Only use `clear_message_history` sparingly when absolutely necessary to avoid breaking the prompt cache.
+
 
 ### Analysis guidance
 - Use `run_python_repl` to aggregate errors or find common failure modes across `traces.jsonl`.
@@ -745,6 +751,12 @@ The traces are stored on disk as `traces/traces.jsonl`.
 You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts to parse these structured files.
 You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.
 
+**IMPORTANT: Prompt Caching & State Management**
+Your python REPL is stateful. Variables assigned in one script will persist to the next.
+To leverage LLM prompt caching efficiently, you should build up state in your Python REPL rather than returning huge strings (like full traces) to your context window.
+If your context window becomes bloated, use the `clear_message_history` tool. This wipes your message history to free up tokens, but your Python REPL variables remain intact!
+Only use `clear_message_history` sparingly when absolutely necessary to avoid breaking the prompt cache.
+
 
 ### Analysis guidance
 - Use `run_python_repl` to aggregate errors or find common failure modes across `traces.jsonl`.
@@ -1048,6 +1060,12 @@ Each trace contains:
 The traces are stored on disk as `traces/traces.jsonl`.
 You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts to parse these structured files.
 You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.
+
+**IMPORTANT: Prompt Caching & State Management**
+Your python REPL is stateful. Variables assigned in one script will persist to the next.
+To leverage LLM prompt caching efficiently, you should build up state in your Python REPL rather than returning huge strings (like full traces) to your context window.
+If your context window becomes bloated, use the `clear_message_history` tool. This wipes your message history to free up tokens, but your Python REPL variables remain intact!
+Only use `clear_message_history` sparingly when absolutely necessary to avoid breaking the prompt cache.
 
 
 ### Analysis guidance

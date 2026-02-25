@@ -64,6 +64,36 @@ def create_trace_toolset(
         session_id = f"repl_{uuid.uuid4().hex[:8]}"
         session = mgr.create_session(session_id)
 
+        # Pre-load files into the session to simulate external functions
+        import base64
+        traces_content = ""
+        traces_file = traces_dir / "traces.jsonl"
+        if traces_file.exists():
+            traces_content = base64.b64encode(traces_file.read_bytes()).decode("utf-8")
+            
+        components_content = ""
+        components_file = base_dir / "components.json"
+        if components_file.exists():
+            components_content = base64.b64encode(components_file.read_bytes()).decode("utf-8")
+            
+        setup_script = f"""
+import base64
+import json
+def read_file(path: str) -> str:
+    if 'traces.jsonl' in path:
+        return base64.b64decode('{traces_content}').decode('utf-8')
+    if 'components.json' in path:
+        return base64.b64decode('{components_content}').decode('utf-8')
+    return "Error: File not found"
+
+def json_loads(data: str):
+    return json.loads(data)
+
+def list_dir(path: str):
+    return ['traces/traces.jsonl', 'components.json']
+"""
+        session.execute(setup_script)
+
         @toolset.tool
         async def run_python_repl(python_code: str) -> str:
             """Execute Python code in your persistent REPL environment.
@@ -112,16 +142,45 @@ def create_trace_toolset(
             child_session_id = f"repl_{uuid.uuid4().hex[:8]}"
             child_session = mgr.create_session(child_session_id)
 
+            # Pre-load files into the session to simulate external functions
+            # without hitting the Ouros Session external function limitation.
+            import base64
+            traces_content = ""
+            traces_file = traces_dir / "traces.jsonl"
+            if traces_file.exists():
+                traces_content = base64.b64encode(traces_file.read_bytes()).decode("utf-8")
+                
+            components_content = ""
+            components_file = base_dir / "components.json"
+            if components_file.exists():
+                components_content = base64.b64encode(components_file.read_bytes()).decode("utf-8")
+                
+            setup_script = f"""
+import base64
+import json
+def read_file(path: str) -> str:
+    if 'traces.jsonl' in path:
+        return base64.b64decode('{traces_content}').decode('utf-8')
+    if 'components.json' in path:
+        return base64.b64decode('{components_content}').decode('utf-8')
+    return "Error: File not found"
+
+def json_loads(data: str):
+    return json.loads(data)
+
+def list_dir(path: str):
+    return ['traces/traces.jsonl', 'components.json']
+"""
+            child_session.execute(setup_script)
+
             child_toolset = FunctionToolset[None]()
             @child_toolset.tool
-            def read_file(path: str) -> str:
-                return _read_file(path)
-            @child_toolset.tool
-            def list_dir(path: str) -> list[str]:
-                return _list_dir(path)
-            @child_toolset.tool
             async def run_python_repl(python_code: str) -> str:
-                """Execute Python code in your persistent REPL environment."""
+                """Execute Python code in your persistent REPL environment.
+                
+                You have access to `read_file(path)`, `list_dir(path)`, and `json_loads(data)`
+                pre-loaded in your Python environment.
+                """
                 try:
                     result = child_session.execute(python_code)
                     if isinstance(result, dict) and 'result' in result:
@@ -131,6 +190,11 @@ def create_trace_toolset(
                     return f"Error executing REPL code: {e}"
             @child_toolset.tool
             def clear_message_history(next_context: str) -> str:
+                """Clear your conversation history to free up context window space. 
+                Use this sparingly to preserve prompt caching efficiency! Only use it 
+                when your context window is overflowing with massive tool outputs.
+                Execution will restart with `next_context` as your new starting prompt.
+                """
                 raise ClearMessageHistoryException(next_context)
             @child_toolset.tool
             async def spawn_agent(instructions: str) -> str:
@@ -138,9 +202,11 @@ def create_trace_toolset(
 
             system_prompt = (
                 f"You are a recursive sub-agent exploring a sub-problem for trace analysis.\n"
-                "Your python environment is persistent.\n"
+                "Your python environment is persistent. Variables stay in memory.\n"
+                "Use `run_python_repl` to read and parse `traces/traces.jsonl` using the built-in `read_file` function.\n"
                 "Return your final answer to the parent agent.\n"
-                "If your conversation gets too long, store findings in REPL variables and call `clear_message_history`."
+                "IMPORTANT: To leverage LLM prompt caching, you should build up state in your Python REPL.\n"
+                "Only call `clear_message_history` sparingly when absolutely necessary to avoid context limits."
             )
             agent = Agent(reflection_model, system_prompt=system_prompt)
             
