@@ -292,13 +292,13 @@ Each trace contains:
 
 2 traces available from the execution: 0 succeeded, 2 failed.
 The traces are stored on disk as `traces/traces.jsonl`.
-You must use the `run_python_script(python_script: str)` tool to write and execute python map-reduce scripts to parse these structured files (using `read_file` and `json_loads`).
-You may also use `analyze_trace_with_llm(trace_id, prompt)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.
+You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts to parse these structured files.
+You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.
 
 
 ### Analysis guidance
-- Use `run_python_script` to aggregate errors or find common failure modes across `traces.jsonl`.
-- Use `analyze_trace_with_llm` to understand *why* a specific trace failed if the python analysis is insufficient.
+- Use `run_python_repl` to aggregate errors or find common failure modes across `traces.jsonl`.
+- Use `spawn_agent` to understand *why* a specific trace failed if the python analysis is insufficient.
 - What failure patterns repeat across runs?
 - Are components misaligned (e.g., instructions referencing tools that don't exist)?
 - Which successful patterns should be preserved or extended?
@@ -742,13 +742,13 @@ Each trace contains:
 
 1 traces available from the execution: 1 succeeded, 0 failed.
 The traces are stored on disk as `traces/traces.jsonl`.
-You must use the `run_python_script(python_script: str)` tool to write and execute python map-reduce scripts to parse these structured files (using `read_file` and `json_loads`).
-You may also use `analyze_trace_with_llm(trace_id, prompt)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.
+You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts to parse these structured files.
+You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.
 
 
 ### Analysis guidance
-- Use `run_python_script` to aggregate errors or find common failure modes across `traces.jsonl`.
-- Use `analyze_trace_with_llm` to understand *why* a specific trace failed if the python analysis is insufficient.
+- Use `run_python_repl` to aggregate errors or find common failure modes across `traces.jsonl`.
+- Use `spawn_agent` to understand *why* a specific trace failed if the python analysis is insufficient.
 - What failure patterns repeat across runs?
 - Are components misaligned (e.g., instructions referencing tools that don't exist)?
 - Which successful patterns should be preserved or extended?
@@ -1046,13 +1046,13 @@ Each trace contains:
 
 2 traces available from the execution: 2 succeeded, 0 failed.
 The traces are stored on disk as `traces/traces.jsonl`.
-You must use the `run_python_script(python_script: str)` tool to write and execute python map-reduce scripts to parse these structured files (using `read_file` and `json_loads`).
-You may also use `analyze_trace_with_llm(trace_id, prompt)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.
+You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts to parse these structured files.
+You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.
 
 
 ### Analysis guidance
-- Use `run_python_script` to aggregate errors or find common failure modes across `traces.jsonl`.
-- Use `analyze_trace_with_llm` to understand *why* a specific trace failed if the python analysis is insufficient.
+- Use `run_python_repl` to aggregate errors or find common failure modes across `traces.jsonl`.
+- Use `spawn_agent` to understand *why* a specific trace failed if the python analysis is insufficient.
 - What failure patterns repeat across runs?
 - Are components misaligned (e.g., instructions referencing tools that don't exist)?
 - Which successful patterns should be preserved or extended?

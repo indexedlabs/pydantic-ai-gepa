@@ -387,14 +387,30 @@ class InstructionProposalGenerator:
                 else None
             )
 
-            result = await self._agent.run(
-                prompt,
-                model=model,
-                model_settings=model_settings,
-                toolsets=toolsets if toolsets else None,
-                instructions=runtime_instructions,
-                usage_limits=UsageLimits(request_limit=15),
-            )
+            from .trace_tools import ClearMessageHistoryException
+
+            current_prompt: str | Sequence[UserContent] = prompt
+            loop_count = 0
+            while True:
+                loop_count += 1
+                if loop_count > 20:
+                    raise RuntimeError("Agent exceeded maximum clear_message_history loops (20).")
+                try:
+                    result = await self._agent.run(
+                        current_prompt,
+                        model=model,
+                        model_settings=model_settings,
+                        toolsets=toolsets if toolsets else None,
+                        instructions=runtime_instructions,
+                        usage_limits=UsageLimits(request_limit=15),
+                    )
+                    break
+                except ClearMessageHistoryException as e:
+                    current_prompt = self._join_user_content([
+                        f"History cleared. You previously left yourself this note to continue:\n\n{e.next_context}\n\n",
+                        "Your Python REPL state is intact."
+                    ])
+
         except InspectionAborted:
             raise
         except Exception:
@@ -718,8 +734,8 @@ class InstructionProposalGenerator:
                 "",
                 f"{total_records} traces available from the execution: {success_records} succeeded, {failed_records} failed.",
                 "The traces are stored on disk as `traces/traces.jsonl`.",
-                "You must use the `run_python_script(python_script: str)` tool to write and execute python map-reduce scripts to parse these structured files (using `read_file` and `json_loads`).",
-                "You may also use `analyze_trace_with_llm(trace_id, prompt)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.",
+                "You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts to parse these structured files.",
+                "You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.",
                 "",
             ]
         )
@@ -728,8 +744,8 @@ class InstructionProposalGenerator:
             [
                 "",
                 "### Analysis guidance",
-                "- Use `run_python_script` to aggregate errors or find common failure modes across `traces.jsonl`.",
-                "- Use `analyze_trace_with_llm` to understand *why* a specific trace failed if the python analysis is insufficient.",
+                "- Use `run_python_repl` to aggregate errors or find common failure modes across `traces.jsonl`.",
+                "- Use `spawn_agent` to understand *why* a specific trace failed if the python analysis is insufficient.",
                 "- What failure patterns repeat across runs?",
                 "- Are components misaligned (e.g., instructions referencing tools that don't exist)?",
                 "- Which successful patterns should be preserved or extended?",
