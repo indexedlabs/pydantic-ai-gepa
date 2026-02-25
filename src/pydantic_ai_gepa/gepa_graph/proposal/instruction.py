@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from pydantic import BaseModel, Field
-from pydantic_ai import Agent
+from pydantic_ai import Agent, UsageLimits
 from pydantic_ai.models import KnownModelName, Model
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.toolsets import AbstractToolset
@@ -396,6 +396,7 @@ class InstructionProposalGenerator:
                 model_settings=model_settings,
                 toolsets=toolsets if toolsets else None,
                 instructions=runtime_instructions,
+                usage_limits=UsageLimits(request_limit=15),
             )
         except InspectionAborted:
             raise
@@ -698,32 +699,40 @@ class InstructionProposalGenerator:
             ]
         )
 
-        # Get records based on SharedReflectiveDataset or ComponentReflectiveDataset
+        # Instead of serializing full traces, we provide high-level metadata and let the agent use trace analysis tools
+        total_records = 0
+        success_records = 0
+        
         if isinstance(reflective_data, SharedReflectiveDataset):
-            lines.append(
-                "**Use these traces to optimize the components listed below:**"
-            )
-            lines.append("")
-            cleaned_records = [
-                {k: v for k, v in record.items() if k not in ("tools", "instructions")}
-                for record in reflective_data.records
-            ]
-            lines.extend(
-                self._format_trace_sections(
-                    cleaned_records,
-                    label="Trace",
-                )
-            )
+            records = reflective_data.records
+            total_records = len(records)
+            success_records = sum(1 for r in records if r.get("success"))
         else:
-            lines.append(
-                "_Component-specific evidence is shown with each component below._"
-            )
-            lines.append("")
-
+            for component_records in reflective_data.records_by_component.values():
+                total_records += len(component_records)
+                success_records += sum(1 for r in component_records if r.get("success"))
+        
+        failed_records = total_records - success_records
+        
+        lines.extend(
+            [
+                "",
+                "## Execution Traces Available for Analysis",
+                "",
+                f"{total_records} traces available from the execution: {success_records} succeeded, {failed_records} failed.",
+                "The traces are stored on disk in structured JSONL format.",
+                "You must use the `run_trace_analysis(python_script: str)` tool to write and execute python map-reduce scripts to analyze these traces within the unbounded Ouros Data Plane.",
+                "You may also use `analyze_trace_with_llm(trace_id, prompt)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.",
+                "",
+            ]
+        )
+        
         lines.extend(
             [
                 "",
                 "### Analysis guidance",
+                "- Use `run_trace_analysis` to aggregate errors or find common failure modes.",
+                "- Use `analyze_trace_with_llm` to understand *why* a specific trace failed if the python analysis is insufficient.",
                 "- What failure patterns repeat across runs?",
                 "- Are components misaligned (e.g., instructions referencing tools that don't exist)?",
                 "- Which successful patterns should be preserved or extended?",
@@ -781,30 +790,6 @@ class InstructionProposalGenerator:
             lines.append(component_value.text.strip())
             lines.append("=== end ===")
             lines.append("")
-
-            # For ComponentReflectiveDataset, show component-specific traces
-            if isinstance(reflective_data, ComponentReflectiveDataset):
-                component_records = reflective_data.records_by_component.get(
-                    component, ()
-                )
-                if component_records:
-                    lines.append("Evidence for this component:")
-                    lines.append("")
-                    cleaned_records = [
-                        {
-                            k: v
-                            for k, v in record.items()
-                            if k not in ("tools", "instructions")
-                        }
-                        for record in component_records
-                    ]
-                    lines.extend(
-                        self._format_trace_sections(
-                            cleaned_records,
-                            label="Example",
-                        )
-                    )
-                    lines.append("")
 
         return self._join_user_content(lines)
 

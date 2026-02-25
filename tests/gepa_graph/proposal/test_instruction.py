@@ -287,52 +287,18 @@ Each trace contains:
 - `success`: Whether the run completed successfully
 - `feedback`: Evaluator feedback on this specific run
 
-**Use these traces to optimize the components listed below:**
 
-=== start trace 1 ===
+## Execution Traces Available for Analysis
 
-- **Score:** 0.5
-
-- **Messages:**
-```json
-[
-  {
-    "kind": "request",
-    "parts": [
-      {
-        "type": "user_prompt",
-        "content": "u1"
-      }
-    ]
-  }
-]
-```
-
-=== end trace 1 ===
-
-=== start trace 2 ===
-
-- **Score:** 0.9
-
-- **Messages:**
-```json
-[
-  {
-    "kind": "request",
-    "parts": [
-      {
-        "type": "user_prompt",
-        "content": "u2"
-      }
-    ]
-  }
-]
-```
-
-=== end trace 2 ===
+2 traces available from the execution: 0 succeeded, 2 failed.
+The traces are stored on disk in structured JSONL format.
+You must use the `run_trace_analysis(python_script: str)` tool to write and execute python map-reduce scripts to analyze these traces within the unbounded Ouros Data Plane.
+You may also use `analyze_trace_with_llm(trace_id, prompt)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.
 
 
 ### Analysis guidance
+- Use `run_trace_analysis` to aggregate errors or find common failure modes.
+- Use `analyze_trace_with_llm` to understand *why* a specific trace failed if the python analysis is insufficient.
 - What failure patterns repeat across runs?
 - Are components misaligned (e.g., instructions referencing tools that don't exist)?
 - Which successful patterns should be preserved or extended?
@@ -771,50 +737,18 @@ Each trace contains:
 - `success`: Whether the run completed successfully
 - `feedback`: Evaluator feedback on this specific run
 
-**Use these traces to optimize the components listed below:**
 
-=== start trace 1 ===
+## Execution Traces Available for Analysis
 
-- **Score:** 0.5
-- **Success:** true
-- **Feedback:** Needs more detail
-
-- **Messages:**
-```json
-[
-  {
-    "kind": "request",
-    "parts": [
-      {
-        "type": "system_prompt",
-        "role": "system",
-        "content": "You are a helpful assistant."
-      },
-      {
-        "type": "user_prompt",
-        "role": "user",
-        "content": "Hello"
-      }
-    ]
-  },
-  {
-    "kind": "response",
-    "model_name": "openai:gpt-4",
-    "parts": [
-      {
-        "type": "text",
-        "role": "assistant",
-        "content": "Hi"
-      }
-    ]
-  }
-]
-```
-
-=== end trace 1 ===
+1 traces available from the execution: 1 succeeded, 0 failed.
+The traces are stored on disk in structured JSONL format.
+You must use the `run_trace_analysis(python_script: str)` tool to write and execute python map-reduce scripts to analyze these traces within the unbounded Ouros Data Plane.
+You may also use `analyze_trace_with_llm(trace_id, prompt)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.
 
 
 ### Analysis guidance
+- Use `run_trace_analysis` to aggregate errors or find common failure modes.
+- Use `analyze_trace_with_llm` to understand *why* a specific trace failed if the python analysis is insufficient.
 - What failure patterns repeat across runs?
 - Are components misaligned (e.g., instructions referencing tools that don't exist)?
 - Which successful patterns should be preserved or extended?
@@ -1103,208 +1037,18 @@ Each trace contains:
 - `success`: Whether the run completed successfully
 - `feedback`: Evaluator feedback on this specific run
 
-**Use these traces to optimize the components listed below:**
 
-=== start trace 1 ===
+## Execution Traces Available for Analysis
 
-- **Score:** 0.9
-- **Success:** true
-- **Feedback:** Good use of tools
-- **Assistant Response:** The weather in San Francisco is sunny and 72°F.
-
-- **Messages:**
-```json
-[
-  {
-    "kind": "request",
-    "parts": [
-      {
-        "type": "user_prompt",
-        "role": "user",
-        "content": "What's the weather in San Francisco?",
-        "timestamp": "2025-01-15T12:00:00+00:00"
-      }
-    ]
-  },
-  {
-    "kind": "response",
-    "model_name": "function:weather_model:",
-    "timestamp": "2025-01-15T12:00:00+00:00",
-    "parts": [
-      {
-        "type": "tool_call",
-        "role": "assistant",
-        "tool_name": "get_weather",
-        "arguments": "{\\"location\\":\\"San Francisco\\"}",
-        "tool_call_id": "call_San_Francisco"
-      }
-    ],
-    "usage": {
-      "input_tokens": 56,
-      "cache_write_tokens": 0,
-      "cache_read_tokens": 0,
-      "output_tokens": 6,
-      "input_audio_tokens": 0,
-      "cache_audio_read_tokens": 0,
-      "output_audio_tokens": 0,
-      "details": {}
-    }
-  },
-  {
-    "kind": "request",
-    "parts": [
-      {
-        "type": "tool_return",
-        "tool_name": "get_weather",
-        "content": "Weather in San Francisco: Sunny, 72\\u00b0F",
-        "tool_call_id": "call_San_Francisco",
-        "timestamp": "2025-01-15T12:00:00+00:00"
-      }
-    ]
-  },
-  {
-    "kind": "response",
-    "model_name": "function:weather_model:",
-    "timestamp": "2025-01-15T12:00:00+00:00",
-    "parts": [
-      {
-        "type": "text",
-        "role": "assistant",
-        "content": "The weather in San Francisco is sunny and 72\\u00b0F."
-      }
-    ],
-    "usage": {
-      "input_tokens": 62,
-      "cache_write_tokens": 0,
-      "cache_read_tokens": 0,
-      "output_tokens": 16,
-      "input_audio_tokens": 0,
-      "cache_audio_read_tokens": 0,
-      "output_audio_tokens": 0,
-      "details": {}
-    }
-  }
-]
-```
-- **Usage:**
-```json
-{
-  "input_tokens": 118,
-  "cache_write_tokens": 0,
-  "cache_read_tokens": 0,
-  "output_tokens": 22,
-  "input_audio_tokens": 0,
-  "cache_audio_read_tokens": 0,
-  "output_audio_tokens": 0,
-  "details": {},
-  "requests": 2,
-  "tool_calls": 1
-}
-```
-
-=== end trace 1 ===
-
-=== start trace 2 ===
-
-- **Score:** 0.9
-- **Success:** true
-- **Feedback:** Good use of tools
-- **Assistant Response:** The weather in New York is sunny and 72°F.
-
-- **Messages:**
-```json
-[
-  {
-    "kind": "request",
-    "parts": [
-      {
-        "type": "user_prompt",
-        "role": "user",
-        "content": "What's the weather in New York?",
-        "timestamp": "2025-01-15T12:00:00+00:00"
-      }
-    ]
-  },
-  {
-    "kind": "response",
-    "model_name": "function:weather_model:",
-    "timestamp": "2025-01-15T12:00:00+00:00",
-    "parts": [
-      {
-        "type": "tool_call",
-        "role": "assistant",
-        "tool_name": "get_weather",
-        "arguments": "{\\"location\\":\\"New York\\"}",
-        "tool_call_id": "call_New_York"
-      }
-    ],
-    "usage": {
-      "input_tokens": 56,
-      "cache_write_tokens": 0,
-      "cache_read_tokens": 0,
-      "output_tokens": 6,
-      "input_audio_tokens": 0,
-      "cache_audio_read_tokens": 0,
-      "output_audio_tokens": 0,
-      "details": {}
-    }
-  },
-  {
-    "kind": "request",
-    "parts": [
-      {
-        "type": "tool_return",
-        "tool_name": "get_weather",
-        "content": "Weather in New York: Sunny, 72\\u00b0F",
-        "tool_call_id": "call_New_York",
-        "timestamp": "2025-01-15T12:00:00+00:00"
-      }
-    ]
-  },
-  {
-    "kind": "response",
-    "model_name": "function:weather_model:",
-    "timestamp": "2025-01-15T12:00:00+00:00",
-    "parts": [
-      {
-        "type": "text",
-        "role": "assistant",
-        "content": "The weather in New York is sunny and 72\\u00b0F."
-      }
-    ],
-    "usage": {
-      "input_tokens": 62,
-      "cache_write_tokens": 0,
-      "cache_read_tokens": 0,
-      "output_tokens": 16,
-      "input_audio_tokens": 0,
-      "cache_audio_read_tokens": 0,
-      "output_audio_tokens": 0,
-      "details": {}
-    }
-  }
-]
-```
-- **Usage:**
-```json
-{
-  "input_tokens": 118,
-  "cache_write_tokens": 0,
-  "cache_read_tokens": 0,
-  "output_tokens": 22,
-  "input_audio_tokens": 0,
-  "cache_audio_read_tokens": 0,
-  "output_audio_tokens": 0,
-  "details": {},
-  "requests": 2,
-  "tool_calls": 1
-}
-```
-
-=== end trace 2 ===
+2 traces available from the execution: 2 succeeded, 0 failed.
+The traces are stored on disk in structured JSONL format.
+You must use the `run_trace_analysis(python_script: str)` tool to write and execute python map-reduce scripts to analyze these traces within the unbounded Ouros Data Plane.
+You may also use `analyze_trace_with_llm(trace_id, prompt)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.
 
 
 ### Analysis guidance
+- Use `run_trace_analysis` to aggregate errors or find common failure modes.
+- Use `analyze_trace_with_llm` to understand *why* a specific trace failed if the python analysis is insufficient.
 - What failure patterns repeat across runs?
 - Are components misaligned (e.g., instructions referencing tools that don't exist)?
 - Which successful patterns should be preserved or extended?

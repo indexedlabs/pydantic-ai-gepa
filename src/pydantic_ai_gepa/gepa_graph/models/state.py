@@ -215,6 +215,10 @@ class GepaConfig(BaseModel):
 class GepaState(BaseModel):
     """Shared mutable state that flows through the GEPA graph steps."""
 
+    run_id: str = Field(
+        default_factory=lambda: __import__("uuid").uuid4().hex,
+        description="Unique identifier for the optimization run.",
+    )
     iteration: int = Field(
         default=-1,
         description="Zero-indexed iteration counter; -1 means StartStep has not seeded the run yet.",

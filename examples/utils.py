@@ -11,7 +11,12 @@ from pydantic_ai import Tool
 
 from typing_extensions import TypeAliasType
 
-from mcp_run_python import code_sandbox
+import ouros
+from typing import TYPE_CHECKING, Literal, TypeAlias
+from typing_extensions import TypeAliasType
+from pydantic import BaseModel, Field
+import json
+import time
 
 if TYPE_CHECKING:
     JsonValue: TypeAlias = (
@@ -22,7 +27,6 @@ else:
         "JsonValue",
         str | bool | int | float | None | list["JsonValue"] | dict[str, "JsonValue"],
     )
-
 
 class SandboxExecutionResult(BaseModel):
     """Structured result returned by the sandbox tool."""
@@ -54,7 +58,6 @@ class SandboxExecutionResult(BaseModel):
         description="Total wall-clock time spent creating the sandbox and executing the script.",
     )
 
-
 def _summarize_answer(
     return_value: JsonValue | None,
     output_lines: list[str],
@@ -73,41 +76,48 @@ def _summarize_answer(
 
     return None, "none"
 
-
 async def _run_python_in_sandbox(
     code: str,
     *,
-    globals: dict[str, JsonValue] | None = None,
+    inputs: dict[str, JsonValue] | None = None,
 ) -> SandboxExecutionResult:
-    """Execute arbitrary Python inside the mcp-run-python sandbox (stdlib only).
+    """Execute arbitrary Python inside the ouros sandbox.
 
     Args:
         code: Complete Python script to run. Include all required imports and print the final answer.
-        globals: Optional JSON-compatible mapping that will be injected as global variables when the script starts.
-
-    Notes:
-        Third-party dependencies (like numpy) are intentionally unsupported to keep each run isolated
-        and predictable. Use only the Python standard library.
+        inputs: Optional JSON-compatible mapping that will be injected as global variables when the script starts.
     """
-
-    def log_handler(_: str, __: str) -> None:
-        return None
-
     started = time.perf_counter()
+    import logging
+    print(f"Executing sandbox code:\\n{code}\\n")
 
     try:
-        async with code_sandbox(
-            dependencies=None,
-            log_handler=log_handler,
-            allow_networking=False,
-        ) as sandbox:
-            sandbox_result = await sandbox.eval(code, globals)
+        sandbox = ouros.Sandbox(code)
+        output_lines_buffer = []
+        def _print_callback(fd: Literal["stdout"], text: str) -> None:
+            output_lines_buffer.append(text)
+            
+        result = await ouros.run_async(
+            sandbox,
+            inputs=inputs if inputs else None,
+            print_callback=_print_callback,
+            limits=ouros.ResourceLimits(
+                timeout_ms=10000, 
+                memory_bytes=500_000_000, 
+                instruction_count=100_000_000
+            )
+        )
+        sandbox_result = {
+            "status": "success",
+            "return_value": result,
+            "output": "".join(output_lines_buffer).splitlines()
+        }
     except Exception as exc:  # pragma: no cover - surfaced to the model instead
         elapsed = time.perf_counter() - started
         return SandboxExecutionResult(
             status="run-error",
             return_value=None,
-            error=f"Sandbox failed before execution: {exc}",
+            error=f"Sandbox execution failed: {exc}",
             output_lines=[],
             answer_text=None,
             answer_source="none",
@@ -121,21 +131,10 @@ async def _run_python_in_sandbox(
         output_lines,
     )
 
-    if sandbox_result["status"] == "success":
-        return SandboxExecutionResult(
-            status="success",
-            return_value=sandbox_result.get("return_value"),
-            error=None,
-            output_lines=output_lines,
-            answer_text=answer_text,
-            answer_source=answer_source,
-            elapsed_seconds=elapsed,
-        )
-
     return SandboxExecutionResult(
-        status=sandbox_result["status"],
-        return_value=None,
-        error=sandbox_result.get("error"),
+        status="success",
+        return_value=sandbox_result.get("return_value"),
+        error=None,
         output_lines=output_lines,
         answer_text=answer_text,
         answer_source=answer_source,

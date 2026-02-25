@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic_ai.models import KnownModelName, Model
 from pydantic_ai.settings import ModelSettings
 
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from .models import CandidateMap
 from .evaluation import ParallelEvaluator, ParetoFrontManager
 from .selectors import BatchSampler, CandidateSelector, ComponentSelector
@@ -32,3 +33,4 @@ class GepaDeps:
     model: Model | KnownModelName | str | None = None
     model_settings: ModelSettings | None = None
     seed_candidate: CandidateMap | None = None
+    memory_exporter: InMemorySpanExporter | None = None

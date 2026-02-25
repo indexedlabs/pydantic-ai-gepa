@@ -49,10 +49,29 @@ async def optimize(
     normalized_seed = _coerce_seed_candidate(seed_candidate)
 
     if deps is None:
+        from opentelemetry import trace
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+        memory_exporter = InMemorySpanExporter()
+        processor = SimpleSpanProcessor(memory_exporter)
+        provider = trace.get_tracer_provider()
+        
+        if not hasattr(provider, "add_span_processor"):
+            try:
+                import logfire
+                provider = logfire.get_tracer_provider()
+            except Exception:
+                pass
+                
+        if hasattr(provider, "add_span_processor"):
+            provider.add_span_processor(processor)
+
         resolved_deps = create_deps(
             adapter,
             config,
             seed_candidate=normalized_seed,
+            memory_exporter=memory_exporter,
         )
     else:
         resolved_deps = deps

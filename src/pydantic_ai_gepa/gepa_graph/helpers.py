@@ -27,6 +27,7 @@ def create_deps(
     config: GepaConfig,
     *,
     seed_candidate: CandidateMap | None = None,
+    memory_exporter: "Any" = None,
 ) -> GepaDeps:
     """Construct :class:`GepaDeps` instances for a GEPA run.
 
@@ -35,6 +36,7 @@ def create_deps(
         config: Immutable optimization configuration.
         seed_candidate: Optional initial candidate mapping injected into ``GepaDeps``
             for consumption by :class:`StartStep`.
+        memory_exporter: Optional InMemorySpanExporter used for capturing OTel traces.
     """
     from .proposal import InstructionProposalGenerator, MergeProposalBuilder
 
@@ -68,6 +70,7 @@ def create_deps(
         model=reflection_model,
         model_settings=reflection_model_settings,
         seed_candidate=seed_candidate,
+        memory_exporter=memory_exporter,
     )
 
 

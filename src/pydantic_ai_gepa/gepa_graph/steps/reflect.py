@@ -122,6 +122,9 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
             create_journal_toolset(state.config.reflection_config.journal_file)
         )
 
+    from ..proposal.trace_tools import create_trace_toolset
+    component_toolsets.append(create_trace_toolset(state.run_id, parent_idx, reflection_model))
+
     if state.config.component_selector == "reflection":
         components_to_update = None
         components_for_dataset = list(parent.components.keys())
@@ -176,6 +179,22 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
             model_settings=deps.model_settings,
             component_toolsets=component_toolsets if component_toolsets else None,
         )
+        
+        # Capture and save the Reflector's own trace data (tool calls, reasoning)
+        if deps.memory_exporter is not None:
+            from pathlib import Path
+            import json
+            spans = deps.memory_exporter.get_finished_spans()
+            print(f"DEBUG: Saving {len(spans)} reflector spans to disk")
+            if spans:
+                reflector_dir = Path(f".gepa_cache/runs/{state.run_id}/candidates/{parent_idx}/reflector_traces")
+                reflector_dir.mkdir(parents=True, exist_ok=True)
+                reflector_file = reflector_dir / "traces.jsonl"
+                with open(reflector_file, "a", encoding="utf-8") as f:
+                    for span in spans:
+                        f.write(span.to_json() + "\\n")
+            deps.memory_exporter.clear()
+
         component_metadata = (
             proposal_result.component_metadata
             if state.config.track_component_hypotheses
@@ -326,13 +345,26 @@ async def _evaluate_minibatch(
     batch: Sequence[Case[Any, Any, Any]],
     capture_traces: bool,
 ) -> EvaluationResults[str]:
-    return await deps.evaluator.evaluate_batch(
+    results = await deps.evaluator.evaluate_batch(
         candidate=candidate,
         batch=batch,
         adapter=deps.adapter,
         capture_traces=capture_traces,
         max_concurrent=state.config.max_concurrent_evaluations,
     )
+    if capture_traces and deps.memory_exporter is not None:
+        from pathlib import Path
+        import json
+        spans = deps.memory_exporter.get_finished_spans()
+        if spans:
+            traces_dir = Path(f".gepa_cache/runs/{state.run_id}/candidates/{candidate.idx}/traces")
+            traces_dir.mkdir(parents=True, exist_ok=True)
+            traces_file = traces_dir / "traces.jsonl"
+            with open(traces_file, "a", encoding="utf-8") as f:
+                for span in spans:
+                    f.write(span.to_json() + "\\n")
+        deps.memory_exporter.clear()
+    return results
 
 
 def _record_minibatch(

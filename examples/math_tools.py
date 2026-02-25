@@ -36,7 +36,7 @@ from pydantic_ai_gepa.types import (
     RolloutOutput,
 )
 
-logfire.configure(console=False)
+logfire.configure(console=logfire.ConsoleOptions(min_log_level='info'))
 logfire.instrument_pydantic_ai()
 logfire.instrument_httpx(capture_all=True)
 
@@ -662,7 +662,7 @@ async def run_math_tools_optimization(
 ) -> GepaResult:
     cache_manager = CacheManager(
         cache_dir=".gepa_cache",
-        enabled=True,
+        enabled=False,
         verbose=True,
     )
 
@@ -678,7 +678,7 @@ async def run_math_tools_optimization(
         max_evaluations=max_evaluations,
         component_selector="all",
         candidate_selector=CandidateSelectorStrategy.PARETO,
-        minibatch_size=10,
+        minibatch_size=5,
         use_merge=True,
         track_component_hypotheses=True,
         max_concurrent_evaluations=20,

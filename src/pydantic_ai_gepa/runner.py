@@ -362,10 +362,31 @@ async def optimize_agent(
         track_component_hypotheses=track_component_hypotheses,
     )
 
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    memory_exporter = InMemorySpanExporter()
+    processor = SimpleSpanProcessor(memory_exporter)
+    provider = trace.get_tracer_provider()
+    
+    # logfire configures a global tracer provider. 
+    # Try getting logfire's provider if default has no add_span_processor
+    if not hasattr(provider, "add_span_processor"):
+        try:
+            import logfire
+            provider = logfire.get_tracer_provider()
+        except Exception:
+            pass
+            
+    if hasattr(provider, "add_span_processor"):
+        provider.add_span_processor(processor)
+
     deps = create_deps(
         adapter,
         config,
         seed_candidate=normalized_seed_candidate,
+        memory_exporter=memory_exporter,
     )
     if deterministic_proposer is not None:
         deps.proposal_generator = deterministic_proposer

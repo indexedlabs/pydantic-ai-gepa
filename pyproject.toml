@@ -23,9 +23,9 @@ dependencies = [
     "pydantic-graph @ git+https://github.com/mwildehahn/pydantic-ai@b9d643c24ef08c0af24f291cc1ed746af93498f7#subdirectory=pydantic_graph",
     "rich>=13.7.1",
     "logfire>=4.14.2",
-    "mcp-run-python>=0.0.21",
     "PyYAML>=6.0.0",
     "pydantic-monty>=0.0.7",
+    "ouros>=0.0.4",
 ]
 
 [dependency-groups]

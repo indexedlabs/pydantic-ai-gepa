@@ -1519,18 +1519,6 @@ wheels = [
 ]
 
 [[package]]
-name = "mcp-run-python"
-version = "0.0.21"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "mcp" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/66/e0/dba9a1fdb5e5173ee29fb6cf55cdfbf03b45a43f7d8d6bd3c3d398031507/mcp_run_python-0.0.21.tar.gz", hash = "sha256:1ea77501b7bccb637192186adf7fc2048e21ee0c1c515de9e35c0c2f61916c04", size = 23296, upload-time = "2025-09-04T02:02:46.12Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/0e/3d/fad699dcb312f91f6a7fc4509c74b0cba8ddd8e2b6f0fd75e8d4b1436d91/mcp_run_python-0.0.21-py3-none-any.whl", hash = "sha256:18b8bc4129e7b5be084904c5bbfb7fc7d1caae9f84fb2d84aa194180e732dc09", size = 26103, upload-time = "2025-09-04T02:02:44.961Z" },
-]
-
-[[package]]
 name = "mdurl"
 version = "0.1.2"
 source = { registry = "https://pypi.org/simple" }
@@ -1843,6 +1831,19 @@ wheels = [
 ]
 
 [[package]]
+name = "ouros"
+version = "0.0.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d5/fc/10f587040b06541a8950d5c83d4e8d89645d1308c4593766392ac46724b5/ouros-0.0.4.tar.gz", hash = "sha256:dcf58bdd3b39dcaf4bc1af0b2eb17d1e85ca3e476974f6eb3da198b489f896f8", size = 1971975, upload-time = "2026-02-19T19:31:26.742Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b8/35/621786c02b2f20e2a844b2b7a37e8b4df06bbf8d796ef9c4a722e7c5e5fc/ouros-0.0.4-cp312-cp312-macosx_10_12_x86_64.whl", hash = "sha256:536a0e643b36524e938aa95e7f45ac7b7cbab1a6c314b1576031c2362da6338b", size = 13732981, upload-time = "2026-02-19T19:31:15.467Z" },
+    { url = "https://files.pythonhosted.org/packages/84/45/d4c863e8f3933f6a719992b0437af80fedcaa1775353f7c646275cd2dff6/ouros-0.0.4-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:5dcb473f88f72e87e9ab82d97d55de969fc7955647291421e1385e45052bd11f", size = 12689899, upload-time = "2026-02-19T19:31:17.953Z" },
+    { url = "https://files.pythonhosted.org/packages/18/f7/df568f6131cb1925756a86960b15aebf6c83917ec7ecc67c1fd9cb8040bd/ouros-0.0.4-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:57fe12673704717bae36ebea58640cdbe16c101464acb805d89a1faf25e52926", size = 12947612, upload-time = "2026-02-19T19:31:20.427Z" },
+    { url = "https://files.pythonhosted.org/packages/6e/03/18e944a87db10b0f5441713fbbeb8342399d1ec73f8d46ac5e10416ae1b4/ouros-0.0.4-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:e9a7cfdcc0bef2ec3dbe40bf6e61a1b610bb58df452f924ed2834c3ade3451bf", size = 14044562, upload-time = "2026-02-19T19:31:22.558Z" },
+    { url = "https://files.pythonhosted.org/packages/e0/d9/8990a84fdb8840cf0baecefd627b085677e1450de4a2c9e3a97b1ac975df/ouros-0.0.4-cp312-cp312-win_amd64.whl", hash = "sha256:2151c620b427664e167e88cbdcfc6bb02c51761718f7a5d218efbb5b174eb21d", size = 14984807, upload-time = "2026-02-19T19:31:24.762Z" },
+]
+
+[[package]]
 name = "packaging"
 version = "25.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2144,7 +2145,7 @@ source = { editable = "." }
 dependencies = [
     { name = "cloudpickle" },
     { name = "logfire" },
-    { name = "mcp-run-python" },
+    { name = "ouros" },
     { name = "pydantic-ai" },
     { name = "pydantic-graph" },
     { name = "pydantic-monty" },
@@ -2169,7 +2170,7 @@ dev = [
 requires-dist = [
     { name = "cloudpickle", specifier = ">=3.0.0" },
     { name = "logfire", specifier = ">=4.14.2" },
-    { name = "mcp-run-python", specifier = ">=0.0.21" },
+    { name = "ouros", specifier = ">=0.0.4" },
     { name = "pydantic-ai", git = "https://github.com/mwildehahn/pydantic-ai?rev=b9d643c24ef08c0af24f291cc1ed746af93498f7" },
     { name = "pydantic-graph", git = "https://github.com/mwildehahn/pydantic-ai?subdirectory=pydantic_graph&rev=b9d643c24ef08c0af24f291cc1ed746af93498f7" },
     { name = "pydantic-monty", specifier = ">=0.0.7" },
