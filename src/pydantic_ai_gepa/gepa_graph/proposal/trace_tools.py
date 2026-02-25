@@ -7,6 +7,12 @@ from typing import Any
 from pydantic_ai import Agent, FunctionToolset
 
 
+class ClearMessageHistoryException(Exception):
+    def __init__(self, next_context: str):
+        super().__init__("Clear message history requested")
+        self.next_context = next_context
+
+
 def create_trace_toolset(
     run_id: str, candidate_idx: int, reflection_model: Any = "gpt-4o-mini"
 ) -> FunctionToolset[None]:
@@ -97,26 +103,74 @@ def create_trace_toolset(
             trace_id: The `context.trace_id` from the span you want to analyze.
             prompt: The specific semantic question for the sub-agent (e.g. "Did the agent misunderstand the API tool?").
         """
-        # Create a dedicated toolset for the sub-agent that contains the same run_python_script
+        # Maintain a persistent scratchpad dictionary across history clears
+        scratchpad: dict[str, str] = {}
+
         subagent_toolset = FunctionToolset[None]()
         subagent_toolset.tools["run_python_script"] = run_python_script
 
-        agent = Agent(
-            reflection_model,
-            system_prompt=(
-                f"You are a senior debugging engineer analyzing an execution trace (trace_id: {trace_id}).\\n"
+        @subagent_toolset.tool
+        def save_to_scratchpad(key: str, value: str) -> str:
+            """Save a string value to your persistent scratchpad."""
+            scratchpad[key] = value
+            return f"Saved to scratchpad[{key}]"
+
+        @subagent_toolset.tool
+        def load_from_scratchpad(key: str) -> str:
+            """Load a value from your persistent scratchpad."""
+            return scratchpad.get(key, f"Key {key} not found.")
+
+        @subagent_toolset.tool
+        def list_scratchpad() -> list[str]:
+            """List all keys currently in your persistent scratchpad."""
+            return list(scratchpad.keys())
+
+        @subagent_toolset.tool
+        def clear_message_history(next_context: str) -> str:
+            """Clear your conversation history to free up context window space. 
+            Execution will restart with `next_context` as your new starting prompt.
+            Ensure you have saved any important findings to your scratchpad before calling this.
+            """
+            raise ClearMessageHistoryException(next_context)
+
+        @subagent_toolset.tool
+        async def spawn_agent(instructions: str) -> str:
+            """Spawn a recursive sub-agent with a fresh context window to investigate a sub-problem. 
+            It has access to its own python script tool and its own scratchpad, but its message history 
+            does NOT affect your context window. It returns a string answer to your instructions.
+            """
+            return await _run_agent_loop(instructions, depth=1)
+
+        async def _run_agent_loop(current_prompt: str, depth: int) -> str:
+            system_prompt = (
+                f"You are a senior debugging engineer analyzing an execution trace (trace_id: {trace_id}).\n"
                 "You MUST use your `run_python_script` tool to read the file `traces/traces.jsonl` "
-                "(and `components.json` if needed) to extract the context you need. "
-                "Do NOT guess. Write python scripts to parse the JSONL and examine the exact conversation messages."
-            ),
-        )
+                "(and `components.json` if needed). Do NOT guess. Write python scripts to extract context.\n"
+                "If your conversation gets too long, save findings to your scratchpad and call `clear_message_history`."
+            ) if depth == 0 else (
+                f"You are a recursive sub-agent exploring a sub-problem for trace {trace_id}.\n"
+                "Use `run_python_script` to read files. Return your final answer to the parent agent.\n"
+                "If your conversation gets too long, save findings to your scratchpad and call `clear_message_history`."
+            )
 
-        full_prompt = f"Analyze the trace to answer this question:\\n\\n{prompt}"
+            agent = Agent(
+                reflection_model,
+                system_prompt=system_prompt,
+            )
 
-        try:
-            result = await agent.run(full_prompt, toolsets=[subagent_toolset])
-            return result.data
-        except Exception as e:
-            return f"Error running sub-agent: {e}"
+            # Execution loop to handle history clears
+            while True:
+                try:
+                    result = await agent.run(current_prompt, toolsets=[subagent_toolset])
+                    return result.data
+                except ClearMessageHistoryException as e:
+                    current_prompt = (
+                        f"History cleared. You previously left yourself this note to continue:\n\n{e.next_context}\n\n"
+                        "Your scratchpad is intact. You may use `load_from_scratchpad` to retrieve your saved data."
+                    )
+                except Exception as e:
+                    return f"Error running sub-agent: {e}"
+
+        return await _run_agent_loop(f"Analyze the trace to answer this question:\n\n{prompt}", depth=0)
 
     return toolset
