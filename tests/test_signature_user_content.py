@@ -76,7 +76,7 @@ def test_duplicate_attachment_reuses_placeholder() -> None:
 Inputs:
 
 - `<reference>` (ReferenceModel): Structured reference data
-- `<repeated>` (Sequence[Union[str, UnionType[ImageUrl, AudioUrl, DocumentUrl, VideoUrl, BinaryContent], CachePoint]]): Repeated attachments for reuse. Provide references using the appropriate attachment types (audio, binary, document, image, video).
+- `<repeated>` (Sequence[Union[str, UnionType[ImageUrl, AudioUrl, DocumentUrl, VideoUrl, BinaryContent, UploadedFile], CachePoint]]): Repeated attachments for reuse. Provide references using the appropriate attachment types (audio, binary, document, image, video).
 
 Schemas:
 

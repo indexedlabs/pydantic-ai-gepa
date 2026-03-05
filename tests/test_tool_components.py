@@ -478,9 +478,10 @@ class TestSearchExamplesToolCapturedDuringAgentRun:
         )
         from pydantic_ai_gepa.gepa_graph.example_bank import InMemoryExampleBank
         from pydantic_ai_gepa.types import ExampleBankConfig
+        from pydantic_ai_gepa.models import OptimizableModel
 
         agent = Agent(
-            model=TestModel(),
+            model=OptimizableModel(TestModel()),
             instructions="Test agent",
         )
 
@@ -503,10 +504,11 @@ class TestSearchExamplesToolCapturedDuringAgentRun:
                 break
 
         assert model_request is not None
-        assert model_request.model_request_parameters is not None
+        assert getattr(model_request, "model_request_parameters", None) is not None
 
         # Check that search_examples is in function_tools
-        function_tools = model_request.model_request_parameters.function_tools
+        model_req_params = getattr(model_request, "model_request_parameters")
+        function_tools = model_req_params.function_tools
         tool_names = [t.name for t in function_tools]
         assert "search_examples" in tool_names
 
