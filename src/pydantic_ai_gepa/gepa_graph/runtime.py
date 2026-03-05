@@ -62,12 +62,12 @@ async def optimize(
             try:
                 import logfire
 
-                provider = logfire.get_tracer_provider()
+                provider = logfire.get_tracer_provider()  # type: ignore
             except Exception:
                 pass
 
         if hasattr(provider, "add_span_processor"):
-            provider.add_span_processor(processor)
+            provider.add_span_processor(processor)  # type: ignore
 
         resolved_deps = create_deps(
             adapter,
@@ -117,6 +117,7 @@ async def optimize(
             )
     except UsageBudgetExceeded:
         state.mark_stopped(reason="Usage budget exceeded")
+        import logfire
         logfire.info(
             "GEPA run stopped early due to usage budget limit",
             best_score=state.best_score,

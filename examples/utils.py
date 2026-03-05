@@ -98,7 +98,7 @@ async def _run_python_in_sandbox(
             sandbox,
             inputs=inputs if inputs else None,
             print_callback=_print_callback,
-            limits=ouros.ResourceLimits(
+            limits=ouros.ResourceLimits(  # type: ignore
                 timeout_ms=10000,
                 memory_bytes=500_000_000,
                 instruction_count=100_000_000,

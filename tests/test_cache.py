@@ -308,21 +308,22 @@ def test_create_cached_metric():
         case = _prompt_case("Test", name="test-1")
         output = RolloutOutput.from_success("Result")
 
+        from typing import cast
         # First call should invoke the metric
-        result = cached_metric(case, output)
+        result = cast(MetricResult, cached_metric(case, output))
         assert result.score == 0.8
         assert result.feedback == "Call 1"
         assert call_count == 1
 
         # Second call with same inputs should use cache
-        result = cached_metric(case, output)
+        result = cast(MetricResult, cached_metric(case, output))
         assert result.score == 0.8
         assert result.feedback == "Call 1"  # Same feedback
         assert call_count == 1  # Metric not called again
 
         # Different inputs should invoke metric again
         case2 = _prompt_case("Different", name="test-2")
-        result = cached_metric(case2, output)
+        result = cast(MetricResult, cached_metric(case2, output))
         assert result.score == 0.8
         assert result.feedback == "Call 2"
         assert call_count == 2

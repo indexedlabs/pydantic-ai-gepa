@@ -72,7 +72,9 @@ Use this skill when working with PDFs.
 """
     parsed = parse_skill_md(raw)
     assert parsed.frontmatter.name == "pdf-processing"
+    assert parsed.frontmatter.description
     assert parsed.frontmatter.description.startswith("Extract text")
+    assert parsed.frontmatter.allowed_tools
     assert parsed.frontmatter.allowed_tools.startswith("Bash(")
     assert parsed.frontmatter.metadata == {"author": "example-org"}
     assert parsed.frontmatter.extras["boundary"] == "trusted"

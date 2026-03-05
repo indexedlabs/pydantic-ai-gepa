@@ -43,7 +43,7 @@ from pydantic_ai_gepa.gepa_graph.selectors import (
     AllComponentSelector,
     RoundRobinComponentSelector,
 )
-from pydantic_ai_gepa.types import RolloutOutput
+from pydantic_ai_gepa.types import RolloutOutput, Trajectory
 
 
 def _make_data(case_id: str) -> Case[str, str, dict[str, str]]:
@@ -93,10 +93,11 @@ async def _training_examples(state: GepaState) -> list[Case[str, str, dict[str, 
 
 
 @dataclass
-class _StubTrajectory:
+class _StubTrajectory(Trajectory):
     instructions: str | None = "seed"
     metric_feedback: str | None = "feedback"
     final_output: Any | None = "result"
+    metric_side_info: dict[str, Any] | None = None
 
     def to_reflective_record(self) -> dict[str, Any]:
         return {"messages": [], "user_prompt": "stub"}
@@ -178,13 +179,14 @@ class _StubProposalGenerator(InstructionProposalGenerator):
         *,
         candidate: CandidateProgram,
         reflective_data: ReflectiveDataset,
-        components: Sequence[str],
+        components: Sequence[str] | None,
         model: Any,
         iteration: int | None = None,
         current_best_score: float | None = None,
         parent_score: float | None = None,
         model_settings: Any = None,
         example_bank: Any = None,
+        component_toolsets: Any = None,
     ) -> ProposalResult:
         self.calls += 1
         self.last_reflective_data = reflective_data
@@ -192,11 +194,11 @@ class _StubProposalGenerator(InstructionProposalGenerator):
             component: self._updates.get(
                 component, candidate.components[component].text
             )
-            for component in components
+            for component in (components or [])
         }
         component_metadata = {
             component: self._metadata[component]
-            for component in components
+            for component in (components or [])
             if component in self._metadata
         }
         return ProposalResult(
@@ -394,13 +396,14 @@ async def test_reflect_step_skips_candidate_eval_on_noop_proposal() -> None:
             *,
             candidate: CandidateProgram,
             reflective_data: ReflectiveDataset,
-            components: Sequence[str],
+            components: Sequence[str] | None,
             model: Any,
             iteration: int | None = None,
             current_best_score: float | None = None,
             parent_score: float | None = None,
             model_settings: Any = None,
             example_bank: Any = None,
+            component_toolsets: Any = None,
         ) -> ProposalResult:
             self.calls += 1
             self.last_reflective_data = reflective_data

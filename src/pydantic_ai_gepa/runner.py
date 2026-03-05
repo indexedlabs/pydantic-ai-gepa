@@ -376,12 +376,12 @@ async def optimize_agent(
     # Try getting logfire's provider if default has no add_span_processor
     if not hasattr(provider, "add_span_processor"):
         try:
-            provider = logfire.get_tracer_provider()
+            provider = logfire.get_tracer_provider()  # type: ignore
         except Exception:
             pass
 
     if hasattr(provider, "add_span_processor"):
-        provider.add_span_processor(processor)
+        provider.add_span_processor(processor)  # type: ignore
 
     deps = create_deps(
         adapter,

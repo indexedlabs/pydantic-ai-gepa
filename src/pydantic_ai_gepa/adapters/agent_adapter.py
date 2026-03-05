@@ -1300,19 +1300,20 @@ class AgentAdapter(
             )
         toolsets = self._build_toolsets(candidate, example_bank)
         
-        model = usage_kwargs.pop("model", None) or self.agent.model
+        run_kwargs = dict(usage_kwargs)
+        model = run_kwargs.pop("model", None) or self.agent.model
         if model is not None:
             from pydantic_ai_gepa.models import OptimizableModel
-            if getattr(model, "__class__", None).__name__ != "OptimizableModel":
-                usage_kwargs["model"] = OptimizableModel(model)
-        elif "model" in usage_kwargs:
-            usage_kwargs["model"] = model
+            if type(model).__name__ != "OptimizableModel":
+                run_kwargs["model"] = OptimizableModel(model)  # type: ignore
+        elif "model" in run_kwargs:
+            run_kwargs["model"] = model
             
         return await self.agent.run(
             prompt,
             message_history=message_history,
             toolsets=toolsets,
-            **usage_kwargs,
+            **run_kwargs,
         )
 
     def _build_synthetic_request(
@@ -1395,13 +1396,14 @@ class SignatureAgentAdapter(
         candidate_text = candidate_texts(candidate)
         toolsets = self._build_toolsets(candidate, example_bank)
         
-        model = usage_kwargs.pop("model", None) or self._signature_agent.wrapped.model
+        run_kwargs = dict(usage_kwargs)
+        model = run_kwargs.pop("model", None) or self._signature_agent.wrapped.model
         if model is not None:
             from pydantic_ai_gepa.models import OptimizableModel
-            if getattr(model, "__class__", None).__name__ != "OptimizableModel":
-                usage_kwargs["model"] = OptimizableModel(model)
-        elif "model" in usage_kwargs:
-            usage_kwargs["model"] = model
+            if type(model).__name__ != "OptimizableModel":
+                run_kwargs["model"] = OptimizableModel(model)  # type: ignore
+        elif "model" in run_kwargs:
+            run_kwargs["model"] = model
             
         return await self._signature_agent.run_signature(
             inputs,
@@ -1409,7 +1411,7 @@ class SignatureAgentAdapter(
             candidate=candidate_text,
             toolsets=toolsets,
             deps=inputs,
-            **usage_kwargs,
+            **run_kwargs,
         )
 
     def _validate_inputs(self, inputs: InputT) -> BaseModel:

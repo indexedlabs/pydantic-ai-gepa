@@ -118,6 +118,12 @@ class _BackendStub(SkillsSearchProvider):
             )
         ][:top_k]
 
+    async def reindex_skill(self, *args, **kwargs) -> None:
+        pass
+
+    async def reindex_skills(self, *args, **kwargs) -> None:
+        pass
+
 
 @pytest.mark.asyncio
 async def test_create_skills_toolset_with_custom_backend_uses_async_search() -> None:

@@ -219,7 +219,7 @@ def list_dir(path: str):
                     return "Error: Child agent exceeded maximum clear_message_history loops (20)."
                 try:
                     result = await agent.run(current_prompt, toolsets=[child_toolset])
-                    return result.data
+                    return result.output
                 except ClearMessageHistoryException as e:
                     current_prompt = (
                         f"History cleared. You previously left yourself this note to continue:\n\n{e.next_context}\n\n"

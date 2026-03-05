@@ -19,11 +19,14 @@ def test_side_info_in_reflective_dataset():
     batch = EvaluationBatch(outputs=[output], scores=[0.5], trajectories=[traj])
 
     dataset = adapter.make_reflective_dataset(
-        candidate={}, eval_batch=batch, components_to_update=[]
+        candidate={}, eval_batch=batch, components_to_update=["instructions"]
     )
 
-    assert len(dataset.records) == 1
-    assert dataset.records[0]["side_info"] == {
+    from pydantic_ai_gepa.adapter import SharedReflectiveDataset
+    assert isinstance(dataset, SharedReflectiveDataset)
+    records = dataset.records
+    assert len(records) == 1
+    assert records[0]["side_info"] == {
         "error": "db_auth_failed",
         "details": {"code": 401},
     }

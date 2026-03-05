@@ -651,7 +651,7 @@ def _build_component_selection_toolset(
             skill_path=skill_path,
             include_examples=include_examples,
         )
-        return activate_skill_components(skill_path, include_examples=include_examples)
+        return activate_skill_components(skill_path, include_examples=include_examples)  # type: ignore
 
     @toolset.tool
     def list_active_skills() -> list[str]:
