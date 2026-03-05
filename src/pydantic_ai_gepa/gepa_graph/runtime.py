@@ -58,13 +58,11 @@ async def optimize(
         processor = SimpleSpanProcessor(memory_exporter)
         provider = trace.get_tracer_provider()
 
-        if not hasattr(provider, "add_span_processor"):
-            try:
-                import logfire
-
-                provider = logfire.get_tracer_provider()  # type: ignore
-            except Exception:
-                pass
+        # Extract real provider from ProxyTracerProvider if logfire or opentelemetry wraps it
+        if hasattr(provider, "_active_tracer_provider"):
+            provider = getattr(provider, "_active_tracer_provider")
+        if hasattr(provider, "provider"):  # Handle logfire's wrapper
+            provider = getattr(provider, "provider")
 
         if hasattr(provider, "add_span_processor"):
             provider.add_span_processor(processor)  # type: ignore
