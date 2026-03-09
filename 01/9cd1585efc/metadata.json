@@ -1,0 +1,31 @@
+{
+  "checkpoint_id": "019cd1585efc",
+  "created_at": "2026-03-09T06:45:56.274780+00:00",
+  "branch_name": "mh/bonsai",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "81ed427f1cbd8a5cbc782242a3bbc8e7ec24f875"
+  ],
+  "entity_touches": [
+    ".mighty/loro/edges/019cd149-4eb1-7981-9d17-795d8a65e2ed.loro",
+    ".mighty/loro/edges/019cd157-01dc-7a30-a342-e715ea6af5bb.loro",
+    ".mighty/loro/edges/019cd157-dd37-7232-ac10-acb09c092290.loro",
+    ".mighty/loro/edges/019cd157-dd37-7e93-8f6f-f22c99414188.loro",
+    ".mighty/loro/edges/019cd157-dd42-7723-9d37-4b2c78947173.loro",
+    ".mighty/loro/edges/019cd157-dd45-7c81-b368-76fe57770feb.loro",
+    ".mighty/loro/edges/019cd157-dd7f-7eb0-b252-321ed118ad2e.loro",
+    ".mighty/loro/edges/019cd158-5267-7523-a65e-1602b784ee24.loro",
+    ".mighty/loro/messages/019cd145-ed10-7bc3-a9b4-3621e3d2586b.loro",
+    ".mighty/loro/messages/019cd149-5978-7ce1-afcb-768bba5df2ed.loro",
+    ".mighty/loro/messages/019cd14a-2f1c-7010-af25-e6c09cd41090.loro",
+    ".mighty/loro/messages/019cd156-c556-77a0-9d21-5691959b0ab2.loro",
+    ".mighty/loro/messages/019cd157-600f-7cd0-bf0c-85ee52161892.loro",
+    ".mighty/loro/messages/019cd158-0154-7510-b3d5-7c413baa9200.loro",
+    ".mighty/loro/records/019cd149-4ea5-7ff1-8eb3-2f27578afd5f.loro",
+    ".mighty/loro/records/019cd157-0183-7122-892c-7312932bd408.loro",
+    ".mighty/loro/records/019cd157-ddbf-7493-9743-0bfb3cdd85f1.loro",
+    ".mighty/loro/records/019cd157-ddc0-7ff1-97bd-1c0ca5db52ea.loro",
+    ".mighty/loro/records/019cd157-ddc2-7a82-b783-aedce146a2db.loro",
+    ".mighty/loro/spaces/019c76fe-8692-7463-a36e-8abcc60b56af.loro"
+  ]
+}
