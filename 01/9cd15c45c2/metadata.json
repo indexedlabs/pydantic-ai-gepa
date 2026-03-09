@@ -1,0 +1,17 @@
+{
+  "checkpoint_id": "019cd15c45c2",
+  "created_at": "2026-03-09T06:50:11.330552+00:00",
+  "branch_name": "mh/bonsai",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "480a243a95527f50bdaaf99598f0d2b93d6b384a"
+  ],
+  "entity_touches": [
+    ".mighty/loro/edges/019cd15b-a6f7-7161-bc32-b91845769a65.loro",
+    ".mighty/loro/messages/019cd15b-c3dd-7021-be61-0f7e7c9cd3dc.loro",
+    ".mighty/loro/messages/019cd15b-ebd1-71e0-af0d-63e602a59797.loro",
+    ".mighty/loro/messages/019cd15c-1f98-7762-9950-06d2348dca09.loro",
+    ".mighty/loro/records/019cd15b-a6ed-72b3-8c07-dd0e93d84170.loro",
+    ".mighty/loro/spaces/019c76fe-8692-7463-a36e-8abcc60b56af.loro"
+  ]
+}
