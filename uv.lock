@@ -911,6 +911,7 @@ dependencies = [
     { name = "logfire" },
     { name = "ouros" },
     { name = "pydantic-ai-slim", extra = ["anthropic", "logfire", "openai", "retries"] },
+    { name = "pydantic-evals" },
     { name = "pydantic-graph" },
     { name = "pydantic-monty" },
     { name = "pyyaml" },
@@ -936,6 +937,7 @@ requires-dist = [
     { name = "logfire", specifier = ">=4.14.2" },
     { name = "ouros", specifier = ">=0.0.4" },
     { name = "pydantic-ai-slim", extras = ["openai", "anthropic", "logfire", "retries"], git = "https://github.com/pydantic/pydantic-ai?subdirectory=pydantic_ai_slim&rev=56263905def8b1d384628cc1434ad758db5e5de0" },
+    { name = "pydantic-evals", git = "https://github.com/pydantic/pydantic-ai?subdirectory=pydantic_evals&rev=56263905def8b1d384628cc1434ad758db5e5de0" },
     { name = "pydantic-graph", git = "https://github.com/pydantic/pydantic-ai?subdirectory=pydantic_graph&rev=56263905def8b1d384628cc1434ad758db5e5de0" },
     { name = "pydantic-monty", specifier = ">=0.0.17" },
     { name = "pyyaml", specifier = ">=6.0.0" },
@@ -1101,6 +1103,19 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/1f/f2/f11dd73284122713f5f89fc940f370d035fa8e1e078d446b3313955157fe/pydantic_core-2.41.5-pp311-pypy311_pp73-musllinux_1_1_armv7l.whl", hash = "sha256:a668ce24de96165bb239160b3d854943128f4334822900534f2fe947930e5770", size = 2330317, upload-time = "2025-11-04T13:43:40.406Z" },
     { url = "https://files.pythonhosted.org/packages/88/9d/b06ca6acfe4abb296110fb1273a4d848a0bfb2ff65f3ee92127b3244e16b/pydantic_core-2.41.5-pp311-pypy311_pp73-musllinux_1_1_x86_64.whl", hash = "sha256:f14f8f046c14563f8eb3f45f499cc658ab8d10072961e07225e507adb700e93f", size = 2316992, upload-time = "2025-11-04T13:43:43.602Z" },
     { url = "https://files.pythonhosted.org/packages/36/c7/cfc8e811f061c841d7990b0201912c3556bfeb99cdcb7ed24adc8d6f8704/pydantic_core-2.41.5-pp311-pypy311_pp73-win_amd64.whl", hash = "sha256:56121965f7a4dc965bff783d70b907ddf3d57f6eba29b6d2e5dabfaf07799c51", size = 2145302, upload-time = "2025-11-04T13:43:46.64Z" },
+]
+
+[[package]]
+name = "pydantic-evals"
+version = "1.89.1.dev73+56263905"
+source = { git = "https://github.com/pydantic/pydantic-ai?subdirectory=pydantic_evals&rev=56263905def8b1d384628cc1434ad758db5e5de0#56263905def8b1d384628cc1434ad758db5e5de0" }
+dependencies = [
+    { name = "anyio" },
+    { name = "logfire-api" },
+    { name = "pydantic" },
+    { name = "pydantic-ai-slim" },
+    { name = "pyyaml" },
+    { name = "rich" },
 ]
 
 [[package]]
