@@ -125,7 +125,10 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
 
     from pathlib import Path
     import json
-    components_file = Path(f".gepa_cache/runs/{state.run_id}/candidates/{parent_idx}/components.json")
+
+    components_file = Path(
+        f".gepa_cache/runs/{state.run_id}/candidates/{parent_idx}/components.json"
+    )
     components_file.parent.mkdir(parents=True, exist_ok=True)
     with open(components_file, "w", encoding="utf-8") as f:
         json.dump({k: v.text for k, v in parent.components.items()}, f, indent=2)
@@ -423,7 +426,7 @@ def _build_component_selection_toolset(
     def _candidate() -> CandidateProgram:
         return state.candidates[parent_idx]
 
-    @toolset.tool
+    @toolset.tool_plain
     def list_components(prefix: str | None = None) -> list[str]:
         """List available component names (optionally filtered by substring)."""
         names = sorted(_candidate().components.keys())
@@ -432,7 +435,7 @@ def _build_component_selection_toolset(
             names = [name for name in names if needle in name.casefold()]
         return names
 
-    @toolset.tool
+    @toolset.tool_plain
     def search_components(query: str, top_k: int = 12) -> list[str]:
         """Search component names by simple token matching."""
         if top_k <= 0:
@@ -449,7 +452,7 @@ def _build_component_selection_toolset(
         scored.sort(key=lambda item: (-item[0], item[1]))
         return [name for _, name in scored[:top_k]]
 
-    @toolset.tool
+    @toolset.tool_plain
     def load_component(component_name: str) -> str:
         """Load the current text value of a component."""
         candidate = _candidate()
@@ -489,7 +492,7 @@ def _build_component_selection_toolset(
             f"Unknown skill_path={skill_path!r}.{hint} Use list_skills() to see valid skill paths."
         )
 
-    @toolset.tool
+    @toolset.tool_plain
     def list_skills() -> list[SkillSummary]:
         """List available skills with their name and description."""
         candidate = _candidate()
@@ -512,7 +515,7 @@ def _build_component_selection_toolset(
                 )
             return sorted(items, key=lambda s: s.skill_path)
 
-    @toolset.tool
+    @toolset.tool_plain
     async def search_skills(query: str, top_k: int = 8) -> list[SkillSearchResult]:
         """Search the enabled skills to find potentially relevant skills."""
         candidate = _candidate()
@@ -524,7 +527,7 @@ def _build_component_selection_toolset(
                 candidate=candidate.components,
             )
 
-    @toolset.tool
+    @toolset.tool_plain
     def load_skill(skill_path: str) -> SkillLoadResult:
         """Load the full SKILL.md for a skill."""
         candidate = _candidate()
@@ -538,7 +541,7 @@ def _build_component_selection_toolset(
             content_hash=_hash_text(content),
         )
 
-    @toolset.tool
+    @toolset.tool_plain
     def load_skill_file(skill_path: str, path: str) -> SkillFileResult:
         """Load a file within a skill directory."""
         candidate = _candidate()
@@ -564,7 +567,7 @@ def _build_component_selection_toolset(
             content_hash=_hash_text(content),
         )
 
-    @toolset.tool
+    @toolset.tool_plain
     def activate_skill_components(
         skill_path: str, include_examples: bool = False
     ) -> list[str]:
@@ -607,7 +610,7 @@ def _build_component_selection_toolset(
 
         return sorted(set(activated))
 
-    @toolset.tool
+    @toolset.tool_plain
     def create_skill(skill_path: str, description: str, body: str) -> list[str]:
         """Create a new skill from scratch and make its components available to edit. Use this to abstract reusable strategies."""
         try:
@@ -643,7 +646,7 @@ def _build_component_selection_toolset(
 
         return sorted(set(activated))
 
-    @toolset.tool
+    @toolset.tool_plain
     def activate_skill(skill_path: str, include_examples: bool = False) -> list[str]:
         """Deprecated alias for activate_skill_components."""
         logfire.warn(
@@ -653,7 +656,7 @@ def _build_component_selection_toolset(
         )
         return activate_skill_components(skill_path, include_examples=include_examples)  # type: ignore
 
-    @toolset.tool
+    @toolset.tool_plain
     def list_active_skills() -> list[str]:
         """List skill paths that have been activated so far."""
         return sorted(state.active_skill_paths)

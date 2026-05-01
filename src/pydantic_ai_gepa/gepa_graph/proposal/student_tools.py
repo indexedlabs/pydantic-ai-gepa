@@ -42,7 +42,7 @@ def create_example_search_tool(
     """
     toolset: FunctionToolset[None] = FunctionToolset()
 
-    @toolset.tool(description=instruction)
+    @toolset.tool_plain(description=instruction)
     def search_examples(query: str) -> str:
         """Search for relevant examples to guide your response.
 
@@ -111,7 +111,7 @@ def create_skills_toolset(
 
     if SkillCapability.READ in capabilities:
 
-        @toolset.tool
+        @toolset.tool_plain
         def list_skills() -> list[SkillSummary]:
             """List available skills with their name and description."""
             items: list[SkillSummary] = []
@@ -135,7 +135,7 @@ def create_skills_toolset(
     if SkillCapability.READ in capabilities:
         if search_backend is None:
 
-            @toolset.tool
+            @toolset.tool_plain
             def search_skills(query: str, top_k: int = 8) -> list[SkillSearchResult]:
                 """Search skills by simple keyword matching (local fallback)."""
                 return local_search_skills_sync(query=query, top_k=top_k, fs=fs)
@@ -143,7 +143,7 @@ def create_skills_toolset(
         else:
             from ...gepa_graph.models import CandidateMap, ComponentValue
 
-            @toolset.tool
+            @toolset.tool_plain
             async def search_skills(
                 query: str, top_k: int = 8
             ) -> list[SkillSearchResult]:
@@ -166,7 +166,7 @@ def create_skills_toolset(
 
     if SkillCapability.READ in capabilities:
 
-        @toolset.tool
+        @toolset.tool_plain
         def load_skill(skill_path: str) -> SkillLoadResult:
             """Load the full SKILL.md for a skill."""
             content, content_hash = _read_skill_md(skill_path)
@@ -179,7 +179,7 @@ def create_skills_toolset(
 
     if SkillCapability.READ in capabilities:
 
-        @toolset.tool
+        @toolset.tool_plain
         def load_skill_file(skill_path: str, path: str) -> SkillFileResult:
             """Load a file within a skill directory."""
             normalized_skill = _resolve_skill_dir(skill_path)
@@ -205,7 +205,7 @@ def create_skills_toolset(
 
     if SkillCapability.EXECUTE in capabilities:
 
-        @toolset.tool
+        @toolset.tool_plain
         def run_skill_script(skill_path: str, script_name: str, args: list[str]) -> str:
             """Execute a script associated with a skill."""
             raise NotImplementedError("Script execution is explicitly disabled.")
@@ -219,7 +219,7 @@ def create_skills_toolset(
 
     if SkillCapability.EXECUTE in capabilities:
 
-        @toolset.tool
+        @toolset.tool_plain
         def execute_skill_script(
             skill_path: str, script_name: str, args: list[str]
         ) -> str:

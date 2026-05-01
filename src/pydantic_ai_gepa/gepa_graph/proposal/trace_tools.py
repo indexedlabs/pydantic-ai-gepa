@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
-import uuid
 
 from pydantic_ai import Agent, FunctionToolset
 
@@ -46,12 +45,12 @@ def create_trace_toolset(
     def _json_loads(data: str) -> Any:
         return json.loads(data)
 
-    @toolset.tool
+    @toolset.tool_plain
     def read_file(path: str) -> str:
         """Read a file relative to the context directory."""
         return _read_file(path)
 
-    @toolset.tool
+    @toolset.tool_plain
     def list_dir(path: str) -> list[str]:
         """List directory contents relative to the context directory."""
         return _list_dir(path)
@@ -59,8 +58,9 @@ def create_trace_toolset(
     try:
         import ouros
         import uuid
+
         mgr = ouros.SessionManager()
-        
+
         session_id = f"repl_{uuid.uuid4().hex[:8]}"
         session = mgr.create_session(session_id)
 
@@ -79,9 +79,13 @@ def create_trace_toolset(
             lines.append(f"{var_name} = ''.join({var_name}_parts)")
             return "\n".join(lines)
 
-        traces_assignment = _build_chunked_assignment("traces_content", traces_dir / "traces.jsonl")
-        components_assignment = _build_chunked_assignment("components_content", base_dir / "components.json")
-            
+        traces_assignment = _build_chunked_assignment(
+            "traces_content", traces_dir / "traces.jsonl"
+        )
+        components_assignment = _build_chunked_assignment(
+            "components_content", base_dir / "components.json"
+        )
+
         setup_script = f"""
 import base64
 import json
@@ -103,46 +107,46 @@ def list_dir(path: str):
 """
         session.execute(setup_script)
 
-        @toolset.tool
+        @toolset.tool_plain
         async def run_python_repl(python_code: str) -> str:
             """Execute Python code in your persistent REPL environment.
-            
-            This is a stateful Jupyter-style REPL. Variables assigned here will persist 
+
+            This is a stateful Jupyter-style REPL. Variables assigned here will persist
             in memory for future `run_python_repl` calls.
-            
+
             You have access to:
             - `read_file(path: str) -> str`: Reads a file relative to the context directory.
             - `list_dir(path: str) -> list[str]`: Lists directory contents.
             - `json_loads(data: str) -> Any`: Parses a JSON string into a Python object.
-            
+
             Available structured files:
             - `components.json`: Contains the candidate components.
             - `traces/traces.jsonl`: Contains the execution traces.
 
-            The script MUST return its output by returning the value from the last expression 
+            The script MUST return its output by returning the value from the last expression
             (or by assigning to a variable that is the last expression).
             """
             try:
                 result = session.execute(python_code)
-                if isinstance(result, dict) and 'result' in result:
-                    return str(result['result'])
+                if isinstance(result, dict) and "result" in result:
+                    return str(result["result"])
                 return str(result)
             except Exception as e:
                 return f"Error executing REPL code: {e}"
 
-        @toolset.tool
+        @toolset.tool_plain
         def clear_message_history(next_context: str) -> str:
-            """Clear your conversation history to free up context window space. 
+            """Clear your conversation history to free up context window space.
             Execution will restart with `next_context` as your new starting prompt.
-            Because your Python REPL is stateful, any variables you declared previously 
+            Because your Python REPL is stateful, any variables you declared previously
             will still be available in memory when you call `run_python_repl` again.
             """
             raise ClearMessageHistoryException(next_context)
 
-        @toolset.tool
+        @toolset.tool_plain
         async def spawn_agent(instructions: str) -> str:
-            """Spawn a recursive sub-agent with a fresh context window to investigate a sub-problem. 
-            It has access to its own isolated Python REPL session. Its message history does NOT affect 
+            """Spawn a recursive sub-agent with a fresh context window to investigate a sub-problem.
+            It has access to its own isolated Python REPL session. Its message history does NOT affect
             your context window. It returns a string answer to your instructions.
             """
             return await _run_child_agent(instructions)
@@ -151,9 +155,13 @@ def list_dir(path: str):
             child_session_id = f"repl_{uuid.uuid4().hex[:8]}"
             child_session = mgr.create_session(child_session_id)
 
-            traces_assignment = _build_chunked_assignment("traces_content", traces_dir / "traces.jsonl")
-            components_assignment = _build_chunked_assignment("components_content", base_dir / "components.json")
-                
+            traces_assignment = _build_chunked_assignment(
+                "traces_content", traces_dir / "traces.jsonl"
+            )
+            components_assignment = _build_chunked_assignment(
+                "components_content", base_dir / "components.json"
+            )
+
             setup_script = f"""
 import base64
 import json
@@ -176,34 +184,37 @@ def list_dir(path: str):
             child_session.execute(setup_script)
 
             child_toolset = FunctionToolset[None]()
-            @child_toolset.tool
+
+            @child_toolset.tool_plain
             async def run_python_repl(python_code: str) -> str:
                 """Execute Python code in your persistent REPL environment.
-                
+
                 You have access to `read_file(path)`, `list_dir(path)`, and `json_loads(data)`
                 pre-loaded in your Python environment.
                 """
                 try:
                     result = child_session.execute(python_code)
-                    if isinstance(result, dict) and 'result' in result:
-                        return str(result['result'])
+                    if isinstance(result, dict) and "result" in result:
+                        return str(result["result"])
                     return str(result)
                 except Exception as e:
                     return f"Error executing REPL code: {e}"
-            @child_toolset.tool
+
+            @child_toolset.tool_plain
             def clear_message_history(next_context: str) -> str:
-                """Clear your conversation history to free up context window space. 
-                Use this sparingly to preserve prompt caching efficiency! Only use it 
+                """Clear your conversation history to free up context window space.
+                Use this sparingly to preserve prompt caching efficiency! Only use it
                 when your context window is overflowing with massive tool outputs.
                 Execution will restart with `next_context` as your new starting prompt.
                 """
                 raise ClearMessageHistoryException(next_context)
-            @child_toolset.tool
+
+            @child_toolset.tool_plain
             async def spawn_agent(instructions: str) -> str:
                 return await _run_child_agent(instructions)
 
             system_prompt = (
-                f"You are a recursive sub-agent exploring a sub-problem for trace analysis.\n"
+                "You are a recursive sub-agent exploring a sub-problem for trace analysis.\n"
                 "Your python environment is persistent. Variables stay in memory.\n"
                 "Use `run_python_repl` to read and parse `traces/traces.jsonl` using the built-in `read_file` function.\n"
                 "Return your final answer to the parent agent.\n"
@@ -211,7 +222,7 @@ def list_dir(path: str):
                 "Only call `clear_message_history` sparingly when absolutely necessary to avoid context limits."
             )
             agent = Agent(reflection_model, system_prompt=system_prompt)
-            
+
             loop_count = 0
             while True:
                 loop_count += 1

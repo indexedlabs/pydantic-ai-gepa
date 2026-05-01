@@ -30,7 +30,7 @@ def create_example_bank_tools(bank: InMemoryExampleBank) -> FunctionToolset:
     """
     toolset: FunctionToolset[None] = FunctionToolset()
 
-    @toolset.tool
+    @toolset.tool_plain
     def add_example(title: str, keywords: list[str], content: str) -> str:
         """Add a few-shot example to help the student agent handle similar cases.
 
@@ -47,7 +47,7 @@ def create_example_bank_tools(bank: InMemoryExampleBank) -> FunctionToolset:
         bank.add(example)
         return f"Added example '{ex.title}' (id: {example.id})"
 
-    @toolset.tool
+    @toolset.tool_plain
     def remove_example(example_id: str) -> str:
         """Remove an example that isn't helping or is causing issues.
 
@@ -60,7 +60,7 @@ def create_example_bank_tools(bank: InMemoryExampleBank) -> FunctionToolset:
             return f"Removed example {example_id}"
         return f"Example {example_id} not found"
 
-    @toolset.tool
+    @toolset.tool_plain
     def list_examples() -> str:
         """View all current examples in the bank (titles and keywords only).
 
@@ -77,7 +77,7 @@ def create_example_bank_tools(bank: InMemoryExampleBank) -> FunctionToolset:
             lines.append(f"  Keywords: {kw_str}")
         return "\n".join(lines)
 
-    @toolset.tool
+    @toolset.tool_plain
     def read_example(example_id: str) -> str:
         """Read the full content of an example.
 
@@ -95,7 +95,7 @@ def create_example_bank_tools(bank: InMemoryExampleBank) -> FunctionToolset:
         ]
         return "\n".join(lines)
 
-    @toolset.tool
+    @toolset.tool_plain
     def test_retrieval(query: str) -> str:
         """Test what examples would be retrieved for a given query.
 

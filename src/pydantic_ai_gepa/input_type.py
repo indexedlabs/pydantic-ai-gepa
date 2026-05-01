@@ -489,9 +489,7 @@ class _InputModelView(_InputShared):
                 def host_json_dumps(obj: Any) -> str:
                     return json.dumps(obj, indent=2)
 
-                m = pydantic_monty.Monty(
-                    encoder_script, inputs=["data"], external_functions=["json_dumps"]
-                )
+                m = pydantic_monty.Monty(encoder_script, inputs=["data"])
                 encoded_str = m.run(
                     inputs={"data": data_dict},
                     external_functions={"json_dumps": host_json_dumps},

@@ -12,6 +12,11 @@ from pydantic_ai import RunContext
 from pydantic_ai.agent import AbstractAgent
 from pydantic_ai.agent.wrapper import WrapperAgent
 from pydantic_ai.builtin_tools import AbstractBuiltinTool
+from pydantic_ai.capabilities import (
+    CombinedCapability,
+    PrepareOutputTools,
+    PrepareTools,
+)
 from pydantic_ai.tools import ToolDefinition
 
 from .gepa_graph.models import CandidateMap, ComponentValue, candidate_texts
@@ -25,6 +30,17 @@ def _unwrap_agent(agent: AbstractAgent[Any, Any]) -> AbstractAgent[Any, Any]:
     while isinstance(current, WrapperAgent):
         current = current.wrapped
     return current
+
+
+def _append_agent_capability(agent: AbstractAgent[Any, Any], capability: Any) -> bool:
+    root_capability = getattr(agent, "_root_capability", None)
+    if not isinstance(root_capability, CombinedCapability):
+        return False
+
+    setattr(
+        agent, "_root_capability", CombinedCapability([root_capability, capability])
+    )
+    return True
 
 
 def _description_key(tool_name: str) -> str:
@@ -222,7 +238,11 @@ class ToolOptimizationManager:
             setattr(
                 self._base_agent, "_gepa_tool_prepare_wrapper", self._prepare_wrapper
             )
-            self._base_agent._prepare_tools = self._prepare_wrapper  # type: ignore[assignment]
+            installed = _append_agent_capability(
+                self._base_agent, PrepareTools(self._prepare_wrapper)
+            )
+            if not installed:
+                self._base_agent._prepare_tools = self._prepare_wrapper  # type: ignore[attr-defined]
 
     def allow_tool(self, tool_name: str) -> None:
         """Add a tool to the allowed set for optimization.
@@ -394,7 +414,11 @@ class OutputToolOptimizationManager:
                 "_gepa_output_tool_prepare_wrapper",
                 self._prepare_wrapper,
             )
-            self._base_agent._prepare_output_tools = self._prepare_wrapper  # type: ignore[assignment]
+            installed = _append_agent_capability(
+                self._base_agent, PrepareOutputTools(self._prepare_wrapper)
+            )
+            if not installed:
+                self._base_agent._prepare_output_tools = self._prepare_wrapper  # type: ignore[attr-defined]
 
     def get_seed_components(self) -> dict[str, str]:
         return self._catalog.seed_snapshot()
