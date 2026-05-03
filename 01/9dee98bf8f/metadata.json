@@ -1,0 +1,17 @@
+{
+  "checkpoint_id": "019dee98bf8f",
+  "created_at": "2026-05-03T16:08:01.252856+00:00",
+  "branch_name": "mh/native-tool-search",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "213ca47984c67d35d2351a98871c1c9dc018590b"
+  ],
+  "entity_touches": [
+    ".mighty/loro/edges/019dee97-6bcb-7020-80de-0c66af21b0ff.loro",
+    ".mighty/loro/edges/019dee98-9649-7fc3-b334-089b60d73ba4.loro",
+    ".mighty/loro/messages/019dee97-97cd-7d80-8aa7-552639af6e66.loro",
+    ".mighty/loro/messages/019dee98-3df2-7d82-aeca-85efef56dc66.loro",
+    ".mighty/loro/messages/019dee98-965c-7bb1-865e-793357383e2b.loro",
+    ".mighty/loro/records/019dee97-6baf-76b3-b262-43a4b88904d8.loro"
+  ]
+}
