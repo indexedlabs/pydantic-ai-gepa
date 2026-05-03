@@ -293,6 +293,7 @@ Each trace contains:
 2 traces available from the execution: 0 succeeded, 2 failed.
 The traces are stored on disk as `traces/traces.jsonl`.
 You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts to parse these structured files.
+For large scans, use the REPL's `read_line_batch(path, offset=0, limit=1000)` helper to iterate with a byte cursor and return only compact aggregate results.
 You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.
 
 **IMPORTANT: Prompt Caching & State Management**
@@ -303,7 +304,7 @@ Only use `clear_message_history` sparingly when absolutely necessary to avoid br
 
 
 ### Analysis guidance
-- Use `run_python_repl` to aggregate errors or find common failure modes across `traces.jsonl`.
+- Use `run_python_repl` with `read_line_batch` to aggregate errors or find common failure modes across `traces.jsonl` without returning full traces.
 - Use `spawn_agent` to understand *why* a specific trace failed if the python analysis is insufficient.
 - What failure patterns repeat across runs?
 - Are components misaligned (e.g., instructions referencing tools that don't exist)?
@@ -749,6 +750,7 @@ Each trace contains:
 1 traces available from the execution: 1 succeeded, 0 failed.
 The traces are stored on disk as `traces/traces.jsonl`.
 You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts to parse these structured files.
+For large scans, use the REPL's `read_line_batch(path, offset=0, limit=1000)` helper to iterate with a byte cursor and return only compact aggregate results.
 You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.
 
 **IMPORTANT: Prompt Caching & State Management**
@@ -759,7 +761,7 @@ Only use `clear_message_history` sparingly when absolutely necessary to avoid br
 
 
 ### Analysis guidance
-- Use `run_python_repl` to aggregate errors or find common failure modes across `traces.jsonl`.
+- Use `run_python_repl` with `read_line_batch` to aggregate errors or find common failure modes across `traces.jsonl` without returning full traces.
 - Use `spawn_agent` to understand *why* a specific trace failed if the python analysis is insufficient.
 - What failure patterns repeat across runs?
 - Are components misaligned (e.g., instructions referencing tools that don't exist)?
@@ -1059,6 +1061,7 @@ Each trace contains:
 2 traces available from the execution: 2 succeeded, 0 failed.
 The traces are stored on disk as `traces/traces.jsonl`.
 You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts to parse these structured files.
+For large scans, use the REPL's `read_line_batch(path, offset=0, limit=1000)` helper to iterate with a byte cursor and return only compact aggregate results.
 You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.
 
 **IMPORTANT: Prompt Caching & State Management**
@@ -1069,7 +1072,7 @@ Only use `clear_message_history` sparingly when absolutely necessary to avoid br
 
 
 ### Analysis guidance
-- Use `run_python_repl` to aggregate errors or find common failure modes across `traces.jsonl`.
+- Use `run_python_repl` with `read_line_batch` to aggregate errors or find common failure modes across `traces.jsonl` without returning full traces.
 - Use `spawn_agent` to understand *why* a specific trace failed if the python analysis is insufficient.
 - What failure patterns repeat across runs?
 - Are components misaligned (e.g., instructions referencing tools that don't exist)?

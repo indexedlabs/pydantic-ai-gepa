@@ -394,7 +394,9 @@ class InstructionProposalGenerator:
             while True:
                 loop_count += 1
                 if loop_count > 20:
-                    raise RuntimeError("Agent exceeded maximum clear_message_history loops (20).")
+                    raise RuntimeError(
+                        "Agent exceeded maximum clear_message_history loops (20)."
+                    )
                 try:
                     result = await self._agent.run(
                         current_prompt,
@@ -406,10 +408,12 @@ class InstructionProposalGenerator:
                     )
                     break
                 except ClearMessageHistoryException as e:
-                    current_prompt = self._join_user_content([
-                        f"History cleared. You previously left yourself this note to continue:\n\n{e.next_context}\n\n",
-                        "Your Python REPL state is intact."
-                    ])
+                    current_prompt = self._join_user_content(
+                        [
+                            f"History cleared. You previously left yourself this note to continue:\n\n{e.next_context}\n\n",
+                            "Your Python REPL state is intact.",
+                        ]
+                    )
 
         except InspectionAborted:
             raise
@@ -735,6 +739,7 @@ class InstructionProposalGenerator:
                 f"{total_records} traces available from the execution: {success_records} succeeded, {failed_records} failed.",
                 "The traces are stored on disk as `traces/traces.jsonl`.",
                 "You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts to parse these structured files.",
+                "For large scans, use the REPL's `read_line_batch(path, offset=0, limit=1000)` helper to iterate with a byte cursor and return only compact aggregate results.",
                 "You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.",
                 "",
                 "**IMPORTANT: Prompt Caching & State Management**",
@@ -750,7 +755,7 @@ class InstructionProposalGenerator:
             [
                 "",
                 "### Analysis guidance",
-                "- Use `run_python_repl` to aggregate errors or find common failure modes across `traces.jsonl`.",
+                "- Use `run_python_repl` with `read_line_batch` to aggregate errors or find common failure modes across `traces.jsonl` without returning full traces.",
                 "- Use `spawn_agent` to understand *why* a specific trace failed if the python analysis is insufficient.",
                 "- What failure patterns repeat across runs?",
                 "- Are components misaligned (e.g., instructions referencing tools that don't exist)?",

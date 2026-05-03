@@ -26,7 +26,6 @@ dependencies = [
     "logfire>=4.14.2",
     "PyYAML>=6.0.0",
     "pydantic-monty>=0.0.17",
-    "ouros>=0.0.4",
 ]
 
 [dependency-groups]
