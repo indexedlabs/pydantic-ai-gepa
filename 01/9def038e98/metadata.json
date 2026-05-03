@@ -1,0 +1,9 @@
+{
+  "checkpoint_id": "019def038e98",
+  "created_at": "2026-05-03T18:04:41.030014+00:00",
+  "branch_name": "mh/native-tool-search",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "5bf225e3195f1a956dd5f6731d851031b1b1be64"
+  ]
+}
