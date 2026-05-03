@@ -40,6 +40,7 @@ from ...skills.models import (
     SkillSummary,
 )
 from ...skills.search import LocalSkillsSearchProvider
+from ...types import DEFAULT_MAX_SPAWNED_AGENTS
 from .continue_step import IterationAction
 
 _IMPROVEMENT_EPSILON = 1e-9
@@ -135,8 +136,18 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
 
     from ..proposal.trace_tools import create_trace_toolset
 
+    max_spawned_agents = (
+        state.config.reflection_config.max_spawned_agents
+        if state.config.reflection_config
+        else DEFAULT_MAX_SPAWNED_AGENTS
+    )
     component_toolsets.append(
-        create_trace_toolset(state.run_id, parent_idx, reflection_model)
+        create_trace_toolset(
+            state.run_id,
+            parent_idx,
+            reflection_model,
+            max_spawned_agents=max_spawned_agents,
+        )
     )
 
     if state.config.component_selector == "reflection":

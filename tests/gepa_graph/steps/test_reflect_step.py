@@ -43,7 +43,7 @@ from pydantic_ai_gepa.gepa_graph.selectors import (
     AllComponentSelector,
     RoundRobinComponentSelector,
 )
-from pydantic_ai_gepa.types import RolloutOutput, Trajectory
+from pydantic_ai_gepa.types import ReflectionConfig, RolloutOutput, Trajectory
 
 
 def _make_data(case_id: str) -> Case[str, str, dict[str, str]]:
@@ -360,6 +360,50 @@ async def test_reflect_step_applies_config_sampler() -> None:
     assert sampler_calls == [(2, 1)]
     assert isinstance(generator.last_reflective_data, ComponentReflectiveDataset)
     assert len(generator.last_reflective_data.records_by_component["instructions"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_reflect_step_passes_subagent_limit_to_trace_toolset(monkeypatch) -> None:
+    from pydantic_ai import FunctionToolset
+
+    captured_limits: list[int] = []
+
+    def fake_create_trace_toolset(
+        run_id, candidate_idx, reflection_model, *, max_spawned_agents
+    ):
+        captured_limits.append(max_spawned_agents)
+        return FunctionToolset()
+
+    monkeypatch.setattr(
+        "pydantic_ai_gepa.gepa_graph.proposal.trace_tools.create_trace_toolset",
+        fake_create_trace_toolset,
+    )
+
+    config = GepaConfig(
+        max_evaluations=100,
+        minibatch_size=2,
+        merges_per_accept=1,
+        perfect_score=1.0,
+        skip_perfect_score=True,
+        reflection_config=ReflectionConfig(max_spawned_agents=2),
+    )
+    state = _make_state(config=config)
+    minibatch = await _training_examples(state)
+    evaluator = _StubEvaluator([_eval_results([0.4, 0.5]), _eval_results([0.6, 0.7])])
+    batch_sampler = _StubBatchSampler(minibatch)
+    adapter = cast(Adapter[str, str, dict[str, str]], _StubAdapter())
+    generator = _StubProposalGenerator({"instructions": "Improved text"})
+    deps = _make_deps(
+        adapter=adapter,
+        evaluator=evaluator,
+        batch_sampler=batch_sampler,
+        proposal_generator=generator,
+    )
+    ctx = _ctx(state, deps)
+
+    await reflect_step(ctx)
+
+    assert captured_limits == [2]
 
 
 @pytest.mark.asyncio

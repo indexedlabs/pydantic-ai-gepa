@@ -293,7 +293,7 @@ Each trace contains:
 2 traces available from the execution: 0 succeeded, 2 failed.
 The traces are stored on disk as `traces/traces.jsonl`.
 You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts to parse these structured files.
-You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.
+You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures. The proposal step has a shared limit of 5 spawned sub-agents, including recursive child spawns.
 
 **IMPORTANT: Prompt Caching & State Management**
 Your python REPL is stateful. Variables assigned in one script will persist to the next.
@@ -785,7 +785,7 @@ Each trace contains:
 1 traces available from the execution: 1 succeeded, 0 failed.
 The traces are stored on disk as `traces/traces.jsonl`.
 You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts to parse these structured files.
-You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.
+You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures. The proposal step has a shared limit of 5 spawned sub-agents, including recursive child spawns.
 
 **IMPORTANT: Prompt Caching & State Management**
 Your python REPL is stateful. Variables assigned in one script will persist to the next.
@@ -1131,7 +1131,7 @@ Each trace contains:
 2 traces available from the execution: 2 succeeded, 0 failed.
 The traces are stored on disk as `traces/traces.jsonl`.
 You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts to parse these structured files.
-You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.
+You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures. The proposal step has a shared limit of 5 spawned sub-agents, including recursive child spawns.
 
 **IMPORTANT: Prompt Caching & State Management**
 Your python REPL is stateful. Variables assigned in one script will persist to the next.

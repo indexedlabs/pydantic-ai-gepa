@@ -7,6 +7,8 @@ from typing import Any
 
 from pydantic_ai import Agent, FunctionToolset
 
+from ...types import DEFAULT_MAX_SPAWNED_AGENTS
+
 
 class ClearMessageHistoryException(Exception):
     def __init__(self, next_context: str):
@@ -130,10 +132,14 @@ def json_loads(data: str):
 
 
 def create_trace_toolset(
-    run_id: str, candidate_idx: int, reflection_model: Any = "gpt-4o-mini"
+    run_id: str,
+    candidate_idx: int,
+    reflection_model: Any = "gpt-4o-mini",
+    max_spawned_agents: int = DEFAULT_MAX_SPAWNED_AGENTS,
 ) -> FunctionToolset[None]:
     toolset = FunctionToolset[None]()
     base_dir = Path(f".gepa_cache/runs/{run_id}/candidates/{candidate_idx}").resolve()
+    max_spawned_agents = max(0, int(max_spawned_agents))
 
     def _read_file(path: str) -> str:
         safe_path = (base_dir / path).resolve()
@@ -395,6 +401,20 @@ def create_trace_toolset(
 
         session = {"repl": _new_repl()}
         session_lock = asyncio.Lock()
+        spawned_agent_count = 0
+        spawned_agent_lock = asyncio.Lock()
+
+        async def _spawn_child_agent(current_prompt: str) -> str:
+            nonlocal spawned_agent_count
+            async with spawned_agent_lock:
+                if spawned_agent_count >= max_spawned_agents:
+                    return (
+                        "Error: spawn_agent limit exceeded "
+                        f"({max_spawned_agents} sub-agents per proposal step)."
+                    )
+                spawned_agent_count += 1
+                spawn_index = spawned_agent_count
+            return await _run_child_agent(current_prompt, spawn_index)
 
         @toolset.tool_plain
         async def run_python_repl(python_code: str) -> str:
@@ -451,10 +471,12 @@ def create_trace_toolset(
             """Spawn a recursive sub-agent with a fresh context window to investigate a sub-problem.
             It has access to its own isolated Python REPL session. Its message history does NOT affect
             your context window. It returns a string answer to your instructions.
+            The proposal step has a shared limit on spawned sub-agents; use them for targeted
+            semantic inspection after narrowing the trace evidence with `run_python_repl`.
             """
-            return await _run_child_agent(instructions)
+            return await _spawn_child_agent(instructions)
 
-        async def _run_child_agent(current_prompt: str) -> str:
+        async def _run_child_agent(current_prompt: str, spawn_index: int) -> str:
             child_session = {"repl": _new_repl()}
             child_session_lock = asyncio.Lock()
 
@@ -489,16 +511,18 @@ def create_trace_toolset(
 
             @child_toolset.tool_plain
             async def spawn_agent(instructions: str) -> str:
-                return await _run_child_agent(instructions)
+                return await _spawn_child_agent(instructions)
 
             system_prompt = (
                 "You are a recursive sub-agent exploring a sub-problem for trace analysis.\n"
+                f"You are sub-agent {spawn_index} of at most {max_spawned_agents} for this proposal step.\n"
                 "Your python environment is persistent. Variables stay in memory.\n"
                 "Use `run_python_repl` to parse `traces/traces.jsonl`; prefer `read_line_batch` for full-file scans.\n"
                 "The REPL is pydantic-monty, not CPython: avoid `with`, `class`, `match`, `yield`, unsupported imports, and `print` as a return value.\n"
                 "Return your final answer to the parent agent.\n"
                 "IMPORTANT: To leverage LLM prompt caching, you should build up state in your Python REPL.\n"
-                "Only call `clear_message_history` sparingly when absolutely necessary to avoid context limits."
+                "Only call `clear_message_history` sparingly when absolutely necessary to avoid context limits.\n"
+                "Only spawn another sub-agent when the question is narrow enough to justify spending the shared budget."
             )
             agent = Agent(reflection_model, system_prompt=system_prompt)
 

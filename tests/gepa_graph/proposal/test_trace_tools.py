@@ -277,3 +277,38 @@ async def test_spawn_agent_uses_fresh_monty_repl_with_trace_context(
     assert first_result == "('missing', 2, 1)"
     assert second_result == "('missing', 2, 1)"
     assert FakeAgent.calls == ["inspect child one", "inspect child two"]
+
+
+@pytest.mark.asyncio
+async def test_spawn_agent_enforces_shared_recursive_limit(
+    monkeypatch, tmp_path
+) -> None:
+    _write_trace_context(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    class FakeAgent:
+        calls: list[str] = []
+
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def run(self, current_prompt, *, toolsets):
+            self.calls.append(str(current_prompt))
+            spawn_agent = toolsets[0].tools["spawn_agent"].function
+            output = await spawn_agent("nested child")
+            return SimpleNamespace(output=output)
+
+    monkeypatch.setattr(
+        "pydantic_ai_gepa.gepa_graph.proposal.trace_tools.Agent",
+        FakeAgent,
+    )
+
+    toolset = create_trace_toolset("run-1", 0, max_spawned_agents=1)
+    spawn_agent = toolset.tools["spawn_agent"].function
+
+    result = await spawn_agent("top child")
+
+    assert (
+        result == "Error: spawn_agent limit exceeded (1 sub-agents per proposal step)."
+    )
+    assert FakeAgent.calls == ["top child"]

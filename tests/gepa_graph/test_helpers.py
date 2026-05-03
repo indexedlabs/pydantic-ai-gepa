@@ -79,7 +79,11 @@ def test_create_deps_defaults() -> None:
     from pydantic_ai_gepa.types import ReflectionConfig
 
     config = GepaConfig(
-        seed=7, reflection_config=ReflectionConfig(model="reflection-model")
+        seed=7,
+        reflection_config=ReflectionConfig(
+            model="reflection-model",
+            max_spawned_agents=2,
+        ),
     )
 
     deps = create_deps(adapter, config)
@@ -93,6 +97,7 @@ def test_create_deps_defaults() -> None:
     assert deps.merge_builder.seed == config.seed
     assert config.reflection_config is not None
     assert deps.model == config.reflection_config.model
+    assert getattr(deps.proposal_generator, "_max_spawned_agents") == 2
 
     # Batch sampler should respect the config seed for determinism.
     sampler_rng = getattr(deps.batch_sampler, "_rng")
