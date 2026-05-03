@@ -30,6 +30,7 @@ from ...adapter import (
 from ..example_bank import InMemoryExampleBank
 from ..models import CandidateProgram, ComponentValue
 from .example_bank_tools import create_example_bank_tools
+from .trace_tools import MONTY_REPL_PROMPT_GUIDANCE
 
 DEFAULT_AGENT_INSTRUCTIONS = """Your mission is to discover instruction formats that measurably improve the student agent's performance.
 
@@ -739,7 +740,6 @@ class InstructionProposalGenerator:
                 f"{total_records} traces available from the execution: {success_records} succeeded, {failed_records} failed.",
                 "The traces are stored on disk as `traces/traces.jsonl`.",
                 "You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts to parse these structured files.",
-                "For large scans, use the REPL's `read_line_batch(path, offset=0, limit=1000)` helper to iterate with a byte cursor and return only compact aggregate results.",
                 "You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.",
                 "",
                 "**IMPORTANT: Prompt Caching & State Management**",
@@ -747,6 +747,8 @@ class InstructionProposalGenerator:
                 "To leverage LLM prompt caching efficiently, you should build up state in your Python REPL rather than returning huge strings (like full traces) to your context window.",
                 "If your context window becomes bloated, use the `clear_message_history` tool. This wipes your message history to free up tokens, but your Python REPL variables remain intact!",
                 "Only use `clear_message_history` sparingly when absolutely necessary to avoid breaking the prompt cache.",
+                "",
+                MONTY_REPL_PROMPT_GUIDANCE,
                 "",
             ]
         )

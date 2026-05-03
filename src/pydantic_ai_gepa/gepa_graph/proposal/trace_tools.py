@@ -24,6 +24,43 @@ _MAX_HOST_LINE_LIMIT = 1000
 _MAX_HOST_LINE_CHARS = 20_000
 _MAX_HOST_BATCH_BYTES = 4 * 1024 * 1024
 _LINE_COUNT_CHUNK_SIZE = 1024 * 1024
+MONTY_REPL_PROMPT_GUIDANCE = """
+### `run_python_repl` environment
+- The REPL is `pydantic-monty`, a sandboxed Python subset, not CPython. It is persistent across calls within one reflection agent run, so variables and helper functions stay bound.
+- Each call has a 10-second execution budget, plus memory and recursion limits. A timed-out call does not make the REPL unusable; preserve useful intermediate state in variables.
+- Return values come from the final expression. `print(...)` writes to stdout and returns `None`, so end scripts with a bare value such as `summary`, `rows[:5]`, or `{"failures": failures}`.
+- Supported syntax includes assignments, `if`/`else`, `for`/`while`, `def`, `lambda`, `try`/`except`, `raise`, comprehensions, and f-strings.
+- Unsupported syntax includes `with` statements, `class` definitions, `match`, and `yield`. Do not use context managers, generators, or custom classes.
+- Unsupported runtime/builtins include `globals()`, `locals()`, `eval()`, `exec()`, and `__import__()`.
+- Imports are limited to a small standard-library subset such as `json`, `re`, `datetime`, `typing`, `sys`, and partial `os`. Third-party packages and most stdlib modules are unavailable. Prefer the pre-bound helpers below instead of filesystem imports or `os.getcwd()`.
+- Pre-bound helpers: `read_file`, `file_info`, `file_size`, `line_count`, `read_lines`, `read_line_batch`, `tail_lines`, `find_lines`, `list_dir`, `json_loads`, plus `Path` and `json`.
+
+### Trace file navigation
+- `traces/traces.jsonl` can be large. Avoid `read_file('traces/traces.jsonl')` unless you already know it is small; returning the whole trace file can overflow the reflection model context.
+- Start with `file_info('traces/traces.jsonl')` to understand size and line count.
+- Use `find_lines('traces/traces.jsonl', query, limit=20)` for targeted search and `tail_lines(..., limit=20)` for recent spans or exceptions.
+- Use `read_lines(path, start=n, limit=10)` for a small window around a known line number.
+- For full-file scans, write one reducer-style script around `read_line_batch(path, offset=0, limit=1000)`. Advance with `offset = batch['next_offset']`, stop when `batch['eof']`, and return only compact aggregates.
+
+Canonical full-scan pattern:
+```python
+offset = 0
+failures = 0
+examples = []
+while True:
+    batch = read_line_batch('traces/traces.jsonl', offset=offset, limit=1000)
+    for line in batch['lines']:
+        row = json_loads(line)
+        if not row.get('success'):
+            failures = failures + 1
+            if len(examples) < 5:
+                examples.append(row.get('feedback'))
+    if batch['eof']:
+        break
+    offset = batch['next_offset']
+{'failures': failures, 'examples': examples}
+```
+""".strip()
 _MONTY_SETUP_SCRIPT = f"""
 from pathlib import Path
 import json
@@ -366,6 +403,13 @@ def create_trace_toolset(
             This is a stateful Jupyter-style REPL. Variables assigned here will persist
             in memory for future `run_python_repl` calls.
 
+            This is pydantic-monty, not CPython. Use a practical Python subset:
+            assignments, control flow, functions, comprehensions, exceptions, f-strings,
+            and final-expression returns work. Do not use `with`, `class`, `match`,
+            `yield`, generators, `globals()`, `locals()`, `eval()`, `exec()`, or broad
+            stdlib/third-party imports. `print(...)` is not the return value; end with
+            a bare expression containing the compact result you want.
+
             You have access to:
             - `read_file(path: str) -> str`: Reads a file relative to the context directory.
             - `file_size(path: str) -> int`: Returns file size in bytes.
@@ -423,6 +467,8 @@ def create_trace_toolset(
                 You have access to file helpers including `read_file`, `file_size`,
                 `line_count`, `file_info`, `read_lines`, `read_line_batch`,
                 `tail_lines`, `find_lines`, `list_dir`, and `json_loads`.
+                This is pydantic-monty, not CPython; avoid unsupported syntax such
+                as `with`, `class`, `match`, and `yield`, and return a final expression.
                 """
                 async with child_session_lock:
                     try:
@@ -449,6 +495,7 @@ def create_trace_toolset(
                 "You are a recursive sub-agent exploring a sub-problem for trace analysis.\n"
                 "Your python environment is persistent. Variables stay in memory.\n"
                 "Use `run_python_repl` to parse `traces/traces.jsonl`; prefer `read_line_batch` for full-file scans.\n"
+                "The REPL is pydantic-monty, not CPython: avoid `with`, `class`, `match`, `yield`, unsupported imports, and `print` as a return value.\n"
                 "Return your final answer to the parent agent.\n"
                 "IMPORTANT: To leverage LLM prompt caching, you should build up state in your Python REPL.\n"
                 "Only call `clear_message_history` sparingly when absolutely necessary to avoid context limits."

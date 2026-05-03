@@ -58,12 +58,16 @@ async def test_monty_repl_reads_trace_context_and_persists_state(
         "rows = [json_loads(line) for line in read_file('traces/traces.jsonl').splitlines()]\n"
         "len(rows)"
     )
+    assignment_result = await run_python_repl("answer = 42")
+    variable_result = await run_python_repl("answer")
     failed_result = await run_python_repl(
         "sum(1 for row in rows if not row['success'])"
     )
     listed_result = await run_python_repl("list_dir('traces')")
 
     assert count_result == "2"
+    assert assignment_result == "None"
+    assert variable_result == "42"
     assert failed_result == "1"
     assert listed_result == "['traces/traces.jsonl']"
 
