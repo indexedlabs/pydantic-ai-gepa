@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 from inline_snapshot import snapshot
@@ -17,6 +18,11 @@ from pydantic_ai_gepa.adapter import (
 from pydantic_ai_gepa.adapters.agent_adapter import AgentAdapter
 from pydantic_ai_gepa.gepa_graph.models import CandidateProgram, ComponentValue
 from pydantic_ai_gepa.gepa_graph.proposal import InstructionProposalGenerator
+from pydantic_ai_gepa.gepa_graph.proposal.instruction import (
+    ComponentUpdate,
+    InstructionProposalOutput,
+    TrajectoryAnalysis,
+)
 from pydantic_ai_gepa.types import MetricResult, RolloutOutput
 
 
@@ -185,6 +191,47 @@ async def test_llm_generator_returns_metadata_when_enabled() -> None:
     assert metadata["edge_insight"] == "Still mislabeling exclusive ranges"
     assert metadata["checkpoint"] == "Zero range mistakes on validation minibatch"
     assert metadata["moves"] == ["Checklist", "Edge Reasoning: ranges"]
+
+
+@pytest.mark.asyncio
+async def test_llm_generator_uses_default_request_limit() -> None:
+    candidate = _make_candidate()
+    reflective_data = ComponentReflectiveDataset(
+        records_by_component={"instructions": [_make_reflective_record()]}
+    )
+    captured_request_limits: list[int | None] = []
+
+    class FakeAgent:
+        async def run(self, *args, **kwargs):
+            captured_request_limits.append(kwargs["usage_limits"].request_limit)
+            return SimpleNamespace(
+                output=InstructionProposalOutput(
+                    reasoning=TrajectoryAnalysis(
+                        pattern_discovery="Patterns",
+                        creative_hypothesis="Hypothesis",
+                        experimental_approach="Approach",
+                    ),
+                    updated_components=[
+                        ComponentUpdate(
+                            component_name="instructions",
+                            optimized_value="Improved instructions",
+                        )
+                    ],
+                )
+            )
+
+    generator = InstructionProposalGenerator()
+    setattr(generator, "_agent", FakeAgent())
+
+    result = await generator.propose_texts(
+        candidate=candidate,
+        reflective_data=reflective_data,
+        components=["instructions"],
+        model="test-model",
+    )
+
+    assert captured_request_limits == [50]
+    assert result.texts == {"instructions": "Improved instructions"}
 
 
 @pytest.mark.asyncio

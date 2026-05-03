@@ -105,7 +105,7 @@ class GepaConfig(BaseModel):
         default=None,
         description=(
             "Configuration for the reflection agent (model, trace context, "
-            "example bank, and sub-agent budget)."
+            "example bank, sub-agent budget, and request limit)."
         ),
     )
     reflection_sampler: ReflectionSampler | None = Field(

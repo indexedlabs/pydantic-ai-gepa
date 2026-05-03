@@ -83,6 +83,7 @@ def test_create_deps_defaults() -> None:
         reflection_config=ReflectionConfig(
             model="reflection-model",
             max_spawned_agents=2,
+            request_limit=17,
         ),
     )
 
@@ -98,6 +99,7 @@ def test_create_deps_defaults() -> None:
     assert config.reflection_config is not None
     assert deps.model == config.reflection_config.model
     assert getattr(deps.proposal_generator, "_max_spawned_agents") == 2
+    assert getattr(deps.proposal_generator, "_request_limit") == 17
 
     # Batch sampler should respect the config seed for determinism.
     sampler_rng = getattr(deps.batch_sampler, "_rng")

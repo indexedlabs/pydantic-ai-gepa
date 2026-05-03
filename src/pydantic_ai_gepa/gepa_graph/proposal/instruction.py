@@ -27,7 +27,7 @@ from ...adapter import (
     ReflectiveDataset,
     SharedReflectiveDataset,
 )
-from ...types import DEFAULT_MAX_SPAWNED_AGENTS
+from ...types import DEFAULT_MAX_SPAWNED_AGENTS, DEFAULT_REFLECTION_REQUEST_LIMIT
 from ..example_bank import InMemoryExampleBank
 from ..models import CandidateProgram, ComponentValue
 from .example_bank_tools import create_example_bank_tools
@@ -301,6 +301,7 @@ class InstructionProposalGenerator:
         include_hypothesis_metadata: bool = False,
         additional_instructions: str | None = None,
         max_spawned_agents: int = DEFAULT_MAX_SPAWNED_AGENTS,
+        request_limit: int = DEFAULT_REFLECTION_REQUEST_LIMIT,
     ) -> None:
         self._agent = Agent(
             instructions=instructions or DEFAULT_AGENT_INSTRUCTIONS,
@@ -309,6 +310,7 @@ class InstructionProposalGenerator:
         self._include_hypothesis_metadata = include_hypothesis_metadata
         self._additional_instructions = additional_instructions
         self._max_spawned_agents = max(0, int(max_spawned_agents))
+        self._request_limit = max(0, int(request_limit))
 
     async def propose_texts(
         self,
@@ -408,7 +410,7 @@ class InstructionProposalGenerator:
                         model_settings=model_settings,
                         toolsets=toolsets if toolsets else None,
                         instructions=runtime_instructions,
-                        usage_limits=UsageLimits(request_limit=15),
+                        usage_limits=UsageLimits(request_limit=self._request_limit),
                     )
                     break
                 except ClearMessageHistoryException as e:

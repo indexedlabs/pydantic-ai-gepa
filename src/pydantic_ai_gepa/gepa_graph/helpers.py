@@ -17,7 +17,7 @@ from .selectors import (
     ReflectionComponentSelector,
     RoundRobinComponentSelector,
 )
-from ..types import DEFAULT_MAX_SPAWNED_AGENTS
+from ..types import DEFAULT_MAX_SPAWNED_AGENTS, DEFAULT_REFLECTION_REQUEST_LIMIT
 
 if TYPE_CHECKING:
     from ..adapter import Adapter
@@ -61,6 +61,11 @@ def create_deps(
         if config.reflection_config
         else DEFAULT_MAX_SPAWNED_AGENTS
     )
+    reflection_request_limit = (
+        config.reflection_config.request_limit
+        if config.reflection_config
+        else DEFAULT_REFLECTION_REQUEST_LIMIT
+    )
     return GepaDeps(
         adapter=adapter,
         evaluator=ParallelEvaluator(),
@@ -72,6 +77,7 @@ def create_deps(
             include_hypothesis_metadata=config.track_component_hypotheses,
             additional_instructions=additional_instructions,
             max_spawned_agents=max_spawned_agents,
+            request_limit=reflection_request_limit,
         ),
         merge_builder=MergeProposalBuilder(seed=config.seed),
         model=reflection_model,

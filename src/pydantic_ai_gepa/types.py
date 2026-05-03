@@ -12,6 +12,7 @@ from pydantic_ai.settings import ModelSettings
 from pydantic_evals import Case
 
 DEFAULT_MAX_SPAWNED_AGENTS = 5
+DEFAULT_REFLECTION_REQUEST_LIMIT = 50
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,9 @@ class ReflectionConfig:
 
     max_spawned_agents: int = DEFAULT_MAX_SPAWNED_AGENTS
     """Maximum number of recursive reflection sub-agents per proposal step."""
+
+    request_limit: int = DEFAULT_REFLECTION_REQUEST_LIMIT
+    """Maximum model requests allowed in a single reflection proposal step."""
 
     journal_file: str | None = None
     """Optional file path to persist reflection strategies and insights across runs.
@@ -144,6 +148,7 @@ class RolloutOutput(Generic[OutputT]):
 __all__ = [
     "Case",
     "DEFAULT_MAX_SPAWNED_AGENTS",
+    "DEFAULT_REFLECTION_REQUEST_LIMIT",
     "ExampleBankConfig",
     "MetadataWithMessageHistory",
     "ReflectionConfig",
