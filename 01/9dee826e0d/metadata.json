@@ -1,0 +1,14 @@
+{
+  "checkpoint_id": "019dee826e0d",
+  "created_at": "2026-05-03T15:43:38.566371+00:00",
+  "branch_name": "mh/native-tool-search",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "c0bbb4a565df4c47b30a9880176cb331f794b5e1"
+  ],
+  "entity_touches": [
+    ".mighty/loro/edges/019dee82-31c0-71c0-95f3-6767a623d242.loro",
+    ".mighty/loro/edges/019dee82-54c7-7d10-8ed6-7deec27a43a9.loro",
+    ".mighty/loro/records/019dee82-31a7-74e2-ac22-ee6ef5105d2e.loro"
+  ]
+}
