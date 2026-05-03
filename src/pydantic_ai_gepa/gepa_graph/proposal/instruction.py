@@ -200,6 +200,7 @@ You have access to a persistent journal via the `read_journal_entries` and `appe
 1. **Always read first:** If the journal tools are available, you should use `read_journal_entries` to see what past iterations have learned before you make any decisions.
 2. **Incorporate insights:** Use the past strategies to inform your new proposals (e.g. avoid repeating known mistakes, apply discovered rules).
 3. **Record new discoveries:** If you identify a concrete, reusable strategy or edge-case insight from analyzing the current evaluation traces, you MUST use `append_journal_entry` to log it for future iterations before finalizing your proposal.
+4. **Record trace-analysis tactics:** If you discover an efficient way to parse, filter, or aggregate `traces/traces.jsonl` for this task, record it too. Include the exact helper pattern or query that worked (for example, `find_lines` queries, `read_line_batch` reducers, key JSON fields, or compact aggregation shapes) so the next reflection step can start from that tactic instead of rediscovering it.
 """
 
 

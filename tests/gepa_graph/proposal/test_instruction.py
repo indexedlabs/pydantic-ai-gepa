@@ -21,6 +21,7 @@ from pydantic_ai_gepa.gepa_graph.proposal import InstructionProposalGenerator
 from pydantic_ai_gepa.gepa_graph.proposal.instruction import (
     ComponentUpdate,
     InstructionProposalOutput,
+    JOURNAL_TOOLS_INSTRUCTIONS,
     TrajectoryAnalysis,
 )
 from pydantic_ai_gepa.types import MetricResult, RolloutOutput
@@ -717,6 +718,13 @@ async def test_prompt_includes_stored_hypothesis_metadata() -> None:
     assert "Components: `instructions`" in captured_prompt
     assert "  - Hypothesis: Spell out range rules" in captured_prompt
     assert "  - Iteration: 4" in captured_prompt
+
+
+def test_journal_guidance_requests_trace_parsing_notes() -> None:
+    assert "Record trace-analysis tactics" in JOURNAL_TOOLS_INSTRUCTIONS
+    assert "`traces/traces.jsonl`" in JOURNAL_TOOLS_INSTRUCTIONS
+    assert "`find_lines` queries" in JOURNAL_TOOLS_INSTRUCTIONS
+    assert "`read_line_batch` reducers" in JOURNAL_TOOLS_INSTRUCTIONS
 
 
 @pytest.mark.asyncio
