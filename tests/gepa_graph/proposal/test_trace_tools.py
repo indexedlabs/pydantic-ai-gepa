@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import pydantic_ai_gepa.gepa_graph.proposal.trace_tools as trace_tools_module
 from pydantic_ai_gepa.gepa_graph.proposal.trace_tools import (
     ClearMessageHistoryException,
     create_trace_toolset,
@@ -65,6 +66,33 @@ async def test_monty_repl_reads_trace_context_and_persists_state(
     assert count_result == "2"
     assert failed_result == "1"
     assert listed_result == "['traces/traces.jsonl']"
+
+
+@pytest.mark.asyncio
+async def test_monty_repl_timeout_does_not_poison_future_calls(
+    monkeypatch, tmp_path
+) -> None:
+    _write_trace_context(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        trace_tools_module,
+        "_MONTY_LIMITS",
+        {
+            "max_duration_secs": 0.01,
+            "max_memory": 128 * 1024 * 1024,
+            "max_recursion_depth": 1000,
+        },
+    )
+
+    toolset = create_trace_toolset("run-1", 0)
+    run_python_repl = toolset.tools["run_python_repl"].function
+
+    await run_python_repl("marker = 'still here'")
+    timeout_result = await run_python_repl("while True:\n    pass")
+    recovered_result = await run_python_repl("(marker, 1 + 1)")
+
+    assert "TimeoutError: time limit exceeded" in timeout_result
+    assert recovered_result == "('still here', 2)"
 
 
 @pytest.mark.asyncio

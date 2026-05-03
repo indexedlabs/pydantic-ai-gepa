@@ -323,6 +323,11 @@ def create_trace_toolset(
             "host_find_lines": _host_find_lines,
         }
 
+        def _reset_repl_timer(repl: Any) -> Any:
+            # Monty's duration limit is cumulative for a REPL tracker. Loading a
+            # snapshot preserves state but resets the tracker's start time.
+            return pydantic_monty.MontyRepl.load(repl.dump())
+
         def _new_repl():
             repl = pydantic_monty.MontyRepl(
                 script_name="trace_analysis.py",
@@ -333,17 +338,25 @@ def create_trace_toolset(
                 mount=mount,
                 external_functions=external_functions,
             )
-            return repl
+            return _reset_repl_timer(repl)
 
-        def _execute_repl(repl: Any, python_code: str) -> str:
-            result = repl.feed_run(
-                python_code,
-                mount=mount,
-                external_functions=external_functions,
-            )
-            return str(result)
+        def _execute_repl(session_state: dict[str, Any], python_code: str) -> str:
+            repl = _reset_repl_timer(session_state["repl"])
+            session_state["repl"] = repl
+            try:
+                result = repl.feed_run(
+                    python_code,
+                    mount=mount,
+                    external_functions=external_functions,
+                )
+                return str(result)
+            finally:
+                try:
+                    session_state["repl"] = _reset_repl_timer(repl)
+                except Exception:
+                    session_state["repl"] = repl
 
-        session = _new_repl()
+        session = {"repl": _new_repl()}
         session_lock = asyncio.Lock()
 
         @toolset.tool_plain
@@ -398,7 +411,7 @@ def create_trace_toolset(
             return await _run_child_agent(instructions)
 
         async def _run_child_agent(current_prompt: str) -> str:
-            child_session = _new_repl()
+            child_session = {"repl": _new_repl()}
             child_session_lock = asyncio.Lock()
 
             child_toolset = FunctionToolset[None]()
