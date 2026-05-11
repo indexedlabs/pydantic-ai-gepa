@@ -62,12 +62,22 @@ class SignatureSuffix:
 
 
 class _AttachmentRegistry:
-    """Track multimodal attachments and provide textual references."""
+    """Track multimodal attachments and provide textual references.
 
-    def __init__(self) -> None:
+    When ``omit_binary_content`` is True, attachments are NOT auto-attached
+    to the user message — only a metadata-rich placeholder is rendered in the
+    text (index, media_type, byte_count, etc.). The agent must call a tool
+    such as ``view_attachment`` to actually see the bytes. This is useful for
+    workflows where blindly sending huge binaries to the model is wasteful and
+    where deterministic tooling should route the model to specific regions.
+    """
+
+    def __init__(self, *, omit_binary_content: bool = False) -> None:
         self.attachments: list[AttachmentContent] = []
         self.placeholders: list[str] = []
         self._placeholders: dict[int, str] = {}
+        self._omit_binary_content = omit_binary_content
+        self._next_index = 0
 
     def register(self, content: AttachmentContent) -> str:
         key = id(content)
@@ -76,13 +86,37 @@ class _AttachmentRegistry:
             return existing
 
         label = self._label_for(content)
-        # Use the content's stable identifier (hash-based) for consistent references
         ref = content.identifier
-        placeholder = f'<{label} ref="{ref}"/>'
-        self.attachments.append(content)
+        index = self._next_index
+        self._next_index += 1
+        if self._omit_binary_content:
+            placeholder = self._metadata_placeholder(content, label, ref, index)
+        else:
+            placeholder = f'<{label} ref="{ref}"/>'
+            self.attachments.append(content)
         self.placeholders.append(placeholder)
         self._placeholders[key] = placeholder
         return placeholder
+
+    @staticmethod
+    def _metadata_placeholder(
+        content: AttachmentContent,
+        label: str,
+        ref: str,
+        index: int,
+    ) -> str:
+        attrs: list[str] = [f'index="{index}"', f'ref="{ref}"']
+        if isinstance(content, BinaryContent):
+            attrs.append(f'media_type="{html.escape(content.media_type, quote=True)}"')
+            attrs.append(f'byte_count="{len(content.data)}"')
+            page_count = _binary_content_page_count(content)
+            if page_count is not None:
+                attrs.append(f'page_count="{page_count}"')
+        elif isinstance(content, (ImageUrl, AudioUrl, DocumentUrl, VideoUrl)):
+            url = getattr(content, "url", None)
+            if isinstance(url, str):
+                attrs.append(f'url="{html.escape(url, quote=True)}"')
+        return f"<{label} " + " ".join(attrs) + "/>"
 
     @staticmethod
     def _label_for(content: AttachmentContent) -> str:
@@ -99,6 +133,27 @@ class _AttachmentRegistry:
                 return "binary"
 
 
+def _binary_content_page_count(content: BinaryContent) -> int | None:
+    """Best-effort PDF page count for metadata placeholders. Silent on failure."""
+    media_type = (content.media_type or "").strip().lower()
+    if media_type != "application/pdf":
+        return None
+    try:
+        import pypdfium2 as pdfium  # type: ignore[import-not-found]
+    except ImportError:
+        return None
+    try:
+        document = pdfium.PdfDocument(content.data)
+        try:
+            return len(document)
+        finally:
+            close = getattr(document, "close", None)
+            if close is not None:
+                close()
+    except Exception:
+        return None
+
+
 def generate_system_instructions(
     instance: BaseModel,
     *,
@@ -113,10 +168,18 @@ def generate_user_content(
     instance: BaseModel,
     *,
     candidate: dict[str, str] | None = None,
+    omit_binary_content: bool = False,
 ) -> Sequence[UserContent]:
-    """Convert a structured input instance to user content."""
+    """Convert a structured input instance to user content.
+
+    When ``omit_binary_content`` is True, multimodal attachment fields are
+    rendered as metadata-only placeholders (with index, media_type, byte
+    count, etc.) instead of being attached as raw multimodal parts.
+    """
     view = _InputModelView(instance)
-    return view.build_user_content(candidate=candidate)
+    return view.build_user_content(
+        candidate=candidate, omit_binary_content=omit_binary_content
+    )
 
 
 def get_gepa_components(
@@ -177,8 +240,11 @@ class BoundInputSpec(Generic[ModelT]):
         instance: ModelT,
         *,
         candidate: dict[str, str] | None = None,
+        omit_binary_content: bool = False,
     ) -> Sequence[UserContent]:
-        return generate_user_content(instance, candidate=candidate)
+        return generate_user_content(
+            instance, candidate=candidate, omit_binary_content=omit_binary_content
+        )
 
     def get_gepa_components(self) -> dict[str, str]:
         return get_gepa_components(
@@ -473,11 +539,12 @@ class _InputModelView(_InputShared):
         self,
         *,
         candidate: dict[str, str] | None = None,
+        omit_binary_content: bool = False,
     ) -> Sequence[UserContent]:
         encoder_key = f"signature:{self.model_cls.__name__}:encoder"
         encoder_script = candidate.get(encoder_key) if candidate else None
 
-        registry = _AttachmentRegistry()
+        registry = _AttachmentRegistry(omit_binary_content=omit_binary_content)
         transformed_instance = self._replace_attachments_with_refs(
             self.instance, registry
         )

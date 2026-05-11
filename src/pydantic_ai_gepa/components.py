@@ -64,13 +64,18 @@ def extract_seed_candidate(
         target_agent = agent.wrapped
 
     # Extract instructions
-    # Note: In v1, we extract the literal instructions only, not the dynamic ones
-    # The dynamic instructions from functions will be disabled during optimization
+    # The candidate only carries literal string instructions — GEPA mutates
+    # text, not callables. Function-based instructions registered via
+    # `@agent.instructions` stay attached to the agent and are re-executed at
+    # rollout time by SignatureAgent (or by pydantic-ai for plain agents),
+    # so don't stringify them here (that would render `<function ... at 0x...>`
+    # into the prompt).
     raw_instructions = getattr(target_agent, "_instructions", None)
     if raw_instructions:
+        literal_parts = [item for item in raw_instructions if isinstance(item, str)]
         candidate["instructions"] = ComponentValue(
             name="instructions",
-            text=_stringify_component_value(raw_instructions),
+            text="\n".join(literal_parts),
         )
     else:
         candidate["instructions"] = ComponentValue(
@@ -147,13 +152,29 @@ def apply_candidate_to_agent(
     optimizer = get_tool_optimizer(agent)
     output_optimizer = get_output_tool_optimizer(agent)
 
+    # `@agent.instructions` callbacks live alongside literal strings in
+    # `_instructions`. When we override with the candidate text we'd otherwise
+    # drop the callbacks; preserve them so per-run dynamic context still
+    # reaches the model.
+    raw_instructions = getattr(target_agent, "_instructions", None) or []
+    instruction_callbacks: list[Any] = [
+        item for item in raw_instructions if not isinstance(item, str)
+    ]
+
     with ExitStack() as stack:
         if optimizer:
             stack.enter_context(optimizer.candidate_context(candidate_map))
         if output_optimizer:
             stack.enter_context(output_optimizer.candidate_context(candidate_map))
+        override_value: list[Any] = []
         if instructions:
-            stack.enter_context(target_agent.override(instructions=instructions))
+            override_value.append(instructions)
+        override_value.extend(instruction_callbacks)
+        if override_value:
+            override_payload: Any = (
+                override_value[0] if len(override_value) == 1 else tuple(override_value)
+            )
+            stack.enter_context(target_agent.override(instructions=override_payload))
         yield
 
 
