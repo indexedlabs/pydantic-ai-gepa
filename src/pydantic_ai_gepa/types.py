@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from typing import Any, Generic, Literal, Protocol, TypeVar, runtime_checkable
 
 from pydantic_ai import usage as _usage
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import KnownModelName, Model
 from pydantic_ai.settings import ModelSettings
+from pydantic_ai.toolsets import AbstractToolset
 from pydantic_evals import Case
 
 DEFAULT_MAX_SPAWNED_AGENTS = 5
@@ -76,6 +78,19 @@ class ReflectionConfig:
     - Domain knowledge about the task being optimized
     - Guidance on analyzing specific error patterns
     - Custom evaluation criteria to consider
+    """
+
+    additional_toolsets: Sequence[AbstractToolset[None]] = field(default_factory=list)
+    """Extra toolsets the reflection agent receives alongside the built-in
+    trace / journal / component-selection toolsets.
+
+    Use this to register domain-specific helpers — e.g. cheaper LLM probes
+    the reflector can dispatch sub-questions on, custom analyzers for the
+    eval suite — without forking the library. Each element is forwarded to
+    the proposal step's ``component_toolsets`` list, and its tool
+    descriptions show up in the reflector's tool catalog. The reflector's
+    ``additional_instructions`` should explain when to reach for each
+    tool.
     """
 
 

@@ -14,6 +14,7 @@ from pydantic_ai import FunctionToolset
 from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.models import KnownModelName, Model
 from pydantic_ai.settings import ModelSettings
+from pydantic_ai.toolsets import AbstractToolset
 
 from ...adapter import (
     ComponentReflectiveDataset,
@@ -115,7 +116,15 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
 
     reflection_model = _resolve_model(deps)
     components_to_update: Sequence[str] | None
-    component_toolsets: list[FunctionToolset] | None = []
+    # The reflector's tool catalog is built here: journal tools (when a
+    # journal is configured), trace tools (always), the component-selection
+    # toolset (when the reflection selector is in use), and finally any
+    # ``ReflectionConfig.additional_toolsets`` the caller supplied. The
+    # local type is intentionally widened to ``AbstractToolset`` so callers
+    # can pass arbitrary toolsets — including bare ``FunctionToolset``
+    # instances built via ``@toolset.tool_plain`` and external
+    # ``AbstractToolset`` subclasses — without violating the type.
+    component_toolsets: list[AbstractToolset[None]] = []
 
     if state.config.reflection_config and state.config.reflection_config.journal_file:
         from ..proposal.journal_tools import create_journal_toolset
@@ -171,6 +180,9 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
             selection = await selection
         components_to_update = list(selection)
         components_for_dataset = components_to_update
+
+    if state.config.reflection_config:
+        component_toolsets.extend(state.config.reflection_config.additional_toolsets)
 
     logfire.debug(
         "ReflectStep selected components",
@@ -749,7 +761,7 @@ async def _propose_new_texts(
     components: Sequence[str] | None,
     model: Model | KnownModelName | str,
     model_settings: ModelSettings | None = None,
-    component_toolsets: Sequence[FunctionToolset] | None = None,
+    component_toolsets: Sequence[AbstractToolset[None]] | None = None,
 ) -> ProposalResult:
     proposal = deps.proposal_generator
     kwargs: dict[str, Any] = dict(
