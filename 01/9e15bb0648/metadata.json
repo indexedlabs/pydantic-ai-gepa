@@ -1,0 +1,9 @@
+{
+  "checkpoint_id": "019e15bb0648",
+  "created_at": "2026-05-11T06:30:38.989818+00:00",
+  "branch_name": "mh/preserve-instruction-functions",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "8027ade0504117cc1c1900d17cbd67d34f8bc125"
+  ]
+}
