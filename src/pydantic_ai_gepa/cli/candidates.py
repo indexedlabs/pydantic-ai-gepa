@@ -62,7 +62,19 @@ class Candidate:
     def load(path: Path) -> Candidate:
         if not path.exists():
             raise FileNotFoundError(f"No candidate file at {path}")
-        return Candidate.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        raw = path.read_text(encoding="utf-8")
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Candidate file {path} is not valid JSON "
+                f"(line {exc.lineno}, column {exc.colno}): {exc.msg}"
+            ) from exc
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"Candidate file {path} must contain a JSON object at the top level."
+            )
+        return Candidate.from_dict(data)
 
     def write(self, path: Path) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)

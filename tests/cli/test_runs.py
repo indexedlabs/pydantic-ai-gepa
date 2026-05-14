@@ -174,6 +174,19 @@ def test_pareto_path_under_run_dir(tmp_path: Path) -> None:
     assert run_dir(run, tmp_path) in log.path.parents
 
 
+def test_pareto_count_rows(tmp_path: Path) -> None:
+    """count_rows must match iter_rows without parsing each row."""
+    ensure_layout(tmp_path)
+    run = new_run_id()
+    log = ParetoLog(run, tmp_path)
+    assert log.count_rows() == 0
+    log.append(_row("c1", {"a": 0.5}))
+    log.append(_row("c2", {"a": 0.6}))
+    log.append(_row("c3", {"a": 0.7}))
+    assert log.count_rows() == 3
+    assert log.count_rows() == len(log.iter_rows())
+
+
 def test_current_commit_sha_outside_git(tmp_path: Path) -> None:
     # tmp_path is not a git repo so we expect None.
     assert current_commit_sha(tmp_path) is None

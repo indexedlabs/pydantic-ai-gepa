@@ -99,6 +99,26 @@ def test_store_write_and_read(tmp_path: Path) -> None:
     assert store.list_staged_slots() == []
 
 
+def test_store_write_clears_staged_by_default(tmp_path: Path) -> None:
+    """Default write() supersedes any staged stub for the slot (confirmation semantics)."""
+    ensure_layout(tmp_path)
+    store = ComponentStore(tmp_path)
+    store.stage("tool:foo:description", "staged")
+    store.write("tool:foo:description", "confirmed")
+    assert store.read("tool:foo:description") == "confirmed"
+    assert store.read_staged("tool:foo:description") is None
+
+
+def test_store_write_with_clear_staged_false_preserves_stub(tmp_path: Path) -> None:
+    """clear_staged=False (used by `init --force`) leaves the staged file alone."""
+    ensure_layout(tmp_path)
+    store = ComponentStore(tmp_path)
+    store.stage("tool:foo:description", "staged")
+    store.write("tool:foo:description", "confirmed", clear_staged=False)
+    assert store.read("tool:foo:description") == "confirmed"
+    assert store.read_staged("tool:foo:description") == "staged"
+
+
 def test_store_stage_and_confirm(tmp_path: Path) -> None:
     ensure_layout(tmp_path)
     store = ComponentStore(tmp_path)

@@ -23,11 +23,18 @@ from pydantic_evals import Case
 
 
 def load_dataset(path: Path) -> list[Case[Any, Any, Any]]:
-    """Load a JSONL dataset into a list of ``Case`` objects."""
+    """Load a JSONL dataset into a list of ``Case`` objects.
+
+    Raises ``ValueError`` if two rows share the same ``name``. Case identity
+    flows into minibatch sampling, pareto bookkeeping, and the per-case report;
+    silent name collisions would let the latest row clobber an earlier one's
+    score with no warning, so we surface the conflict explicitly.
+    """
     if not path.exists():
         raise FileNotFoundError(f"No dataset at {path}")
 
     cases: list[Case[Any, Any, Any]] = []
+    seen_names: dict[str, int] = {}
     for idx, raw in enumerate(path.read_text(encoding="utf-8").splitlines()):
         stripped = raw.strip()
         if not stripped:
@@ -39,6 +46,13 @@ def load_dataset(path: Path) -> list[Case[Any, Any, Any]]:
         if not isinstance(row, dict):
             raise ValueError(f"{path}:{idx + 1}: each row must be a JSON object")
         name = row.get("name") or f"case-{idx + 1}"
+        if name in seen_names:
+            raise ValueError(
+                f"{path}:{idx + 1}: duplicate case name {name!r} "
+                f"(first seen at line {seen_names[name]}). "
+                "Case names must be unique across the dataset."
+            )
+        seen_names[name] = idx + 1
         inputs = row.get("inputs")
         expected_output = row.get("expected_output")
         metadata = row.get("metadata")

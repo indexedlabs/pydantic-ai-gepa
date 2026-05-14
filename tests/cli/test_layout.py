@@ -289,3 +289,44 @@ def test_load_dotenv_skips_invalid_lines(
     monkeypatch.delenv("GOOD", raising=False)
     applied = load_dotenv(tmp_path)
     assert applied == {"GOOD": "ok"}
+
+
+def test_load_dotenv_interpolates_var_references(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BASE_URL", "https://api.example")
+    monkeypatch.delenv("FULL_URL_UNQUOTED", raising=False)
+    monkeypatch.delenv("FULL_URL_DQ", raising=False)
+    monkeypatch.delenv("BRACED", raising=False)
+    (tmp_path / ".env").write_text(
+        "FULL_URL_UNQUOTED=$BASE_URL/v1\n"
+        'FULL_URL_DQ="$BASE_URL/v2"\n'
+        "BRACED=${BASE_URL}/v3\n",
+        encoding="utf-8",
+    )
+    applied = load_dotenv(tmp_path)
+    assert applied["FULL_URL_UNQUOTED"] == "https://api.example/v1"
+    assert applied["FULL_URL_DQ"] == "https://api.example/v2"
+    assert applied["BRACED"] == "https://api.example/v3"
+
+
+def test_load_dotenv_single_quoted_is_literal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WORLD", "earth")
+    monkeypatch.delenv("LITERAL", raising=False)
+    (tmp_path / ".env").write_text("LITERAL='$WORLD'\n", encoding="utf-8")
+    applied = load_dotenv(tmp_path)
+    assert applied["LITERAL"] == "$WORLD"
+
+
+def test_load_dotenv_unknown_var_expands_to_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("NOT_DEFINED", raising=False)
+    monkeypatch.delenv("RESULT", raising=False)
+    (tmp_path / ".env").write_text(
+        "RESULT=prefix-$NOT_DEFINED-suffix\n", encoding="utf-8"
+    )
+    applied = load_dotenv(tmp_path)
+    assert applied["RESULT"] == "prefix--suffix"

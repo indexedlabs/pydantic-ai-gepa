@@ -254,6 +254,23 @@ class ParetoLog:
             rows.append(ParetoRow.from_dict(json.loads(stripped)))
         return rows
 
+    def count_rows(self) -> int:
+        """Count appended rows without parsing each row's JSON.
+
+        ``gepa eval`` calls this every invocation to enforce the
+        ``--max-iterations`` cap; parsing the whole log on each call grew the
+        per-eval cost as the log grew. Counting non-blank lines is O(n) in
+        bytes but skips the JSON decode + dataclass construction.
+        """
+        if not self._path.exists():
+            return 0
+        count = 0
+        with self._path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip():
+                    count += 1
+        return count
+
     def front(self) -> list[ParetoRow]:
         """Return rows that are Pareto-dominant across per-case scores.
 

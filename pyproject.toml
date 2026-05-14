@@ -4,6 +4,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pydantic_ai_gepa"]
+# Non-Python resources (SKILL.md, future agent docs) are picked up by `packages`
+# automatically, but enumerate them here so a future hatchling default change
+# can't silently drop them from the wheel.
+artifacts = ["src/pydantic_ai_gepa/skills/**/*.md"]
 
 [tool.hatch.build.targets.sdist]
 include = ["src/pydantic_ai_gepa", "README.md", "pyproject.toml"]

@@ -2,7 +2,7 @@
 
 This module is the single source of truth for where each artifact lives. Every
 verb in the CLI reads/writes through these helpers so the directory shape stays
-consistent across `init`, `propose`, `eval`, `apply`, etc.
+consistent across `init`, `eval`, `apply`, etc.
 
 Layout overview::
 
@@ -275,6 +275,21 @@ def insert_repo_root_on_path(root: Path | None = None) -> None:
         sys.path.insert(0, root_path)
 
 
+_DOTENV_INTERPOLATION_RE = re.compile(
+    r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))"
+)
+
+
+def _interpolate_dotenv_value(value: str, env: dict[str, str]) -> str:
+    """Expand ``$VAR`` / ``${VAR}`` references against ``env`` (missing → empty)."""
+
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1) or match.group(2)
+        return env.get(name, "")
+
+    return _DOTENV_INTERPOLATION_RE.sub(replace, value)
+
+
 def load_dotenv(root: Path | None = None) -> dict[str, str]:
     """Load ``.env`` from the repo root into ``os.environ`` without overriding.
 
@@ -286,6 +301,15 @@ def load_dotenv(root: Path | None = None) -> dict[str, str]:
     are ignored. A leading ``export `` on the key is stripped. A single matched
     pair of surrounding quotes on the value is stripped. Lines without an ``=``
     are silently skipped.
+
+    ``$VAR`` and ``${VAR}`` references are expanded against the in-process
+    environment (current ``os.environ`` plus any prior keys from this same
+    file). Single-quoted values are kept verbatim (POSIX shell semantics);
+    double-quoted and unquoted values are interpolated. Missing references
+    expand to the empty string.
+
+    Multi-line values, escape sequences, and command substitution are NOT
+    supported — switch to ``python-dotenv`` if the repo needs those.
     """
     base = (root or repo_root()).resolve()
     path = base / ".env"
@@ -304,9 +328,12 @@ def load_dotenv(root: Path | None = None) -> dict[str, str]:
         if not key:
             continue
         value = raw_value.strip()
-        # Strip a single matched pair of surrounding quotes.
+        quote_type: str | None = None
         if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+            quote_type = value[0]
             value = value[1:-1]
+        if quote_type != "'":
+            value = _interpolate_dotenv_value(value, dict(os.environ))
         if key not in os.environ:
             os.environ[key] = value
             applied[key] = value

@@ -62,11 +62,13 @@ def _resolve_run_id(run_id: str | None) -> str:
 
 
 def _count_evals_in_run(run_id: str) -> int:
-    pareto = ParetoLog(run_id)
-    return len(pareto.iter_rows())
+    return ParetoLog(run_id).count_rows()
 
 
-def _format_failures(records, threshold: float = 0.999) -> str:
+DEFAULT_FAILURE_THRESHOLD = 0.999
+
+
+def _format_failures(records, threshold: float = DEFAULT_FAILURE_THRESHOLD) -> str:
     lines = ["# Eval report", ""]
     failures = [r for r in records if r.score < threshold]
     if not failures:
@@ -126,6 +128,11 @@ def eval_(
         100,
         "--max-iterations",
         help="Hard cap on eval rows in this run (per pydanticaigepa-dec-xd6). Exits 70 when exceeded.",
+    ),
+    threshold: float = typer.Option(
+        DEFAULT_FAILURE_THRESHOLD,
+        "--threshold",
+        help="Score below which a case is listed as a failure in the per-case report. Default is 0.999 so any non-perfect case is flagged; lower it (e.g. 0.7) when partial-credit metrics expect imperfect scores.",
     ),
 ) -> None:
     """Evaluate the current baseline (default) or an explicit candidate file."""
@@ -253,7 +260,9 @@ def eval_(
     reports_dir = run_dir(active_run_id) / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
     report_path = reports_dir / f"{candidate.id}.md"
-    report_path.write_text(_format_failures(records), encoding="utf-8")
+    report_path.write_text(
+        _format_failures(records, threshold=threshold), encoding="utf-8"
+    )
 
     output_lines = []
     for record in records:

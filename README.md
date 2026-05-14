@@ -287,7 +287,7 @@ tests/                # Test suite
 
 ## External-reflection CLI
 
-In addition to the Python `optimize_agent()` entry point, `pydantic-ai-gepa` ships a `gepa` CLI that lets coding agents (Claude Code, Codex, etc.) drive the optimization loop directly. The CLI exposes a small verb set — `init`, `propose`, `eval`, `apply`, `components`, `pareto`, `journal` — and the library handles minibatch selection, evaluation, and Pareto bookkeeping internally. See the bundled skill at [`src/pydantic_ai_gepa/skills/gepa_optimize/SKILL.md`](src/pydantic_ai_gepa/skills/gepa_optimize/SKILL.md) for the full workflow and the content-file convention.
+In addition to the Python `optimize_agent()` entry point, `pydantic-ai-gepa` ships a `gepa` CLI that lets coding agents (Claude Code, Codex, etc.) drive the optimization loop directly. The CLI exposes a small verb set — `init`, `eval`, `apply`, `components`, `pareto`, `journal` — and the library handles minibatch selection, evaluation, and Pareto bookkeeping internally. The coding agent IS the reflection model; it reads the per-case report `gepa eval` writes and edits component slots or source code between runs. See the bundled skill at [`src/pydantic_ai_gepa/skills/gepa_optimize/SKILL.md`](src/pydantic_ai_gepa/skills/gepa_optimize/SKILL.md) for the full workflow and the content-file convention.
 
 ## More Info
 

@@ -198,3 +198,60 @@ def test_eval_loads_existing_minibatch(repo: Path, tmp_path: Path) -> None:
 def test_eval_rejects_missing_candidate_file(repo: Path, tmp_path: Path) -> None:
     result = _run("eval", "--candidate-file", str(tmp_path / "does_not_exist.json"))
     assert result.exit_code != 0
+
+
+def test_eval_threshold_flag_filters_report(repo: Path, tmp_path: Path) -> None:
+    """--threshold controls which cases land in the per-case report."""
+    cand_path = _candidate_file(tmp_path, {"instructions": "Custom."})
+
+    # Threshold 0.0: no case is a failure → report is the "all passed" body.
+    result_lenient = _run(
+        "eval",
+        "--candidate-file",
+        str(cand_path),
+        "--size",
+        "3",
+        "--seed",
+        "0",
+        "--epoch",
+        "0",
+        "--threshold",
+        "0.0",
+    )
+    assert result_lenient.exit_code == 0, result_lenient.output
+    lenient_summary = next(
+        json.loads(line)
+        for line in result_lenient.output.splitlines()
+        if line.startswith("{") and '"summary"' in line
+    )
+    report_path_lenient = Path(lenient_summary["summary"]["report_path"])
+    lenient_text = report_path_lenient.read_text(encoding="utf-8")
+    assert "Every case in this minibatch passed" in lenient_text
+
+    # Threshold 1.0 (strict): every case scores < 1.0 here because TestModel's
+    # output text contains, but does not equal, the expected strings — so the
+    # report lists them as failures.
+    result_strict = _run(
+        "eval",
+        "--candidate-file",
+        str(cand_path),
+        "--size",
+        "3",
+        "--seed",
+        "0",
+        "--epoch",
+        "0",
+        "--threshold",
+        "1.0",
+    )
+    assert result_strict.exit_code == 0, result_strict.output
+    strict_summary = next(
+        json.loads(line)
+        for line in result_strict.output.splitlines()
+        if line.startswith("{") and '"summary"' in line
+    )
+    strict_text = Path(strict_summary["summary"]["report_path"]).read_text(
+        encoding="utf-8"
+    )
+    assert "case(s) underperformed" in strict_text
+    assert "case-fail" in strict_text

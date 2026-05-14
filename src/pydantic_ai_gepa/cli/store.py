@@ -140,17 +140,24 @@ class ComponentStore:
 
     # ---------- mutations ----------
 
-    def write(self, slot: str, content: str) -> Path:
-        """Write a confirmed value, atomically replacing any existing one."""
+    def write(self, slot: str, content: str, *, clear_staged: bool = True) -> Path:
+        """Write a confirmed value, atomically replacing any existing one.
+
+        ``clear_staged`` defaults to True because the normal write path is
+        ``gepa components set`` / ``gepa components confirm``, where the user
+        is intentionally promoting / overwriting a slot and any staged stub is
+        superseded. Pass ``clear_staged=False`` from re-seeding paths (e.g.
+        ``gepa init --force``) so a user's in-progress staged edits survive.
+        """
         self._components_dir.mkdir(parents=True, exist_ok=True)
         path = self._component_path(slot)
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(content, encoding="utf-8")
         tmp.replace(path)
-        # Confirming a slot supersedes any staged stub for it.
-        staged = self._staged_path(slot)
-        if staged.exists():
-            staged.unlink()
+        if clear_staged:
+            staged = self._staged_path(slot)
+            if staged.exists():
+                staged.unlink()
         return path
 
     def stage(self, slot: str, content: str) -> Path:
@@ -230,7 +237,7 @@ class ComponentStore:
             if name in confirmed:
                 continue
             if self._staged_path(name).exists():
-                # Already staged from a prior propose — leave it; only confirm changes the state.
+                # Already staged — leave it; only `gepa components confirm` advances the state.
                 continue
             self.stage(name, seed or "")
             staged_now.append(name)
