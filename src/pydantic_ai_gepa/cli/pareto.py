@@ -67,7 +67,7 @@ def pareto(
         active_run = _resolve_run_id(run_id)
     except typer.Exit:
         typer.echo(
-            "No runs found under .gepa/runs/. Run `gepa propose` or `gepa eval` first.",
+            "No runs found under .gepa/runs/. Run `gepa eval` first.",
             err=True,
         )
         raise

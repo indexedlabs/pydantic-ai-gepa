@@ -20,6 +20,7 @@ from pydantic_ai_gepa.cli.layout import (
     is_run_id,
     journal_path,
     latest_run_id,
+    load_dotenv,
     minibatch_path,
     new_run_id,
     pareto_log_path,
@@ -203,3 +204,88 @@ def test_resolve_agent_invalid_ref() -> None:
     cfg = GepaConfig(agent="no_colon")
     with pytest.raises(GepaConfigError, match="Invalid agent ref"):
         resolve_agent(cfg)
+
+
+# ---------- .env loader ----------
+
+
+def test_load_dotenv_no_file_is_noop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert load_dotenv(tmp_path) == {}
+
+
+def test_load_dotenv_basic_key_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / ".env").write_text("FOO_KEY=hello\nBAR_KEY=world\n", encoding="utf-8")
+    monkeypatch.delenv("FOO_KEY", raising=False)
+    monkeypatch.delenv("BAR_KEY", raising=False)
+
+    applied = load_dotenv(tmp_path)
+    assert applied == {"FOO_KEY": "hello", "BAR_KEY": "world"}
+    import os
+
+    assert os.environ["FOO_KEY"] == "hello"
+    assert os.environ["BAR_KEY"] == "world"
+
+
+def test_load_dotenv_ignores_comments_and_blanks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / ".env").write_text(
+        "\n# This is a comment\n\nA=1\n  # also a comment\nB=2\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("A", raising=False)
+    monkeypatch.delenv("B", raising=False)
+    applied = load_dotenv(tmp_path)
+    assert applied == {"A": "1", "B": "2"}
+
+
+def test_load_dotenv_does_not_override_existing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / ".env").write_text("X=from_dotenv\n", encoding="utf-8")
+    monkeypatch.setenv("X", "from_shell")
+    applied = load_dotenv(tmp_path)
+    assert applied == {}
+    import os
+
+    assert os.environ["X"] == "from_shell"
+
+
+def test_load_dotenv_strips_matched_quotes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / ".env").write_text(
+        'DQ="quoted value"\nSQ=\'single\'\nMIXED="ok\n', encoding="utf-8"
+    )
+    for key in ("DQ", "SQ", "MIXED"):
+        monkeypatch.delenv(key, raising=False)
+    applied = load_dotenv(tmp_path)
+    assert applied["DQ"] == "quoted value"
+    assert applied["SQ"] == "single"
+    # Mismatched quotes (only one of the pair) are kept verbatim.
+    assert applied["MIXED"] == '"ok'
+
+
+def test_load_dotenv_strips_leading_export(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / ".env").write_text("export FOO=bar\n", encoding="utf-8")
+    monkeypatch.delenv("FOO", raising=False)
+    applied = load_dotenv(tmp_path)
+    assert applied == {"FOO": "bar"}
+
+
+def test_load_dotenv_skips_invalid_lines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / ".env").write_text(
+        "no_equals_here\nGOOD=ok\n=missing_key\n", encoding="utf-8"
+    )
+    monkeypatch.delenv("GOOD", raising=False)
+    applied = load_dotenv(tmp_path)
+    assert applied == {"GOOD": "ok"}

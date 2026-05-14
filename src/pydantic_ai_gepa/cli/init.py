@@ -58,5 +58,5 @@ def init(
     typer.echo(
         "Next steps:\n"
         f"  1. Write dataset cases as JSONL at {dataset}\n"
-        "  2. Run `gepa propose --minibatch-size N` for the first optimization step"
+        "  2. Run `gepa eval --size N` to score the baseline + write the per-case report"
     )

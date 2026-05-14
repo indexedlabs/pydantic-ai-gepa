@@ -2,8 +2,9 @@
 
 The demo lives at the intersection of two things `pydantic-ai-gepa` is good at:
 the agent's instructions are vague, and each tool's description is intentionally
-underspecified, so the optimizer has somewhere to go. Run `gepa propose` /
-`gepa eval` against this agent to watch tool descriptions improve.
+underspecified, so the optimizer has somewhere to go. Run `gepa eval` (and
+edit slots in `.gepa/components/`) against this agent to watch routing
+accuracy improve.
 
 Override the model via the `GEPA_EXAMPLE_MODEL` env var. The default is
 `openai:gpt-4o-mini` because it picks up reasonable tool-routing signal without

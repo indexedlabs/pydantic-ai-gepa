@@ -1,4 +1,21 @@
-"""`gepa eval` — evaluate a candidate JSON against the configured dataset."""
+"""`gepa eval` — score the current baseline (default) or an explicit candidate.
+
+External-reflection mode (per pydanticaigepa-spec-973) keeps the coding agent
+as the reflector. The library's job is to:
+
+  * sample a fresh minibatch (or reuse one),
+  * evaluate either the current confirmed baseline (``.gepa/components/``) or
+    an explicit ``--candidate-file``,
+  * enforce stage-and-confirm when the baseline is what's being evaluated and
+    new component slots were discovered (per pydanticaigepa-dec-0ky),
+  * append a ParetoRow + write a per-case failure report under
+    ``.gepa/runs/<run_id>/reports/``,
+  * enforce ``--max-iterations`` as a hard cap (per pydanticaigepa-dec-xd6).
+
+The coding agent reads the report, edits component slots or source code, and
+re-runs ``gepa eval`` — there is no separate ``propose`` verb because the
+agent IS the reflector.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +27,7 @@ import typer
 
 from ..evaluation import evaluate_candidate_dataset
 from ._io import write_content_file
-from .candidates import Candidate
+from .candidates import Candidate, candidate_id_from_components
 from .dataset import case_ids as dataset_case_ids
 from .dataset import cases_by_id, load_dataset
 from .layout import (
@@ -22,6 +39,7 @@ from .layout import (
     repo_root,
     resolve_agent,
     resolve_metric,
+    run_dir,
 )
 from .metrics import default_substring_metric
 from .runs import (
@@ -31,6 +49,7 @@ from .runs import (
     current_commit_sha,
     utc_now_iso,
 )
+from .store import ComponentStore
 
 
 def _resolve_run_id(run_id: str | None) -> str:
@@ -42,9 +61,35 @@ def _resolve_run_id(run_id: str | None) -> str:
     return new_run_id()
 
 
+def _count_evals_in_run(run_id: str) -> int:
+    pareto = ParetoLog(run_id)
+    return len(pareto.iter_rows())
+
+
+def _format_failures(records, threshold: float = 0.999) -> str:
+    lines = ["# Eval report", ""]
+    failures = [r for r in records if r.score < threshold]
+    if not failures:
+        lines.append("Every case in this minibatch passed; nothing to act on.")
+        return "\n".join(lines)
+    lines.append(
+        f"{len(failures)} of {len(records)} case(s) underperformed (score < {threshold}). "
+        "Review per-case feedback and edit slots in `.gepa/components/` or change the agent's source.\n"
+    )
+    for record in failures:
+        lines.append(f"## {record.case_id} — score {record.score:.3f}")
+        if record.feedback:
+            lines.append("")
+            lines.append(record.feedback.rstrip())
+        lines.append("")
+    return "\n".join(lines)
+
+
 def eval_(
-    candidate_file: Path = typer.Option(
-        ..., "--candidate-file", help="Path to a candidate JSON file."
+    candidate_file: Path | None = typer.Option(
+        None,
+        "--candidate-file",
+        help="Path to a candidate JSON file. Omit to evaluate the current confirmed baseline in `.gepa/components/`.",
     ),
     minibatch_id: str | None = typer.Option(None, "--minibatch-id"),
     size: int = typer.Option(10, "--size"),
@@ -55,8 +100,13 @@ def eval_(
         None, "--output-file", help="Write JSONL results to a file (or - for stdout)."
     ),
     concurrency: int = typer.Option(5, "--concurrency"),
+    max_iterations: int = typer.Option(
+        100,
+        "--max-iterations",
+        help="Hard cap on eval rows in this run (per pydanticaigepa-dec-xd6). Exits 70 when exceeded.",
+    ),
 ) -> None:
-    """Evaluate a candidate JSON file against the configured dataset (or a minibatch)."""
+    """Evaluate the current baseline (default) or an explicit candidate file."""
     cfg = GepaConfig.load(config_path())
     insert_repo_root_on_path()
 
@@ -69,12 +119,50 @@ def eval_(
         typer.echo(f"Dataset {dataset_path} is empty.", err=True)
         raise typer.Exit(code=1)
 
-    candidate = Candidate.load(candidate_file)
-    candidate_map = candidate.to_candidate_map()
+    # When evaluating the baseline (no explicit candidate), enforce the
+    # stage-and-confirm gate per pydanticaigepa-dec-0ky.
+    store = ComponentStore()
+    is_baseline_eval = candidate_file is None
+    if is_baseline_eval:
+        staged = store.detect_new_slots(agent)
+        if staged:
+            typer.echo(
+                "Found unconfirmed component slots; refusing to evaluate the baseline.",
+                err=True,
+            )
+            typer.echo("Staged stubs:", err=True)
+            for slot in staged:
+                typer.echo(f"  {store.staged_path(slot)}", err=True)
+            typer.echo("Confirm with:", err=True)
+            for slot in staged:
+                typer.echo(f"  gepa components confirm {slot}", err=True)
+            raise typer.Exit(code=2)
+
+        baseline_components = store.effective_candidate(agent)
+        candidate = Candidate(
+            id=candidate_id_from_components(baseline_components),
+            components=baseline_components,
+            metadata={"role": "baseline"},
+        )
+        candidate_overrides_id = "(baseline)"
+        status = "baseline"
+    else:
+        candidate = Candidate.load(candidate_file)
+        candidate_overrides_id = str(candidate_file)
+        status = "evaluated"
 
     active_run_id = _resolve_run_id(run_id)
-    minibatch_store = MinibatchStore(active_run_id)
+    prior_count = _count_evals_in_run(active_run_id)
+    if prior_count >= max_iterations:
+        typer.echo(
+            f"Max iterations reached ({prior_count}/{max_iterations}). "
+            "Start a new run (omit --run-id) or raise --max-iterations.",
+            err=True,
+        )
+        raise typer.Exit(code=70)
 
+    run_dir(active_run_id).mkdir(parents=True, exist_ok=True)
+    minibatch_store = MinibatchStore(active_run_id)
     if minibatch_id:
         minibatch = minibatch_store.load(minibatch_id)
     else:
@@ -97,7 +185,7 @@ def eval_(
             agent=agent,
             metric=metric,
             dataset=subset,
-            candidate=candidate_map,
+            candidate=candidate.to_candidate_map(),
             concurrency=concurrency,
         )
     )
@@ -110,15 +198,21 @@ def eval_(
         ParetoRow(
             candidate_id=candidate.id,
             commit_sha=current_commit_sha(),
-            component_overrides_id=str(candidate_file),
+            component_overrides_id=candidate_overrides_id,
             minibatch_id=minibatch.id,
             per_case_scores=per_case,
             mean_score=mean,
-            status="evaluated",
-            summary=f"eval candidate {candidate.id} on minibatch {minibatch.id}",
+            status=status,
+            summary=f"{status} eval of {candidate.id} on minibatch {minibatch.id} (mean={mean:.3f})",
             timestamp=utc_now_iso(),
         )
     )
+
+    # Write the per-case report next to the pareto log.
+    reports_dir = run_dir(active_run_id) / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    report_path = reports_dir / f"{candidate.id}.md"
+    report_path.write_text(_format_failures(records), encoding="utf-8")
 
     output_lines = []
     for record in records:
@@ -136,10 +230,14 @@ def eval_(
             {
                 "summary": {
                     "candidate_id": candidate.id,
+                    "candidate_role": status,
                     "minibatch_id": minibatch.id,
                     "run_id": active_run_id,
                     "mean_score": mean,
                     "n_cases": len(records),
+                    "iterations": prior_count + 1,
+                    "max_iterations": max_iterations,
+                    "report_path": str(report_path),
                 }
             }
         )

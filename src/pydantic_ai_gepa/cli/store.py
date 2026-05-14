@@ -166,7 +166,7 @@ class ComponentStore:
         if not staged.exists():
             raise FileNotFoundError(
                 f"No staged stub for slot {slot!r} at {staged}. "
-                f"Run `gepa propose` first to detect new slots, or use `gepa components set` for an existing slot."
+                f"Run `gepa eval` first to detect new slots, or use `gepa components set` for an existing slot."
             )
         content = (
             override_text
@@ -244,7 +244,7 @@ class ComponentStore:
           2. introspected seed from the live agent
           3. empty string (slot exists but no text yet)
 
-        Staged-only slots are *not* included — `gepa propose` is supposed to block on them.
+        Staged-only slots are *not* included — baseline `gepa eval` is supposed to block on them.
         Orphan slots (file exists but not introspected) are *not* included either.
         """
         introspected = introspect_agent(agent)

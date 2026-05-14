@@ -30,7 +30,7 @@ AGENT_MODULE_SOURCE_V1 = textwrap.dedent("""
 
 
 # A "v2" agent module that adds a new tool. Used to exercise the
-# stage-and-confirm flow when source mutates between propose calls.
+# stage-and-confirm flow when source mutates between eval calls.
 AGENT_MODULE_SOURCE_V2 = textwrap.dedent('''
     from pydantic_ai import Agent
     from pydantic_ai.models.test import TestModel
@@ -83,7 +83,7 @@ def _reload_agent_module() -> None:
             sys.modules.pop(name, None)
 
 
-def test_full_workflow_init_propose_eval_apply(repo: Path) -> None:
+def test_full_workflow_init_eval_apply(repo: Path) -> None:
     # 1. Init the repo.
     result = _run("init", "--agent", "agent_pkg.agents:agent")
     assert result.exit_code == 0, result.output
@@ -103,34 +103,45 @@ def test_full_workflow_init_propose_eval_apply(repo: Path) -> None:
     rows = json.loads(listing.output)
     assert any(r["name"] == "instructions" and r["status"] == "confirmed" for r in rows)
 
-    # 3. propose runs to completion.
-    propose = _run(
-        "propose", "--minibatch-size", "3", "--seed", "0", "--max-iterations", "5"
+    # 3. Evaluate the current baseline (no --candidate-file).
+    baseline_eval = _run("eval", "--size", "3", "--seed", "0", "--max-iterations", "5")
+    assert baseline_eval.exit_code == 0, baseline_eval.output
+    summary_line = next(
+        line
+        for line in baseline_eval.output.splitlines()
+        if line.startswith("{") and '"summary"' in line
     )
-    assert propose.exit_code == 0, propose.output
-    summary = json.loads(propose.output)
-    proposal_path = Path(summary["proposal_path"])
+    summary = json.loads(summary_line)["summary"]
     run_id = summary["run_id"]
-    assert proposal_path.exists()
+    assert summary["candidate_role"] == "baseline"
     rows = ParetoLog(run_id, repo).iter_rows()
     statuses = [r.status for r in rows]
-    assert "baseline" in statuses and "proposal" in statuses
+    assert "baseline" in statuses
+    report_path = Path(summary["report_path"])
+    assert report_path.exists()
 
-    # 4. eval the proposal candidate.
-    eval_ = _run(
+    # 4. Edit a slot via gepa components set and re-eval as an explicit candidate.
+    new_text = repo / "new_instructions.md"
+    new_text.write_text(
+        "Tuned instructions: pick a tool and echo its return verbatim.",
+        encoding="utf-8",
+    )
+    set_result = _run(
+        "components", "set", "instructions", "--content-file", str(new_text)
+    )
+    assert set_result.exit_code == 0, set_result.output
+
+    # 5. Evaluate the new baseline (same minibatch via --minibatch-id).
+    second_eval = _run(
         "eval",
-        "--candidate-file",
-        str(proposal_path),
-        "--size",
-        "2",
+        "--minibatch-id",
+        summary["minibatch_id"],
         "--run-id",
         run_id,
+        "--max-iterations",
+        "5",
     )
-    assert eval_.exit_code == 0, eval_.output
-
-    # 5. apply the proposal as the new baseline.
-    apply_ = _run("apply", "--candidate-file", str(proposal_path))
-    assert apply_.exit_code == 0, apply_.output
+    assert second_eval.exit_code == 0, second_eval.output
 
     # 6. pareto tsv listing the run shows non-empty rows.
     tsv = _run("pareto", "--run-id", run_id, "--all", "--format", "tsv")
@@ -165,10 +176,15 @@ def test_mid_run_tool_addition_triggers_stage_and_confirm(repo: Path) -> None:
         "\n".join(json.dumps(row) for row in DATASET) + "\n", encoding="utf-8"
     )
 
-    # Run propose with v1 source — should succeed.
-    first = _run("propose", "--minibatch-size", "2")
+    # Baseline eval with v1 source — should succeed.
+    first = _run("eval", "--size", "2")
     assert first.exit_code == 0, first.output
-    run_id = json.loads(first.output)["run_id"]
+    summary_line = next(
+        line
+        for line in first.output.splitlines()
+        if line.startswith("{") and '"summary"' in line
+    )
+    run_id = json.loads(summary_line)["summary"]["run_id"]
 
     # Edit source: add a new tool. Reimport to pick it up.
     (repo / "agent_pkg" / "agents.py").write_text(
@@ -176,9 +192,9 @@ def test_mid_run_tool_addition_triggers_stage_and_confirm(repo: Path) -> None:
     )
     _reload_agent_module()
 
-    # Next propose must refuse with stage-and-confirm because the new tool
-    # introduces unconfirmed component slots.
-    second = _run("propose", "--minibatch-size", "2", "--run-id", run_id)
+    # Next baseline eval must refuse with stage-and-confirm because the new
+    # tool introduces unconfirmed component slots.
+    second = _run("eval", "--size", "2", "--run-id", run_id)
     assert second.exit_code == 2, second.output
     assert "unconfirmed component slots" in second.output
 
@@ -186,14 +202,14 @@ def test_mid_run_tool_addition_triggers_stage_and_confirm(repo: Path) -> None:
     new_slots = [s for s in store.list_staged_slots() if "lookup_country" in s]
     assert new_slots, store.list_staged_slots()
 
-    # Confirm each newly staged slot; propose should now succeed.
+    # Confirm each newly staged slot; eval should now succeed.
     for slot in new_slots:
         confirm = _run("components", "confirm", slot)
         assert confirm.exit_code == 0, confirm.output
 
-    third = _run("propose", "--minibatch-size", "2", "--run-id", run_id)
+    third = _run("eval", "--size", "2", "--run-id", run_id)
     assert third.exit_code == 0, third.output
-    # The same run accumulates a second proposal.
+    # The same run accumulates a second eval row.
     assert pareto_log_path(run_id, repo).exists()
 
 

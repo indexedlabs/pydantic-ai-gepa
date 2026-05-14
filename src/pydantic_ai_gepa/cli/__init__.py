@@ -15,7 +15,7 @@ from . import eval as eval_cmd
 from . import init as init_cmd
 from . import journal as journal_cmd
 from . import pareto as pareto_cmd
-from . import propose as propose_cmd
+from .layout import load_dotenv
 
 app = typer.Typer(
     name="gepa",
@@ -25,15 +25,32 @@ app = typer.Typer(
     rich_markup_mode="rich",
 )
 
+
+@app.callback()
+def _gepa_root(
+    no_dotenv: bool = typer.Option(
+        False,
+        "--no-dotenv",
+        help="Skip auto-loading .env from the repo root.",
+    ),
+) -> None:
+    """Load .env once before any verb runs.
+
+    The user's agent module often resolves to a real provider (openai, anthropic,
+    etc.) that eagerly constructs a client at import time. Auto-loading .env
+    means `gepa components list`, `gepa eval`, etc. just work in a repo that
+    already has API keys configured.
+    """
+    if not no_dotenv:
+        load_dotenv()
+
+
 app.command(name="init", help="Scaffold .gepa/ and seed components from the agent.")(
     init_cmd.init
 )
 app.command(
-    name="propose",
-    help="Run one optimization step: eval baseline, reflect, emit proposal.",
-)(propose_cmd.propose)
-app.command(
-    name="eval", help="Evaluate a candidate JSON against the configured dataset."
+    name="eval",
+    help="Evaluate the current baseline (default) or an explicit --candidate-file.",
 )(eval_cmd.eval_)
 app.command(
     name="apply", help="Apply a candidate's component overrides into .gepa/components/."

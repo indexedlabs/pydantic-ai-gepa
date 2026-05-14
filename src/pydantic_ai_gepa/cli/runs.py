@@ -1,6 +1,6 @@
 """Per-run on-disk state: minibatch persistence + Pareto append-only log.
 
-Each `gepa propose` invocation reads/writes through `MinibatchStore` and
+Each `gepa eval` invocation reads/writes through `MinibatchStore` and
 `ParetoLog`. The Pareto row schema records the tuple required by
 pydanticaigepa-dec-xd6 — `(candidate_id, commit_sha, component_overrides_id,
 minibatch_id, per_case_scores, mean_score, status, summary, timestamp)` — so

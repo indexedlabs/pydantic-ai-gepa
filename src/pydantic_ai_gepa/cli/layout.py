@@ -27,6 +27,7 @@ file implements.
 from __future__ import annotations
 
 import importlib
+import os
 import re
 import sys
 import tomllib
@@ -61,7 +62,7 @@ class GepaConfig:
     """Optional ``module.path:attr`` reference for a custom metric callable."""
 
     defaults: dict[str, Any] = field(default_factory=dict)
-    """Default knob values for `gepa propose`, `gepa eval`, etc. Optional."""
+    """Default knob values for `gepa eval`, etc. Optional."""
 
     @staticmethod
     def from_dict(data: dict[str, Any]) -> GepaConfig:
@@ -266,3 +267,41 @@ def insert_repo_root_on_path(root: Path | None = None) -> None:
     root_path = str((root or repo_root()).resolve())
     if root_path not in sys.path:
         sys.path.insert(0, root_path)
+
+
+def load_dotenv(root: Path | None = None) -> dict[str, str]:
+    """Load ``.env`` from the repo root into ``os.environ`` without overriding.
+
+    Returns the dict of keys that were actually applied (empty if no .env
+    exists, or if every key in .env was already set in the environment).
+    Behaves like ``os.environ.setdefault`` — existing env vars always win.
+
+    Format: ``KEY=VALUE`` per line. Blank lines and lines starting with ``#``
+    are ignored. A leading ``export `` on the key is stripped. A single matched
+    pair of surrounding quotes on the value is stripped. Lines without an ``=``
+    are silently skipped.
+    """
+    base = (root or repo_root()).resolve()
+    path = base / ".env"
+    if not path.is_file():
+        return {}
+
+    applied: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, raw_value = stripped.partition("=")
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export ") :].strip()
+        if not key:
+            continue
+        value = raw_value.strip()
+        # Strip a single matched pair of surrounding quotes.
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+            value = value[1:-1]
+        if key not in os.environ:
+            os.environ[key] = value
+            applied[key] = value
+    return applied
