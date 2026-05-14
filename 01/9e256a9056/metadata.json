@@ -1,0 +1,9 @@
+{
+  "checkpoint_id": "019e256a9056",
+  "created_at": "2026-05-14T07:36:41.355540+00:00",
+  "branch_name": "mh/external-reflection-cli",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "fde163add18975baa8ed73e9c314c97e2a93f57f"
+  ]
+}
