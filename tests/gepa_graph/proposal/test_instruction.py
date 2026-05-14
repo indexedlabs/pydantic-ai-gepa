@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 from inline_snapshot import snapshot
@@ -17,6 +18,12 @@ from pydantic_ai_gepa.adapter import (
 from pydantic_ai_gepa.adapters.agent_adapter import AgentAdapter
 from pydantic_ai_gepa.gepa_graph.models import CandidateProgram, ComponentValue
 from pydantic_ai_gepa.gepa_graph.proposal import InstructionProposalGenerator
+from pydantic_ai_gepa.gepa_graph.proposal.instruction import (
+    ComponentUpdate,
+    InstructionProposalOutput,
+    JOURNAL_TOOLS_INSTRUCTIONS,
+    TrajectoryAnalysis,
+)
 from pydantic_ai_gepa.types import MetricResult, RolloutOutput
 
 
@@ -188,6 +195,47 @@ async def test_llm_generator_returns_metadata_when_enabled() -> None:
 
 
 @pytest.mark.asyncio
+async def test_llm_generator_uses_default_request_limit() -> None:
+    candidate = _make_candidate()
+    reflective_data = ComponentReflectiveDataset(
+        records_by_component={"instructions": [_make_reflective_record()]}
+    )
+    captured_request_limits: list[int | None] = []
+
+    class FakeAgent:
+        async def run(self, *args, **kwargs):
+            captured_request_limits.append(kwargs["usage_limits"].request_limit)
+            return SimpleNamespace(
+                output=InstructionProposalOutput(
+                    reasoning=TrajectoryAnalysis(
+                        pattern_discovery="Patterns",
+                        creative_hypothesis="Hypothesis",
+                        experimental_approach="Approach",
+                    ),
+                    updated_components=[
+                        ComponentUpdate(
+                            component_name="instructions",
+                            optimized_value="Improved instructions",
+                        )
+                    ],
+                )
+            )
+
+    generator = InstructionProposalGenerator()
+    setattr(generator, "_agent", FakeAgent())
+
+    result = await generator.propose_texts(
+        candidate=candidate,
+        reflective_data=reflective_data,
+        components=["instructions"],
+        model="test-model",
+    )
+
+    assert captured_request_limits == [50]
+    assert result.texts == {"instructions": "Improved instructions"}
+
+
+@pytest.mark.asyncio
 async def test_llm_generator_uses_shared_dataset_once() -> None:
     candidate = _make_candidate()
     reflective_data = SharedReflectiveDataset(
@@ -293,7 +341,7 @@ Each trace contains:
 2 traces available from the execution: 0 succeeded, 2 failed.
 The traces are stored on disk as `traces/traces.jsonl`.
 You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts to parse these structured files.
-You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.
+You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures. The proposal step has a shared limit of 5 spawned sub-agents, including recursive child spawns.
 
 **IMPORTANT: Prompt Caching & State Management**
 Your python REPL is stateful. Variables assigned in one script will persist to the next.
@@ -301,9 +349,45 @@ To leverage LLM prompt caching efficiently, you should build up state in your Py
 If your context window becomes bloated, use the `clear_message_history` tool. This wipes your message history to free up tokens, but your Python REPL variables remain intact!
 Only use `clear_message_history` sparingly when absolutely necessary to avoid breaking the prompt cache.
 
+### `run_python_repl` environment
+- The REPL is `pydantic-monty`, a sandboxed Python subset, not CPython. It is persistent across calls within one reflection agent run, so variables and helper functions stay bound.
+- Each call has a 10-second execution budget, plus memory and recursion limits. A timed-out call does not make the REPL unusable; preserve useful intermediate state in variables.
+- Return values come from the final expression. `print(...)` writes to stdout and returns `None`, so end scripts with a bare value such as `summary`, `rows[:5]`, or `{"failures": failures}`.
+- Supported syntax includes assignments, `if`/`else`, `for`/`while`, `def`, `lambda`, `try`/`except`, `raise`, comprehensions, and f-strings.
+- Unsupported syntax includes `with` statements, `class` definitions, `match`, and `yield`. Do not use context managers, generators, or custom classes.
+- Unsupported runtime/builtins include `globals()`, `locals()`, `eval()`, `exec()`, and `__import__()`.
+- Imports are limited to a small standard-library subset such as `json`, `re`, `datetime`, `typing`, `sys`, and partial `os`. Third-party packages and most stdlib modules are unavailable. Prefer the pre-bound helpers below instead of filesystem imports or `os.getcwd()`.
+- Pre-bound helpers: `read_file`, `file_info`, `file_size`, `line_count`, `read_lines`, `read_line_batch`, `tail_lines`, `find_lines`, `list_dir`, `json_loads`, plus `Path` and `json`.
+
+### Trace file navigation
+- `traces/traces.jsonl` can be large. Avoid `read_file('traces/traces.jsonl')` unless you already know it is small; returning the whole trace file can overflow the reflection model context.
+- Start with `file_info('traces/traces.jsonl')` to understand size and line count.
+- Use `find_lines('traces/traces.jsonl', query, limit=20)` for targeted search and `tail_lines(..., limit=20)` for recent spans or exceptions.
+- Use `read_lines(path, start=n, limit=10)` for a small window around a known line number.
+- For full-file scans, write one reducer-style script around `read_line_batch(path, offset=0, limit=1000)`. Advance with `offset = batch['next_offset']`, stop when `batch['eof']`, and return only compact aggregates.
+
+Canonical full-scan pattern:
+```python
+offset = 0
+failures = 0
+examples = []
+while True:
+    batch = read_line_batch('traces/traces.jsonl', offset=offset, limit=1000)
+    for line in batch['lines']:
+        row = json_loads(line)
+        if not row.get('success'):
+            failures = failures + 1
+            if len(examples) < 5:
+                examples.append(row.get('feedback'))
+    if batch['eof']:
+        break
+    offset = batch['next_offset']
+{'failures': failures, 'examples': examples}
+```
+
 
 ### Analysis guidance
-- Use `run_python_repl` to aggregate errors or find common failure modes across `traces.jsonl`.
+- Use `run_python_repl` with `read_line_batch` to aggregate errors or find common failure modes across `traces.jsonl` without returning full traces.
 - Use `spawn_agent` to understand *why* a specific trace failed if the python analysis is insufficient.
 - What failure patterns repeat across runs?
 - Are components misaligned (e.g., instructions referencing tools that don't exist)?
@@ -636,6 +720,13 @@ async def test_prompt_includes_stored_hypothesis_metadata() -> None:
     assert "  - Iteration: 4" in captured_prompt
 
 
+def test_journal_guidance_requests_trace_parsing_notes() -> None:
+    assert "Record trace-analysis tactics" in JOURNAL_TOOLS_INSTRUCTIONS
+    assert "`traces/traces.jsonl`" in JOURNAL_TOOLS_INSTRUCTIONS
+    assert "`find_lines` queries" in JOURNAL_TOOLS_INSTRUCTIONS
+    assert "`read_line_batch` reducers" in JOURNAL_TOOLS_INSTRUCTIONS
+
+
 @pytest.mark.asyncio
 async def test_llm_generator_skips_entire_call_when_no_records() -> None:
     candidate = _make_candidate()
@@ -749,7 +840,7 @@ Each trace contains:
 1 traces available from the execution: 1 succeeded, 0 failed.
 The traces are stored on disk as `traces/traces.jsonl`.
 You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts to parse these structured files.
-You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.
+You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures. The proposal step has a shared limit of 5 spawned sub-agents, including recursive child spawns.
 
 **IMPORTANT: Prompt Caching & State Management**
 Your python REPL is stateful. Variables assigned in one script will persist to the next.
@@ -757,9 +848,45 @@ To leverage LLM prompt caching efficiently, you should build up state in your Py
 If your context window becomes bloated, use the `clear_message_history` tool. This wipes your message history to free up tokens, but your Python REPL variables remain intact!
 Only use `clear_message_history` sparingly when absolutely necessary to avoid breaking the prompt cache.
 
+### `run_python_repl` environment
+- The REPL is `pydantic-monty`, a sandboxed Python subset, not CPython. It is persistent across calls within one reflection agent run, so variables and helper functions stay bound.
+- Each call has a 10-second execution budget, plus memory and recursion limits. A timed-out call does not make the REPL unusable; preserve useful intermediate state in variables.
+- Return values come from the final expression. `print(...)` writes to stdout and returns `None`, so end scripts with a bare value such as `summary`, `rows[:5]`, or `{"failures": failures}`.
+- Supported syntax includes assignments, `if`/`else`, `for`/`while`, `def`, `lambda`, `try`/`except`, `raise`, comprehensions, and f-strings.
+- Unsupported syntax includes `with` statements, `class` definitions, `match`, and `yield`. Do not use context managers, generators, or custom classes.
+- Unsupported runtime/builtins include `globals()`, `locals()`, `eval()`, `exec()`, and `__import__()`.
+- Imports are limited to a small standard-library subset such as `json`, `re`, `datetime`, `typing`, `sys`, and partial `os`. Third-party packages and most stdlib modules are unavailable. Prefer the pre-bound helpers below instead of filesystem imports or `os.getcwd()`.
+- Pre-bound helpers: `read_file`, `file_info`, `file_size`, `line_count`, `read_lines`, `read_line_batch`, `tail_lines`, `find_lines`, `list_dir`, `json_loads`, plus `Path` and `json`.
+
+### Trace file navigation
+- `traces/traces.jsonl` can be large. Avoid `read_file('traces/traces.jsonl')` unless you already know it is small; returning the whole trace file can overflow the reflection model context.
+- Start with `file_info('traces/traces.jsonl')` to understand size and line count.
+- Use `find_lines('traces/traces.jsonl', query, limit=20)` for targeted search and `tail_lines(..., limit=20)` for recent spans or exceptions.
+- Use `read_lines(path, start=n, limit=10)` for a small window around a known line number.
+- For full-file scans, write one reducer-style script around `read_line_batch(path, offset=0, limit=1000)`. Advance with `offset = batch['next_offset']`, stop when `batch['eof']`, and return only compact aggregates.
+
+Canonical full-scan pattern:
+```python
+offset = 0
+failures = 0
+examples = []
+while True:
+    batch = read_line_batch('traces/traces.jsonl', offset=offset, limit=1000)
+    for line in batch['lines']:
+        row = json_loads(line)
+        if not row.get('success'):
+            failures = failures + 1
+            if len(examples) < 5:
+                examples.append(row.get('feedback'))
+    if batch['eof']:
+        break
+    offset = batch['next_offset']
+{'failures': failures, 'examples': examples}
+```
+
 
 ### Analysis guidance
-- Use `run_python_repl` to aggregate errors or find common failure modes across `traces.jsonl`.
+- Use `run_python_repl` with `read_line_batch` to aggregate errors or find common failure modes across `traces.jsonl` without returning full traces.
 - Use `spawn_agent` to understand *why* a specific trace failed if the python analysis is insufficient.
 - What failure patterns repeat across runs?
 - Are components misaligned (e.g., instructions referencing tools that don't exist)?
@@ -1059,7 +1186,7 @@ Each trace contains:
 2 traces available from the execution: 2 succeeded, 0 failed.
 The traces are stored on disk as `traces/traces.jsonl`.
 You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts to parse these structured files.
-You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.
+You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures. The proposal step has a shared limit of 5 spawned sub-agents, including recursive child spawns.
 
 **IMPORTANT: Prompt Caching & State Management**
 Your python REPL is stateful. Variables assigned in one script will persist to the next.
@@ -1067,9 +1194,45 @@ To leverage LLM prompt caching efficiently, you should build up state in your Py
 If your context window becomes bloated, use the `clear_message_history` tool. This wipes your message history to free up tokens, but your Python REPL variables remain intact!
 Only use `clear_message_history` sparingly when absolutely necessary to avoid breaking the prompt cache.
 
+### `run_python_repl` environment
+- The REPL is `pydantic-monty`, a sandboxed Python subset, not CPython. It is persistent across calls within one reflection agent run, so variables and helper functions stay bound.
+- Each call has a 10-second execution budget, plus memory and recursion limits. A timed-out call does not make the REPL unusable; preserve useful intermediate state in variables.
+- Return values come from the final expression. `print(...)` writes to stdout and returns `None`, so end scripts with a bare value such as `summary`, `rows[:5]`, or `{"failures": failures}`.
+- Supported syntax includes assignments, `if`/`else`, `for`/`while`, `def`, `lambda`, `try`/`except`, `raise`, comprehensions, and f-strings.
+- Unsupported syntax includes `with` statements, `class` definitions, `match`, and `yield`. Do not use context managers, generators, or custom classes.
+- Unsupported runtime/builtins include `globals()`, `locals()`, `eval()`, `exec()`, and `__import__()`.
+- Imports are limited to a small standard-library subset such as `json`, `re`, `datetime`, `typing`, `sys`, and partial `os`. Third-party packages and most stdlib modules are unavailable. Prefer the pre-bound helpers below instead of filesystem imports or `os.getcwd()`.
+- Pre-bound helpers: `read_file`, `file_info`, `file_size`, `line_count`, `read_lines`, `read_line_batch`, `tail_lines`, `find_lines`, `list_dir`, `json_loads`, plus `Path` and `json`.
+
+### Trace file navigation
+- `traces/traces.jsonl` can be large. Avoid `read_file('traces/traces.jsonl')` unless you already know it is small; returning the whole trace file can overflow the reflection model context.
+- Start with `file_info('traces/traces.jsonl')` to understand size and line count.
+- Use `find_lines('traces/traces.jsonl', query, limit=20)` for targeted search and `tail_lines(..., limit=20)` for recent spans or exceptions.
+- Use `read_lines(path, start=n, limit=10)` for a small window around a known line number.
+- For full-file scans, write one reducer-style script around `read_line_batch(path, offset=0, limit=1000)`. Advance with `offset = batch['next_offset']`, stop when `batch['eof']`, and return only compact aggregates.
+
+Canonical full-scan pattern:
+```python
+offset = 0
+failures = 0
+examples = []
+while True:
+    batch = read_line_batch('traces/traces.jsonl', offset=offset, limit=1000)
+    for line in batch['lines']:
+        row = json_loads(line)
+        if not row.get('success'):
+            failures = failures + 1
+            if len(examples) < 5:
+                examples.append(row.get('feedback'))
+    if batch['eof']:
+        break
+    offset = batch['next_offset']
+{'failures': failures, 'examples': examples}
+```
+
 
 ### Analysis guidance
-- Use `run_python_repl` to aggregate errors or find common failure modes across `traces.jsonl`.
+- Use `run_python_repl` with `read_line_batch` to aggregate errors or find common failure modes across `traces.jsonl` without returning full traces.
 - Use `spawn_agent` to understand *why* a specific trace failed if the python analysis is insufficient.
 - What failure patterns repeat across runs?
 - Are components misaligned (e.g., instructions referencing tools that don't exist)?

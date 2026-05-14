@@ -23,6 +23,7 @@ def test_side_info_in_reflective_dataset():
     )
 
     from pydantic_ai_gepa.adapter import SharedReflectiveDataset
+
     assert isinstance(dataset, SharedReflectiveDataset)
     records = dataset.records
     assert len(records) == 1

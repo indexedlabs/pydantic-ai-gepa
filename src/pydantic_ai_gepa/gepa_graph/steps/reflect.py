@@ -14,6 +14,7 @@ from pydantic_ai import FunctionToolset
 from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.models import KnownModelName, Model
 from pydantic_ai.settings import ModelSettings
+from pydantic_ai.toolsets import AbstractToolset
 
 from ...adapter import (
     ComponentReflectiveDataset,
@@ -40,6 +41,7 @@ from ...skills.models import (
     SkillSummary,
 )
 from ...skills.search import LocalSkillsSearchProvider
+from ...types import DEFAULT_MAX_SPAWNED_AGENTS
 from .continue_step import IterationAction
 
 _IMPROVEMENT_EPSILON = 1e-9
@@ -114,7 +116,15 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
 
     reflection_model = _resolve_model(deps)
     components_to_update: Sequence[str] | None
-    component_toolsets: list[FunctionToolset] | None = []
+    # The reflector's tool catalog is built here: journal tools (when a
+    # journal is configured), trace tools (always), the component-selection
+    # toolset (when the reflection selector is in use), and finally any
+    # ``ReflectionConfig.additional_toolsets`` the caller supplied. The
+    # local type is intentionally widened to ``AbstractToolset`` so callers
+    # can pass arbitrary toolsets — including bare ``FunctionToolset``
+    # instances built via ``@toolset.tool_plain`` and external
+    # ``AbstractToolset`` subclasses — without violating the type.
+    component_toolsets: list[AbstractToolset[None]] = []
 
     if state.config.reflection_config and state.config.reflection_config.journal_file:
         from ..proposal.journal_tools import create_journal_toolset
@@ -125,15 +135,28 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
 
     from pathlib import Path
     import json
-    components_file = Path(f".gepa_cache/runs/{state.run_id}/candidates/{parent_idx}/components.json")
+
+    components_file = Path(
+        f".gepa_cache/runs/{state.run_id}/candidates/{parent_idx}/components.json"
+    )
     components_file.parent.mkdir(parents=True, exist_ok=True)
     with open(components_file, "w", encoding="utf-8") as f:
         json.dump({k: v.text for k, v in parent.components.items()}, f, indent=2)
 
     from ..proposal.trace_tools import create_trace_toolset
 
+    max_spawned_agents = (
+        state.config.reflection_config.max_spawned_agents
+        if state.config.reflection_config
+        else DEFAULT_MAX_SPAWNED_AGENTS
+    )
     component_toolsets.append(
-        create_trace_toolset(state.run_id, parent_idx, reflection_model)
+        create_trace_toolset(
+            state.run_id,
+            parent_idx,
+            reflection_model,
+            max_spawned_agents=max_spawned_agents,
+        )
     )
 
     if state.config.component_selector == "reflection":
@@ -157,6 +180,9 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
             selection = await selection
         components_to_update = list(selection)
         components_for_dataset = components_to_update
+
+    if state.config.reflection_config:
+        component_toolsets.extend(state.config.reflection_config.additional_toolsets)
 
     logfire.debug(
         "ReflectStep selected components",
@@ -423,7 +449,7 @@ def _build_component_selection_toolset(
     def _candidate() -> CandidateProgram:
         return state.candidates[parent_idx]
 
-    @toolset.tool
+    @toolset.tool_plain
     def list_components(prefix: str | None = None) -> list[str]:
         """List available component names (optionally filtered by substring)."""
         names = sorted(_candidate().components.keys())
@@ -432,7 +458,7 @@ def _build_component_selection_toolset(
             names = [name for name in names if needle in name.casefold()]
         return names
 
-    @toolset.tool
+    @toolset.tool_plain
     def search_components(query: str, top_k: int = 12) -> list[str]:
         """Search component names by simple token matching."""
         if top_k <= 0:
@@ -449,7 +475,7 @@ def _build_component_selection_toolset(
         scored.sort(key=lambda item: (-item[0], item[1]))
         return [name for _, name in scored[:top_k]]
 
-    @toolset.tool
+    @toolset.tool_plain
     def load_component(component_name: str) -> str:
         """Load the current text value of a component."""
         candidate = _candidate()
@@ -489,7 +515,7 @@ def _build_component_selection_toolset(
             f"Unknown skill_path={skill_path!r}.{hint} Use list_skills() to see valid skill paths."
         )
 
-    @toolset.tool
+    @toolset.tool_plain
     def list_skills() -> list[SkillSummary]:
         """List available skills with their name and description."""
         candidate = _candidate()
@@ -512,7 +538,7 @@ def _build_component_selection_toolset(
                 )
             return sorted(items, key=lambda s: s.skill_path)
 
-    @toolset.tool
+    @toolset.tool_plain
     async def search_skills(query: str, top_k: int = 8) -> list[SkillSearchResult]:
         """Search the enabled skills to find potentially relevant skills."""
         candidate = _candidate()
@@ -524,7 +550,7 @@ def _build_component_selection_toolset(
                 candidate=candidate.components,
             )
 
-    @toolset.tool
+    @toolset.tool_plain
     def load_skill(skill_path: str) -> SkillLoadResult:
         """Load the full SKILL.md for a skill."""
         candidate = _candidate()
@@ -538,7 +564,7 @@ def _build_component_selection_toolset(
             content_hash=_hash_text(content),
         )
 
-    @toolset.tool
+    @toolset.tool_plain
     def load_skill_file(skill_path: str, path: str) -> SkillFileResult:
         """Load a file within a skill directory."""
         candidate = _candidate()
@@ -564,7 +590,7 @@ def _build_component_selection_toolset(
             content_hash=_hash_text(content),
         )
 
-    @toolset.tool
+    @toolset.tool_plain
     def activate_skill_components(
         skill_path: str, include_examples: bool = False
     ) -> list[str]:
@@ -607,7 +633,7 @@ def _build_component_selection_toolset(
 
         return sorted(set(activated))
 
-    @toolset.tool
+    @toolset.tool_plain
     def create_skill(skill_path: str, description: str, body: str) -> list[str]:
         """Create a new skill from scratch and make its components available to edit. Use this to abstract reusable strategies."""
         try:
@@ -643,7 +669,7 @@ def _build_component_selection_toolset(
 
         return sorted(set(activated))
 
-    @toolset.tool
+    @toolset.tool_plain
     def activate_skill(skill_path: str, include_examples: bool = False) -> list[str]:
         """Deprecated alias for activate_skill_components."""
         logfire.warn(
@@ -653,7 +679,7 @@ def _build_component_selection_toolset(
         )
         return activate_skill_components(skill_path, include_examples=include_examples)  # type: ignore
 
-    @toolset.tool
+    @toolset.tool_plain
     def list_active_skills() -> list[str]:
         """List skill paths that have been activated so far."""
         return sorted(state.active_skill_paths)
@@ -735,7 +761,7 @@ async def _propose_new_texts(
     components: Sequence[str] | None,
     model: Model | KnownModelName | str,
     model_settings: ModelSettings | None = None,
-    component_toolsets: Sequence[FunctionToolset] | None = None,
+    component_toolsets: Sequence[AbstractToolset[None]] | None = None,
 ) -> ProposalResult:
     proposal = deps.proposal_generator
     kwargs: dict[str, Any] = dict(

@@ -100,6 +100,7 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         optimize_tools: bool = False,
         optimize_output_type: bool = False,
         base_encoder_script: str | None = None,
+        omit_binary_content: bool = False,
     ):
         """Initialize the SignatureAgent wrapper.
 
@@ -112,6 +113,11 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
             optimize_output_type: If True, expose and optimize output tool descriptions and schemas derived
                 from the agent's output_type via GEPA.
             base_encoder_script: Optional base script to encode input values.
+            omit_binary_content: If True, multimodal attachment fields on the input model are rendered
+                as metadata-only placeholders (index, media_type, byte_count, ...) and are NOT auto-attached
+                as multimodal user-message parts. The agent must use a tool that reads from ``deps`` (e.g. a
+                ``view_attachment`` tool) to actually look at the bytes. Useful when blindly handing the model
+                large binaries is wasteful.
         """
         bound_spec = build_input_spec(
             input_type, base_encoder_script=base_encoder_script
@@ -135,6 +141,7 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         self._default_output_type = inferred_output_type
         self._optimize_tools = optimize_tools
         self._optimize_output_type = optimize_output_type
+        self._omit_binary_content = omit_binary_content
 
         self._tool_optimizer: ToolOptimizationManager | None = None
         existing_optimizer = get_tool_optimizer(wrapped)
@@ -226,7 +233,11 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         Returns:
             The user content without system instructions.
         """
-        return input_spec.generate_user_content(input_instance, candidate=candidate)
+        return input_spec.generate_user_content(
+            input_instance,
+            candidate=candidate,
+            omit_binary_content=self._omit_binary_content,
+        )
 
     def _prepare_system_instructions(
         self,
@@ -251,20 +262,29 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
 
     def _compose_instructions_override(
         self,
-        base_instructions: Instructions[AgentDepsT] | None,
+        literal_base: str | None,
+        instruction_functions: Sequence[Any],
         system_instructions: str | None,
     ) -> Instructions[AgentDepsT] | None:
-        """Combine candidate/base instructions with signature instructions."""
-        if system_instructions:
-            if base_instructions:
-                if isinstance(base_instructions, Sequence) and not isinstance(
-                    base_instructions, str
-                ):
-                    return (*base_instructions, system_instructions)
-                return (base_instructions, system_instructions)
-            return system_instructions
+        """Compose the override that ``agent.run(instructions=...)`` receives.
 
-        return base_instructions
+        Order matters: literal (candidate or seed) first, then the agent's
+        dynamic ``@agent.instructions`` callbacks, then the signature-derived
+        ``system_instructions``. pydantic-ai's ``_get_instructions`` will split
+        strings vs callables so each function executes on every run.
+        """
+        parts: list[Any] = []
+        if literal_base:
+            parts.append(literal_base)
+        parts.extend(instruction_functions)
+        if system_instructions:
+            parts.append(system_instructions)
+
+        if not parts:
+            return None
+        if len(parts) == 1:
+            return parts[0]
+        return tuple(parts)
 
     def _prepare_run_arguments(
         self,
@@ -293,18 +313,68 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
             input_instance, input_spec, candidate
         )
 
+        literal_base, instruction_functions = self._resolve_base_instructions_split()
         if candidate and "instructions" in candidate:
-            base_instructions = candidate["instructions"]
-        else:
-            base_instructions = self._resolve_base_instructions()
+            # GEPA mutates the literal text; drop the original literal and use
+            # the candidate's optimized version. Function-based instructions
+            # registered via `@agent.instructions` stay attached so dynamic
+            # context (e.g. per-case metadata) still reaches the model.
+            literal_base = candidate["instructions"]
 
         instructions_override = self._compose_instructions_override(
-            base_instructions, system_instructions
+            literal_base,
+            instruction_functions,
+            system_instructions,
         )
         return run_user_prompt, instructions_override
 
     def _resolve_base_instructions(self) -> Instructions[AgentDepsT] | None:
-        """Find the effective base instructions, unwrapping nested agents if needed."""
+        """Return the effective base instructions for the wrapped agent.
+
+        Preserved for callers that want the raw, unsplit instructions list.
+        New code should use ``_resolve_base_instructions_split`` so dynamic
+        callables can be re-attached at rollout time instead of stringified
+        into the prompt.
+        """
+        literal, functions = self._resolve_base_instructions_split()
+        if not functions:
+            return literal
+        if literal is None:
+            return tuple(functions)
+        return (literal, *functions)
+
+    def _resolve_base_instructions_split(
+        self,
+    ) -> tuple[str | None, list[Any]]:
+        """Split base instructions into a literal string and a list of callables.
+
+        Walks any wrapper agents and respects an active override. Strings are
+        joined with newlines; non-string entries are returned as-is so the
+        caller can re-attach them when composing the run-time override.
+        """
+
+        def _split_value(
+            value: Any,
+        ) -> tuple[str | None, list[Any]] | None:
+            if value is None:
+                return None
+            items: list[Any]
+            if isinstance(value, str):
+                return value, []
+            if isinstance(value, Sequence):
+                items = list(value)
+            else:
+                items = [value]
+            literal_parts: list[str] = []
+            functions: list[Any] = []
+            for item in items:
+                if isinstance(item, str):
+                    literal_parts.append(item)
+                else:
+                    functions.append(item)
+            literal = "\n".join(literal_parts) if literal_parts else None
+            return literal, functions
+
         agent: AbstractAgent[Any, Any] | WrapperAgent[Any, Any] = self.wrapped
 
         while True:
@@ -312,17 +382,21 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
             if override_mgr is not None:
                 inst = override_mgr.get()
                 if inst is not None and inst.value is not None:
-                    return inst.value
+                    split = _split_value(inst.value)
+                    if split is not None:
+                        return split
 
             direct_instructions = getattr(agent, "_instructions", None)
             if direct_instructions is not None:
-                return direct_instructions
+                split = _split_value(direct_instructions)
+                if split is not None:
+                    return split
 
             if isinstance(agent, WrapperAgent):
                 agent = agent.wrapped
                 continue
 
-            return None
+            return None, []
 
     @staticmethod
     def _normalize_user_prompt(

@@ -1,4 +1,4 @@
-"""Helpers for exposing the mcp-run-python sandbox as a PydanticAI tool."""
+"""Helpers for exposing a sandboxed Python execution tool to PydanticAI agents."""
 
 from __future__ import annotations
 
@@ -6,12 +6,11 @@ import json
 import time
 from typing import Literal, TypeAlias, TYPE_CHECKING
 
+import pydantic_monty
 from pydantic import BaseModel, Field
 from pydantic_ai import Tool
 
 from typing_extensions import TypeAliasType
-
-import ouros
 
 if TYPE_CHECKING:
     JsonValue: TypeAlias = (
@@ -79,36 +78,29 @@ async def _run_python_in_sandbox(
     *,
     inputs: dict[str, JsonValue] | None = None,
 ) -> SandboxExecutionResult:
-    """Execute arbitrary Python inside the ouros sandbox.
+    """Execute arbitrary Python inside a pydantic-monty sandbox.
 
     Args:
         code: Complete Python script to run. Include all required imports and print the final answer.
         inputs: Optional JSON-compatible mapping that will be injected as global variables when the script starts.
     """
     started = time.perf_counter()
+    output_lines_buffer: list[str] = []
+
+    def _print_callback(fd: Literal["stdout"], text: str) -> None:
+        output_lines_buffer.append(text)
 
     try:
-        sandbox = ouros.Sandbox(code)
-        output_lines_buffer = []
-
-        def _print_callback(fd: Literal["stdout"], text: str) -> None:
-            output_lines_buffer.append(text)
-
-        result = await ouros.run_async(
-            sandbox,
-            inputs=inputs if inputs else None,
+        monty = pydantic_monty.Monty(code)
+        return_value = await pydantic_monty.run_monty_async(
+            monty,
+            inputs=dict(inputs) if inputs else None,
             print_callback=_print_callback,
-            limits=ouros.ResourceLimits(  # type: ignore
-                timeout_ms=10000,
-                memory_bytes=500_000_000,
-                instruction_count=100_000_000,
+            limits=pydantic_monty.ResourceLimits(
+                max_duration_secs=10.0,
+                max_memory=500_000_000,
             ),
         )
-        sandbox_result = {
-            "status": "success",
-            "return_value": result,
-            "output": "".join(output_lines_buffer).splitlines(),
-        }
     except Exception as exc:  # pragma: no cover - surfaced to the model instead
         elapsed = time.perf_counter() - started
         return SandboxExecutionResult(
@@ -122,15 +114,12 @@ async def _run_python_in_sandbox(
         )
 
     elapsed = time.perf_counter() - started
-    output_lines: list[str] = sandbox_result.get("output", [])
-    answer_text, answer_source = _summarize_answer(
-        sandbox_result.get("return_value"),
-        output_lines,
-    )
+    output_lines = "".join(output_lines_buffer).splitlines()
+    answer_text, answer_source = _summarize_answer(return_value, output_lines)
 
     return SandboxExecutionResult(
         status="success",
-        return_value=sandbox_result.get("return_value"),
+        return_value=return_value,
         error=None,
         output_lines=output_lines,
         answer_text=answer_text,
@@ -143,8 +132,8 @@ run_python_tool = Tool(
     _run_python_in_sandbox,
     name="run_python",
     description=(
-        "Execute Python code inside an isolated sandbox using only the Python standard library. "
-        "Provide fully self-contained scripts that print their final answer."
+        "Execute Python code inside an isolated pydantic-monty sandbox using a practical Python subset. "
+        "Provide fully self-contained scripts that print their final answer or end with a bare expression."
     ),
 )
 

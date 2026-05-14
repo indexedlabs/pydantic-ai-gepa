@@ -202,8 +202,9 @@ async def optimize_agent(
         skills_capabilities: Optional set of capabilities for skills tools (e.g. {SkillCapability.READ}).
             By default, GEPA restricts to READ capabilities to avoid untrusted script execution.
 
-        reflection_config: Configuration for the reflection agent (model, include_case_metadata,
-            include_expected_output, example_bank). When None, reflection runs with default settings.
+        reflection_config: Configuration for the reflection agent (model, trace
+            context, example bank, sub-agent budget, and request limit). When
+            None, reflection runs with default settings.
         candidate_selection_strategy: Strategy for selecting candidates ('pareto' or 'current_best').
         skip_perfect_score: Whether to skip updating if perfect score achieved on minibatch.
         reflection_minibatch_size: Number of examples to use for reflection in each proposal.

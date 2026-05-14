@@ -20,7 +20,7 @@ class OptimizableModel(WrapperModel):
     """Wraps an agent's model to capture request parameters for GEPA optimization.
 
     This captures the final `ModelRequestParameters` and `ModelSettings` (which include
-    resolved tools and runtime configurations) and dynamically attaches them to the 
+    resolved tools and runtime configurations) and dynamically attaches them to the
     corresponding `ModelRequest` message in the history.
     """
 

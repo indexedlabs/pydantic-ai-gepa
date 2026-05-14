@@ -388,7 +388,7 @@ uv run pre-commit run --all-files
 
 ## Experimental
 
-This library is experimental and depends on pydantic-ai PR #2926 (not yet merged). Expect API changes.
+This library is experimental and currently depends on pydantic-ai PR #5143 until those changes are released. Expect API changes.
 
 ## Contributing
 

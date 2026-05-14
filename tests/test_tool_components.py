@@ -7,7 +7,7 @@ from typing import Any, cast
 import pytest
 
 from pydantic_ai.agent import AbstractAgent
-from pydantic_ai.builtin_tools import WebSearchTool
+from pydantic_ai.native_tools import WebSearchTool
 from pydantic_ai.tools import ToolDefinition
 
 from pydantic_ai_gepa.tool_components import (
@@ -80,15 +80,15 @@ def test_apply_candidate_updates_tool_definition() -> None:
     assert params["style"]["description"] == "Formatting instructions to apply."
 
 
-def test_record_model_request_tracks_builtin_tools() -> None:
+def test_record_model_request_tracks_native_tools() -> None:
     manager = ToolOptimizationManager(cast(AbstractAgent[Any, Any], _DummyAgent()))
-    builtin = WebSearchTool()
+    native = WebSearchTool()
 
     manager.record_model_request(
-        function_tools=[_make_tool_definition()], builtin_tools=[builtin]
+        function_tools=[_make_tool_definition()], native_tools=[native]
     )
 
-    latest = manager.latest_builtin_tools()
+    latest = manager.latest_native_tools()
     assert len(latest) == 1
     assert latest[0].kind == "web_search"
 

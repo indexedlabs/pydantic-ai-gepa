@@ -309,6 +309,7 @@ def test_create_cached_metric():
         output = RolloutOutput.from_success("Result")
 
         from typing import cast
+
         # First call should invoke the metric
         result = cast(MetricResult, cached_metric(case, output))
         assert result.score == 0.8

@@ -43,7 +43,7 @@ from pydantic_ai_gepa.gepa_graph.selectors import (
     AllComponentSelector,
     RoundRobinComponentSelector,
 )
-from pydantic_ai_gepa.types import RolloutOutput, Trajectory
+from pydantic_ai_gepa.types import ReflectionConfig, RolloutOutput, Trajectory
 
 
 def _make_data(case_id: str) -> Case[str, str, dict[str, str]]:
@@ -363,6 +363,50 @@ async def test_reflect_step_applies_config_sampler() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reflect_step_passes_subagent_limit_to_trace_toolset(monkeypatch) -> None:
+    from pydantic_ai import FunctionToolset
+
+    captured_limits: list[int] = []
+
+    def fake_create_trace_toolset(
+        run_id, candidate_idx, reflection_model, *, max_spawned_agents
+    ):
+        captured_limits.append(max_spawned_agents)
+        return FunctionToolset()
+
+    monkeypatch.setattr(
+        "pydantic_ai_gepa.gepa_graph.proposal.trace_tools.create_trace_toolset",
+        fake_create_trace_toolset,
+    )
+
+    config = GepaConfig(
+        max_evaluations=100,
+        minibatch_size=2,
+        merges_per_accept=1,
+        perfect_score=1.0,
+        skip_perfect_score=True,
+        reflection_config=ReflectionConfig(max_spawned_agents=2),
+    )
+    state = _make_state(config=config)
+    minibatch = await _training_examples(state)
+    evaluator = _StubEvaluator([_eval_results([0.4, 0.5]), _eval_results([0.6, 0.7])])
+    batch_sampler = _StubBatchSampler(minibatch)
+    adapter = cast(Adapter[str, str, dict[str, str]], _StubAdapter())
+    generator = _StubProposalGenerator({"instructions": "Improved text"})
+    deps = _make_deps(
+        adapter=adapter,
+        evaluator=evaluator,
+        batch_sampler=batch_sampler,
+        proposal_generator=generator,
+    )
+    ctx = _ctx(state, deps)
+
+    await reflect_step(ctx)
+
+    assert captured_limits == [2]
+
+
+@pytest.mark.asyncio
 async def test_reflect_step_rejects_when_not_improved() -> None:
     state = _make_state()
     minibatch = await _training_examples(state)
@@ -544,3 +588,62 @@ async def test_reflect_step_preserves_shared_dataset_with_all_selector() -> None
     assert isinstance(generator.last_reflective_data, SharedReflectiveDataset)
     assert generator.calls == 1
     assert shared_adapter.dataset_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_reflect_step_forwards_reflection_config_additional_toolsets() -> None:
+    """`ReflectionConfig.additional_toolsets` should be appended to the
+    reflector's `component_toolsets` so callers can attach domain-specific
+    helpers (e.g. cheaper LLM probes) without forking the library."""
+
+    from pydantic_ai import FunctionToolset
+
+    from pydantic_ai_gepa.types import ReflectionConfig
+
+    extra_toolset: FunctionToolset[None] = FunctionToolset()
+
+    @extra_toolset.tool_plain
+    def custom_reflector_probe(prompt: str) -> str:
+        """A user-injected helper the reflector should see."""
+        return prompt
+
+    config = GepaConfig(
+        max_evaluations=100,
+        minibatch_size=2,
+        merges_per_accept=2,
+        perfect_score=1.0,
+        skip_perfect_score=True,
+        reflection_config=ReflectionConfig(
+            model="reflection-model",
+            additional_toolsets=[extra_toolset],
+        ),
+    )
+    state = _make_state(config=config)
+    minibatch = await _training_examples(state)
+    evaluator = _StubEvaluator([_eval_results([0.4, 0.5]), _eval_results([0.6, 0.7])])
+    batch_sampler = _StubBatchSampler(minibatch)
+    stub_adapter = _StubAdapter()
+    adapter = cast(Adapter[str, str, dict[str, str]], stub_adapter)
+
+    captured_toolsets: list[Any] = []
+
+    class _ToolsetCapturingProposalGenerator(_StubProposalGenerator):
+        async def propose_texts(self, **kwargs):
+            captured_toolsets.append(kwargs.get("component_toolsets"))
+            return await super().propose_texts(**kwargs)
+
+    generator = _ToolsetCapturingProposalGenerator({"instructions": "Improved"})
+    deps = _make_deps(
+        adapter=adapter,
+        evaluator=evaluator,
+        batch_sampler=batch_sampler,
+        proposal_generator=generator,
+    )
+    ctx = _ctx(state, deps)
+
+    await reflect_step(ctx)
+
+    assert captured_toolsets, "propose_texts was not invoked"
+    seen = captured_toolsets[-1]
+    assert seen is not None, "component_toolsets should be non-empty"
+    assert extra_toolset in seen, "additional_toolsets entry must reach proposer"

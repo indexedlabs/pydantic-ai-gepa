@@ -103,7 +103,10 @@ class GepaConfig(BaseModel):
     )
     reflection_config: ReflectionConfig | None = Field(
         default=None,
-        description="Configuration for the reflection agent (model, include_case_metadata, include_expected_output).",
+        description=(
+            "Configuration for the reflection agent (model, trace context, "
+            "example bank, sub-agent budget, and request limit)."
+        ),
     )
     reflection_sampler: ReflectionSampler | None = Field(
         default=None,

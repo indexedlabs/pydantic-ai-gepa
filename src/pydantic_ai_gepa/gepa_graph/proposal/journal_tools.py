@@ -8,7 +8,7 @@ def create_journal_toolset(journal_file: str) -> FunctionToolset[None]:
     toolset = FunctionToolset()
     journal_path = Path(journal_file)
 
-    @toolset.tool
+    @toolset.tool_plain
     def read_journal_entries() -> str:
         """Read past insights and strategies recorded during previous optimization runs."""
         if not journal_path.exists():
@@ -18,7 +18,7 @@ def create_journal_toolset(journal_file: str) -> FunctionToolset[None]:
         except Exception as e:
             return f"Failed to read journal: {e}"
 
-    @toolset.tool
+    @toolset.tool_plain
     def append_journal_entry(insight: str, strategy: str) -> str:
         """Record a newly discovered insight or strategy to the durable journal so it can be used in future optimization runs.
 

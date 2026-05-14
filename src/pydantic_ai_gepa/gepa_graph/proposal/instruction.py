@@ -27,9 +27,11 @@ from ...adapter import (
     ReflectiveDataset,
     SharedReflectiveDataset,
 )
+from ...types import DEFAULT_MAX_SPAWNED_AGENTS, DEFAULT_REFLECTION_REQUEST_LIMIT
 from ..example_bank import InMemoryExampleBank
 from ..models import CandidateProgram, ComponentValue
 from .example_bank_tools import create_example_bank_tools
+from .trace_tools import MONTY_REPL_PROMPT_GUIDANCE
 
 DEFAULT_AGENT_INSTRUCTIONS = """Your mission is to discover instruction formats that measurably improve the student agent's performance.
 
@@ -198,6 +200,7 @@ You have access to a persistent journal via the `read_journal_entries` and `appe
 1. **Always read first:** If the journal tools are available, you should use `read_journal_entries` to see what past iterations have learned before you make any decisions.
 2. **Incorporate insights:** Use the past strategies to inform your new proposals (e.g. avoid repeating known mistakes, apply discovered rules).
 3. **Record new discoveries:** If you identify a concrete, reusable strategy or edge-case insight from analyzing the current evaluation traces, you MUST use `append_journal_entry` to log it for future iterations before finalizing your proposal.
+4. **Record trace-analysis tactics:** If you discover an efficient way to parse, filter, or aggregate `traces/traces.jsonl` for this task, record it too. Include the exact helper pattern or query that worked (for example, `find_lines` queries, `read_line_batch` reducers, key JSON fields, or compact aggregation shapes) so the next reflection step can start from that tactic instead of rediscovering it.
 """
 
 
@@ -298,6 +301,8 @@ class InstructionProposalGenerator:
         *,
         include_hypothesis_metadata: bool = False,
         additional_instructions: str | None = None,
+        max_spawned_agents: int = DEFAULT_MAX_SPAWNED_AGENTS,
+        request_limit: int = DEFAULT_REFLECTION_REQUEST_LIMIT,
     ) -> None:
         self._agent = Agent(
             instructions=instructions or DEFAULT_AGENT_INSTRUCTIONS,
@@ -305,6 +310,8 @@ class InstructionProposalGenerator:
         )
         self._include_hypothesis_metadata = include_hypothesis_metadata
         self._additional_instructions = additional_instructions
+        self._max_spawned_agents = max(0, int(max_spawned_agents))
+        self._request_limit = max(0, int(request_limit))
 
     async def propose_texts(
         self,
@@ -394,7 +401,9 @@ class InstructionProposalGenerator:
             while True:
                 loop_count += 1
                 if loop_count > 20:
-                    raise RuntimeError("Agent exceeded maximum clear_message_history loops (20).")
+                    raise RuntimeError(
+                        "Agent exceeded maximum clear_message_history loops (20)."
+                    )
                 try:
                     result = await self._agent.run(
                         current_prompt,
@@ -402,14 +411,16 @@ class InstructionProposalGenerator:
                         model_settings=model_settings,
                         toolsets=toolsets if toolsets else None,
                         instructions=runtime_instructions,
-                        usage_limits=UsageLimits(request_limit=15),
+                        usage_limits=UsageLimits(request_limit=self._request_limit),
                     )
                     break
                 except ClearMessageHistoryException as e:
-                    current_prompt = self._join_user_content([
-                        f"History cleared. You previously left yourself this note to continue:\n\n{e.next_context}\n\n",
-                        "Your Python REPL state is intact."
-                    ])
+                    current_prompt = self._join_user_content(
+                        [
+                            f"History cleared. You previously left yourself this note to continue:\n\n{e.next_context}\n\n",
+                            "Your Python REPL state is intact.",
+                        ]
+                    )
 
         except InspectionAborted:
             raise
@@ -735,13 +746,15 @@ class InstructionProposalGenerator:
                 f"{total_records} traces available from the execution: {success_records} succeeded, {failed_records} failed.",
                 "The traces are stored on disk as `traces/traces.jsonl`.",
                 "You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts to parse these structured files.",
-                "You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures.",
+                f"You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures. The proposal step has a shared limit of {self._max_spawned_agents} spawned sub-agents, including recursive child spawns.",
                 "",
                 "**IMPORTANT: Prompt Caching & State Management**",
                 "Your python REPL is stateful. Variables assigned in one script will persist to the next.",
                 "To leverage LLM prompt caching efficiently, you should build up state in your Python REPL rather than returning huge strings (like full traces) to your context window.",
                 "If your context window becomes bloated, use the `clear_message_history` tool. This wipes your message history to free up tokens, but your Python REPL variables remain intact!",
                 "Only use `clear_message_history` sparingly when absolutely necessary to avoid breaking the prompt cache.",
+                "",
+                MONTY_REPL_PROMPT_GUIDANCE,
                 "",
             ]
         )
@@ -750,7 +763,7 @@ class InstructionProposalGenerator:
             [
                 "",
                 "### Analysis guidance",
-                "- Use `run_python_repl` to aggregate errors or find common failure modes across `traces.jsonl`.",
+                "- Use `run_python_repl` with `read_line_batch` to aggregate errors or find common failure modes across `traces.jsonl` without returning full traces.",
                 "- Use `spawn_agent` to understand *why* a specific trace failed if the python analysis is insufficient.",
                 "- What failure patterns repeat across runs?",
                 "- Are components misaligned (e.g., instructions referencing tools that don't exist)?",

@@ -21,14 +21,14 @@ from pydantic_ai.agent import AgentRunResult
 from pydantic_ai.messages import (
     AudioUrl,
     BinaryContent,
-    BuiltinToolCallPart,
-    BuiltinToolReturnPart,
     DocumentUrl,
     FilePart,
     ImageUrl,
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    NativeToolCallPart,
+    NativeToolReturnPart,
     RetryPromptPart,
     SystemPromptPart,
     TextPart,
@@ -253,7 +253,7 @@ def _serialize_user_prompt_content(content: str | Sequence[UserContent]) -> str:
 
 
 def _serialize_tool_return(
-    part: ToolReturnPart | BuiltinToolReturnPart,
+    part: ToolReturnPart | NativeToolReturnPart,
 ) -> dict[str, Any]:
     content_str = _truncate_text(part.model_response_str())
     serialized = {
@@ -308,7 +308,7 @@ def _serialize_request_part(part: Any) -> dict[str, Any]:
                 "timestamp": _timestamp_iso(part.timestamp),
             }
         )
-    if isinstance(part, (ToolReturnPart, BuiltinToolReturnPart)):
+    if isinstance(part, (ToolReturnPart, NativeToolReturnPart)):
         return _serialize_tool_return(part)
     if isinstance(part, RetryPromptPart):
         return _serialize_retry_part(part)
@@ -339,7 +339,7 @@ def _serialize_response_part(part: Any) -> dict[str, Any]:
                 "provider_name": part.provider_name,
             }
         )
-    if isinstance(part, (ToolCallPart, BuiltinToolCallPart)):
+    if isinstance(part, (ToolCallPart, NativeToolCallPart)):
         serialized = {
             "type": "tool_call",
             "role": "assistant",
@@ -352,7 +352,7 @@ def _serialize_response_part(part: Any) -> dict[str, Any]:
         if provider_name:
             serialized["provider_name"] = provider_name
         return _compact_dict(serialized)
-    if isinstance(part, BuiltinToolReturnPart):
+    if isinstance(part, NativeToolReturnPart):
         return _serialize_tool_return(part)
     if isinstance(part, FilePart):
         return _compact_dict(
@@ -1004,7 +1004,7 @@ class _BaseAgentAdapter(
                     example_bank=example_bank,
                 )
                 messages = run_result.new_messages()
-            run_usage = run_result.usage()
+            run_usage = run_result.usage
             await self._record_gepa_usage(run_usage)
         except InspectionAborted:
             raise
@@ -1115,7 +1115,7 @@ class _BaseAgentAdapter(
                 usage_kwargs=usage_kwargs,
                 example_bank=example_bank,
             )
-            run_usage = result.usage()
+            run_usage = result.usage
             await self._record_gepa_usage(run_usage)
             return RolloutOutput.from_success(result.output, usage=run_usage)
         except InspectionAborted:
@@ -1299,16 +1299,17 @@ class AgentAdapter(
                 "AgentAdapter expects Case.inputs to be a string prompt for prompt-based agents"
             )
         toolsets = self._build_toolsets(candidate, example_bank)
-        
+
         run_kwargs = dict(usage_kwargs)
         model = run_kwargs.pop("model", None) or self.agent.model
         if model is not None:
             from pydantic_ai_gepa.models import OptimizableModel
+
             if type(model).__name__ != "OptimizableModel":
                 run_kwargs["model"] = OptimizableModel(model)  # type: ignore
         elif "model" in run_kwargs:
             run_kwargs["model"] = model
-            
+
         return await self.agent.run(
             prompt,
             message_history=message_history,
@@ -1395,16 +1396,17 @@ class SignatureAgentAdapter(
         inputs = self._validate_inputs(case.inputs)
         candidate_text = candidate_texts(candidate)
         toolsets = self._build_toolsets(candidate, example_bank)
-        
+
         run_kwargs = dict(usage_kwargs)
         model = run_kwargs.pop("model", None) or self._signature_agent.wrapped.model
         if model is not None:
             from pydantic_ai_gepa.models import OptimizableModel
+
             if type(model).__name__ != "OptimizableModel":
                 run_kwargs["model"] = OptimizableModel(model)  # type: ignore
         elif "model" in run_kwargs:
             run_kwargs["model"] = model
-            
+
         return await self._signature_agent.run_signature(
             inputs,
             message_history=message_history,
