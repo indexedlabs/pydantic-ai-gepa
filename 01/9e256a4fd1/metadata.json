@@ -1,0 +1,24 @@
+{
+  "checkpoint_id": "019e256a4fd1",
+  "created_at": "2026-05-14T07:36:24.890929+00:00",
+  "branch_name": "mh/external-reflection-cli",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "03492f1e26641f80b7a1b7159921a3bff5225fb7"
+  ],
+  "entity_touches": [
+    ".mighty/loro/edges/019e2564-8a74-7a92-b10e-703832283c9d.loro",
+    ".mighty/loro/edges/019e256a-4e35-7e10-8f18-4dc5b5e5d1dd.loro",
+    ".mighty/loro/edges/019e256a-4e78-7a33-a29c-674117dca8b7.loro",
+    ".mighty/loro/edges/019e256a-4eb5-7c53-a532-72fcda043858.loro",
+    ".mighty/loro/edges/019e256a-4ef0-7520-9389-93f0be5047f4.loro",
+    ".mighty/loro/edges/019e256a-4f2e-7ff3-80b8-b22adb4fc030.loro",
+    ".mighty/loro/edges/019e256a-4f69-78c0-915b-e071bfb9706f.loro",
+    ".mighty/loro/records/019e2564-8a4f-7411-b92e-b454793cff30.loro",
+    ".mighty/loro/records/019e256a-4e37-7511-a0e6-16c7308dc651.loro",
+    ".mighty/loro/records/019e256a-4e78-7a33-a29c-675b423a18e8.loro",
+    ".mighty/loro/records/019e256a-4eb5-7c53-a532-730f7811b0b9.loro",
+    ".mighty/loro/records/019e256a-4ef0-7520-9389-9403f3d81531.loro",
+    ".mighty/loro/records/019e256a-4f2e-7ff3-80b8-b236319abab1.loro"
+  ]
+}
