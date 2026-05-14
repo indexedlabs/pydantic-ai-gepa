@@ -1,0 +1,18 @@
+{"name": "case-01", "inputs": "My order #A-1042 hasn't arrived yet, where is it?", "expected_output": "lookup_order"}
+{"name": "case-02", "inputs": "I forgot my password and can't sign in. Reset it for me — me@example.com.", "expected_output": "send_reset_link"}
+{"name": "case-03", "inputs": "Track package, tracking number 1Z999AA10123456784 please.", "expected_output": "check_shipment_status"}
+{"name": "case-04", "inputs": "I want to file a complaint about a rude support agent.", "expected_output": "escalate_to_human"}
+{"name": "case-05", "inputs": "Please open a ticket: my product arrived damaged.", "expected_output": "open_ticket"}
+{"name": "case-06", "inputs": "Where's my package 1Z111AA22001122334?", "expected_output": "check_shipment_status"}
+{"name": "case-07", "inputs": "Cannot log in, send a password reset to user42@example.org.", "expected_output": "send_reset_link"}
+{"name": "case-08", "inputs": "Order B-77 status?", "expected_output": "lookup_order"}
+{"name": "case-09", "inputs": "I am threatening to take legal action over this — escalate now.", "expected_output": "escalate_to_human"}
+{"name": "case-10", "inputs": "Battery on item B-203 is defective, please open a support ticket.", "expected_output": "open_ticket"}
+{"name": "case-11", "inputs": "Can someone tell me where order #B-2030 currently is?", "expected_output": "lookup_order"}
+{"name": "case-12", "inputs": "Reset link please, sarah@workmail.com.", "expected_output": "send_reset_link"}
+{"name": "case-13", "inputs": "Speak to a supervisor immediately; this is unacceptable.", "expected_output": "escalate_to_human"}
+{"name": "case-14", "inputs": "Tracking 9405511899560123456789 hasn't moved in 5 days.", "expected_output": "check_shipment_status"}
+{"name": "case-15", "inputs": "I'd like to report a billing error: open a ticket for it.", "expected_output": "open_ticket"}
+{"name": "case-16", "inputs": "My account got locked — send a reset link to lock@out.com.", "expected_output": "send_reset_link"}
+{"name": "case-17", "inputs": "Manager. Now. I'm done dealing with this.", "expected_output": "escalate_to_human"}
+{"name": "case-18", "inputs": "Looking for order C-99 ETA.", "expected_output": "lookup_order"}

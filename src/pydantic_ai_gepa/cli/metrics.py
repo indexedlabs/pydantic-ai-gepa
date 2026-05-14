@@ -19,13 +19,21 @@ from typing import Any
 
 from pydantic_evals import Case
 
-from ..types import MetricResult
+from ..types import MetricResult, RolloutOutput
+
+
+def _unwrap_output(output: Any) -> Any:
+    """Return the underlying value for a `RolloutOutput` wrapper, else the value as-is."""
+    if isinstance(output, RolloutOutput):
+        return output.result
+    return output
 
 
 async def default_substring_metric(
     case: Case[Any, Any, Any], output: Any
 ) -> MetricResult:
     expected = case.expected_output
+    output = _unwrap_output(output)
     if expected is None:
         return MetricResult(
             score=1.0, feedback="No expected_output set; presence-only check."
