@@ -10,8 +10,10 @@ You are the reflection model. The `gepa` CLI is a small toolkit that handles min
 ## Setup (run once)
 
 ```bash
-gepa init --agent mypkg.agents:my_agent
+gepa init --agent mypkg.agents:my_agent --install-skill
 ```
+
+`--install-skill` drops a copy of this skill into `<repo>/.agents/skills/gepa-optimize/SKILL.md` so coding agents discover it automatically when running in the repo. Omit the flag if you only want `.gepa/` scaffolded (e.g. when the skill is already installed in a parent repo or you're managing skills out-of-band).
 
 Then write the dataset cases at `.gepa/dataset.jsonl` — one JSON object per line:
 

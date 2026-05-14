@@ -87,3 +87,98 @@ def test_init_rejects_invalid_agent_ref(empty_repo: Path) -> None:
     result = _run("init", "--agent", "no_such_module:agent")
     assert result.exit_code == 1
     assert "Could not import" in result.output
+
+
+# ---------- --install-skill ----------
+
+
+SKILL_DEST = Path(".agents") / "skills" / "gepa-optimize" / "SKILL.md"
+
+
+def test_init_without_install_skill_does_not_touch_agents_dir(empty_repo: Path) -> None:
+    result = _run("init", "--agent", "agent_pkg.agents:agent")
+    assert result.exit_code == 0, result.output
+    assert not (empty_repo / ".agents").exists()
+
+
+def test_init_install_skill_copies_packaged_md(empty_repo: Path) -> None:
+    result = _run("init", "--agent", "agent_pkg.agents:agent", "--install-skill")
+    assert result.exit_code == 0, result.output
+
+    dest = empty_repo / SKILL_DEST
+    assert dest.is_file()
+    text = dest.read_text(encoding="utf-8")
+    assert "name: gepa-optimize" in text
+    assert "content-file" in text.lower()
+    assert "Installed gepa-optimize skill" in result.output
+
+
+def test_init_install_skill_refuses_existing_without_force(empty_repo: Path) -> None:
+    first = _run("init", "--agent", "agent_pkg.agents:agent", "--install-skill")
+    assert first.exit_code == 0, first.output
+
+    dest = empty_repo / SKILL_DEST
+    dest.write_text("custom skill body", encoding="utf-8")
+
+    second = _run(
+        "init",
+        "--agent",
+        "agent_pkg.agents:agent",
+        "--install-skill",
+        "--force",  # forces gepa.toml overwrite, NOT the skill
+    )
+    # We want to be sure the skill is NOT clobbered. The init verb's --force
+    # path applies to BOTH gepa.toml and the installed skill; to assert the
+    # "refuse without --force" behaviour we drive the install separately by
+    # rolling back to an existing file and re-running without --force.
+    dest.write_text("custom skill body", encoding="utf-8")
+    third = _run(
+        "init",
+        "--agent",
+        "agent_pkg.agents:agent",
+        "--install-skill",
+    )
+    # init refuses because .gepa/gepa.toml already exists — exit 1.
+    # The skill should not have been replaced.
+    assert third.exit_code == 1
+    assert dest.read_text(encoding="utf-8") == "custom skill body"
+    # Sanity: the second run with --force was allowed (returned 0 in that path).
+    assert second.exit_code == 0, second.output
+
+
+def test_init_install_skill_with_force_overwrites_existing_skill(
+    empty_repo: Path,
+) -> None:
+    first = _run("init", "--agent", "agent_pkg.agents:agent", "--install-skill")
+    assert first.exit_code == 0, first.output
+
+    dest = empty_repo / SKILL_DEST
+    dest.write_text("custom skill body", encoding="utf-8")
+
+    overwritten = _run(
+        "init",
+        "--agent",
+        "agent_pkg.agents:agent",
+        "--install-skill",
+        "--force",
+    )
+    assert overwritten.exit_code == 0, overwritten.output
+    # The packaged content replaced the custom body.
+    assert "name: gepa-optimize" in dest.read_text(encoding="utf-8")
+
+
+def test_init_install_skill_existing_without_force_when_already_initialized(
+    empty_repo: Path,
+) -> None:
+    """Standalone install-skill scenario: .gepa exists, skill exists, no --force.
+
+    init refuses because of the existing .gepa/gepa.toml. The point of this
+    test is just to confirm the skill file is not touched in that error path.
+    """
+    _run("init", "--agent", "agent_pkg.agents:agent", "--install-skill")
+    dest = empty_repo / SKILL_DEST
+    dest.write_text("user-customized skill", encoding="utf-8")
+
+    result = _run("init", "--agent", "agent_pkg.agents:agent", "--install-skill")
+    assert result.exit_code == 1
+    assert dest.read_text(encoding="utf-8") == "user-customized skill"

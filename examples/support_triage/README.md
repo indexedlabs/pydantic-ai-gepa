@@ -19,7 +19,9 @@ per-case report; you read the report and edit slots or source code.
 
 cd <repo root>
 
-gepa init --agent examples.support_triage.agent:agent --dataset examples/support_triage/dataset.jsonl --force
+# --install-skill drops the gepa-optimize SKILL.md into .agents/skills/gepa-optimize/
+# so Claude Code / Codex pick it up automatically.
+gepa init --agent examples.support_triage.agent:agent --dataset examples/support_triage/dataset.jsonl --install-skill --force
 ```
 
 `gepa init` introspects the agent and pre-seeds `.gepa/components/` with the
