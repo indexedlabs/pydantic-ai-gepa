@@ -21,7 +21,13 @@ cd <repo root>
 
 # --install-skill drops the gepa-optimize SKILL.md into .agents/skills/gepa-optimize/
 # so Claude Code / Codex pick it up automatically.
-gepa init --agent examples.support_triage.agent:agent --dataset examples/support_triage/dataset.jsonl --install-skill --force
+# --metric writes the routing-accuracy metric ref into gepa.toml.
+gepa init \
+  --agent examples.support_triage.agent:agent \
+  --dataset examples/support_triage/dataset.jsonl \
+  --metric examples.support_triage.metric:routed_to_expected_tool \
+  --install-skill \
+  --force
 ```
 
 `gepa init` introspects the agent and pre-seeds `.gepa/components/` with the
@@ -41,21 +47,6 @@ gepa components list
 #   tool:send_reset_link:param:email
 #   tool:check_shipment_status:description
 #   tool:check_shipment_status:param:tracking_number
-```
-
-## Wire up the custom metric
-
-The default substring metric won't score routing correctly. We have a metric
-that checks whether the agent routed to the expected tool — register it as a
-**top-level** `metric =` line in `.gepa/gepa.toml` (NOT inside `[defaults]`):
-
-```toml
-agent = "examples.support_triage.agent:agent"
-dataset = "examples/support_triage/dataset.jsonl"
-metric = "examples.support_triage.metric:routed_to_expected_tool"
-
-[defaults]
-# minibatch_size = 10
 ```
 
 ## Run the loop

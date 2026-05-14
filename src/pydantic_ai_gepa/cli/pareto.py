@@ -57,12 +57,12 @@ def pareto(
         "json", "--format", help="json | tsv", show_default=True
     ),
     front: bool = typer.Option(
-        True,
+        False,
         "--front/--all",
-        help="--front (default) shows current Pareto front; --all shows full history.",
+        help="--all (default) shows full chronological history; --front shows only Pareto-dominant rows (useful with multi-objective scoring; mostly degenerate with a single-objective mean).",
     ),
 ) -> None:
-    """Show the Pareto front or full history for a run."""
+    """Show the eval history for a run (default) or just the Pareto front (`--front`)."""
     try:
         active_run = _resolve_run_id(run_id)
     except typer.Exit:

@@ -138,6 +138,25 @@ def eval_(
                 typer.echo(f"  gepa components confirm {slot}", err=True)
             raise typer.Exit(code=2)
 
+        # Warn (don't fail) on orphan slots — files in .gepa/components/ that
+        # no longer correspond to an introspected slot. These are skipped by
+        # `effective_candidate`, but worth surfacing so the agent notices.
+        introspected_names = set(store.effective_candidate(agent))
+        orphans = sorted(
+            slot
+            for slot in store.list_confirmed_slots()
+            if slot not in introspected_names
+        )
+        if orphans:
+            typer.echo("Orphan slot files (no longer on the agent):", err=True)
+            for slot in orphans:
+                typer.echo(f"  {store.confirmed_path(slot)}", err=True)
+            typer.echo(
+                "These files are ignored during eval. Delete them with "
+                "`rm` or re-init with --force to remove the cruft.",
+                err=True,
+            )
+
         baseline_components = store.effective_candidate(agent)
         candidate = Candidate(
             id=candidate_id_from_components(baseline_components),

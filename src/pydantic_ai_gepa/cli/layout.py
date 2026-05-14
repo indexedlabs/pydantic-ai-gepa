@@ -236,22 +236,28 @@ def write_default_config(
     agent: str,
     dataset: str = DEFAULT_DATASET_PATH,
     *,
+    metric: str | None = None,
     root: Path | None = None,
     force: bool = False,
 ) -> Path:
-    """Write a minimal `.gepa/gepa.toml`. Returns the path written."""
+    """Write a minimal `.gepa/gepa.toml`. Returns the path written.
+
+    ``metric`` is written as a top-level key when provided. Anything that
+    might evolve into a defaults block lives outside this function — keeping
+    the bootstrap template small avoids documenting features that are not yet
+    wired into the CLI.
+    """
     path = config_path(root)
     if path.exists() and not force:
         raise GepaConfigError(f"{path} already exists. Pass --force to overwrite.")
     path.parent.mkdir(parents=True, exist_ok=True)
-    contents = (
-        f'agent = "{agent}"\n'
-        f'dataset = "{dataset}"\n'
-        f"\n[defaults]\n"
-        f"# Override CLI knob defaults here, e.g.:\n"
-        f"# minibatch_size = 10\n"
-        f"# max_iterations = 100\n"
-    )
+    lines = [
+        f'agent = "{agent}"',
+        f'dataset = "{dataset}"',
+    ]
+    if metric:
+        lines.append(f'metric = "{metric}"')
+    contents = "\n".join(lines) + "\n"
     path.write_text(contents, encoding="utf-8")
     return path
 

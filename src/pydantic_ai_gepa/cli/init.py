@@ -59,6 +59,11 @@ def init(
         "--dataset",
         help="Relative path to the dataset JSONL.",
     ),
+    metric: str | None = typer.Option(
+        None,
+        "--metric",
+        help='Optional metric module ref written to gepa.toml as `metric = "..."`, e.g. "mypkg.metrics:my_metric". When omitted, gepa falls back to a substring/equality scorer.',
+    ),
     install_skill: bool = typer.Option(
         False,
         "--install-skill",
@@ -67,32 +72,35 @@ def init(
     force: bool = typer.Option(
         False,
         "--force",
-        help="Overwrite an existing .gepa/gepa.toml (and an existing installed skill, when used with --install-skill).",
+        help="Overwrite an existing .gepa/gepa.toml AND re-seed all component slot files from agent introspection AND overwrite an installed skill (when used with --install-skill).",
     ),
 ) -> None:
     """Bootstrap .gepa/ in the current repo: write gepa.toml + seed components."""
     insert_repo_root_on_path()
 
-    # Sanity-check the agent ref before persisting config.
+    # Sanity-check the agent ref (and metric ref, if provided) before persisting config.
     try:
         agent_obj = resolve_module_attr(agent, kind="agent")
+        if metric:
+            resolve_module_attr(metric, kind="metric")
     except GepaConfigError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
 
     ensure_layout()
     try:
-        cfg_path = write_default_config(agent, dataset, force=force)
+        cfg_path = write_default_config(agent, dataset, metric=metric, force=force)
     except GepaConfigError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
 
-    # Seed components/ with the introspected slot values. These are *confirmed*
-    # at init time — init is the explicit bootstrap moment.
+    # Seed components/ with the introspected slot values. With --force the
+    # existing slot files are re-seeded; without it, existing files win so
+    # user edits between init runs survive.
     store = ComponentStore()
     seeds = introspect_agent(agent_obj)
     for slot, text in seeds.items():
-        if store.read(slot) is None:
+        if force or store.read(slot) is None:
             store.write(slot, text)
 
     typer.echo(f"Wrote {cfg_path}")

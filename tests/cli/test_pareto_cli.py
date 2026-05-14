@@ -48,7 +48,8 @@ def _run(*argv: str) -> object:
     return CliRunner().invoke(gepa_app, list(argv))
 
 
-def test_pareto_default_format_is_front_json(repo: Path) -> None:
+def test_pareto_default_is_full_history(repo: Path) -> None:
+    """Default is `--all` — full chronological history, not just the front."""
     run = new_run_id()
     _seed_pareto(
         repo,
@@ -61,11 +62,10 @@ def test_pareto_default_format_is_front_json(repo: Path) -> None:
     result = _run("pareto", "--run-id", run)
     assert result.exit_code == 0, result.output
     rows = json.loads(result.output)
-    assert isinstance(rows, list)
-    assert {row["candidate_id"] for row in rows} == {"dominator"}
+    assert {row["candidate_id"] for row in rows} == {"dominated", "dominator"}
 
 
-def test_pareto_all_includes_history(repo: Path) -> None:
+def test_pareto_front_keeps_only_dominators(repo: Path) -> None:
     run = new_run_id()
     _seed_pareto(
         repo,
@@ -75,10 +75,10 @@ def test_pareto_all_includes_history(repo: Path) -> None:
             _make_row("dominator", {"a": 0.5, "b": 0.7}),
         ],
     )
-    result = _run("pareto", "--run-id", run, "--all")
+    result = _run("pareto", "--run-id", run, "--front")
     assert result.exit_code == 0, result.output
     rows = json.loads(result.output)
-    assert {row["candidate_id"] for row in rows} == {"dominated", "dominator"}
+    assert {row["candidate_id"] for row in rows} == {"dominator"}
 
 
 def test_pareto_tsv_format(repo: Path) -> None:
@@ -114,7 +114,7 @@ def test_pareto_picks_latest_run_when_no_run_id(repo: Path) -> None:
     _seed_pareto(repo, older, [_make_row("old", {"a": 0.5})])
     _seed_pareto(repo, newer, [_make_row("new", {"a": 0.6})])
 
-    result = _run("pareto", "--all")
+    result = _run("pareto")  # default is now --all
     assert result.exit_code == 0, result.output
     ids = {row["candidate_id"] for row in json.loads(result.output)}
     assert "new" in ids
