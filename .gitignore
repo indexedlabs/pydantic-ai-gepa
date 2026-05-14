@@ -207,6 +207,8 @@ marimo/_lsp/
 __marimo__/
 
 .gepa_cache
+.gepa/
+.agents/skills/gepa-optimize/
 .env
 optimization_results
 history
