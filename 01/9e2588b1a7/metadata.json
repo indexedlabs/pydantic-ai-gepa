@@ -1,0 +1,16 @@
+{
+  "checkpoint_id": "019e2588b1a7",
+  "created_at": "2026-05-14T08:09:35.982476+00:00",
+  "branch_name": "mh/external-reflection-cli",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "8ab7b70f3c578ed7d29528b5b7803ae5474f6e95"
+  ],
+  "entity_touches": [
+    ".mighty/loro/edges/019e2585-e221-7ea0-bf1c-3ccef96669fa.loro",
+    ".mighty/loro/edges/019e2588-b0a1-7f81-ba98-bea2b9996d66.loro",
+    ".mighty/loro/edges/019e2588-b0e1-77a1-8566-dd4ebf0c9cad.loro",
+    ".mighty/loro/edges/019e2588-b116-7510-ab2a-2af79b8a5b0b.loro",
+    ".mighty/loro/records/019e2585-e202-7773-bd50-dde7b2bb5801.loro"
+  ]
+}
