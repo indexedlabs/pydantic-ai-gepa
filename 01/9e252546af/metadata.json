@@ -1,0 +1,20 @@
+{
+  "checkpoint_id": "019e252546af",
+  "created_at": "2026-05-14T06:21:00.570023+00:00",
+  "branch_name": "main",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "e054a5cab49ec9431b3230cb23e3cd719cc0757d"
+  ],
+  "entity_touches": [
+    ".mighty/loro/edges/019e2525-0be3-7be0-8b85-a93fc229e4ba.loro",
+    ".mighty/loro/edges/019e2525-24a5-7020-a941-adc00f2f93a2.loro",
+    ".mighty/loro/edges/019e2525-451d-73c1-8786-f481e0f92553.loro",
+    ".mighty/loro/records/019c7706-c107-7711-8636-72330bacda5d.loro",
+    ".mighty/loro/records/019e2523-0607-73f2-898b-886fc81bc70f.loro",
+    ".mighty/loro/records/019e2525-0bc3-7010-9d34-a9b2707a9ab3.loro",
+    ".mighty/loro/records/019e2525-247e-7aa3-a79c-4225e77339a3.loro",
+    ".mighty/loro/records/019e2525-4501-7340-abd5-edc1a8a8adde.loro",
+    ".mighty/loro/spaces/019e2510-071f-7e70-ba4a-2d90b33bead0.loro"
+  ]
+}
