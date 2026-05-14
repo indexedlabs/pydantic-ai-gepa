@@ -39,6 +39,7 @@ dev = [
     "pyright>=1.1.405",
     "time-machine>=2.19.0",
     "ruff>=0.6.9",
+    "pydantic-ai-slim[temporal]>=1.96.0",
 ]
 
 [tool.inline-snapshot]

@@ -116,6 +116,7 @@ async def optimize(
     except UsageBudgetExceeded:
         state.mark_stopped(reason="Usage budget exceeded")
         import logfire
+
         logfire.info(
             "GEPA run stopped early due to usage budget limit",
             best_score=state.best_score,

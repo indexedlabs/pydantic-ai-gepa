@@ -1299,16 +1299,17 @@ class AgentAdapter(
                 "AgentAdapter expects Case.inputs to be a string prompt for prompt-based agents"
             )
         toolsets = self._build_toolsets(candidate, example_bank)
-        
+
         run_kwargs = dict(usage_kwargs)
         model = run_kwargs.pop("model", None) or self.agent.model
         if model is not None:
             from pydantic_ai_gepa.models import OptimizableModel
+
             if type(model).__name__ != "OptimizableModel":
                 run_kwargs["model"] = OptimizableModel(model)  # type: ignore
         elif "model" in run_kwargs:
             run_kwargs["model"] = model
-            
+
         return await self.agent.run(
             prompt,
             message_history=message_history,
@@ -1395,16 +1396,17 @@ class SignatureAgentAdapter(
         inputs = self._validate_inputs(case.inputs)
         candidate_text = candidate_texts(candidate)
         toolsets = self._build_toolsets(candidate, example_bank)
-        
+
         run_kwargs = dict(usage_kwargs)
         model = run_kwargs.pop("model", None) or self._signature_agent.wrapped.model
         if model is not None:
             from pydantic_ai_gepa.models import OptimizableModel
+
             if type(model).__name__ != "OptimizableModel":
                 run_kwargs["model"] = OptimizableModel(model)  # type: ignore
         elif "model" in run_kwargs:
             run_kwargs["model"] = model
-            
+
         return await self._signature_agent.run_signature(
             inputs,
             message_history=message_history,

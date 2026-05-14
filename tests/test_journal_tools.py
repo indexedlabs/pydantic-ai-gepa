@@ -12,7 +12,8 @@ def test_journal_tools(tmp_path: Path):
 
     # Test appending an entry
     result = toolset.tools["append_journal_entry"].function(
-        insight="The API is rate limited", strategy="Add exponential backoff"  # type: ignore
+        insight="The API is rate limited",
+        strategy="Add exponential backoff",  # type: ignore
     )
     assert "Successfully" in result
 
