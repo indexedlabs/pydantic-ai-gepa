@@ -30,7 +30,9 @@ Then write the dataset cases at `.gepa/dataset.jsonl` — one JSON object per li
 {"name": "case-1", "inputs": "...", "expected_output": "...", "metadata": {}}
 ```
 
-`gepa init` introspects the agent, writes `.gepa/gepa.toml`, and pre-seeds `.gepa/components/<slot>.md` from each slot's docstring / declared description. Slot names look like `instructions`, `tool:foo:description`, `tool:foo:param:query`, etc. — on disk colons become `__`.
+`gepa init` introspects the agent, writes `.gepa/gepa.toml`, and pre-seeds `.gepa/components/<slot>.md` from each slot's docstring / declared description.
+
+**Slot names use colons** — you type them with colons everywhere: `instructions`, `tool:foo:description`, `tool:foo:param:query`, etc. The CLI handles disk encoding for you (the on-disk filename uses `__` instead of `:`, but you never have to type that — `gepa components set tool:foo:description --content-file ...` and `gepa components show tool:foo:description` both Just Work).
 
 `gepa` auto-loads `.env` from the repo root, so `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / etc. are picked up automatically. Pass `--no-dotenv` to skip.
 
@@ -156,6 +158,17 @@ Look at the per-case `feedback` field in the report:
 | Prompt instructions ambiguous | Improve `instructions` |
 
 **The library can't fix code-shape bugs by editing text**. When the gap is structural, edit Python source.
+
+## Exit codes
+
+| Code | Meaning | Where |
+|---|---|---|
+| 0 | Success | All verbs |
+| 1 | Recoverable error (missing file, invalid agent ref, dataset empty, orphan slots on `apply`) | All verbs |
+| 2 | Refusal — input wrong shape OR baseline blocked by stage-and-confirm | `gepa eval` (unconfirmed slots), every verb on argparse errors |
+| 70 | Hard cap — `--max-iterations` exceeded | `gepa eval` |
+
+When you see exit 2 from `gepa eval`, the stderr block tells you exactly which `gepa components confirm <slot>` calls to make.
 
 ## Inspection
 

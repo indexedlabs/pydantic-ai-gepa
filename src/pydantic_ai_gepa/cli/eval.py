@@ -91,15 +91,37 @@ def eval_(
         "--candidate-file",
         help="Path to a candidate JSON file. Omit to evaluate the current confirmed baseline in `.gepa/components/`.",
     ),
-    minibatch_id: str | None = typer.Option(None, "--minibatch-id"),
-    size: int = typer.Option(10, "--size"),
-    seed: int = typer.Option(0, "--seed"),
-    epoch: int = typer.Option(0, "--epoch"),
-    run_id: str | None = typer.Option(None, "--run-id"),
+    minibatch_id: str | None = typer.Option(
+        None,
+        "--minibatch-id",
+        help="Re-use an existing minibatch (e.g. from a previous eval summary) for a clean A/B against a slot edit.",
+    ),
+    size: int = typer.Option(
+        10, "--size", help="Number of cases to sample when a new minibatch is drawn."
+    ),
+    seed: int = typer.Option(
+        0,
+        "--seed",
+        help="Deterministic minibatch sampling seed. Same (seed, epoch) reproduces the same minibatch_id.",
+    ),
+    epoch: int = typer.Option(
+        0,
+        "--epoch",
+        help="Bumps the minibatch identity without changing the seeding regime — use it to draw a fresh independent sample with the same seed.",
+    ),
+    run_id: str | None = typer.Option(
+        None,
+        "--run-id",
+        help="Append to a specific run. Omit to use the latest existing run, or start a new one if none exists.",
+    ),
     output_file: Path | None = typer.Option(
         None, "--output-file", help="Write JSONL results to a file (or - for stdout)."
     ),
-    concurrency: int = typer.Option(5, "--concurrency"),
+    concurrency: int = typer.Option(
+        5,
+        "--concurrency",
+        help="Max parallel agent calls during evaluation.",
+    ),
     max_iterations: int = typer.Option(
         100,
         "--max-iterations",

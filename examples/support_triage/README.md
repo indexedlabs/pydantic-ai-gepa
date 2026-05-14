@@ -56,7 +56,7 @@ gepa components list
 # failures — expect mean_score well below 1.0.
 gepa eval --size 6 --seed 0 --max-iterations 50
 
-# The summary line at the bottom of stdout points at the report:
+# The last JSON line on stdout is the summary — it has the report_path:
 #   "report_path": ".gepa/runs/<run_id>/reports/<candidate_id>.md"
 cat .gepa/runs/<run_id>/reports/<candidate_id>.md
 
@@ -69,7 +69,7 @@ EOF
 gepa components set tool:lookup_order:description --content-file /tmp/lookup_desc.md
 
 # Re-eval the new baseline against the same minibatch for a clean A/B.
-# The minibatch_id is in the previous summary line.
+# The minibatch_id is in the previous summary's last JSON line.
 gepa eval --minibatch-id <id> --run-id <run_id>
 
 # When you've got a baseline you like, commit it.
