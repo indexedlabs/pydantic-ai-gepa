@@ -19,9 +19,9 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "cloudpickle>=3.0.0",
-    "pydantic-ai-slim[openai,anthropic,logfire,retries] @ git+https://github.com/pydantic/pydantic-ai@56263905def8b1d384628cc1434ad758db5e5de0#subdirectory=pydantic_ai_slim",
-    "pydantic-graph @ git+https://github.com/pydantic/pydantic-ai@56263905def8b1d384628cc1434ad758db5e5de0#subdirectory=pydantic_graph",
-    "pydantic-evals @ git+https://github.com/pydantic/pydantic-ai@56263905def8b1d384628cc1434ad758db5e5de0#subdirectory=pydantic_evals",
+    "pydantic-ai-slim[openai,anthropic,logfire,retries]>=1.96.0",
+    "pydantic-graph>=1.96.0",
+    "pydantic-evals>=1.96.0",
     "rich>=13.7.1",
     "logfire>=4.14.2",
     "PyYAML>=6.0.0",

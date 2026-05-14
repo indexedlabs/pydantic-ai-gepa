@@ -11,12 +11,12 @@ from typing import Any, Iterable, Iterator, Mapping, cast
 from pydantic_ai import RunContext
 from pydantic_ai.agent import AbstractAgent
 from pydantic_ai.agent.wrapper import WrapperAgent
-from pydantic_ai.builtin_tools import AbstractBuiltinTool
 from pydantic_ai.capabilities import (
     CombinedCapability,
     PrepareOutputTools,
     PrepareTools,
 )
+from pydantic_ai.native_tools import AbstractNativeTool
 from pydantic_ai.tools import ToolDefinition
 
 from .gepa_graph.models import CandidateMap, ComponentValue, candidate_texts
@@ -229,7 +229,7 @@ class ToolOptimizationManager:
             contextvars.ContextVar("gepa_tool_candidate", default=None)
         )
         self._catalog = ToolComponentCatalog()
-        self._latest_builtin_tools: list[AbstractBuiltinTool] = []
+        self._latest_native_tools: list[AbstractNativeTool] = []
         # When None, all tools are optimized. When a set, only those tools are optimized.
         self._allowed_tools: set[str] | None = allowed_tools
 
@@ -267,17 +267,17 @@ class ToolOptimizationManager:
         self,
         *,
         function_tools: Iterable[ToolDefinition] | None = None,
-        builtin_tools: Iterable[AbstractBuiltinTool] | None = None,
+        native_tools: Iterable[AbstractNativeTool] | None = None,
     ) -> None:
         """Update internal state from a completed ModelRequest."""
         if function_tools:
             self._catalog.ingest(function_tools)
-        if builtin_tools:
-            self._latest_builtin_tools = list(builtin_tools)
+        if native_tools:
+            self._latest_native_tools = list(native_tools)
 
-    def latest_builtin_tools(self) -> list[AbstractBuiltinTool]:
-        """Return the most recent builtin tools observed."""
-        return list(self._latest_builtin_tools)
+    def latest_native_tools(self) -> list[AbstractNativeTool]:
+        """Return the most recent native tools observed."""
+        return list(self._latest_native_tools)
 
     @contextmanager
     def candidate_context(
