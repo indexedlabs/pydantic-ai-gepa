@@ -161,9 +161,12 @@ def test_set_rejects_inline_content_flag(repo: Path) -> None:
         "--content",
         "inline text",
     )
-    # Typer reports unknown option with exit code 2.
+    # Typer reports unknown option / unexpected argument with exit code 2.
+    # The exact wrapped error text varies with terminal width; the durable
+    # contract is exit code 2 + no mutation to the slot.
     assert result.exit_code == 2
-    assert "--content" in (result.output + result.output)
+    store = ComponentStore(repo)
+    assert store.read("instructions") is None
 
 
 def test_confirm_promotes_staged(repo: Path, tmp_path: Path) -> None:
