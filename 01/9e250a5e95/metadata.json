@@ -1,0 +1,13 @@
+{
+  "checkpoint_id": "019e250a5e95",
+  "created_at": "2026-05-14T05:51:37.191590+00:00",
+  "branch_name": "mh/preserve-instruction-functions",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "8ad520e6819b1efc1e540030c0f3f967154d4473"
+  ],
+  "entity_touches": [
+    ".mighty/loro/records/019e2506-3ee7-7460-b8c2-66c573d6ff35.loro",
+    ".mighty/loro/spaces/019e2502-0aa3-7d83-a516-6f2c659148b2.loro"
+  ]
+}
