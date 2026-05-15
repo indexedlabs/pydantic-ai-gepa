@@ -278,3 +278,88 @@ def test_init_install_skill_existing_without_force_when_already_initialized(
     result = _run("init", "--agent", "agent_pkg.agents:agent", "--install-skill")
     assert result.exit_code == 1
     assert dest.read_text(encoding="utf-8") == "user-customized skill"
+
+
+# ---------- --gepa-dir / multi-workspace ----------
+
+
+@pytest.fixture(autouse=True)
+def _reset_gepa_dirname_around_init_tests() -> Iterator[None]:
+    """Each test in this file mutates the module-level dirname via the CLI flag.
+
+    The fixture is autouse to guarantee that override state can't leak from
+    one test into another, regardless of test order or which tests pass the
+    --gepa-dir flag.
+    """
+    from pydantic_ai_gepa.cli.layout import set_gepa_dirname
+
+    set_gepa_dirname(None)
+    yield
+    set_gepa_dirname(None)
+
+
+def test_gepa_dir_flag_routes_to_custom_workspace(empty_repo: Path) -> None:
+    """`gepa --gepa-dir .gepa.alt init` writes the workspace under .gepa.alt/."""
+    result = _run(
+        "--gepa-dir",
+        ".gepa.alt",
+        "init",
+        "--agent",
+        "agent_pkg.agents:agent",
+    )
+    assert result.exit_code == 0, result.output
+
+    cfg_file = empty_repo / ".gepa.alt" / "gepa.toml"
+    assert cfg_file.is_file()
+    body = cfg_file.read_text(encoding="utf-8")
+    # Dataset default tracks the workspace dirname.
+    assert 'dataset = ".gepa.alt/dataset.jsonl"' in body
+    # Components seeded under the custom workspace, NOT the default `.gepa/`.
+    assert (empty_repo / ".gepa.alt" / "components").is_dir()
+    assert not (empty_repo / ".gepa").exists()
+    # Next-steps hint reminds the agent to repeat the flag on follow-up verbs.
+    assert "--gepa-dir .gepa.alt eval" in result.output
+
+
+def test_default_workspace_unchanged_when_flag_omitted(empty_repo: Path) -> None:
+    """Without --gepa-dir, the default `.gepa/` workspace is still used.
+
+    Pinned because the override is module-level state — this is the
+    regression test for the autouse reset fixture above.
+    """
+    result = _run("init", "--agent", "agent_pkg.agents:agent")
+    assert result.exit_code == 0, result.output
+    assert (empty_repo / ".gepa" / "gepa.toml").is_file()
+    body = (empty_repo / ".gepa" / "gepa.toml").read_text(encoding="utf-8")
+    assert 'dataset = ".gepa/dataset.jsonl"' in body
+
+
+def test_parallel_workspaces_isolated(empty_repo: Path) -> None:
+    """Two workspaces in the same repo do not collide."""
+    first = _run(
+        "--gepa-dir",
+        ".gepa.personalize",
+        "init",
+        "--agent",
+        "agent_pkg.agents:agent",
+    )
+    assert first.exit_code == 0, first.output
+
+    second = _run(
+        "--gepa-dir",
+        ".gepa.support",
+        "init",
+        "--agent",
+        "agent_pkg.agents:agent",
+    )
+    assert second.exit_code == 0, second.output
+
+    assert (empty_repo / ".gepa.personalize" / "gepa.toml").is_file()
+    assert (empty_repo / ".gepa.support" / "gepa.toml").is_file()
+    # Datasets are scoped per-workspace.
+    assert ".gepa.personalize/dataset.jsonl" in (
+        empty_repo / ".gepa.personalize" / "gepa.toml"
+    ).read_text(encoding="utf-8")
+    assert ".gepa.support/dataset.jsonl" in (
+        empty_repo / ".gepa.support" / "gepa.toml"
+    ).read_text(encoding="utf-8")

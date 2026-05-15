@@ -183,6 +183,101 @@ def test_repo_root_falls_back_to_pyproject(tmp_path: Path) -> None:
     assert repo_root(nested) == tmp_path.resolve()
 
 
+# ---------- --gepa-dir override ----------
+
+
+@pytest.fixture
+def _reset_gepa_dirname():
+    """Clear the explicit override before and after each test that touches it."""
+    from pydantic_ai_gepa.cli.layout import set_gepa_dirname
+
+    set_gepa_dirname(None)
+    yield
+    set_gepa_dirname(None)
+
+
+def test_current_gepa_dirname_default_is_dot_gepa(
+    monkeypatch: pytest.MonkeyPatch, _reset_gepa_dirname: None
+) -> None:
+    from pydantic_ai_gepa.cli.layout import current_gepa_dirname
+
+    monkeypatch.delenv("GEPA_DIR", raising=False)
+    assert current_gepa_dirname() == ".gepa"
+
+
+def test_set_gepa_dirname_overrides_default(
+    monkeypatch: pytest.MonkeyPatch, _reset_gepa_dirname: None
+) -> None:
+    from pydantic_ai_gepa.cli.layout import (
+        current_gepa_dirname,
+        gepa_dir,
+        set_gepa_dirname,
+    )
+
+    monkeypatch.delenv("GEPA_DIR", raising=False)
+    set_gepa_dirname(".gepa.personalize")
+    assert current_gepa_dirname() == ".gepa.personalize"
+    assert gepa_dir(Path("/tmp/repo")) == Path("/tmp/repo/.gepa.personalize")
+
+
+def test_env_var_falls_back_when_no_explicit_override(
+    monkeypatch: pytest.MonkeyPatch, _reset_gepa_dirname: None
+) -> None:
+    from pydantic_ai_gepa.cli.layout import current_gepa_dirname
+
+    monkeypatch.setenv("GEPA_DIR", ".gepa.from-env")
+    assert current_gepa_dirname() == ".gepa.from-env"
+
+
+def test_explicit_override_beats_env_var(
+    monkeypatch: pytest.MonkeyPatch, _reset_gepa_dirname: None
+) -> None:
+    from pydantic_ai_gepa.cli.layout import current_gepa_dirname, set_gepa_dirname
+
+    monkeypatch.setenv("GEPA_DIR", ".gepa.from-env")
+    set_gepa_dirname(".gepa.from-flag")
+    assert current_gepa_dirname() == ".gepa.from-flag"
+
+
+def test_repo_root_finds_custom_workspace_dirname(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _reset_gepa_dirname: None
+) -> None:
+    from pydantic_ai_gepa.cli.layout import set_gepa_dirname
+
+    monkeypatch.delenv("GEPA_DIR", raising=False)
+    (tmp_path / ".gepa.alt").mkdir()
+    nested = tmp_path / "a" / "b"
+    nested.mkdir(parents=True)
+    set_gepa_dirname(".gepa.alt")
+    assert repo_root(nested) == tmp_path.resolve()
+
+
+def test_default_dataset_path_follows_active_dirname(
+    monkeypatch: pytest.MonkeyPatch, _reset_gepa_dirname: None
+) -> None:
+    from pydantic_ai_gepa.cli.layout import default_dataset_path, set_gepa_dirname
+
+    monkeypatch.delenv("GEPA_DIR", raising=False)
+    assert default_dataset_path() == ".gepa/dataset.jsonl"
+    set_gepa_dirname(".gepa.personalize")
+    assert default_dataset_path() == ".gepa.personalize/dataset.jsonl"
+
+
+def test_write_default_config_uses_active_dirname(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _reset_gepa_dirname: None
+) -> None:
+    from pydantic_ai_gepa.cli.layout import set_gepa_dirname
+
+    monkeypatch.delenv("GEPA_DIR", raising=False)
+    set_gepa_dirname(".gepa.personalize")
+    path = write_default_config("pkg:agent", root=tmp_path)
+    # File lands under the custom workspace, and the dataset default
+    # reflects the active dirname rather than the literal ".gepa".
+    assert path == tmp_path / ".gepa.personalize" / "gepa.toml"
+    body = path.read_text(encoding="utf-8")
+    assert 'dataset = ".gepa.personalize/dataset.jsonl"' in body
+
+
 def test_resolve_agent_success() -> None:
     cfg = GepaConfig(agent="pydantic_ai_gepa.cli.layout:GEPA_DIRNAME")
     assert resolve_agent(cfg) == ".gepa"

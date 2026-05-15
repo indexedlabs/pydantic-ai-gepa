@@ -8,8 +8,9 @@ from pathlib import Path
 import typer
 
 from .layout import (
-    DEFAULT_DATASET_PATH,
     GepaConfigError,
+    current_gepa_dirname,
+    default_dataset_path,
     ensure_layout,
     insert_repo_root_on_path,
     repo_root,
@@ -53,10 +54,13 @@ def init(
     agent: str = typer.Option(
         ..., "--agent", help='Agent module ref, e.g. "mypkg.agents:my_agent".'
     ),
-    dataset: str = typer.Option(
-        DEFAULT_DATASET_PATH,
+    dataset: str | None = typer.Option(
+        None,
         "--dataset",
-        help="Relative path to the dataset JSONL.",
+        help=(
+            "Relative path to the dataset JSONL. "
+            "Defaults to `<workspace>/dataset.jsonl` for the active --gepa-dir."
+        ),
     ),
     metric: str | None = typer.Option(
         None,
@@ -89,7 +93,7 @@ def init(
         ),
     ),
 ) -> None:
-    """Bootstrap .gepa/ in the current repo: write gepa.toml + seed components."""
+    """Bootstrap the workspace in the current repo: write gepa.toml + seed components."""
     insert_repo_root_on_path()
 
     # Sanity-check the agent ref (and metric / case_factory refs, when
@@ -104,11 +108,12 @@ def init(
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
 
+    resolved_dataset = dataset if dataset is not None else default_dataset_path()
     ensure_layout()
     try:
         cfg_path = write_default_config(
             agent,
-            dataset,
+            resolved_dataset,
             metric=metric,
             case_factory=case_factory,
             force=force,
@@ -160,10 +165,12 @@ def init(
         else:
             typer.echo(f"Installed gepa-optimize skill at {skill_installed}")
 
+    dirname = current_gepa_dirname()
+    workspace_hint = "" if dirname == ".gepa" else f" --gepa-dir {dirname}"
     typer.echo(
         "Next steps:\n"
-        f"  1. Write dataset cases as JSONL at {dataset}\n"
-        "  2. Run `gepa eval --size N` to score the baseline + write the per-case report"
+        f"  1. Write dataset cases as JSONL at {resolved_dataset}\n"
+        f"  2. Run `gepa{workspace_hint} eval --size N` to score the baseline + write the per-case report"
     )
 
 

@@ -57,8 +57,16 @@ def apply(
         commit_message = message or f"gepa apply: {candidate.id}"
         root = repo_root()
         try:
+            components_path = components_dir(root)
+            try:
+                git_path = str(components_path.relative_to(root))
+            except ValueError:
+                # Components dir lives outside the repo root (absolute
+                # --gepa-dir pointing elsewhere); fall back to the absolute
+                # path so git still receives a valid target.
+                git_path = str(components_path)
             subprocess.run(
-                ["git", "add", ".gepa/components"],
+                ["git", "add", git_path],
                 cwd=root,
                 check=True,
                 capture_output=True,

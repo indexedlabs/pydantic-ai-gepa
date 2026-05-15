@@ -15,7 +15,7 @@ from . import eval as eval_cmd
 from . import init as init_cmd
 from . import journal as journal_cmd
 from . import pareto as pareto_cmd
-from .layout import load_dotenv
+from .layout import load_dotenv, set_gepa_dirname
 
 app = typer.Typer(
     name="gepa",
@@ -34,14 +34,28 @@ def _gepa_root(
         "--no-dotenv",
         help="Skip auto-loading .env from the repo root.",
     ),
+    gepa_dir: str | None = typer.Option(
+        None,
+        "--gepa-dir",
+        "-G",
+        envvar="GEPA_DIR",
+        help=(
+            "Workspace directory to use instead of the default `.gepa/`. "
+            "Pass a name (e.g. `.gepa.personalize`) to keep multiple "
+            "optimization workspaces side by side in the same repo, or an "
+            "absolute path to point at a workspace outside the repo."
+        ),
+    ),
 ) -> None:
-    """Load .env once before any verb runs.
+    """Set the active workspace dir, then load .env once before any verb runs.
 
     The user's agent module often resolves to a real provider (openai, anthropic,
     etc.) that eagerly constructs a client at import time. Auto-loading .env
     means `gepa components list`, `gepa eval`, etc. just work in a repo that
     already has API keys configured.
     """
+    if gepa_dir:
+        set_gepa_dirname(gepa_dir)
     if not no_dotenv:
         load_dotenv()
 

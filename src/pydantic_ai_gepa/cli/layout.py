@@ -39,9 +39,47 @@ from typing import Any
 
 
 GEPA_DIRNAME = ".gepa"
+GEPA_DIR_ENV = "GEPA_DIR"
 CONFIG_FILENAME = "gepa.toml"
-DEFAULT_DATASET_PATH = ".gepa/dataset.jsonl"
 JOURNAL_FILENAME = "journal.jsonl"
+
+
+_explicit_gepa_dirname: str | None = None
+
+
+def set_gepa_dirname(name: str | None) -> None:
+    """Override the active workspace dirname (used by the root Typer callback).
+
+    Pass ``None`` to clear the override; subsequent reads fall back to the
+    ``GEPA_DIR`` environment variable, then to the default ``.gepa``.
+    """
+    global _explicit_gepa_dirname
+    _explicit_gepa_dirname = name
+
+
+def current_gepa_dirname() -> str:
+    """Return the active workspace dirname.
+
+    Precedence: explicit override (``--gepa-dir`` flag) > ``GEPA_DIR`` env
+    var > the default ``.gepa``. Read on every call so ``.env``-loaded
+    values picked up by the root callback take effect.
+    """
+    if _explicit_gepa_dirname is not None:
+        return _explicit_gepa_dirname
+    env_value = os.environ.get(GEPA_DIR_ENV)
+    if env_value:
+        return env_value
+    return GEPA_DIRNAME
+
+
+def default_dataset_path() -> str:
+    """Default dataset path (relative to repo root) for the active dirname."""
+    return f"{current_gepa_dirname()}/dataset.jsonl"
+
+
+DEFAULT_DATASET_PATH = ".gepa/dataset.jsonl"
+"""Kept for backwards compatibility. Prefer :func:`default_dataset_path`,
+which reflects the currently active ``--gepa-dir`` override."""
 
 
 class GepaConfigError(RuntimeError):
@@ -55,8 +93,14 @@ class GepaConfig:
     agent: str
     """Module reference for the user's pydantic-ai agent, e.g. ``"mypkg.agents:my_agent"``."""
 
-    dataset: str = DEFAULT_DATASET_PATH
-    """Relative path (from repo root) to the dataset JSONL file."""
+    dataset: str = ".gepa/dataset.jsonl"
+    """Relative path (from repo root) to the dataset JSONL file.
+
+    When omitted from ``gepa.toml``, ``GepaConfig.from_dict`` fills this
+    in from :func:`default_dataset_path` so a workspace at
+    ``.gepa.personalize/`` gets ``.gepa.personalize/dataset.jsonl`` rather
+    than the hardcoded default.
+    """
 
     metric: str | None = None
     """Optional ``module.path:attr`` reference for a custom metric callable."""
@@ -86,7 +130,7 @@ class GepaConfig:
             raise GepaConfigError(
                 f"Invalid 'agent' value: {agent!r}. Expected 'module.path:attr'."
             )
-        dataset = data.get("dataset", DEFAULT_DATASET_PATH)
+        dataset = data.get("dataset", default_dataset_path())
         metric = data.get("metric")
         if metric is not None and (not isinstance(metric, str) or ":" not in metric):
             raise GepaConfigError(
@@ -125,14 +169,20 @@ class GepaConfig:
 
 
 def repo_root(start: Path | None = None) -> Path:
-    """Return the repo root (directory containing `.gepa/` or `pyproject.toml`).
+    """Return the repo root (directory containing the active workspace or `pyproject.toml`).
 
-    Walks upward from `start` (or cwd) until a `.gepa/` or `pyproject.toml` is found.
-    Falls back to cwd if neither marker exists.
+    Walks upward from ``start`` (or cwd) until the active workspace dirname
+    (see :func:`current_gepa_dirname`) or a ``pyproject.toml`` is found. Falls
+    back to cwd if neither marker exists.
+
+    When the active dirname is an absolute path, the workspace itself can't
+    sit at the repo root, so only ``pyproject.toml`` is used for the walk.
     """
     cursor = (start or Path.cwd()).resolve()
+    dirname = current_gepa_dirname()
+    workspace_marker_is_relative = not Path(dirname).is_absolute()
     for candidate in [cursor, *cursor.parents]:
-        if (candidate / GEPA_DIRNAME).is_dir():
+        if workspace_marker_is_relative and (candidate / dirname).is_dir():
             return candidate
         if (candidate / "pyproject.toml").is_file():
             return candidate
@@ -140,7 +190,7 @@ def repo_root(start: Path | None = None) -> Path:
 
 
 def gepa_dir(root: Path | None = None) -> Path:
-    return (root or repo_root()) / GEPA_DIRNAME
+    return (root or repo_root()) / current_gepa_dirname()
 
 
 def config_path(root: Path | None = None) -> Path:
@@ -269,7 +319,7 @@ def resolve_module_attr(ref: str, *, kind: str = "object") -> Any:
 
 def write_default_config(
     agent: str,
-    dataset: str = DEFAULT_DATASET_PATH,
+    dataset: str | None = None,
     *,
     metric: str | None = None,
     case_factory: str | None = None,
@@ -287,9 +337,10 @@ def write_default_config(
     if path.exists() and not force:
         raise GepaConfigError(f"{path} already exists. Pass --force to overwrite.")
     path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_dataset = dataset if dataset is not None else default_dataset_path()
     lines = [
         f'agent = "{agent}"',
-        f'dataset = "{dataset}"',
+        f'dataset = "{resolved_dataset}"',
     ]
     if metric:
         lines.append(f'metric = "{metric}"')
