@@ -38,6 +38,7 @@ from .layout import (
     new_run_id,
     repo_root,
     resolve_agent,
+    resolve_case_factory,
     resolve_metric,
     run_dir,
 )
@@ -141,6 +142,7 @@ def eval_(
 
     agent = resolve_agent(cfg)
     metric = resolve_metric(cfg) or default_substring_metric
+    case_factory = resolve_case_factory(cfg)
 
     dataset_path = repo_root() / cfg.dataset
     cases = load_dataset(dataset_path)
@@ -235,6 +237,7 @@ def eval_(
             dataset=subset,
             candidate=candidate.to_candidate_map(),
             concurrency=concurrency,
+            case_factory=case_factory,
         )
     )
 

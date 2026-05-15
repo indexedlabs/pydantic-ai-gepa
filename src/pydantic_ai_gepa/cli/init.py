@@ -63,6 +63,11 @@ def init(
         "--metric",
         help='Optional metric module ref written to gepa.toml as `metric = "..."`, e.g. "mypkg.metrics:my_metric". When omitted, gepa falls back to a substring/equality scorer.',
     ),
+    case_factory: str | None = typer.Option(
+        None,
+        "--case-factory",
+        help='Optional case-factory module ref written to gepa.toml as `case_factory = "..."`, e.g. "mypkg.eval:my_case_factory". Use when dataset rows carry deferred references (file paths, Mighty file ids, base64 blobs) that need to be materialized into the agent\'s input model before each rollout.',
+    ),
     install_skill: bool = typer.Option(
         False,
         "--install-skill",
@@ -87,18 +92,27 @@ def init(
     """Bootstrap .gepa/ in the current repo: write gepa.toml + seed components."""
     insert_repo_root_on_path()
 
-    # Sanity-check the agent ref (and metric ref, if provided) before persisting config.
+    # Sanity-check the agent ref (and metric / case_factory refs, when
+    # provided) before persisting config.
     try:
         agent_obj = resolve_module_attr(agent, kind="agent")
         if metric:
             resolve_module_attr(metric, kind="metric")
+        if case_factory:
+            resolve_module_attr(case_factory, kind="case_factory")
     except GepaConfigError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
 
     ensure_layout()
     try:
-        cfg_path = write_default_config(agent, dataset, metric=metric, force=force)
+        cfg_path = write_default_config(
+            agent,
+            dataset,
+            metric=metric,
+            case_factory=case_factory,
+            force=force,
+        )
     except GepaConfigError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc

@@ -61,6 +61,17 @@ class GepaConfig:
     metric: str | None = None
     """Optional ``module.path:attr`` reference for a custom metric callable."""
 
+    case_factory: str | None = None
+    """Optional ``module.path:attr`` reference for a case-factory callable.
+
+    The factory's signature is ``(case: Case) -> BaseModel`` (sync or
+    async). When set, the adapter invokes it for every rollout to convert
+    the raw dataset row into the agent's input model — useful when the
+    input carries binary content (PDFs, images, audio) or other
+    non-JSON-roundtrippable state. The factory runs at eval time only;
+    the runtime agent's input model stays unchanged.
+    """
+
     defaults: dict[str, Any] = field(default_factory=dict)
     """Default knob values for `gepa eval`, etc. Optional."""
 
@@ -81,13 +92,25 @@ class GepaConfig:
             raise GepaConfigError(
                 f"Invalid 'metric' value: {metric!r}. Expected 'module.path:attr' or omit."
             )
+        case_factory = data.get("case_factory")
+        if case_factory is not None and (
+            not isinstance(case_factory, str) or ":" not in case_factory
+        ):
+            raise GepaConfigError(
+                f"Invalid 'case_factory' value: {case_factory!r}. "
+                "Expected 'module.path:attr' or omit."
+            )
         defaults = data.get("defaults", {}) or {}
         if not isinstance(defaults, dict):
             raise GepaConfigError(
                 f"'defaults' must be a TOML table, got {type(defaults).__name__}."
             )
         return GepaConfig(
-            agent=agent, dataset=dataset, metric=metric, defaults=defaults
+            agent=agent,
+            dataset=dataset,
+            metric=metric,
+            case_factory=case_factory,
+            defaults=defaults,
         )
 
     @staticmethod
@@ -212,6 +235,18 @@ def resolve_metric(config: GepaConfig) -> Any:
     return resolve_module_attr(config.metric, kind="metric")
 
 
+def resolve_case_factory(config: GepaConfig) -> Any:
+    """Import the configured case factory, or return ``None`` if absent.
+
+    The returned callable (when set) is invoked by the adapter at rollout
+    time to convert a raw ``Case`` into the agent's input model — see
+    ``GepaConfig.case_factory`` for the contract.
+    """
+    if not config.case_factory:
+        return None
+    return resolve_module_attr(config.case_factory, kind="case_factory")
+
+
 def resolve_module_attr(ref: str, *, kind: str = "object") -> Any:
     """Resolve a ``module.path:attr`` reference to the named attribute."""
     if ":" not in ref:
@@ -237,15 +272,16 @@ def write_default_config(
     dataset: str = DEFAULT_DATASET_PATH,
     *,
     metric: str | None = None,
+    case_factory: str | None = None,
     root: Path | None = None,
     force: bool = False,
 ) -> Path:
     """Write a minimal `.gepa/gepa.toml`. Returns the path written.
 
-    ``metric`` is written as a top-level key when provided. Anything that
-    might evolve into a defaults block lives outside this function — keeping
-    the bootstrap template small avoids documenting features that are not yet
-    wired into the CLI.
+    ``metric`` and ``case_factory`` are written as top-level keys when
+    provided. Anything that might evolve into a defaults block lives
+    outside this function — keeping the bootstrap template small avoids
+    documenting features that are not yet wired into the CLI.
     """
     path = config_path(root)
     if path.exists() and not force:
@@ -257,6 +293,8 @@ def write_default_config(
     ]
     if metric:
         lines.append(f'metric = "{metric}"')
+    if case_factory:
+        lines.append(f'case_factory = "{case_factory}"')
     contents = "\n".join(lines) + "\n"
     path.write_text(contents, encoding="utf-8")
     return path

@@ -1339,6 +1339,18 @@ class AgentAdapter(
         )
 
 
+CaseFactory = Callable[[Case[Any, Any, Any]], Any]
+"""Convert a raw ``Case`` into a fully-materialized agent input model.
+
+The callable may return a ``BaseModel`` directly or an awaitable that
+resolves to one. Adapters use this hook (when configured) at rollout
+time, which is the right place for eval-only side effects like loading
+binary attachments from disk, Mighty file refs, etc. The runtime agent
+sees the same materialized model the adapter built, with no eval-side
+machinery leaking into the production input type.
+"""
+
+
 class SignatureAgentAdapter(
     _BaseAgentAdapter[InputT, OutputT, MetadataT],
     Generic[InputT, OutputT, MetadataT],
@@ -1362,6 +1374,7 @@ class SignatureAgentAdapter(
         skills_capabilities: set[SkillCapability] | None = None,
         agent_usage_limits: _usage.UsageLimits | None = None,
         gepa_usage_limits: _usage.UsageLimits | None = None,
+        case_factory: CaseFactory | None = None,
     ) -> None:
         bound_spec = (
             build_input_spec(input_type) if input_type is not None else agent.input_spec
@@ -1370,6 +1383,7 @@ class SignatureAgentAdapter(
             bound_spec.model_cls if bound_spec else None
         )
         self._signature_agent: SignatureAgent[Any, OutputT] = agent
+        self._case_factory: CaseFactory | None = case_factory
         super().__init__(
             agent=agent,
             metric=metric,
@@ -1393,7 +1407,7 @@ class SignatureAgentAdapter(
         usage_kwargs: Mapping[str, Any],
         example_bank: "InMemoryExampleBank | None" = None,
     ) -> AgentRunResult[Any]:
-        inputs = self._validate_inputs(case.inputs)
+        inputs = await self._materialize_inputs(case)
         candidate_text = candidate_texts(candidate)
         toolsets = self._build_toolsets(candidate, example_bank)
 
@@ -1416,6 +1430,34 @@ class SignatureAgentAdapter(
             **run_kwargs,
         )
 
+    async def _materialize_inputs(
+        self, case: Case[InputT, OutputT, MetadataT]
+    ) -> BaseModel:
+        """Resolve the case to the fully-materialized agent input model.
+
+        When ``case_factory`` is configured, it owns the conversion —
+        useful for eval rows whose ``inputs`` carry deferred references
+        (file paths, Mighty file ids, base64 blobs) that need to be
+        loaded into ``BinaryContent`` (or similar) before the agent
+        runs. The factory's product replaces ``case.inputs`` for both
+        the agent's input parameter and ``deps``.
+
+        Without a factory, fall back to the historical behavior:
+        pass-through ``BaseModel`` cases or ``model_validate`` for dict
+        cases via ``self._input_model_cls``.
+        """
+        if self._case_factory is not None:
+            produced = self._case_factory(case)
+            if inspect.isawaitable(produced):
+                produced = await produced
+            if not isinstance(produced, BaseModel):
+                raise TypeError(
+                    "case_factory must return a pydantic BaseModel "
+                    f"(or an awaitable that resolves to one); got {type(produced).__name__}"
+                )
+            return produced
+        return self._validate_inputs(case.inputs)
+
     def _validate_inputs(self, inputs: InputT) -> BaseModel:
         if isinstance(inputs, BaseModel):
             return inputs
@@ -1437,20 +1479,32 @@ def create_adapter(
     ],
     input_type: InputSpec[BaseModel] | None = None,
     optimize_output_type: bool = False,
+    case_factory: CaseFactory | None = None,
     **kwargs: Any,
 ) -> AgentAdapter[Any, MetadataT] | SignatureAgentAdapter[Any, Any, MetadataT]:
-    """Create an adapter suited for the provided agent."""
+    """Create an adapter suited for the provided agent.
+
+    ``case_factory`` is forwarded to ``SignatureAgentAdapter`` only —
+    plain ``Agent`` rollouts work on prompt-string inputs that don't
+    need rollout-time materialization, so passing a factory there is a
+    configuration error.
+    """
     if isinstance(agent, SignatureAgent):
         return SignatureAgentAdapter(
             agent=agent,
             metric=metric,
             input_type=input_type,
             optimize_output_type=optimize_output_type,
+            case_factory=case_factory,
             **kwargs,
         )
     if input_type is not None:
         raise TypeError(
             "input_type can only be provided when agent is a SignatureAgent"
+        )
+    if case_factory is not None:
+        raise TypeError(
+            "case_factory can only be provided when agent is a SignatureAgent"
         )
     return AgentAdapter(
         agent=agent,

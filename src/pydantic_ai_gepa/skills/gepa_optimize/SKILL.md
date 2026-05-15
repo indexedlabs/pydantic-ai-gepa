@@ -212,10 +212,11 @@ Slot identity always comes from the live agent (introspection); slot values alwa
 ```toml
 agent = "mypkg.agents:my_agent"
 dataset = ".gepa/dataset.jsonl"
-metric = "mypkg.metrics:my_metric"   # optional; (case, output) -> MetricResult | float
+metric = "mypkg.metrics:my_metric"           # optional; (case, output) -> MetricResult | float
+case_factory = "mypkg.eval:my_case_factory"  # optional; (case) -> BaseModel (sync or async)
 ```
 
-All keys are top-level — `metric` MUST NOT be nested under any `[section]`.
+All keys are top-level — `metric` / `case_factory` MUST NOT be nested under any `[section]`.
 
 The metric callable signature:
 
@@ -231,3 +232,45 @@ async def my_metric(case: Case[Any, Any, Any], output: RolloutOutput[Any] | Any)
     return MetricResult(score=1.0 if text == case.expected_output else 0.0,
                         feedback="exact match" if text == case.expected_output else f"got {text!r}")
 ```
+
+## Binary inputs: the `case_factory` hook
+
+`dataset.jsonl` is JSON, so anything that doesn't roundtrip JSON cleanly — PDF bytes, image buffers, audio blobs — can't live in `inputs` directly. The `case_factory` config field is the eval-time hook that bridges raw dataset rows to a fully-materialized agent input model:
+
+```toml
+agent = "mypkg.agents:school_calendar_extractor"
+dataset = ".gepa/dataset.jsonl"
+case_factory = "mypkg.eval:school_calendar_case_factory"
+```
+
+```python
+# mypkg/eval.py — eval-only module, NOT imported by the runtime agent
+from pathlib import Path
+from datetime import date
+from typing import Any
+from pydantic_ai import BinaryContent
+from pydantic_evals import Case
+from mypkg.agents.school_calendar import SchoolCalendarInput
+
+def school_calendar_case_factory(case: Case[Any, Any, Any]) -> SchoolCalendarInput:
+    raw = case.inputs
+    attachments = [
+        BinaryContent(data=Path(spec["path"]).read_bytes(), media_type=spec["media_type"])
+        for spec in raw["attachments"]
+    ]
+    return SchoolCalendarInput(
+        file_summaries=raw["file_summaries"],
+        current_date=date.fromisoformat(raw["current_date"]),
+    ).with_binary_attachments(attachments)
+```
+
+```jsonl
+{"name": "ridgewood-2025-26", "inputs": {"attachments": [{"path": "fixtures/ridgewood.pdf", "media_type": "application/pdf"}], "file_summaries": [...], "current_date": "2025-09-01"}, "expected_output": {...}}
+```
+
+Rules:
+
+- The factory may be sync or async (return `BaseModel` or `Awaitable[BaseModel]`).
+- The returned model is used as both the agent's input AND `deps`, matching the no-factory path. Tools that read `ctx.deps.attachments` see the materialized binaries.
+- Only honored for `SignatureAgent` agents. `gepa init --case-factory ...` validates the dotted ref at scaffold time.
+- The factory lives in eval code, not in the runtime agent's input model — no `BinaryContentRef` or deferred-loading types leak into production. The runtime agent receives the same fully-materialized input whether called from production or eval.

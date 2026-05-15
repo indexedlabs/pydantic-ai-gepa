@@ -12,7 +12,7 @@ from pydantic_ai.agent import AbstractAgent
 from pydantic import BaseModel
 from pydantic_evals import Case, Dataset
 
-from .adapters.agent_adapter import create_adapter
+from .adapters.agent_adapter import CaseFactory, create_adapter
 from .gepa_graph.models import CandidateMap, candidate_texts
 from .input_type import InputSpec
 
@@ -37,8 +37,16 @@ async def evaluate_candidate_dataset(
     agent_usage_limits: UsageLimits | None = None,
     capture_traces: bool = False,
     input_type: InputSpec[BaseModel] | None = None,
+    case_factory: CaseFactory | None = None,
 ) -> list[EvaluationRecord]:
-    """Evaluate an agent/candidate pair on a dataset in parallel."""
+    """Evaluate an agent/candidate pair on a dataset in parallel.
+
+    ``case_factory`` (when set) converts each ``Case`` into the agent's
+    input model at rollout time. Use it when dataset rows carry deferred
+    references — file paths, Mighty file ids, base64 blobs — that need
+    to be materialized into ``BinaryContent`` (or similar) before the
+    agent runs. Only honored for ``SignatureAgent`` agents.
+    """
 
     semaphore = asyncio.Semaphore(max(1, concurrency))
     records: list[EvaluationRecord] = []
@@ -58,6 +66,7 @@ async def evaluate_candidate_dataset(
         input_type=input_type,
         cache_manager=None,
         agent_usage_limits=agent_usage_limits,
+        case_factory=case_factory,
     )
 
     candidate_map: CandidateMap = candidate.copy() if candidate is not None else {}
