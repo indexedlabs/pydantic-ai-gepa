@@ -104,6 +104,23 @@ def test_continue_recommends_discard_when_candidate_does_not_improve(
     assert Path(str(comparison["candidate_trace_path"])).exists()
 
 
+def test_continue_after_revert_discards_candidate_and_advances(repo: Path) -> None:
+    start = _run("run", "start", "--size", "2", "--max-iterations", "3")
+    run_id = str(_run_payload(start.output)["run_id"])
+
+    first_continue = _run("run", "continue", "--run-id", run_id)
+    assert first_continue.exit_code == 0, first_continue.output
+    assert _run_payload(first_continue.output)["status"] == "paused_after_candidate_eval"
+
+    second_continue = _run("run", "continue", "--run-id", run_id)
+
+    assert second_continue.exit_code == 0, second_continue.output
+    assert "discarding the losing candidate and advancing" in second_continue.output
+    payload = _run_payload(second_continue.output)
+    assert payload["status"] == "done"
+    assert payload["iterations"] == 3
+
+
 def test_managed_run_prints_final_report_at_max_iterations(repo: Path) -> None:
     start = _run("run", "start", "--size", "2", "--max-iterations", "2")
     run_id = str(_run_payload(start.output)["run_id"])

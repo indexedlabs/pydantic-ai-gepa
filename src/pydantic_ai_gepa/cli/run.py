@@ -16,15 +16,21 @@ from typing import Any, Literal
 
 import typer
 
+from .candidates import candidate_id_from_components
 from .eval import DEFAULT_FAILURE_THRESHOLD, EvalOutcome, run_eval_once
 from .layout import (
+    GepaConfig,
+    config_path,
     final_report_path,
+    insert_repo_root_on_path,
     new_run_id,
+    resolve_agent,
     run_dir,
     run_state_path,
     runs_dir,
 )
 from .runs import ParetoLog, utc_now_iso
+from .store import ComponentStore
 
 
 app = typer.Typer(
@@ -313,6 +319,16 @@ def _evaluate_reflected_candidate(
     return state, outcome, comparison
 
 
+def _current_baseline_candidate_id() -> str:
+    """Return the candidate id for the currently confirmed component files."""
+
+    cfg = GepaConfig.load(config_path())
+    insert_repo_root_on_path()
+    agent = resolve_agent(cfg)
+    components = ComponentStore().effective_candidate(agent)
+    return candidate_id_from_components(components)
+
+
 def _write_final_report(state: RunState) -> tuple[Path, str]:
     rows = ParetoLog(state.run_id).iter_rows()
     path = final_report_path(state.run_id)
@@ -502,6 +518,29 @@ def continue_(
 
     outcomes: list[EvalOutcome] = []
     comparison_outcome: EvalOutcome | None = None
+    if (
+        state.status == "paused_after_candidate_eval"
+        and state.reflection_baseline_candidate_id is not None
+        and _current_baseline_candidate_id() == state.reflection_baseline_candidate_id
+    ):
+        typer.echo(
+            "Current components match the reflection baseline; discarding the "
+            "losing candidate and advancing."
+        )
+        state, outcomes = _advance_to_reflection_or_done(state)
+        state.save()
+        final_path = None
+        final_text = None
+        if state.status == "done":
+            final_path, final_text = _write_final_report(state)
+        _emit_status(
+            state,
+            outcomes=outcomes,
+            final_report=final_path,
+            final_report_text=final_text,
+        )
+        return
+
     if state.reflection_minibatch_id is not None:
         state, comparison_outcome, comparison = _evaluate_reflected_candidate(state)
         outcomes.append(comparison_outcome)
