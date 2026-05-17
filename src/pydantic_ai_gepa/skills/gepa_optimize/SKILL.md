@@ -5,9 +5,9 @@ description: Optimize a pydantic-ai agent's instructions, tool descriptions, out
 
 # gepa-optimize
 
-You are the reflection model. The `gepa` CLI is a small toolkit that handles minibatches, evaluation, and history bookkeeping; you read failure reports, edit component slots or source code, and re-eval until the metric stabilizes.
+You are the reflection model. The `gepa` CLI is a small toolkit that handles minibatches, trace/report persistence, candidate evaluation, comparison, and history bookkeeping; you read failure reports and traces, edit component slots or source code, and continue until the run completes.
 
-There is no `propose` or `reflect` verb on the CLI because that's the work you do — between `gepa eval` invocations — by editing files.
+There is no `propose` or `reflect` verb on the CLI because that's the work you do — while `gepa run` is paused, or between manual `gepa eval` invocations — by editing files.
 
 ## Setup (run once)
 
@@ -38,6 +38,29 @@ Then write the dataset cases at `.gepa/dataset.jsonl` — one JSON object per li
 
 ## Standard loop
 
+Prefer the managed loop when you want a real max-iteration optimization run:
+
+```text
+gepa run start --max-iterations 100 --size 5
+read the printed report_path and trace_path
+reflect on the failures; edit .gepa/components/<slot>.md or source code
+gepa run continue --run-id <run_id>
+if it says discard_or_revise, discard/revise your edits and continue again
+if it pauses_for_reflection, inspect the new report/trace and reflect again
+repeat until the JSON summary says status=done and prints final_report_path
+```
+
+`gepa run start` evaluates sampled mini-valsets until at least one case falls below `--threshold`, then pauses and writes:
+
+- `reflection_baseline_report_path`
+- `reflection_baseline_trace_path`
+- `state_path`
+- `next_command`
+
+`gepa run continue` evaluates your edited baseline against the same mini-valset. If the candidate mean is not higher than the reflection baseline, it pauses with `recommendation=discard_or_revise`; you handle the discard or revision because code/components live in git and `.gepa/components/`. If it improves, the CLI advances to the next mini-valset and pauses again when reflection is useful. At `--max-iterations`, it prints and writes `final_report.md`.
+
+Use one-off `gepa eval` for manual probes or clean A/B checks:
+
 ```text
 gepa eval                                       # score the current baseline + write per-case report
 read .gepa/runs/<run_id>/reports/<id>.md        # see what failed
@@ -52,11 +75,17 @@ The eval summary you parse is **the last JSON line on stdout** — it carries `r
 ### Concrete commands
 
 ```bash
-# Score the current confirmed baseline.
-gepa eval --size 5 --seed 0 --epoch 0 --max-iterations 50
+# Start a managed optimization run.
+gepa run start --size 5 --seed 0 --epoch 0 --max-iterations 50
+
+# Continue after editing components/source.
+gepa run continue --run-id <run_id>
+
+# Manual: score the current confirmed baseline once.
+gepa eval --size 5 --seed 0 --epoch 0 --max-iterations 50 --capture-traces
 
 # Read the report path printed in the summary line.
-cat .gepa/runs/<run_id>/reports/<candidate_id>.md
+cat .gepa/runs/<run_id>/reports/<iteration>-<candidate_id>.md
 
 # Edit a component slot. Content always comes from a file or stdin.
 echo "Refined instructions about geography." > /tmp/new_instr.md
@@ -84,7 +113,7 @@ Minibatch sampling is deterministic in `(seed, epoch)` over the dataset. Use the
 
 ### `--max-iterations`
 
-Hard cap on eval rows in a single run. Exceeding it exits with code 70 — a deterministic safety stop. For overnight or unattended runs, drive `gepa eval` from your host loop/goal mechanism (Claude Code `/loop`, Codex goals) and let `--max-iterations` keep each run bounded.
+Hard cap on eval rows in a single run. In the managed loop, `gepa run start` persists the budget and each `gepa run continue` advances until it either pauses for reflection or reaches `status=done`. In one-off `gepa eval`, exceeding the cap exits with code 70.
 
 ## Candidate JSON schema
 
@@ -165,10 +194,10 @@ Look at the per-case `feedback` field in the report:
 |---|---|---|
 | 0 | Success | All verbs |
 | 1 | Recoverable error (missing file, invalid agent ref, dataset empty, orphan slots on `apply`) | All verbs |
-| 2 | Refusal — input wrong shape OR baseline blocked by stage-and-confirm | `gepa eval` (unconfirmed slots), every verb on argparse errors |
+| 2 | Refusal — input wrong shape OR baseline blocked by stage-and-confirm | `gepa eval` / `gepa run` (unconfirmed slots), every verb on argparse errors |
 | 70 | Hard cap — `--max-iterations` exceeded | `gepa eval` |
 
-When you see exit 2 from `gepa eval`, the stderr block tells you exactly which `gepa components confirm <slot>` calls to make.
+When you see exit 2 from `gepa eval` or `gepa run`, the stderr block tells you exactly which `gepa components confirm <slot>` calls to make.
 
 ## Inspection
 
@@ -188,6 +217,9 @@ gepa components show instructions --output-file /tmp/current.md
 gepa pareto                             # default: full chronological history (json)
 gepa pareto --format tsv                # | grep | awk
 gepa pareto --front                     # only Pareto-dominant rows (multi-objective scoring)
+
+# Managed run state.
+gepa run status --run-id <run_id>
 ```
 
 ## File layout reference
@@ -200,9 +232,12 @@ gepa pareto --front                     # only Pareto-dominant rows (multi-objec
 ├── components/<slot>.md       # confirmed slot text (THE source of truth for values)
 ├── staged/<slot>.md           # stubs awaiting `gepa components confirm`
 └── runs/<run_id>/
+    ├── state.json             # managed `gepa run` controller state
+    ├── final_report.md        # written when managed run reaches done
     ├── pareto.jsonl           # append-only ParetoRow history (one row per eval)
     ├── minibatches/<mb_id>.json
-    └── reports/<candidate_id>.md
+    ├── reports/<iteration>-<candidate_id>.md
+    └── traces/minibatches/<mb_id>/<iteration>-<candidate_id>.jsonl
 ```
 
 Slot identity always comes from the live agent (introspection); slot values always come from `.gepa/components/<slot>.md` (or the introspected seed when no file exists yet).

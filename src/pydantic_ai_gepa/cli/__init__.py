@@ -15,6 +15,7 @@ from . import eval as eval_cmd
 from . import init as init_cmd
 from . import journal as journal_cmd
 from . import pareto as pareto_cmd
+from . import run as run_cmd
 from .layout import load_dotenv, set_gepa_dirname
 
 app = typer.Typer(
@@ -72,6 +73,11 @@ app.command(
 )(apply_cmd.apply)
 app.command(name="pareto", help="Show Pareto front or full history (json or tsv).")(
     pareto_cmd.pareto
+)
+app.add_typer(
+    run_cmd.app,
+    name="run",
+    help="Start/resume a managed pause-for-reflection GEPA loop.",
 )
 
 app.add_typer(

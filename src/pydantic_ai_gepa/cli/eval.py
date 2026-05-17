@@ -21,11 +21,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import typer
 
-from ..evaluation import evaluate_candidate_dataset
+from ..evaluation import EvaluationRecord, evaluate_candidate_dataset
 from ._io import write_content_file
 from .candidates import Candidate, candidate_id_from_components
 from .dataset import case_ids as dataset_case_ids
@@ -69,6 +71,18 @@ def _count_evals_in_run(run_id: str) -> int:
 DEFAULT_FAILURE_THRESHOLD = 0.999
 
 
+@dataclass(frozen=True)
+class EvalOutcome:
+    records: list[EvaluationRecord]
+    summary: dict[str, Any]
+    report_path: Path
+    trace_path: Path | None
+
+    @property
+    def n_failures(self) -> int:
+        return int(self.summary["n_failures"])
+
+
 def _format_failures(records, threshold: float = DEFAULT_FAILURE_THRESHOLD) -> str:
     lines = ["# Eval report", ""]
     failures = [r for r in records if r.score < threshold]
@@ -88,55 +102,62 @@ def _format_failures(records, threshold: float = DEFAULT_FAILURE_THRESHOLD) -> s
     return "\n".join(lines)
 
 
-def eval_(
-    candidate_file: Path | None = typer.Option(
-        None,
-        "--candidate-file",
-        help="Path to a candidate JSON file. Omit to evaluate the current confirmed baseline in `.gepa/components/`.",
-    ),
-    minibatch_id: str | None = typer.Option(
-        None,
-        "--minibatch-id",
-        help="Re-use an existing minibatch (e.g. from a previous eval summary) for a clean A/B against a slot edit.",
-    ),
-    size: int = typer.Option(
-        10, "--size", help="Number of cases to sample when a new minibatch is drawn."
-    ),
-    seed: int = typer.Option(
-        0,
-        "--seed",
-        help="Deterministic minibatch sampling seed. Same (seed, epoch) reproduces the same minibatch_id.",
-    ),
-    epoch: int = typer.Option(
-        0,
-        "--epoch",
-        help="Bumps the minibatch identity without changing the seeding regime — use it to draw a fresh independent sample with the same seed.",
-    ),
-    run_id: str | None = typer.Option(
-        None,
-        "--run-id",
-        help="Append to a specific run. Omit to use the latest existing run, or start a new one if none exists.",
-    ),
-    output_file: Path | None = typer.Option(
-        None, "--output-file", help="Write JSONL results to a file (or - for stdout)."
-    ),
-    concurrency: int = typer.Option(
-        5,
-        "--concurrency",
-        help="Max parallel agent calls during evaluation.",
-    ),
-    max_iterations: int = typer.Option(
-        100,
-        "--max-iterations",
-        help="Hard cap on eval rows in this run (per pydanticaigepa-dec-xd6). Exits 70 when exceeded.",
-    ),
-    threshold: float = typer.Option(
-        DEFAULT_FAILURE_THRESHOLD,
-        "--threshold",
-        help="Score below which a case is listed as a failure in the per-case report. Default is 0.999 so any non-perfect case is flagged; lower it (e.g. 0.7) when partial-credit metrics expect imperfect scores.",
-    ),
-) -> None:
-    """Evaluate the current baseline (default) or an explicit candidate file."""
+def _json_default(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if hasattr(value, "__dataclass_fields__"):
+        from dataclasses import asdict
+
+        return asdict(value)
+    return str(value)
+
+
+def _write_trace_file(
+    *,
+    run_id: str,
+    iteration: int,
+    candidate_id: str,
+    minibatch_id: str,
+    records: list[EvaluationRecord],
+) -> Path | None:
+    trace_rows: list[dict[str, Any]] = []
+    for record in records:
+        trajectory = record.payload.get("trajectory")
+        if trajectory is None or not hasattr(trajectory, "to_reflective_record"):
+            continue
+        trace_record = trajectory.to_reflective_record()
+        trace_record["case_id"] = record.case_id
+        trace_record["score"] = record.score
+        if record.feedback:
+            trace_record["feedback"] = record.feedback
+        trace_rows.append(trace_record)
+
+    if not trace_rows:
+        return None
+
+    trace_dir = run_dir(run_id) / "traces" / "minibatches" / minibatch_id
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    path = trace_dir / f"{iteration:04d}-{candidate_id}.jsonl"
+    with path.open("w", encoding="utf-8") as fh:
+        for row in trace_rows:
+            fh.write(json.dumps(row, default=_json_default, sort_keys=True) + "\n")
+    return path
+
+
+def run_eval_once(
+    *,
+    candidate_file: Path | None,
+    minibatch_id: str | None,
+    size: int,
+    seed: int,
+    epoch: int,
+    run_id: str | None,
+    concurrency: int,
+    max_iterations: int,
+    threshold: float,
+    capture_traces: bool = False,
+) -> EvalOutcome:
+    """Evaluate one baseline/candidate and append the standard run artifacts."""
     cfg = GepaConfig.load(config_path())
     insert_repo_root_on_path()
 
@@ -238,11 +259,13 @@ def eval_(
             candidate=candidate.to_candidate_map(),
             concurrency=concurrency,
             case_factory=case_factory,
+            capture_traces=capture_traces,
         )
     )
 
     per_case = {record.case_id: record.score for record in records}
     mean = sum(per_case.values()) / len(per_case) if per_case else 0.0
+    iteration = prior_count + 1
 
     pareto = ParetoLog(active_run_id)
     pareto.append(
@@ -262,13 +285,47 @@ def eval_(
     # Write the per-case report next to the pareto log.
     reports_dir = run_dir(active_run_id) / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
-    report_path = reports_dir / f"{candidate.id}.md"
+    report_path = reports_dir / f"{iteration:04d}-{candidate.id}.md"
     report_path.write_text(
         _format_failures(records, threshold=threshold), encoding="utf-8"
     )
+    trace_path = (
+        _write_trace_file(
+            run_id=active_run_id,
+            iteration=iteration,
+            candidate_id=candidate.id,
+            minibatch_id=minibatch.id,
+            records=records,
+        )
+        if capture_traces
+        else None
+    )
 
+    summary: dict[str, Any] = {
+        "candidate_id": candidate.id,
+        "candidate_role": status,
+        "minibatch_id": minibatch.id,
+        "run_id": active_run_id,
+        "mean_score": mean,
+        "n_cases": len(records),
+        "n_failures": len([record for record in records if record.score < threshold]),
+        "iterations": iteration,
+        "max_iterations": max_iterations,
+        "report_path": str(report_path),
+        "trace_path": str(trace_path) if trace_path else None,
+    }
+
+    return EvalOutcome(
+        records=records,
+        summary=summary,
+        report_path=report_path,
+        trace_path=trace_path,
+    )
+
+
+def _format_output_lines(outcome: EvalOutcome) -> str:
     output_lines = []
-    for record in records:
+    for record in outcome.records:
         output_lines.append(
             json.dumps(
                 {
@@ -278,22 +335,75 @@ def eval_(
                 }
             )
         )
-    output_lines.append(
-        json.dumps(
-            {
-                "summary": {
-                    "candidate_id": candidate.id,
-                    "candidate_role": status,
-                    "minibatch_id": minibatch.id,
-                    "run_id": active_run_id,
-                    "mean_score": mean,
-                    "n_cases": len(records),
-                    "iterations": prior_count + 1,
-                    "max_iterations": max_iterations,
-                    "report_path": str(report_path),
-                }
-            }
-        )
+    output_lines.append(json.dumps({"summary": outcome.summary}))
+    return "\n".join(output_lines)
+
+
+def eval_(
+    candidate_file: Path | None = typer.Option(
+        None,
+        "--candidate-file",
+        help="Path to a candidate JSON file. Omit to evaluate the current confirmed baseline in `.gepa/components/`.",
+    ),
+    minibatch_id: str | None = typer.Option(
+        None,
+        "--minibatch-id",
+        help="Re-use an existing minibatch (e.g. from a previous eval summary) for a clean A/B against a slot edit.",
+    ),
+    size: int = typer.Option(
+        10, "--size", help="Number of cases to sample when a new minibatch is drawn."
+    ),
+    seed: int = typer.Option(
+        0,
+        "--seed",
+        help="Deterministic minibatch sampling seed. Same (seed, epoch) reproduces the same minibatch_id.",
+    ),
+    epoch: int = typer.Option(
+        0,
+        "--epoch",
+        help="Bumps the minibatch identity without changing the seeding regime — use it to draw a fresh independent sample with the same seed.",
+    ),
+    run_id: str | None = typer.Option(
+        None,
+        "--run-id",
+        help="Append to a specific run. Omit to use the latest existing run, or start a new one if none exists.",
+    ),
+    output_file: Path | None = typer.Option(
+        None, "--output-file", help="Write JSONL results to a file (or - for stdout)."
+    ),
+    concurrency: int = typer.Option(
+        5,
+        "--concurrency",
+        help="Max parallel agent calls during evaluation.",
+    ),
+    max_iterations: int = typer.Option(
+        100,
+        "--max-iterations",
+        help="Hard cap on eval rows in this run (per pydanticaigepa-dec-xd6). Exits 70 when exceeded.",
+    ),
+    threshold: float = typer.Option(
+        DEFAULT_FAILURE_THRESHOLD,
+        "--threshold",
+        help="Score below which a case is listed as a failure in the per-case report. Default is 0.999 so any non-perfect case is flagged; lower it (e.g. 0.7) when partial-credit metrics expect imperfect scores.",
+    ),
+    capture_traces: bool = typer.Option(
+        False,
+        "--capture-traces",
+        help="Persist reflective trace records for this minibatch under the run's traces directory.",
+    ),
+) -> None:
+    """Evaluate the current baseline (default) or an explicit candidate file."""
+    outcome = run_eval_once(
+        candidate_file=candidate_file,
+        minibatch_id=minibatch_id,
+        size=size,
+        seed=seed,
+        epoch=epoch,
+        run_id=run_id,
+        concurrency=concurrency,
+        max_iterations=max_iterations,
+        threshold=threshold,
+        capture_traces=capture_traces,
     )
 
-    write_content_file(output_file, "\n".join(output_lines))
+    write_content_file(output_file, _format_output_lines(outcome))

@@ -237,6 +237,14 @@ def pareto_log_path(run_id: str, root: Path | None = None) -> Path:
     return run_dir(run_id, root) / "pareto.jsonl"
 
 
+def run_state_path(run_id: str, root: Path | None = None) -> Path:
+    return run_dir(run_id, root) / "state.json"
+
+
+def final_report_path(run_id: str, root: Path | None = None) -> Path:
+    return run_dir(run_id, root) / "final_report.md"
+
+
 def ensure_layout(root: Path | None = None) -> Path:
     """Create the standard `.gepa/` subtree if missing. Idempotent. Returns the gepa dir."""
     base = gepa_dir(root)
