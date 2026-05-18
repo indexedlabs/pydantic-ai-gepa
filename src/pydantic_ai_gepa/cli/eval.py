@@ -42,6 +42,7 @@ from .layout import (
     resolve_agent,
     resolve_case_factory,
     resolve_metric,
+    resolve_skills,
     run_dir,
 )
 from .metrics import default_substring_metric
@@ -164,6 +165,7 @@ def run_eval_once(
     agent = resolve_agent(cfg)
     metric = resolve_metric(cfg) or default_substring_metric
     case_factory = resolve_case_factory(cfg)
+    skills_fs = resolve_skills(cfg)
 
     dataset_path = repo_root() / cfg.dataset
     cases = load_dataset(dataset_path)
@@ -260,6 +262,7 @@ def run_eval_once(
             concurrency=concurrency,
             case_factory=case_factory,
             capture_traces=capture_traces,
+            skills_fs=skills_fs,
         )
     )
 

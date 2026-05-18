@@ -72,6 +72,21 @@ def test_config_parse_with_defaults(tmp_path: Path) -> None:
     assert cfg.defaults == {"minibatch_size": 5, "max_iterations": 20}
 
 
+def test_config_parse_with_skills(tmp_path: Path) -> None:
+    (tmp_path / ".gepa").mkdir()
+    cfg_path = tmp_path / ".gepa" / "gepa.toml"
+    cfg_path.write_text(
+        textwrap.dedent("""
+        agent = "pkg.agents:other"
+        skills = "skills"
+    """).strip(),
+        encoding="utf-8",
+    )
+
+    cfg = GepaConfig.load(cfg_path)
+    assert cfg.skills == "skills"
+
+
 def test_config_missing_agent(tmp_path: Path) -> None:
     cfg = tmp_path / "gepa.toml"
     cfg.write_text('dataset = "x.jsonl"', encoding="utf-8")

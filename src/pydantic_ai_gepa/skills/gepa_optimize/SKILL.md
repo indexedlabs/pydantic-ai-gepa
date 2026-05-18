@@ -249,9 +249,10 @@ agent = "mypkg.agents:my_agent"
 dataset = ".gepa/dataset.jsonl"
 metric = "mypkg.metrics:my_metric"           # optional; (case, output) -> MetricResult | float
 case_factory = "mypkg.eval:my_case_factory"  # optional; (case) -> BaseModel (sync or async)
+skills = "path/to/skills"                    # optional; enables list/search/load_skill tools
 ```
 
-All keys are top-level — `metric` / `case_factory` MUST NOT be nested under any `[section]`.
+All keys are top-level — `metric` / `case_factory` / `skills` MUST NOT be nested under any `[section]`.
 
 The metric callable signature:
 

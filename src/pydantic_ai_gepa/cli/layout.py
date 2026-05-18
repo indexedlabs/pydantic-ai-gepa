@@ -119,6 +119,9 @@ class GepaConfig:
     defaults: dict[str, Any] = field(default_factory=dict)
     """Default knob values for `gepa eval`, etc. Optional."""
 
+    skills: str | None = None
+    """Optional path (relative to repo root) to an Agent Skills directory."""
+
     @staticmethod
     def from_dict(data: dict[str, Any]) -> GepaConfig:
         if "agent" not in data:
@@ -149,12 +152,18 @@ class GepaConfig:
             raise GepaConfigError(
                 f"'defaults' must be a TOML table, got {type(defaults).__name__}."
             )
+        skills = data.get("skills")
+        if skills is not None and not isinstance(skills, str):
+            raise GepaConfigError(
+                f"Invalid 'skills' value: {skills!r}. Expected a path string or omit."
+            )
         return GepaConfig(
             agent=agent,
             dataset=dataset,
             metric=metric,
             case_factory=case_factory,
             defaults=defaults,
+            skills=skills,
         )
 
     @staticmethod
@@ -305,6 +314,18 @@ def resolve_case_factory(config: GepaConfig) -> Any:
     return resolve_module_attr(config.case_factory, kind="case_factory")
 
 
+def resolve_skills(config: GepaConfig) -> Any:
+    """Resolve the optional ``skills`` directory from ``gepa.toml``."""
+    if not config.skills:
+        return None
+    from pydantic_ai_gepa.skills import SkillsFS
+
+    skills_path = repo_root() / config.skills
+    if not skills_path.exists():
+        raise GepaConfigError(f"Skills directory does not exist: {skills_path}")
+    return SkillsFS.from_disk(skills_path)
+
+
 def resolve_module_attr(ref: str, *, kind: str = "object") -> Any:
     """Resolve a ``module.path:attr`` reference to the named attribute."""
     if ":" not in ref:
@@ -331,6 +352,7 @@ def write_default_config(
     *,
     metric: str | None = None,
     case_factory: str | None = None,
+    skills: str | None = None,
     root: Path | None = None,
     force: bool = False,
 ) -> Path:
@@ -354,6 +376,8 @@ def write_default_config(
         lines.append(f'metric = "{metric}"')
     if case_factory:
         lines.append(f'case_factory = "{case_factory}"')
+    if skills:
+        lines.append(f'skills = "{skills}"')
     contents = "\n".join(lines) + "\n"
     path.write_text(contents, encoding="utf-8")
     return path

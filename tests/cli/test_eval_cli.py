@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Iterator
 
 import pytest
+from click.testing import Result
 from typer.testing import CliRunner
 
 from pydantic_ai_gepa.cli import app as gepa_app
@@ -31,6 +32,18 @@ AGENT_MODULE_SOURCE = textwrap.dedent("""
 
     agent = Agent(
         TestModel(custom_output_text="Paris"),
+        instructions="You are a geography expert.",
+        name="geo-agent",
+    )
+""").lstrip()
+
+
+SKILL_AGENT_MODULE_SOURCE = textwrap.dedent("""
+    from pydantic_ai import Agent
+    from pydantic_ai.models.test import TestModel
+
+    agent = Agent(
+        TestModel(call_tools=[], custom_output_text="Paris"),
         instructions="You are a geography expert.",
         name="geo-agent",
     )
@@ -85,7 +98,7 @@ def _candidate_file(tmp_path: Path, components: dict[str, str]) -> Path:
     return path
 
 
-def _run(*argv: str) -> object:
+def _run(*argv: str) -> Result:
     return CliRunner().invoke(gepa_app, list(argv))
 
 
@@ -255,3 +268,65 @@ def test_eval_threshold_flag_filters_report(repo: Path, tmp_path: Path) -> None:
     )
     assert "case(s) underperformed" in strict_text
     assert "case-fail" in strict_text
+
+
+def test_eval_gepa_toml_skills_reach_model_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_dir = tmp_path / "agent_pkg"
+    module_dir.mkdir()
+    (module_dir / "__init__.py").touch()
+    (module_dir / "agents.py").write_text(
+        SKILL_AGENT_MODULE_SOURCE,
+        encoding="utf-8",
+    )
+    skills_dir = tmp_path / "skills"
+    (skills_dir / "text-calendar").mkdir(parents=True)
+    (skills_dir / "text-calendar" / "SKILL.md").write_text(
+        textwrap.dedent("""
+        ---
+        name: text-calendar
+        description: Process text-first calendars.
+        ---
+
+        # Text Calendar
+    """).lstrip(),
+        encoding="utf-8",
+    )
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    ensure_layout(tmp_path)
+    write_default_config("agent_pkg.agents:agent", root=tmp_path, skills="skills")
+    (tmp_path / ".gepa" / "dataset.jsonl").write_text(
+        json.dumps(DATASET_LINES[0]) + "\n",
+        encoding="utf-8",
+    )
+
+    result = _run(
+        "eval",
+        "--candidate-file",
+        str(_candidate_file(tmp_path, {"instructions": "Use skills."})),
+        "--size",
+        "1",
+        "--seed",
+        "0",
+        "--epoch",
+        "0",
+        "--capture-traces",
+    )
+    assert result.exit_code == 0, result.output
+    summary = next(
+        json.loads(line)
+        for line in result.output.splitlines()
+        if line.startswith("{") and '"summary"' in line
+    )["summary"]
+
+    trace_path = Path(summary["trace_path"])
+    trace = json.loads(trace_path.read_text(encoding="utf-8").splitlines()[0])
+    tool_names = [tool["function"]["name"] for tool in trace["tools"]]
+    assert "list_skills" in tool_names
+    assert "search_skills" in tool_names
+    assert "load_skill" in tool_names
+    assert "load_skill_file" in tool_names

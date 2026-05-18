@@ -15,6 +15,8 @@ from pydantic_evals import Case, Dataset
 from .adapters.agent_adapter import CaseFactory, create_adapter
 from .gepa_graph.models import CandidateMap, candidate_texts
 from .input_type import InputSpec
+from .skills import SkillsFS
+from .skills.models import SkillCapability
 
 
 @dataclass(slots=True)
@@ -38,6 +40,8 @@ async def evaluate_candidate_dataset(
     capture_traces: bool = False,
     input_type: InputSpec[BaseModel] | None = None,
     case_factory: CaseFactory | None = None,
+    skills_fs: SkillsFS | None = None,
+    skills_capabilities: set[SkillCapability] | None = None,
 ) -> list[EvaluationRecord]:
     """Evaluate an agent/candidate pair on a dataset in parallel.
 
@@ -67,6 +71,8 @@ async def evaluate_candidate_dataset(
         cache_manager=None,
         agent_usage_limits=agent_usage_limits,
         case_factory=case_factory,
+        skills_fs=skills_fs,
+        skills_capabilities=skills_capabilities,
     )
 
     candidate_map: CandidateMap = candidate.copy() if candidate is not None else {}
