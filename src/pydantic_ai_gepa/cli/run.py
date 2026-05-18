@@ -25,6 +25,7 @@ from .layout import (
     insert_repo_root_on_path,
     new_run_id,
     resolve_agent,
+    resolve_skills,
     run_dir,
     run_state_path,
     runs_dir,
@@ -325,7 +326,8 @@ def _current_baseline_candidate_id() -> str:
     cfg = GepaConfig.load(config_path())
     insert_repo_root_on_path()
     agent = resolve_agent(cfg)
-    components = ComponentStore().effective_candidate(agent)
+    skills_fs = resolve_skills(cfg)
+    components = ComponentStore().effective_candidate(agent, skills_fs=skills_fs)
     return candidate_id_from_components(components)
 
 

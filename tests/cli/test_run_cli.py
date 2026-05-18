@@ -13,6 +13,7 @@ from click.testing import Result
 from typer.testing import CliRunner
 
 from pydantic_ai_gepa.cli import app as gepa_app
+from pydantic_ai_gepa.cli.candidates import candidate_id_from_components
 from pydantic_ai_gepa.cli.layout import final_report_path, run_state_path
 
 
@@ -110,7 +111,9 @@ def test_continue_after_revert_discards_candidate_and_advances(repo: Path) -> No
 
     first_continue = _run("run", "continue", "--run-id", run_id)
     assert first_continue.exit_code == 0, first_continue.output
-    assert _run_payload(first_continue.output)["status"] == "paused_after_candidate_eval"
+    assert (
+        _run_payload(first_continue.output)["status"] == "paused_after_candidate_eval"
+    )
 
     second_continue = _run("run", "continue", "--run-id", run_id)
 
@@ -119,6 +122,44 @@ def test_continue_after_revert_discards_candidate_and_advances(repo: Path) -> No
     payload = _run_payload(second_continue.output)
     assert payload["status"] == "done"
     assert payload["iterations"] == 3
+
+
+def test_current_baseline_candidate_id_includes_configured_skills(repo: Path) -> None:
+    skills_dir = repo / "skills" / "month-grid"
+    skills_dir.mkdir(parents=True)
+    (skills_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: month-grid\n"
+        "description: Use for visual calendar grids.\n"
+        "---\n"
+        "# Month Grid\n",
+        encoding="utf-8",
+    )
+    config = repo / ".gepa" / "gepa.toml"
+    config.write_text(
+        config.read_text(encoding="utf-8") + 'skills = "skills"\n',
+        encoding="utf-8",
+    )
+
+    from pydantic_ai_gepa.cli.layout import (
+        GepaConfig,
+        config_path,
+        resolve_agent,
+        resolve_skills,
+    )
+    from pydantic_ai_gepa.cli.run import _current_baseline_candidate_id
+    from pydantic_ai_gepa.cli.store import ComponentStore
+
+    cfg = GepaConfig.load(config_path())
+    agent = resolve_agent(cfg)
+    store = ComponentStore()
+    without_skills = candidate_id_from_components(store.effective_candidate(agent))
+    expected = candidate_id_from_components(
+        store.effective_candidate(agent, skills_fs=resolve_skills(cfg))
+    )
+
+    assert expected != without_skills
+    assert _current_baseline_candidate_id() == expected
 
 
 def test_managed_run_prints_final_report_at_max_iterations(repo: Path) -> None:
