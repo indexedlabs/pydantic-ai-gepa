@@ -109,6 +109,19 @@ def create_skills_toolset(
         content = fs.read_text(path)
         return content, _hash_text(content)
 
+    def _list_skill_files(skill_path: str) -> list[str]:
+        normalized = _resolve_skill_dir(skill_path)
+        prefix = f"{normalized}/"
+        files: list[str] = []
+        for path, _file in fs.iter_files():
+            if not path.startswith(prefix):
+                continue
+            relative_path = path.removeprefix(prefix)
+            if relative_path == "SKILL.md":
+                continue
+            files.append(relative_path)
+        return sorted(files)
+
     if SkillCapability.READ in capabilities:
 
         @toolset.tool_plain
@@ -168,13 +181,14 @@ def create_skills_toolset(
 
         @toolset.tool_plain
         def load_skill(skill_path: str) -> SkillLoadResult:
-            """Load the full SKILL.md for a skill."""
+            """Load the full SKILL.md for a skill and list its loadable files."""
             content, content_hash = _read_skill_md(skill_path)
             normalized = _resolve_skill_dir(skill_path)
             return SkillLoadResult(
                 skill_path=normalized,
                 content=content,
                 content_hash=content_hash,
+                files=_list_skill_files(normalized),
             )
 
     if SkillCapability.READ in capabilities:

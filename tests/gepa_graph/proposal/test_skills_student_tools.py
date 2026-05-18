@@ -56,6 +56,7 @@ def test_create_skills_toolset_list_search_load() -> None:
     load_fn = _get_tool_fn(toolset, "load_skill")
     loaded = load_fn(skill_path="index/tasks")
     assert loaded.content.startswith("---")
+    assert loaded.files == ["references/REF.md"]
 
     load_file_fn = _get_tool_fn(toolset, "load_skill_file")
     loaded_file = load_file_fn(skill_path="index/tasks", path="references/REF.md")

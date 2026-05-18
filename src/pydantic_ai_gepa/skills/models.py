@@ -32,6 +32,13 @@ class SkillLoadResult(BaseModel):
     skill_path: str
     content: str
     content_hash: str
+    files: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Relative file paths available within this skill. "
+            "Pass one of these paths to load_skill_file(skill_path, path)."
+        ),
+    )
 
 
 class SkillFileResult(BaseModel):

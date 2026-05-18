@@ -515,6 +515,19 @@ def _build_component_selection_toolset(
             f"Unknown skill_path={skill_path!r}.{hint} Use list_skills() to see valid skill paths."
         )
 
+    def _list_skill_files(view: OverlayFS, skill_path: str) -> list[str]:
+        normalized = _resolve_skill_dir(view, skill_path)
+        prefix = f"{normalized}/"
+        files: list[str] = []
+        for path, _file in view.iter_files():
+            if not path.startswith(prefix):
+                continue
+            relative_path = path.removeprefix(prefix)
+            if relative_path == "SKILL.md":
+                continue
+            files.append(relative_path)
+        return sorted(files)
+
     @toolset.tool_plain
     def list_skills() -> list[SkillSummary]:
         """List available skills with their name and description."""
@@ -552,16 +565,18 @@ def _build_component_selection_toolset(
 
     @toolset.tool_plain
     def load_skill(skill_path: str) -> SkillLoadResult:
-        """Load the full SKILL.md for a skill."""
+        """Load the full SKILL.md for a skill and list its loadable files."""
         candidate = _candidate()
         with apply_candidate_to_skills(skills_fs, candidate.components) as view:
             normalized = _resolve_skill_dir(view, skill_path)
             path = f"{normalized}/SKILL.md"
             content = view.read_text(path)
+            files = _list_skill_files(view, normalized)
         return SkillLoadResult(
             skill_path=normalized,
             content=content,
             content_hash=_hash_text(content),
+            files=files,
         )
 
     @toolset.tool_plain
