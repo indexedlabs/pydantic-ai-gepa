@@ -21,6 +21,9 @@ from .layout import components_dir, staged_dir
 
 if TYPE_CHECKING:
     from pydantic_ai.agent import AbstractAgent
+    from ..skills import SkillsFS
+    from ..skills.models import SkillCapability
+    from ..skills.search import SkillsSearchProvider
 
 
 SLOT_SEPARATOR = "__"
@@ -193,9 +196,21 @@ class ComponentStore:
 
     # ---------- lifecycle composition ----------
 
-    def slot_records(self, agent: AbstractAgent[Any, Any]) -> list[SlotRecord]:
+    def slot_records(
+        self,
+        agent: AbstractAgent[Any, Any],
+        *,
+        skills_fs: SkillsFS | None = None,
+        skills_search_backend: SkillsSearchProvider | None = None,
+        skills_capabilities: set[SkillCapability] | None = None,
+    ) -> list[SlotRecord]:
         """Compose a per-slot view across introspection + on-disk state."""
-        introspected = introspect_agent(agent)
+        introspected = introspect_agent(
+            agent,
+            skills_fs=skills_fs,
+            skills_search_backend=skills_search_backend,
+            skills_capabilities=skills_capabilities,
+        )
         introspected_names = set(introspected)
         confirmed = set(self.list_confirmed_slots())
         staged = set(self.list_staged_slots())
@@ -228,9 +243,21 @@ class ComponentStore:
             )
         return records
 
-    def detect_new_slots(self, agent: AbstractAgent[Any, Any]) -> list[str]:
+    def detect_new_slots(
+        self,
+        agent: AbstractAgent[Any, Any],
+        *,
+        skills_fs: SkillsFS | None = None,
+        skills_search_backend: SkillsSearchProvider | None = None,
+        skills_capabilities: set[SkillCapability] | None = None,
+    ) -> list[str]:
         """Stage stubs for any introspected slots that lack a confirmed file. Returns the newly-staged names."""
-        introspected = introspect_agent(agent)
+        introspected = introspect_agent(
+            agent,
+            skills_fs=skills_fs,
+            skills_search_backend=skills_search_backend,
+            skills_capabilities=skills_capabilities,
+        )
         confirmed = set(self.list_confirmed_slots())
         staged_now: list[str] = []
         for name, seed in introspected.items():
@@ -243,7 +270,14 @@ class ComponentStore:
             staged_now.append(name)
         return sorted(staged_now)
 
-    def effective_candidate(self, agent: AbstractAgent[Any, Any]) -> dict[str, str]:
+    def effective_candidate(
+        self,
+        agent: AbstractAgent[Any, Any],
+        *,
+        skills_fs: SkillsFS | None = None,
+        skills_search_backend: SkillsSearchProvider | None = None,
+        skills_capabilities: set[SkillCapability] | None = None,
+    ) -> dict[str, str]:
         """Return the candidate dict that should be applied for the current baseline.
 
         Resolution order per slot:
@@ -254,7 +288,12 @@ class ComponentStore:
         Staged-only slots are *not* included — baseline `gepa eval` is supposed to block on them.
         Orphan slots (file exists but not introspected) are *not* included either.
         """
-        introspected = introspect_agent(agent)
+        introspected = introspect_agent(
+            agent,
+            skills_fs=skills_fs,
+            skills_search_backend=skills_search_backend,
+            skills_capabilities=skills_capabilities,
+        )
         candidate: dict[str, str] = {}
         for slot, seed in introspected.items():
             confirmed = self.read(slot)
@@ -270,7 +309,13 @@ class ComponentStore:
 # ---------- agent introspection ----------
 
 
-def introspect_agent(agent: AbstractAgent[Any, Any]) -> dict[str, str]:
+def introspect_agent(
+    agent: AbstractAgent[Any, Any],
+    *,
+    skills_fs: SkillsFS | None = None,
+    skills_search_backend: SkillsSearchProvider | None = None,
+    skills_capabilities: set[SkillCapability] | None = None,
+) -> dict[str, str]:
     """Return ``{slot_name: introspected_seed_text}`` for the optimizable surface of an agent.
 
     Slot kinds covered:
@@ -285,6 +330,7 @@ def introspect_agent(agent: AbstractAgent[Any, Any]) -> dict[str, str]:
     catalog has seen the registered tools. It does NOT execute the agent.
     """
     from ..components import extract_seed_candidate_with_input_type
+    from ..gepa_graph.proposal.student_tools import create_skills_toolset
     from ..signature_agent import SignatureAgent
     from ..tool_components import (
         get_or_create_output_tool_optimizer,
@@ -294,7 +340,16 @@ def introspect_agent(agent: AbstractAgent[Any, Any]) -> dict[str, str]:
     # Installing the optimizers pre-seeds their catalogs from registered tools
     # (and registers the `PrepareTools` capability so future runs ingest dynamic
     # tools too). For introspection alone we just need the pre-seed.
-    get_or_create_tool_optimizer(agent)
+    tool_optimizer = get_or_create_tool_optimizer(agent)
+    if skills_fs is not None:
+        toolset = create_skills_toolset(
+            skills_fs,
+            search_backend=skills_search_backend,
+            capabilities=skills_capabilities,
+        )
+        tool_optimizer.record_model_request(
+            function_tools=[tool.tool_def for tool in toolset.tools.values()]
+        )
     optimize_output_type = False
     try:
         get_or_create_output_tool_optimizer(agent)

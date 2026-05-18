@@ -14,7 +14,13 @@ from pathlib import Path
 import typer
 
 from ._io import read_content_file, write_content_file
-from .layout import GepaConfig, config_path, insert_repo_root_on_path, resolve_agent
+from .layout import (
+    GepaConfig,
+    config_path,
+    insert_repo_root_on_path,
+    resolve_agent,
+    resolve_skills,
+)
 from .store import ComponentStore, SlotRecord
 
 
@@ -23,11 +29,11 @@ app = typer.Typer(
 )
 
 
-def _load_agent():
+def _load_context():
     cfg_path = config_path()
     cfg = GepaConfig.load(cfg_path)
     insert_repo_root_on_path()
-    return resolve_agent(cfg)
+    return resolve_agent(cfg), resolve_skills(cfg)
 
 
 def _records_for_output(records: list[SlotRecord]) -> list[dict[str, object]]:
@@ -86,9 +92,9 @@ def list_(
     ),
 ) -> None:
     """List the canonical slot set with per-slot status."""
-    agent = _load_agent()
+    agent, skills_fs = _load_context()
     store = ComponentStore()
-    records = store.slot_records(agent)
+    records = store.slot_records(agent, skills_fs=skills_fs)
 
     if format_ == "json":
         typer.echo(json.dumps(_records_for_output(records), indent=2))
@@ -130,19 +136,19 @@ def show(
     elif source == "staged":
         text = store.read_staged(slot)
     elif source == "seed":
-        agent = _load_agent()
+        agent, skills_fs = _load_context()
         from .store import introspect_agent
 
-        text = introspect_agent(agent).get(slot)
+        text = introspect_agent(agent, skills_fs=skills_fs).get(slot)
     elif source == "auto":
         text = store.read(slot)
         if text is None:
             text = store.read_staged(slot)
         if text is None:
-            agent = _load_agent()
+            agent, skills_fs = _load_context()
             from .store import introspect_agent
 
-            text = introspect_agent(agent).get(slot)
+            text = introspect_agent(agent, skills_fs=skills_fs).get(slot)
     else:
         typer.echo(
             f"Unknown --source {source!r}; expected one of: auto, confirmed, staged, seed",

@@ -178,7 +178,7 @@ def run_eval_once(
     store = ComponentStore()
     is_baseline_eval = candidate_file is None
     if is_baseline_eval:
-        staged = store.detect_new_slots(agent)
+        staged = store.detect_new_slots(agent, skills_fs=skills_fs)
         if staged:
             typer.echo(
                 "Found unconfirmed component slots; refusing to evaluate the baseline.",
@@ -195,7 +195,7 @@ def run_eval_once(
         # Warn (don't fail) on orphan slots — files in .gepa/components/ that
         # no longer correspond to an introspected slot. These are skipped by
         # `effective_candidate`, but worth surfacing so the agent notices.
-        introspected_names = set(store.effective_candidate(agent))
+        introspected_names = set(store.effective_candidate(agent, skills_fs=skills_fs))
         orphans = sorted(
             slot
             for slot in store.list_confirmed_slots()
@@ -211,7 +211,7 @@ def run_eval_once(
                 err=True,
             )
 
-        baseline_components = store.effective_candidate(agent)
+        baseline_components = store.effective_candidate(agent, skills_fs=skills_fs)
         candidate = Candidate(
             id=candidate_id_from_components(baseline_components),
             components=baseline_components,

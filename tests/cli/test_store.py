@@ -17,6 +17,7 @@ from pydantic_ai_gepa.cli.store import (
     introspect_agent,
     slot_to_filename,
 )
+from pydantic_ai_gepa.skills import SkillsFS
 
 
 def _make_agent() -> Agent[None, str]:
@@ -37,6 +38,19 @@ def _make_agent() -> Agent[None, str]:
         return f"{style}: {text}"
 
     return agent
+
+
+def _make_skills_fs() -> SkillsFS:
+    fs = SkillsFS()
+    fs.write_text(
+        "month-grid/SKILL.md",
+        "---\n"
+        "name: month-grid\n"
+        "description: Use for visual calendar grids.\n"
+        "---\n"
+        "# Month Grid\n",
+    )
+    return fs
 
 
 def test_slot_filename_round_trip() -> None:
@@ -71,6 +85,16 @@ def test_introspect_agent_finds_instructions_and_tools() -> None:
     # Parameter descriptions should appear too.
     param_slots = [s for s in slots if s.startswith("tool:format_text:param:")]
     assert any("text" in s for s in param_slots), slots
+
+
+def test_introspect_agent_with_skills_includes_skill_tool_slots() -> None:
+    agent = _make_agent()
+    slots = introspect_agent(agent, skills_fs=_make_skills_fs())
+
+    assert "tool:list_skills:description" in slots
+    assert "tool:search_skills:description" in slots
+    assert "tool:load_skill:description" in slots
+    assert "tool:load_skill_file:description" in slots
 
 
 def test_introspect_agent_with_signature_includes_input_fields() -> None:
@@ -188,6 +212,27 @@ def test_slot_records_status_resolution(tmp_path: Path) -> None:
     records = store.slot_records(agent)
     by_name = {r.name: r for r in records}
     assert by_name["tool:ghost:description"].status == SlotStatus.ORPHAN
+
+
+def test_slot_records_keep_confirmed_skill_tool_slots_valid(tmp_path: Path) -> None:
+    ensure_layout(tmp_path)
+    store = ComponentStore(tmp_path)
+    agent = _make_agent()
+    skills_fs = _make_skills_fs()
+
+    store.write("tool:list_skills:description", "Custom skill list guidance.")
+
+    records = store.slot_records(agent, skills_fs=skills_fs)
+    by_name = {r.name: r for r in records}
+
+    assert by_name["tool:list_skills:description"].status == SlotStatus.CONFIRMED
+    assert by_name["tool:list_skills:description"].introspected_seed is not None
+    assert (
+        store.effective_candidate(agent, skills_fs=skills_fs)[
+            "tool:list_skills:description"
+        ]
+        == "Custom skill list guidance."
+    )
 
 
 def test_detect_new_slots_stages_unconfirmed(tmp_path: Path) -> None:
