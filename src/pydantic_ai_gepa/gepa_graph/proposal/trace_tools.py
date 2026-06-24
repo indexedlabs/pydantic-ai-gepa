@@ -8,6 +8,7 @@ from typing import Any
 from pydantic_ai import Agent, FunctionToolset
 
 from ...types import DEFAULT_MAX_SPAWNED_AGENTS
+from .trace_store import StructuredTraceStore
 
 
 class ClearMessageHistoryException(Exception):
@@ -35,16 +36,26 @@ MONTY_REPL_PROMPT_GUIDANCE = """
 - Unsupported syntax includes `with` statements, `class` definitions, `match`, and `yield`. Do not use context managers, generators, or custom classes.
 - Unsupported runtime/builtins include `globals()`, `locals()`, `eval()`, `exec()`, and `__import__()`.
 - Imports are limited to a small standard-library subset such as `json`, `re`, `datetime`, `typing`, `sys`, and partial `os`. Third-party packages and most stdlib modules are unavailable. Prefer the pre-bound helpers below instead of filesystem imports or `os.getcwd()`.
-- Pre-bound helpers: `read_file`, `file_info`, `file_size`, `line_count`, `read_lines`, `read_line_batch`, `tail_lines`, `find_lines`, `list_dir`, `json_loads`, plus `Path` and `json`.
+- Pre-bound helpers: `trace_overview`, `query_traces`, `count_traces`, `view_trace`, `view_spans`, `search_trace`, `search_span`, `read_file`, `file_info`, `file_size`, `line_count`, `read_lines`, `read_line_batch`, `tail_lines`, `find_lines`, `list_dir`, `json_loads`, plus `Path` and `json`.
 
 ### Trace file navigation
 - `traces/traces.jsonl` can be large. Avoid `read_file('traces/traces.jsonl')` unless you already know it is small; returning the whole trace file can overflow the reflection model context.
-- Start with `file_info('traces/traces.jsonl')` to understand size and line count.
-- Use `find_lines('traces/traces.jsonl', query, limit=20)` for targeted search and `tail_lines(..., limit=20)` for recent spans or exceptions.
+- Prefer the structured trace helpers first: call `trace_overview()` to size the dataset, `query_traces(...)` to find trace IDs, `view_trace(trace_id)` for bounded span views, `view_spans(trace_id, span_ids)` for surgical reads, and `search_trace(...)` / `search_span(...)` for raw regex evidence.
+- Use `file_info('traces/traces.jsonl')` to understand raw file size and line count when dropping down to file-level analysis.
+- Use `find_lines('traces/traces.jsonl', query, limit=20)` for simple targeted raw search and `tail_lines(..., limit=20)` for recent spans or exceptions.
 - Use `read_lines(path, start=n, limit=10)` for a small window around a known line number.
 - For full-file scans, write one reducer-style script around `read_line_batch(path, offset=0, limit=1000)`. Advance with `offset = batch['next_offset']`, stop when `batch['eof']`, and return only compact aggregates.
 
-Canonical full-scan pattern:
+Canonical structured pattern:
+```python
+overview = trace_overview()
+errors = query_traces({'has_errors': True}, limit=20)
+first_error = errors['traces'][0]['trace_id'] if errors['traces'] else None
+view = view_trace(first_error) if first_error else {'spans': []}
+{'overview': overview, 'first_error_span_count': len(view['spans'])}
+```
+
+Canonical raw full-scan pattern:
 ```python
 offset = 0
 failures = 0
@@ -128,6 +139,53 @@ def list_dir(path: str):
 
 def json_loads(data: str):
     return json.loads(data)
+
+def trace_overview(filters=None, path: str = 'traces/traces.jsonl'):
+    return host_trace_overview(str(path), filters)
+
+def query_traces(filters=None, limit: int = 50, offset: int = 0, path: str = 'traces/traces.jsonl'):
+    return host_query_traces(str(path), filters, limit, offset)
+
+def count_traces(filters=None, path: str = 'traces/traces.jsonl'):
+    return host_count_traces(str(path), filters)
+
+def view_trace(trace_id: str, path: str = 'traces/traces.jsonl'):
+    return host_view_trace(str(path), str(trace_id))
+
+def view_spans(trace_id: str, span_ids, path: str = 'traces/traces.jsonl'):
+    return host_view_spans(str(path), str(trace_id), span_ids)
+
+def search_trace(
+    trace_id: str,
+    regex_pattern: str,
+    context_chars: int = 100,
+    max_matches: int = 50,
+    path: str = 'traces/traces.jsonl',
+):
+    return host_search_trace(
+        str(path),
+        str(trace_id),
+        str(regex_pattern),
+        context_chars,
+        max_matches,
+    )
+
+def search_span(
+    trace_id: str,
+    span_id: str,
+    regex_pattern: str,
+    context_chars: int = 100,
+    max_matches: int = 50,
+    path: str = 'traces/traces.jsonl',
+):
+    return host_search_span(
+        str(path),
+        str(trace_id),
+        str(span_id),
+        str(regex_pattern),
+        context_chars,
+        max_matches,
+    )
 """
 
 
@@ -338,6 +396,92 @@ def create_trace_toolset(
                     break
         return matches
 
+    trace_store_cache: dict[tuple[Path, int, int], StructuredTraceStore] = {}
+
+    def _get_trace_store(path: str) -> StructuredTraceStore:
+        safe_path = _resolve_host_path(path)
+        stat = safe_path.stat()
+        cache_key = (safe_path, stat.st_size, stat.st_mtime_ns)
+        store = trace_store_cache.get(cache_key)
+        if store is None:
+            store = StructuredTraceStore.load(safe_path)
+            trace_store_cache.clear()
+            trace_store_cache[cache_key] = store
+        return store
+
+    def _host_trace_overview(
+        path: str = "traces/traces.jsonl",
+        filters: Any = None,
+    ) -> dict[str, Any]:
+        return _get_trace_store(path).overview(filters)
+
+    def _host_query_traces(
+        path: str = "traces/traces.jsonl",
+        filters: Any = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        return _get_trace_store(path).query_traces(
+            filters,
+            limit=limit,
+            offset=offset,
+        )
+
+    def _host_count_traces(
+        path: str = "traces/traces.jsonl",
+        filters: Any = None,
+    ) -> dict[str, int]:
+        return _get_trace_store(path).count_traces(filters)
+
+    def _host_view_trace(
+        path: str,
+        trace_id: str,
+    ) -> dict[str, Any]:
+        return _get_trace_store(path).view_trace(trace_id)
+
+    def _host_view_spans(
+        path: str,
+        trace_id: str,
+        span_ids: Any,
+    ) -> dict[str, Any]:
+        if isinstance(span_ids, str):
+            normalized_span_ids = [span_ids]
+        elif isinstance(span_ids, (list, tuple, set, frozenset)):
+            normalized_span_ids = [str(span_id) for span_id in span_ids]
+        else:
+            normalized_span_ids = [str(span_ids)]
+        return _get_trace_store(path).view_spans(trace_id, normalized_span_ids)
+
+    def _host_search_trace(
+        path: str,
+        trace_id: str,
+        regex_pattern: str,
+        context_chars: int = 100,
+        max_matches: int = 50,
+    ) -> dict[str, Any]:
+        return _get_trace_store(path).search_trace(
+            trace_id,
+            regex_pattern,
+            context_chars=context_chars,
+            max_matches=max_matches,
+        )
+
+    def _host_search_span(
+        path: str,
+        trace_id: str,
+        span_id: str,
+        regex_pattern: str,
+        context_chars: int = 100,
+        max_matches: int = 50,
+    ) -> dict[str, Any]:
+        return _get_trace_store(path).search_span(
+            trace_id,
+            span_id,
+            regex_pattern,
+            context_chars=context_chars,
+            max_matches=max_matches,
+        )
+
     @toolset.tool_plain
     def read_file(path: str) -> str:
         """Read a file relative to the context directory."""
@@ -364,6 +508,13 @@ def create_trace_toolset(
             "host_read_line_batch": _host_read_line_batch,
             "host_tail_lines": _host_tail_lines,
             "host_find_lines": _host_find_lines,
+            "host_trace_overview": _host_trace_overview,
+            "host_query_traces": _host_query_traces,
+            "host_count_traces": _host_count_traces,
+            "host_view_trace": _host_view_trace,
+            "host_view_spans": _host_view_spans,
+            "host_search_trace": _host_search_trace,
+            "host_search_span": _host_search_span,
         }
 
         def _reset_repl_timer(repl: Any) -> Any:
@@ -431,6 +582,13 @@ def create_trace_toolset(
             a bare expression containing the compact result you want.
 
             You have access to:
+            - `trace_overview(filters=None) -> dict`: Dataset-level rollup across OTel traces.
+            - `query_traces(filters=None, limit=50, offset=0) -> dict`: Paginated trace summaries.
+            - `count_traces(filters=None) -> dict`: Count traces matching filters.
+            - `view_trace(trace_id: str) -> dict`: Bounded span view for one trace.
+            - `view_spans(trace_id: str, span_ids: list[str]) -> dict`: Higher-budget view for selected spans.
+            - `search_trace(trace_id: str, regex_pattern: str, ...) -> dict`: Regex-search raw span JSON within one trace.
+            - `search_span(trace_id: str, span_id: str, regex_pattern: str, ...) -> dict`: Regex-search raw JSON within one span.
             - `read_file(path: str) -> str`: Reads a file relative to the context directory.
             - `file_size(path: str) -> int`: Returns file size in bytes.
             - `line_count(path: str) -> int`: Counts lines without reading the file into the REPL.
@@ -488,7 +646,10 @@ def create_trace_toolset(
 
                 You have access to file helpers including `read_file`, `file_size`,
                 `line_count`, `file_info`, `read_lines`, `read_line_batch`,
-                `tail_lines`, `find_lines`, `list_dir`, and `json_loads`.
+                `tail_lines`, `find_lines`, `list_dir`, `json_loads`, and
+                structured trace helpers including `trace_overview`,
+                `query_traces`, `view_trace`, `view_spans`, `search_trace`, and
+                `search_span`.
                 This is pydantic-monty, not CPython; avoid unsupported syntax such
                 as `with`, `class`, `match`, and `yield`, and return a final expression.
                 """
@@ -517,7 +678,7 @@ def create_trace_toolset(
                 "You are a recursive sub-agent exploring a sub-problem for trace analysis.\n"
                 f"You are sub-agent {spawn_index} of at most {max_spawned_agents} for this proposal step.\n"
                 "Your python environment is persistent. Variables stay in memory.\n"
-                "Use `run_python_repl` to parse `traces/traces.jsonl`; prefer `read_line_batch` for full-file scans.\n"
+                "Use `run_python_repl` to analyze `traces/traces.jsonl`; prefer structured helpers like `trace_overview`, `query_traces`, `view_trace`, and `search_trace` before raw file scans.\n"
                 "The REPL is pydantic-monty, not CPython: avoid `with`, `class`, `match`, `yield`, unsupported imports, and `print` as a return value.\n"
                 "Return your final answer to the parent agent.\n"
                 "IMPORTANT: To leverage LLM prompt caching, you should build up state in your Python REPL.\n"

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+import json
 
 import pytest
 
 import pydantic_ai_gepa.gepa_graph.proposal.trace_tools as trace_tools_module
+from pydantic_ai_gepa.gepa_graph.proposal.trace_store import (
+    StructuredTraceStore,
+    span_to_jsonl_line,
+)
 from pydantic_ai_gepa.gepa_graph.proposal.trace_tools import (
     ClearMessageHistoryException,
     create_trace_toolset,
@@ -33,6 +38,142 @@ def _write_trace_context(tmp_path):
         encoding="utf-8",
     )
     return base_dir
+
+
+def _span(
+    *,
+    trace_id: str,
+    span_id: str,
+    parent_id: str = "",
+    name: str = "chat test",
+    status_code: str = "UNSET",
+    attributes: dict | None = None,
+):
+    return {
+        "name": name,
+        "context": {
+            "trace_id": trace_id,
+            "span_id": span_id,
+            "trace_state": "[]",
+        },
+        "kind": "SpanKind.CLIENT",
+        "parent_id": parent_id,
+        "start_time": "2026-05-03T18:03:48.000000Z",
+        "end_time": "2026-05-03T18:03:49.000000Z",
+        "status": {"status_code": status_code},
+        "attributes": attributes or {},
+        "events": [],
+        "links": [],
+        "resource": {
+            "attributes": {
+                "service.name": "gepa-test",
+            },
+            "schema_url": "",
+        },
+    }
+
+
+def _write_otel_trace_context(tmp_path):
+    base_dir = tmp_path / ".gepa_cache" / "runs" / "run-1" / "candidates" / "0"
+    traces_dir = base_dir / "traces"
+    traces_dir.mkdir(parents=True)
+    spans = [
+        _span(
+            trace_id="trace-a",
+            span_id="span-a1",
+            attributes={
+                "gen_ai.agent.name": "student",
+                "gen_ai.request.model": "test-model",
+                "gen_ai.response.model": "test-model",
+                "gen_ai.usage.input_tokens": 12,
+                "gen_ai.usage.output_tokens": 3,
+                "gen_ai.output.messages": '[{"role":"assistant","content":"ok"}]',
+            },
+        ),
+        _span(
+            trace_id="trace-a",
+            span_id="span-a2",
+            parent_id="span-a1",
+            name="lookup tool",
+            attributes={"tool.name": "lookup"},
+        ),
+        _span(
+            trace_id="trace-b",
+            span_id="span-b1",
+            name="chat test",
+            status_code="ERROR",
+            attributes={
+                "gen_ai.agent.name": "student",
+                "gen_ai.request.model": "test-model",
+                "exception.message": "ValueError: bad input",
+            },
+        ),
+    ]
+    (traces_dir / "traces.jsonl").write_text(
+        "".join(json.dumps(span, separators=(",", ":")) + "\n" for span in spans),
+        encoding="utf-8",
+    )
+    (base_dir / "components.json").write_text(
+        '{"instructions": "seed instructions"}',
+        encoding="utf-8",
+    )
+    return base_dir
+
+
+def test_span_to_jsonl_line_compacts_pretty_span_json() -> None:
+    class FakeSpan:
+        def to_json(self):
+            return json.dumps(
+                _span(trace_id="trace-a", span_id="span-a1"),
+                indent=2,
+            )
+
+    line = span_to_jsonl_line(FakeSpan())
+
+    assert line.endswith("\n")
+    assert "\\n" not in line.rstrip("\n")
+    parsed = json.loads(line)
+    assert parsed["context"]["trace_id"] == "trace-a"
+    assert parsed["context"]["span_id"] == "span-a1"
+
+
+def test_structured_trace_store_reads_legacy_literal_newline_separator(
+    tmp_path,
+) -> None:
+    path = tmp_path / "traces.jsonl"
+    path.write_text(
+        json.dumps(_span(trace_id="trace-a", span_id="span-a1"), indent=2)
+        + "\\n"
+        + json.dumps(_span(trace_id="trace-b", span_id="span-b1"), indent=2),
+        encoding="utf-8",
+    )
+
+    store = StructuredTraceStore.load(path)
+
+    assert store.overview()["total_traces"] == 2
+    assert store.query_traces(limit=10)["traces"][1]["trace_id"] == "trace-b"
+
+
+def test_structured_trace_store_filters_span_name_across_all_spans(tmp_path) -> None:
+    path = tmp_path / "traces.jsonl"
+    spans = [
+        _span(trace_id="trace-a", span_id=f"span-a{idx}", name=f"common-{idx}")
+        for idx in range(25)
+    ]
+    spans.append(_span(trace_id="trace-a", span_id="span-rare", name="rare target"))
+    spans.append(_span(trace_id="trace-b", span_id="span-b1", name="other trace"))
+    path.write_text(
+        "".join(json.dumps(span, separators=(",", ":")) + "\n" for span in spans),
+        encoding="utf-8",
+    )
+
+    store = StructuredTraceStore.load(path)
+
+    assert store.count_traces({"span_name": "rare target"}) == {"total": 1}
+    assert (
+        store.query_traces({"span_name": "rare target"})["traces"][0]["trace_id"]
+        == "trace-a"
+    )
 
 
 @pytest.mark.asyncio
@@ -70,6 +211,51 @@ async def test_monty_repl_reads_trace_context_and_persists_state(
     assert variable_result == "42"
     assert failed_result == "1"
     assert listed_result == "['traces/traces.jsonl']"
+
+
+@pytest.mark.asyncio
+async def test_structured_trace_helpers_query_view_and_search_spans(
+    monkeypatch, tmp_path
+) -> None:
+    _write_otel_trace_context(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    toolset = create_trace_toolset("run-1", 0)
+    run_python_repl = toolset.tools["run_python_repl"].function
+
+    overview_result = await run_python_repl(
+        "overview = trace_overview()\n"
+        "(overview['total_traces'], overview['total_spans'], "
+        "overview['error_trace_count'], overview['model_names'])"
+    )
+    query_result = await run_python_repl(
+        "errors = query_traces({'has_errors': True})\n"
+        "(errors['total'], errors['traces'][0]['trace_id'], "
+        "errors['traces'][0]['status_counts'])"
+    )
+    count_result = await run_python_repl(
+        "count_traces({'model_names': ['test-model']})['total']"
+    )
+    view_result = await run_python_repl(
+        "view = view_trace('trace-a')\n"
+        "(len(view['spans']), view['spans'][0]['attributes']['gen_ai.request.model'])"
+    )
+    span_result = await run_python_repl(
+        "selected = view_spans('trace-a', ['span-a2'])\n"
+        "(len(selected['spans']), selected['spans'][0]['attributes']['tool.name'])"
+    )
+    search_result = await run_python_repl(
+        "matches = search_trace('trace-b', 'ValueError')\n"
+        "(matches['match_count'], matches['matches'][0]['span_id'], "
+        "'ValueError' in matches['matches'][0]['matched_context'])"
+    )
+
+    assert overview_result == "(2, 3, 1, ['test-model'])"
+    assert query_result == "(1, 'trace-b', {'ERROR': 1})"
+    assert count_result == "2"
+    assert view_result == "(2, 'test-model')"
+    assert span_result == "(1, 'lookup')"
+    assert search_result == "(1, 'span-b1', True)"
 
 
 @pytest.mark.asyncio

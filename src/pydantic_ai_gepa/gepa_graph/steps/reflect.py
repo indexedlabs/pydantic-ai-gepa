@@ -223,6 +223,8 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
 
             spans = deps.memory_exporter.get_finished_spans()
             if spans:
+                from ..proposal.trace_store import span_to_jsonl_line
+
                 reflector_dir = Path(
                     f".gepa_cache/runs/{state.run_id}/candidates/{parent_idx}/reflector_traces"
                 )
@@ -230,7 +232,7 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
                 reflector_file = reflector_dir / "traces.jsonl"
                 with open(reflector_file, "a", encoding="utf-8") as f:
                     for span in spans:
-                        f.write(span.to_json() + "\\n")
+                        f.write(span_to_jsonl_line(span))
             deps.memory_exporter.clear()
 
         component_metadata = (
@@ -395,6 +397,8 @@ async def _evaluate_minibatch(
 
         spans = deps.memory_exporter.get_finished_spans()
         if spans:
+            from ..proposal.trace_store import span_to_jsonl_line
+
             traces_dir = Path(
                 f".gepa_cache/runs/{state.run_id}/candidates/{candidate.idx}/traces"
             )
@@ -402,7 +406,7 @@ async def _evaluate_minibatch(
             traces_file = traces_dir / "traces.jsonl"
             with open(traces_file, "a", encoding="utf-8") as f:
                 for span in spans:
-                    f.write(span.to_json() + "\\n")
+                    f.write(span_to_jsonl_line(span))
         deps.memory_exporter.clear()
     return results
 

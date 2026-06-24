@@ -40,6 +40,8 @@ async def evaluate_step(ctx: StepContext[GepaState, GepaDeps, None]) -> None:
 
         spans = ctx.deps.memory_exporter.get_finished_spans()
         if spans:
+            from ..proposal.trace_store import span_to_jsonl_line
+
             traces_dir = Path(
                 f".gepa_cache/runs/{state.run_id}/candidates/{candidate.idx}/traces"
             )
@@ -48,7 +50,7 @@ async def evaluate_step(ctx: StepContext[GepaState, GepaDeps, None]) -> None:
 
             with open(traces_file, "a", encoding="utf-8") as f:
                 for span in spans:
-                    f.write(span.to_json() + "\\n")
+                    f.write(span_to_jsonl_line(span))
 
         ctx.deps.memory_exporter.clear()
 

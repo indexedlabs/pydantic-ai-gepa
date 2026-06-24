@@ -328,19 +328,15 @@ Seed tools
 
 ## Production traces from student agent runs
 
-Each trace contains:
-- `messages`: Full conversation history with system prompts, user inputs, assistant responses, tool calls, and tool returns
-- `tools`: Tool definitions that were available (if any)
-- `score`: Performance score (0.0-1.0, higher is better)
-- `success`: Whether the run completed successfully
-- `feedback`: Evaluator feedback on this specific run
+The prompt includes compact reflection examples with scores, success flags, evaluator feedback, messages, and tool definitions.
+Full execution spans are available separately on disk as OTel/Logfire span JSON and should be inspected through the structured trace helpers in `run_python_repl`.
 
 
 ## Execution Traces Available for Analysis
 
 2 traces available from the execution: 0 succeeded, 2 failed.
-The traces are stored on disk as `traces/traces.jsonl`.
-You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts to parse these structured files.
+The OTel/Logfire spans are stored on disk as `traces/traces.jsonl`.
+You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts for trace analysis. Prefer structured helpers such as `trace_overview`, `query_traces`, `view_trace`, `view_spans`, `search_trace`, and `search_span`; drop down to raw file helpers only when needed.
 You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures. The proposal step has a shared limit of 5 spawned sub-agents, including recursive child spawns.
 
 **IMPORTANT: Prompt Caching & State Management**
@@ -357,16 +353,26 @@ Only use `clear_message_history` sparingly when absolutely necessary to avoid br
 - Unsupported syntax includes `with` statements, `class` definitions, `match`, and `yield`. Do not use context managers, generators, or custom classes.
 - Unsupported runtime/builtins include `globals()`, `locals()`, `eval()`, `exec()`, and `__import__()`.
 - Imports are limited to a small standard-library subset such as `json`, `re`, `datetime`, `typing`, `sys`, and partial `os`. Third-party packages and most stdlib modules are unavailable. Prefer the pre-bound helpers below instead of filesystem imports or `os.getcwd()`.
-- Pre-bound helpers: `read_file`, `file_info`, `file_size`, `line_count`, `read_lines`, `read_line_batch`, `tail_lines`, `find_lines`, `list_dir`, `json_loads`, plus `Path` and `json`.
+- Pre-bound helpers: `trace_overview`, `query_traces`, `count_traces`, `view_trace`, `view_spans`, `search_trace`, `search_span`, `read_file`, `file_info`, `file_size`, `line_count`, `read_lines`, `read_line_batch`, `tail_lines`, `find_lines`, `list_dir`, `json_loads`, plus `Path` and `json`.
 
 ### Trace file navigation
 - `traces/traces.jsonl` can be large. Avoid `read_file('traces/traces.jsonl')` unless you already know it is small; returning the whole trace file can overflow the reflection model context.
-- Start with `file_info('traces/traces.jsonl')` to understand size and line count.
-- Use `find_lines('traces/traces.jsonl', query, limit=20)` for targeted search and `tail_lines(..., limit=20)` for recent spans or exceptions.
+- Prefer the structured trace helpers first: call `trace_overview()` to size the dataset, `query_traces(...)` to find trace IDs, `view_trace(trace_id)` for bounded span views, `view_spans(trace_id, span_ids)` for surgical reads, and `search_trace(...)` / `search_span(...)` for raw regex evidence.
+- Use `file_info('traces/traces.jsonl')` to understand raw file size and line count when dropping down to file-level analysis.
+- Use `find_lines('traces/traces.jsonl', query, limit=20)` for simple targeted raw search and `tail_lines(..., limit=20)` for recent spans or exceptions.
 - Use `read_lines(path, start=n, limit=10)` for a small window around a known line number.
 - For full-file scans, write one reducer-style script around `read_line_batch(path, offset=0, limit=1000)`. Advance with `offset = batch['next_offset']`, stop when `batch['eof']`, and return only compact aggregates.
 
-Canonical full-scan pattern:
+Canonical structured pattern:
+```python
+overview = trace_overview()
+errors = query_traces({'has_errors': True}, limit=20)
+first_error = errors['traces'][0]['trace_id'] if errors['traces'] else None
+view = view_trace(first_error) if first_error else {'spans': []}
+{'overview': overview, 'first_error_span_count': len(view['spans'])}
+```
+
+Canonical raw full-scan pattern:
 ```python
 offset = 0
 failures = 0
@@ -387,7 +393,8 @@ while True:
 
 
 ### Analysis guidance
-- Use `run_python_repl` with `read_line_batch` to aggregate errors or find common failure modes across `traces.jsonl` without returning full traces.
+- Use `run_python_repl` with structured trace helpers to aggregate errors or find common failure modes across `traces.jsonl` without returning full traces.
+- Start with `trace_overview()`, use `query_traces(...)` to identify trace IDs, and then use `view_trace(...)`, `view_spans(...)`, `search_trace(...)`, or `search_span(...)` for focused evidence.
 - Use `spawn_agent` to understand *why* a specific trace failed if the python analysis is insufficient.
 - What failure patterns repeat across runs?
 - Are components misaligned (e.g., instructions referencing tools that don't exist)?
@@ -827,19 +834,15 @@ Seed tools
 
 ## Production traces from student agent runs
 
-Each trace contains:
-- `messages`: Full conversation history with system prompts, user inputs, assistant responses, tool calls, and tool returns
-- `tools`: Tool definitions that were available (if any)
-- `score`: Performance score (0.0-1.0, higher is better)
-- `success`: Whether the run completed successfully
-- `feedback`: Evaluator feedback on this specific run
+The prompt includes compact reflection examples with scores, success flags, evaluator feedback, messages, and tool definitions.
+Full execution spans are available separately on disk as OTel/Logfire span JSON and should be inspected through the structured trace helpers in `run_python_repl`.
 
 
 ## Execution Traces Available for Analysis
 
 1 traces available from the execution: 1 succeeded, 0 failed.
-The traces are stored on disk as `traces/traces.jsonl`.
-You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts to parse these structured files.
+The OTel/Logfire spans are stored on disk as `traces/traces.jsonl`.
+You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts for trace analysis. Prefer structured helpers such as `trace_overview`, `query_traces`, `view_trace`, `view_spans`, `search_trace`, and `search_span`; drop down to raw file helpers only when needed.
 You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures. The proposal step has a shared limit of 5 spawned sub-agents, including recursive child spawns.
 
 **IMPORTANT: Prompt Caching & State Management**
@@ -856,16 +859,26 @@ Only use `clear_message_history` sparingly when absolutely necessary to avoid br
 - Unsupported syntax includes `with` statements, `class` definitions, `match`, and `yield`. Do not use context managers, generators, or custom classes.
 - Unsupported runtime/builtins include `globals()`, `locals()`, `eval()`, `exec()`, and `__import__()`.
 - Imports are limited to a small standard-library subset such as `json`, `re`, `datetime`, `typing`, `sys`, and partial `os`. Third-party packages and most stdlib modules are unavailable. Prefer the pre-bound helpers below instead of filesystem imports or `os.getcwd()`.
-- Pre-bound helpers: `read_file`, `file_info`, `file_size`, `line_count`, `read_lines`, `read_line_batch`, `tail_lines`, `find_lines`, `list_dir`, `json_loads`, plus `Path` and `json`.
+- Pre-bound helpers: `trace_overview`, `query_traces`, `count_traces`, `view_trace`, `view_spans`, `search_trace`, `search_span`, `read_file`, `file_info`, `file_size`, `line_count`, `read_lines`, `read_line_batch`, `tail_lines`, `find_lines`, `list_dir`, `json_loads`, plus `Path` and `json`.
 
 ### Trace file navigation
 - `traces/traces.jsonl` can be large. Avoid `read_file('traces/traces.jsonl')` unless you already know it is small; returning the whole trace file can overflow the reflection model context.
-- Start with `file_info('traces/traces.jsonl')` to understand size and line count.
-- Use `find_lines('traces/traces.jsonl', query, limit=20)` for targeted search and `tail_lines(..., limit=20)` for recent spans or exceptions.
+- Prefer the structured trace helpers first: call `trace_overview()` to size the dataset, `query_traces(...)` to find trace IDs, `view_trace(trace_id)` for bounded span views, `view_spans(trace_id, span_ids)` for surgical reads, and `search_trace(...)` / `search_span(...)` for raw regex evidence.
+- Use `file_info('traces/traces.jsonl')` to understand raw file size and line count when dropping down to file-level analysis.
+- Use `find_lines('traces/traces.jsonl', query, limit=20)` for simple targeted raw search and `tail_lines(..., limit=20)` for recent spans or exceptions.
 - Use `read_lines(path, start=n, limit=10)` for a small window around a known line number.
 - For full-file scans, write one reducer-style script around `read_line_batch(path, offset=0, limit=1000)`. Advance with `offset = batch['next_offset']`, stop when `batch['eof']`, and return only compact aggregates.
 
-Canonical full-scan pattern:
+Canonical structured pattern:
+```python
+overview = trace_overview()
+errors = query_traces({'has_errors': True}, limit=20)
+first_error = errors['traces'][0]['trace_id'] if errors['traces'] else None
+view = view_trace(first_error) if first_error else {'spans': []}
+{'overview': overview, 'first_error_span_count': len(view['spans'])}
+```
+
+Canonical raw full-scan pattern:
 ```python
 offset = 0
 failures = 0
@@ -886,7 +899,8 @@ while True:
 
 
 ### Analysis guidance
-- Use `run_python_repl` with `read_line_batch` to aggregate errors or find common failure modes across `traces.jsonl` without returning full traces.
+- Use `run_python_repl` with structured trace helpers to aggregate errors or find common failure modes across `traces.jsonl` without returning full traces.
+- Start with `trace_overview()`, use `query_traces(...)` to identify trace IDs, and then use `view_trace(...)`, `view_spans(...)`, `search_trace(...)`, or `search_span(...)` for focused evidence.
 - Use `spawn_agent` to understand *why* a specific trace failed if the python analysis is insufficient.
 - What failure patterns repeat across runs?
 - Are components misaligned (e.g., instructions referencing tools that don't exist)?
@@ -1173,19 +1187,15 @@ The city name to get weather for.
 
 ## Production traces from student agent runs
 
-Each trace contains:
-- `messages`: Full conversation history with system prompts, user inputs, assistant responses, tool calls, and tool returns
-- `tools`: Tool definitions that were available (if any)
-- `score`: Performance score (0.0-1.0, higher is better)
-- `success`: Whether the run completed successfully
-- `feedback`: Evaluator feedback on this specific run
+The prompt includes compact reflection examples with scores, success flags, evaluator feedback, messages, and tool definitions.
+Full execution spans are available separately on disk as OTel/Logfire span JSON and should be inspected through the structured trace helpers in `run_python_repl`.
 
 
 ## Execution Traces Available for Analysis
 
 2 traces available from the execution: 2 succeeded, 0 failed.
-The traces are stored on disk as `traces/traces.jsonl`.
-You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts to parse these structured files.
+The OTel/Logfire spans are stored on disk as `traces/traces.jsonl`.
+You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts for trace analysis. Prefer structured helpers such as `trace_overview`, `query_traces`, `view_trace`, `view_spans`, `search_trace`, and `search_span`; drop down to raw file helpers only when needed.
 You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures. The proposal step has a shared limit of 5 spawned sub-agents, including recursive child spawns.
 
 **IMPORTANT: Prompt Caching & State Management**
@@ -1202,16 +1212,26 @@ Only use `clear_message_history` sparingly when absolutely necessary to avoid br
 - Unsupported syntax includes `with` statements, `class` definitions, `match`, and `yield`. Do not use context managers, generators, or custom classes.
 - Unsupported runtime/builtins include `globals()`, `locals()`, `eval()`, `exec()`, and `__import__()`.
 - Imports are limited to a small standard-library subset such as `json`, `re`, `datetime`, `typing`, `sys`, and partial `os`. Third-party packages and most stdlib modules are unavailable. Prefer the pre-bound helpers below instead of filesystem imports or `os.getcwd()`.
-- Pre-bound helpers: `read_file`, `file_info`, `file_size`, `line_count`, `read_lines`, `read_line_batch`, `tail_lines`, `find_lines`, `list_dir`, `json_loads`, plus `Path` and `json`.
+- Pre-bound helpers: `trace_overview`, `query_traces`, `count_traces`, `view_trace`, `view_spans`, `search_trace`, `search_span`, `read_file`, `file_info`, `file_size`, `line_count`, `read_lines`, `read_line_batch`, `tail_lines`, `find_lines`, `list_dir`, `json_loads`, plus `Path` and `json`.
 
 ### Trace file navigation
 - `traces/traces.jsonl` can be large. Avoid `read_file('traces/traces.jsonl')` unless you already know it is small; returning the whole trace file can overflow the reflection model context.
-- Start with `file_info('traces/traces.jsonl')` to understand size and line count.
-- Use `find_lines('traces/traces.jsonl', query, limit=20)` for targeted search and `tail_lines(..., limit=20)` for recent spans or exceptions.
+- Prefer the structured trace helpers first: call `trace_overview()` to size the dataset, `query_traces(...)` to find trace IDs, `view_trace(trace_id)` for bounded span views, `view_spans(trace_id, span_ids)` for surgical reads, and `search_trace(...)` / `search_span(...)` for raw regex evidence.
+- Use `file_info('traces/traces.jsonl')` to understand raw file size and line count when dropping down to file-level analysis.
+- Use `find_lines('traces/traces.jsonl', query, limit=20)` for simple targeted raw search and `tail_lines(..., limit=20)` for recent spans or exceptions.
 - Use `read_lines(path, start=n, limit=10)` for a small window around a known line number.
 - For full-file scans, write one reducer-style script around `read_line_batch(path, offset=0, limit=1000)`. Advance with `offset = batch['next_offset']`, stop when `batch['eof']`, and return only compact aggregates.
 
-Canonical full-scan pattern:
+Canonical structured pattern:
+```python
+overview = trace_overview()
+errors = query_traces({'has_errors': True}, limit=20)
+first_error = errors['traces'][0]['trace_id'] if errors['traces'] else None
+view = view_trace(first_error) if first_error else {'spans': []}
+{'overview': overview, 'first_error_span_count': len(view['spans'])}
+```
+
+Canonical raw full-scan pattern:
 ```python
 offset = 0
 failures = 0
@@ -1232,7 +1252,8 @@ while True:
 
 
 ### Analysis guidance
-- Use `run_python_repl` with `read_line_batch` to aggregate errors or find common failure modes across `traces.jsonl` without returning full traces.
+- Use `run_python_repl` with structured trace helpers to aggregate errors or find common failure modes across `traces.jsonl` without returning full traces.
+- Start with `trace_overview()`, use `query_traces(...)` to identify trace IDs, and then use `view_trace(...)`, `view_spans(...)`, `search_trace(...)`, or `search_span(...)` for focused evidence.
 - Use `spawn_agent` to understand *why* a specific trace failed if the python analysis is insufficient.
 - What failure patterns repeat across runs?
 - Are components misaligned (e.g., instructions referencing tools that don't exist)?
