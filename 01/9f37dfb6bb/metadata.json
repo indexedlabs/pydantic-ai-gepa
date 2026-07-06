@@ -1,0 +1,9 @@
+{
+  "checkpoint_id": "019f37dfb6bb",
+  "created_at": "2026-07-06T14:40:36.089884+00:00",
+  "branch_name": "fix-output-type-guard-wrapper-blind",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "11001b9d0fd70f9965a4d810a19e0e50c0145ff9"
+  ]
+}
