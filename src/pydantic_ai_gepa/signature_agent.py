@@ -531,13 +531,16 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
                 "run_signature(..., output_type=...)."
             )
 
-        # If the wrapped agent has output_validators, we can't pass output_type
-        # at runtime (pydantic-ai raises UserError). Only pass it if the user
-        # explicitly requested a different type than the agent's default.
+        # Passing the wrapped agent's own default output_type at runtime is
+        # always redundant -- and actively breaks agents with output_validators
+        # (pydantic-ai raises UserError on any custom run output_type). Checking
+        # for validators here is wrapper-blind (e.g. TemporalAgent does not
+        # proxy the private _output_validators), so drop the run override
+        # whenever it matches the agent's default and only pass an output_type
+        # the caller explicitly changed.
         wrapped_output_type = getattr(self.wrapped, "output_type", None)
-        wrapped_has_validators = bool(getattr(self.wrapped, "_output_validators", None))
         run_output_type: OutputSpec[Any] | type[Any] | None = effective_output_type
-        if wrapped_has_validators and effective_output_type == wrapped_output_type:
+        if effective_output_type == wrapped_output_type:
             run_output_type = None
 
         with ExitStack() as stack:
@@ -669,13 +672,16 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
                 "run_signature_sync(..., output_type=...)."
             )
 
-        # If the wrapped agent has output_validators, we can't pass output_type
-        # at runtime (pydantic-ai raises UserError). Only pass it if the user
-        # explicitly requested a different type than the agent's default.
+        # Passing the wrapped agent's own default output_type at runtime is
+        # always redundant -- and actively breaks agents with output_validators
+        # (pydantic-ai raises UserError on any custom run output_type). Checking
+        # for validators here is wrapper-blind (e.g. TemporalAgent does not
+        # proxy the private _output_validators), so drop the run override
+        # whenever it matches the agent's default and only pass an output_type
+        # the caller explicitly changed.
         wrapped_output_type = getattr(self.wrapped, "output_type", None)
-        wrapped_has_validators = bool(getattr(self.wrapped, "_output_validators", None))
         run_output_type: OutputSpec[Any] | type[Any] | None = effective_output_type
-        if wrapped_has_validators and effective_output_type == wrapped_output_type:
+        if effective_output_type == wrapped_output_type:
             run_output_type = None
 
         with ExitStack() as stack:
@@ -808,13 +814,16 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
                 "run_signature_stream(..., output_type=...)."
             )
 
-        # If the wrapped agent has output_validators, we can't pass output_type
-        # at runtime (pydantic-ai raises UserError). Only pass it if the user
-        # explicitly requested a different type than the agent's default.
+        # Passing the wrapped agent's own default output_type at runtime is
+        # always redundant -- and actively breaks agents with output_validators
+        # (pydantic-ai raises UserError on any custom run output_type). Checking
+        # for validators here is wrapper-blind (e.g. TemporalAgent does not
+        # proxy the private _output_validators), so drop the run override
+        # whenever it matches the agent's default and only pass an output_type
+        # the caller explicitly changed.
         wrapped_output_type = getattr(self.wrapped, "output_type", None)
-        wrapped_has_validators = bool(getattr(self.wrapped, "_output_validators", None))
         run_output_type: OutputSpec[Any] | type[Any] | None = effective_output_type
-        if wrapped_has_validators and effective_output_type == wrapped_output_type:
+        if effective_output_type == wrapped_output_type:
             run_output_type = None
 
         with (
