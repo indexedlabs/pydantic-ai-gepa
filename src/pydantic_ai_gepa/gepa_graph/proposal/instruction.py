@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logfire
 from dataclasses import dataclass
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -438,7 +439,15 @@ class InstructionProposalGenerator:
 
         except InspectionAborted:
             raise
-        except Exception:
+        except Exception as error:
+            # An empty proposal is a silent no-op round: the engine skips
+            # evaluation and the reflector re-derives the same work next
+            # iteration with no idea it was lost. Make the cause loud.
+            logfire.warning(
+                "Instruction proposal failed; returning empty proposal",
+                error_type=type(error).__name__,
+                error=str(error)[:2000],
+            )
             return ProposalResult(
                 texts={},
                 component_metadata={},
