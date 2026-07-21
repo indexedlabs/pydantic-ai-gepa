@@ -363,9 +363,12 @@ async def test_reflect_step_applies_config_sampler() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reflect_step_passes_subagent_limit_to_trace_toolset(monkeypatch) -> None:
+async def test_reflect_step_passes_subagent_limit_to_trace_toolset(
+    monkeypatch, tmp_path
+) -> None:
     from pydantic_ai import FunctionToolset
 
+    monkeypatch.chdir(tmp_path)
     captured_limits: list[int] = []
 
     def fake_create_trace_toolset(
@@ -400,6 +403,15 @@ async def test_reflect_step_passes_subagent_limit_to_trace_toolset(monkeypatch) 
         proposal_generator=generator,
     )
     ctx = _ctx(state, deps)
+
+    # Trace tools are only offered when span files exist for the candidate.
+    from pathlib import Path
+
+    traces_file = Path(
+        f".gepa_cache/runs/{state.run_id}/candidates/0/traces/traces.jsonl"
+    )
+    traces_file.parent.mkdir(parents=True, exist_ok=True)
+    traces_file.write_text("{}\n")
 
     await reflect_step(ctx)
 

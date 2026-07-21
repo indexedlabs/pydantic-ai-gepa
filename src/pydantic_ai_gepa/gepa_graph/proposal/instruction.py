@@ -226,6 +226,15 @@ def _skills_tools_enabled(component_toolsets: Sequence[AbstractToolset[None]]) -
     )
 
 
+def _trace_tools_enabled(component_toolsets: Sequence[AbstractToolset[None]]) -> bool:
+    # Trace tools are only attached when the run has span files on disk; their
+    # absence means the adapter produced no instrumented traces.
+    return any(
+        _toolset_has_tool(toolset, "run_python_repl")
+        for toolset in component_toolsets
+    )
+
+
 def _journal_tools_enabled(component_toolsets: Sequence[AbstractToolset[None]]) -> bool:
     return any(
         _toolset_has_tool(toolset, "read_journal_entries")
@@ -363,6 +372,11 @@ class InstructionProposalGenerator:
             reflective_data=reflective_data,
             components=actionable,
             example_bank=example_bank,
+            traces_on_disk=(
+                _trace_tools_enabled(component_toolsets)
+                if component_toolsets is not None
+                else True
+            ),
         )
 
         try:
@@ -475,6 +489,7 @@ class InstructionProposalGenerator:
         reflective_data: ReflectiveDataset,
         components: Sequence[str],
         example_bank: InMemoryExampleBank | None = None,
+        traces_on_disk: bool = True,
     ) -> Sequence[UserContent]:
         selection_mode = not components
         lines: list[Any] = [
@@ -714,7 +729,11 @@ class InstructionProposalGenerator:
                 "## Production traces from student agent runs",
                 "",
                 "The prompt includes compact reflection examples with scores, success flags, evaluator feedback, messages, and tool definitions.",
-                "Full execution spans are available separately on disk as OTel/Logfire span JSON and should be inspected through the structured trace helpers in `run_python_repl`.",
+                (
+                    "Full execution spans are available separately on disk as OTel/Logfire span JSON and should be inspected through the structured trace helpers in `run_python_repl`."
+                    if traces_on_disk
+                    else "No execution span files exist for this run: the adapter under optimization performs no instrumented model calls. The reflection records in this prompt are the complete evidence."
+                ),
                 "",
             ]
         )
@@ -734,34 +753,52 @@ class InstructionProposalGenerator:
 
         failed_records = total_records - success_records
 
-        lines.extend(
-            [
-                "",
-                "## Execution Traces Available for Analysis",
-                "",
-                f"{total_records} traces available from the execution: {success_records} succeeded, {failed_records} failed.",
-                "The OTel/Logfire spans are stored on disk as `traces/traces.jsonl`.",
-                "You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts for trace analysis. Prefer structured helpers such as `trace_overview`, `query_traces`, `view_trace`, `view_spans`, `search_trace`, and `search_span`; drop down to raw file helpers only when needed.",
-                f"You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures. The proposal step has a shared limit of {self._max_spawned_agents} spawned sub-agents, including recursive child spawns.",
-                "",
-                "**IMPORTANT: Prompt Caching & State Management**",
-                "Your python REPL is stateful. Variables assigned in one script will persist to the next.",
-                "To leverage LLM prompt caching efficiently, you should build up state in your Python REPL rather than returning huge strings (like full traces) to your context window.",
-                "If your context window becomes bloated, use the `clear_message_history` tool. This wipes your message history to free up tokens, but your Python REPL variables remain intact!",
-                "Only use `clear_message_history` sparingly when absolutely necessary to avoid breaking the prompt cache.",
-                "",
-                MONTY_REPL_PROMPT_GUIDANCE,
-                "",
-            ]
-        )
+        if traces_on_disk:
+            lines.extend(
+                [
+                    "",
+                    "## Execution Traces Available for Analysis",
+                    "",
+                    f"{total_records} traces available from the execution: {success_records} succeeded, {failed_records} failed.",
+                    "The OTel/Logfire spans are stored on disk as `traces/traces.jsonl`.",
+                    "You must use the `run_python_repl(python_code: str)` tool to write and execute python scripts for trace analysis. Prefer structured helpers such as `trace_overview`, `query_traces`, `view_trace`, `view_spans`, `search_trace`, and `search_span`; drop down to raw file helpers only when needed.",
+                    f"You may also use `spawn_agent(instructions: str)` to spawn a Recursive Language Model (RLM) sub-agent to deeply inspect specific traces for semantic failures. The proposal step has a shared limit of {self._max_spawned_agents} spawned sub-agents, including recursive child spawns.",
+                    "",
+                    "**IMPORTANT: Prompt Caching & State Management**",
+                    "Your python REPL is stateful. Variables assigned in one script will persist to the next.",
+                    "To leverage LLM prompt caching efficiently, you should build up state in your Python REPL rather than returning huge strings (like full traces) to your context window.",
+                    "If your context window becomes bloated, use the `clear_message_history` tool. This wipes your message history to free up tokens, but your Python REPL variables remain intact!",
+                    "Only use `clear_message_history` sparingly when absolutely necessary to avoid breaking the prompt cache.",
+                    "",
+                    MONTY_REPL_PROMPT_GUIDANCE,
+                    "",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "",
+                    "## No execution traces exist for this run",
+                    "",
+                    f"{total_records} reflection records: {success_records} succeeded, {failed_records} failed.",
+                    "There are no span files and no trace tools for this run. The reflection records above — scores, evaluator feedback, and any per-component evidence — are the complete evidence. Do not search for traces.jsonl or attempt trace analysis; reason directly from the records.",
+                    "",
+                ]
+            )
 
         lines.extend(
             [
                 "",
                 "### Analysis guidance",
-                "- Use `run_python_repl` with structured trace helpers to aggregate errors or find common failure modes across `traces.jsonl` without returning full traces.",
-                "- Start with `trace_overview()`, use `query_traces(...)` to identify trace IDs, and then use `view_trace(...)`, `view_spans(...)`, `search_trace(...)`, or `search_span(...)` for focused evidence.",
-                "- Use `spawn_agent` to understand *why* a specific trace failed if the python analysis is insufficient.",
+                *(
+                    [
+                        "- Use `run_python_repl` with structured trace helpers to aggregate errors or find common failure modes across `traces.jsonl` without returning full traces.",
+                        "- Start with `trace_overview()`, use `query_traces(...)` to identify trace IDs, and then use `view_trace(...)`, `view_spans(...)`, `search_trace(...)`, or `search_span(...)` for focused evidence.",
+                        "- Use `spawn_agent` to understand *why* a specific trace failed if the python analysis is insufficient.",
+                    ]
+                    if traces_on_disk
+                    else []
+                ),
                 "- What failure patterns repeat across runs?",
                 "- Are components misaligned (e.g., instructions referencing tools that don't exist)?",
                 "- Which successful patterns should be preserved or extended?",
