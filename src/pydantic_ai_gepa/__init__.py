@@ -18,6 +18,13 @@ from .inspection import (
 )
 from .exceptions import UsageBudgetExceeded
 from .runner import GepaOptimizationResult, optimize_agent
+from .compose import (
+    PipelineResult,
+    optimize_best_of,
+    optimize_parallel,
+    optimize_sequential,
+    optimize_vote,
+)
 from .engines import (
     BudgetExhausted,
     BudgetTracker,
@@ -60,6 +67,11 @@ from .types import (
 
 __all__ = [
     "optimize_agent",
+    "optimize_parallel",
+    "optimize_best_of",
+    "optimize_sequential",
+    "optimize_vote",
+    "PipelineResult",
     "GepaOptimizationResult",
     "Adapter",
     "AgentAdapter",

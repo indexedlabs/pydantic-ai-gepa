@@ -19,10 +19,12 @@ from .registry import (
 )
 from .gepa_engine import GepaEngine
 from .coding_agent_engine import CodingAgentEngine, Proposer, ReflectionContext
+from .best_of_n import BestOfNEngine
 
 __all__ = [
     "BudgetExhausted",
     "BudgetTracker",
+    "BestOfNEngine",
     "CandidateEvaluation",
     "CodingAgentEngine",
     "EngineConfig",
