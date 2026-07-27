@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Generator
 from typing import Any
 
 import pytest
@@ -72,7 +73,7 @@ class _FakeEngine:
 
 
 @pytest.fixture(autouse=True)
-def _registered_fake_engine() -> None:
+def _registered_fake_engine() -> Generator[None, None, None]:
     unregister_engine(_ENGINE_NAME)
     register_engine(_ENGINE_NAME, _FakeEngine, replace=True)
     yield
