@@ -17,6 +17,7 @@ from .registry import (
     register_engine,
     unregister_engine,
 )
+from .gepa_engine import GepaEngine
 
 __all__ = [
     "BudgetExhausted",
@@ -26,6 +27,7 @@ __all__ = [
     "EngineEvent",
     "EngineFactory",
     "EngineResult",
+    "GepaEngine",
     "OptimizationEngine",
     "OptimizationTask",
     "get_engine",
