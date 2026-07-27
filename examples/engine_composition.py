@@ -1,8 +1,9 @@
 """Compare built-in optimization engines on a tiny classification task.
 
 Run hermetically with ``uv run python examples/engine_composition.py``. Set
-``OPENAI_API_KEY`` (and optionally ``GEPA_EXAMPLE_MODEL``) to include a small
-GEPA run with a real model.
+``OPENAI_API_KEY`` to include a small GEPA run with real models. Override the
+student (``GEPA_STUDENT_MODEL``) and teacher/reflection (``GEPA_TEACHER_MODEL``)
+models to pair a weaker student with a stronger teacher.
 """
 
 from __future__ import annotations
@@ -55,10 +56,24 @@ def has_real_model() -> bool:
     return bool(os.environ.get("OPENAI_API_KEY"))
 
 
+def student_model() -> str:
+    """The model that runs the agent being optimized.
+
+    Defaults to the Responses API because newer reasoning models reject
+    function-tool (structured-output) calls on the chat-completions endpoint.
+    """
+    return os.environ.get("GEPA_STUDENT_MODEL", "openai-responses:gpt-4o-mini")
+
+
+def teacher_model() -> str:
+    """The model that drives reflection; defaults to the student model."""
+    return os.environ.get("GEPA_TEACHER_MODEL", student_model())
+
+
 def make_agent() -> Agent[None, ClassificationOutput]:
     """Use the same environment-variable model override pattern as other demos."""
     if has_real_model():
-        model = os.environ.get("GEPA_EXAMPLE_MODEL", "openai:gpt-4o-mini")
+        model = student_model()
     else:
         model = TestModel(custom_output_args={"label": "positive"})
 
@@ -120,16 +135,18 @@ async def main() -> None:
                 max_metric_calls=6,
                 max_iterations=1,
                 engine_config={
-                    "reflection_config": ReflectionConfig(
-                        model=os.environ.get("GEPA_EXAMPLE_MODEL", "openai:gpt-4o-mini")
-                    )
+                    "reflection_config": ReflectionConfig(model=teacher_model())
                 },
             )
         )
 
     result = await optimize_best_of(task, configs, max_metric_calls=6 * len(configs))
 
-    model_kind = "real model" if has_real_model() else "TestModel fallback"
+    model_kind = (
+        f"student={student_model()} teacher={teacher_model()}"
+        if has_real_model()
+        else "TestModel fallback"
+    )
     print(f"Model: {model_kind}")
     for engine_result, score in zip(result.results, result.fair_scores):
         print(f"{engine_result.engine}: fair valset accuracy {score:.2f}")
