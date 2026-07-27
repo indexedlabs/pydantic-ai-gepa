@@ -1,0 +1,12 @@
+{
+  "checkpoint_id": "019fa59ff1ee",
+  "created_at": "2026-07-27T22:09:10.720007+00:00",
+  "branch_name": "eng/base",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "c6ad1ed72da76fa9a66cb8148fa642c668f7288a"
+  ],
+  "entity_touches": [
+    ".mighty/loro/records/019fa59e-de86-7650-a835-2cb89bc58856.loro"
+  ]
+}
