@@ -18,11 +18,13 @@ from .registry import (
     unregister_engine,
 )
 from .gepa_engine import GepaEngine
+from .coding_agent_engine import CodingAgentEngine, Proposer, ReflectionContext
 
 __all__ = [
     "BudgetExhausted",
     "BudgetTracker",
     "CandidateEvaluation",
+    "CodingAgentEngine",
     "EngineConfig",
     "EngineEvent",
     "EngineFactory",
@@ -30,6 +32,8 @@ __all__ = [
     "GepaEngine",
     "OptimizationEngine",
     "OptimizationTask",
+    "Proposer",
+    "ReflectionContext",
     "get_engine",
     "list_engines",
     "register_engine",

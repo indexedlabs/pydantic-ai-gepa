@@ -1,0 +1,404 @@
+"""An in-process managed reflection loop driven by a caller-supplied proposer."""
+
+from __future__ import annotations
+
+import random
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
+from typing import Any, TypeAlias, cast
+
+from pydantic_evals import Case
+
+from ..evaluation import EvaluationRecord, evaluate_candidate_dataset
+from ..gepa_graph.models import CandidateMap
+from .base import (
+    BudgetExhausted,
+    BudgetTracker,
+    EngineConfig,
+    EngineEvent,
+    EngineResult,
+    OptimizationTask,
+    _aggregate_side_info,
+)
+from .registry import register_engine
+
+
+@dataclass(frozen=True, slots=True)
+class ReflectionContext:
+    """Evidence supplied to a coding agent before it proposes a revision."""
+
+    candidate: CandidateMap
+    minibatch_records: list[EvaluationRecord]
+    report: str
+    iteration: int
+    side_info: dict[str, Any]
+
+
+Proposer: TypeAlias = Callable[[ReflectionContext], Awaitable[CandidateMap]]
+
+
+class CodingAgentEngine:
+    """Optimize with a caller-supplied coding agent under a shared budget.
+
+    The library owns minibatch sampling, evaluation, and monotonic candidate
+    selection.  The caller's ``propose`` callback only receives failure
+    evidence and returns a candidate to test on that same minibatch.
+    """
+
+    name = "coding_agent"
+
+    def __init__(self, config: EngineConfig) -> None:
+        """Read the required asynchronous proposal callback from configuration."""
+        propose = config.engine_config.get("propose")
+        if not callable(propose):
+            raise TypeError(
+                "engine_config['propose'] must be a callable async callback that "
+                "accepts ReflectionContext and returns a CandidateMap."
+            )
+        self._propose = cast(Proposer, propose)
+        self._engine_config = config.engine_config
+
+    async def run(
+        self,
+        task: OptimizationTask,
+        config: EngineConfig,
+        budget: BudgetTracker,
+    ) -> EngineResult:
+        """Run managed baseline/reflection rounds and return the best candidate."""
+        budget.check()
+
+        minibatch_size = self._positive_int_option("minibatch_size", 5)
+        concurrency = self._positive_int_option("concurrency", 5)
+        max_proposals = self._positive_int_option("max_proposals_per_run", 10)
+        failure_threshold = float(self._option("failure_threshold", 0.999))
+
+        best = _copy_candidate(await task.seed_candidate())
+        train_loader = await task.train_loader()
+        all_ids = list(await train_loader.all_ids())
+        starting_spend = budget.spent
+        engine_budget = BudgetTracker(config.max_metric_calls)
+        history: list[EngineEvent] = []
+        epoch = 0
+        iterations = 0
+        proposals = 0
+        stop_reason = "completed"
+
+        while (
+            (config.max_iterations is None or iterations < config.max_iterations)
+            and not budget.exhausted
+            and not engine_budget.exhausted
+            and proposals < max_proposals
+        ):
+            minibatch_ids = _sample_minibatch(
+                all_ids,
+                size=minibatch_size,
+                seed=config.seed,
+                epoch=epoch,
+            )
+            epoch += 1
+            minibatch = await train_loader.fetch(minibatch_ids)
+            baseline_records = await self._evaluate_minibatch(
+                task=task,
+                candidate=best,
+                minibatch=minibatch,
+                concurrency=concurrency,
+            )
+            iterations += 1
+            if not self._spend_or_record_overshoot(
+                budget=budget,
+                engine_budget=engine_budget,
+                history=history,
+                stage="baseline_minibatch",
+                records=baseline_records,
+            ):
+                stop_reason = "budget_overshoot"
+                break
+
+            baseline_score = _mean_score(baseline_records)
+            if (
+                config.stop_at_score is not None
+                and baseline_score >= config.stop_at_score
+            ):
+                stop_reason = "stop_at_score"
+                break
+            if budget.exhausted or engine_budget.exhausted:
+                stop_reason = "budget_exhausted"
+                break
+
+            failures = [
+                record
+                for record in baseline_records
+                if record.score < failure_threshold
+            ]
+            if not failures:
+                history.append(
+                    EngineEvent(
+                        kind="clean_minibatch",
+                        data={
+                            "iteration": iterations,
+                            "mean_score": baseline_score,
+                            "minibatch_case_ids": [
+                                record.case_id for record in baseline_records
+                            ],
+                        },
+                    )
+                )
+                continue
+
+            context = ReflectionContext(
+                candidate=_copy_candidate(best),
+                minibatch_records=failures,
+                report=_format_failure_report(baseline_records, failure_threshold),
+                iteration=iterations,
+                side_info=_aggregate_side_info(baseline_records),
+            )
+            proposal = await self._propose(context)
+            proposals += 1
+
+            try:
+                proposal_records = await self._evaluate_minibatch(
+                    task=task,
+                    candidate=proposal,
+                    minibatch=minibatch,
+                    concurrency=concurrency,
+                )
+            except Exception as exc:
+                raise RuntimeError("Coding-agent proposal evaluation failed.") from exc
+
+            if not self._spend_or_record_overshoot(
+                budget=budget,
+                engine_budget=engine_budget,
+                history=history,
+                stage="proposal_minibatch",
+                records=proposal_records,
+            ):
+                stop_reason = "budget_overshoot"
+                break
+
+            proposal_score = _mean_score(proposal_records)
+            comparison = {
+                "iteration": iterations,
+                "baseline_score": baseline_score,
+                "proposal_score": proposal_score,
+                "delta": proposal_score - baseline_score,
+                "minibatch_case_ids": [record.case_id for record in baseline_records],
+            }
+            if proposal_score > baseline_score:
+                best = _copy_candidate(proposal)
+                history.append(EngineEvent(kind="accepted", data=comparison))
+            else:
+                history.append(EngineEvent(kind="rejected", data=comparison))
+
+        if (budget.exhausted or engine_budget.exhausted) and stop_reason == "completed":
+            stop_reason = "budget_exhausted"
+        elif proposals >= max_proposals and stop_reason == "completed":
+            stop_reason = "max_proposals_per_run"
+        elif (
+            config.max_iterations is not None
+            and iterations >= config.max_iterations
+            and stop_reason == "completed"
+        ):
+            stop_reason = "max_iterations"
+
+        final_score, final_evaluation_charged = await self._score_final_candidate(
+            task=task,
+            candidate=best,
+            budget=budget,
+            engine_budget=engine_budget,
+            history=history,
+        )
+        history.append(
+            EngineEvent(
+                kind="summary",
+                data={
+                    "iterations": iterations,
+                    "proposals": proposals,
+                    "stop_reason": stop_reason,
+                    "final_evaluation_charged": final_evaluation_charged,
+                },
+            )
+        )
+        return EngineResult(
+            engine=self.name,
+            best_candidate=best,
+            best_score=final_score,
+            num_metric_calls=budget.spent - starting_spend,
+            history=history,
+        )
+
+    async def _evaluate_minibatch(
+        self,
+        *,
+        task: OptimizationTask,
+        candidate: CandidateMap,
+        minibatch: Sequence[Case[Any, Any, Any]],
+        concurrency: int,
+    ) -> list[EvaluationRecord]:
+        """Evaluate one candidate on the explicitly selected minibatch."""
+        return await evaluate_candidate_dataset(
+            agent=task.agent,
+            metric=task.metric,
+            dataset=minibatch,
+            candidate=candidate,
+            concurrency=concurrency,
+            input_type=task.input_type,
+            case_factory=task.case_factory,
+            skills_fs=task.skills_fs,
+            skills_capabilities=task.skills_capabilities,
+            capture_traces=True,
+        )
+
+    async def _score_final_candidate(
+        self,
+        *,
+        task: OptimizationTask,
+        candidate: CandidateMap,
+        budget: BudgetTracker,
+        engine_budget: BudgetTracker,
+        history: list[EngineEvent],
+    ) -> tuple[float, bool]:
+        """Score the winner on the valset and charge that fair comparison.
+
+        The score is evaluated before spending so it remains available for the
+        result when the final comparison itself would exceed the shared budget.
+        In that overshoot case the budget remains unchanged and the event makes
+        the uncharged evaluation explicit to a composing caller.
+        """
+        final_evaluation = await task.evaluate(candidate, budget=None)
+        if final_evaluation.num_cases > engine_budget.remaining:
+            history.append(
+                EngineEvent(
+                    kind="budget_overshoot",
+                    message="Final valset evaluation exceeded the engine metric-call budget.",
+                    data={
+                        "stage": "final_valset",
+                        "requested": final_evaluation.num_cases,
+                        "budget_remaining": budget.remaining,
+                        "engine_budget_remaining": engine_budget.remaining,
+                    },
+                )
+            )
+            return final_evaluation.score, False
+        try:
+            budget.spend(final_evaluation.num_cases)
+        except BudgetExhausted:
+            history.append(
+                EngineEvent(
+                    kind="budget_overshoot",
+                    message="Final valset evaluation exceeded the shared metric-call budget.",
+                    data={
+                        "stage": "final_valset",
+                        "requested": final_evaluation.num_cases,
+                        "budget_remaining": budget.remaining,
+                        "engine_budget_remaining": engine_budget.remaining,
+                    },
+                )
+            )
+            return final_evaluation.score, False
+        engine_budget.spend(final_evaluation.num_cases)
+        return final_evaluation.score, True
+
+    def _spend_or_record_overshoot(
+        self,
+        *,
+        budget: BudgetTracker,
+        engine_budget: BudgetTracker,
+        history: list[EngineEvent],
+        stage: str,
+        records: Sequence[EvaluationRecord],
+    ) -> bool:
+        """Charge an evaluation or record the budget overshoot that stops it."""
+        if len(records) > engine_budget.remaining:
+            history.append(
+                EngineEvent(
+                    kind="budget_overshoot",
+                    message="Minibatch evaluation exceeded the engine metric-call budget.",
+                    data={
+                        "stage": stage,
+                        "requested": len(records),
+                        "budget_remaining": budget.remaining,
+                        "engine_budget_remaining": engine_budget.remaining,
+                    },
+                )
+            )
+            return False
+        try:
+            budget.spend(len(records))
+        except BudgetExhausted:
+            history.append(
+                EngineEvent(
+                    kind="budget_overshoot",
+                    message="Minibatch evaluation exceeded the shared metric-call budget.",
+                    data={
+                        "stage": stage,
+                        "requested": len(records),
+                        "budget_remaining": budget.remaining,
+                        "engine_budget_remaining": engine_budget.remaining,
+                    },
+                )
+            )
+            return False
+        engine_budget.spend(len(records))
+        return True
+
+    def _option(self, name: str, default: Any) -> Any:
+        """Return a coding-agent option from the engine-specific configuration."""
+        return self._engine_config.get(name, default)
+
+    def _positive_int_option(self, name: str, default: int) -> int:
+        """Read an engine count option while rejecting invalid runtime settings."""
+        value = self._option(name, default)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"engine_config[{name!r}] must be a positive integer.")
+        return value
+
+
+def _sample_minibatch(
+    all_ids: Sequence[Any],
+    *,
+    size: int,
+    seed: int,
+    epoch: int,
+) -> list[Any]:
+    """Return a deterministic, without-replacement minibatch for one epoch."""
+    return random.Random(seed + epoch).sample(list(all_ids), k=min(size, len(all_ids)))
+
+
+def _mean_score(records: Sequence[EvaluationRecord]) -> float:
+    """Return the mean score for an evaluated minibatch."""
+    return sum(record.score for record in records) / len(records) if records else 0.0
+
+
+def _copy_candidate(candidate: CandidateMap) -> CandidateMap:
+    """Isolate retained candidates from proposer-side mutation."""
+    return {
+        name: component.model_copy(deep=True) for name, component in candidate.items()
+    }
+
+
+def _format_failure_report(
+    records: Sequence[EvaluationRecord], threshold: float
+) -> str:
+    """Format failed records in the managed CLI's markdown report style."""
+    lines = ["# Eval report", ""]
+    failures = [record for record in records if record.score < threshold]
+    if not failures:
+        lines.append("Every case in this minibatch passed; nothing to act on.")
+        return "\n".join(lines)
+
+    lines.append(
+        f"{len(failures)} of {len(records)} case(s) underperformed "
+        f"(score < {threshold}). Review per-case feedback and revise the candidate.\n"
+    )
+    for record in failures:
+        lines.append(f"## {record.case_id} — score {record.score:.3f}")
+        if record.feedback:
+            lines.extend(["", record.feedback.rstrip()])
+        lines.append("")
+    return "\n".join(lines)
+
+
+register_engine(CodingAgentEngine.name, CodingAgentEngine, replace=True)
+
+
+__all__ = ["CodingAgentEngine", "Proposer", "ReflectionContext"]
