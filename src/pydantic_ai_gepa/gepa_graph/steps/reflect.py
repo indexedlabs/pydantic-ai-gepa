@@ -143,21 +143,29 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
     with open(components_file, "w", encoding="utf-8") as f:
         json.dump({k: v.text for k, v in parent.components.items()}, f, indent=2)
 
-    from ..proposal.trace_tools import create_trace_toolset
+    # Only offer trace tools when span files actually exist for this candidate.
+    # Custom adapters whose rollouts make no instrumented model calls produce
+    # no spans; handing the reflector trace tools that point at nothing sends
+    # it hunting for files that will never appear.
+    candidate_traces_file = Path(
+        f".gepa_cache/runs/{state.run_id}/candidates/{parent_idx}/traces/traces.jsonl"
+    )
+    if candidate_traces_file.exists():
+        from ..proposal.trace_tools import create_trace_toolset
 
-    max_spawned_agents = (
-        state.config.reflection_config.max_spawned_agents
-        if state.config.reflection_config
-        else DEFAULT_MAX_SPAWNED_AGENTS
-    )
-    component_toolsets.append(
-        create_trace_toolset(
-            state.run_id,
-            parent_idx,
-            reflection_model,
-            max_spawned_agents=max_spawned_agents,
+        max_spawned_agents = (
+            state.config.reflection_config.max_spawned_agents
+            if state.config.reflection_config
+            else DEFAULT_MAX_SPAWNED_AGENTS
         )
-    )
+        component_toolsets.append(
+            create_trace_toolset(
+                state.run_id,
+                parent_idx,
+                reflection_model,
+                max_spawned_agents=max_spawned_agents,
+            )
+        )
 
     if state.config.component_selector == "reflection":
         components_to_update = None
