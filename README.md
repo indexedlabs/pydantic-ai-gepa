@@ -191,6 +191,39 @@ Evaluations run in parallel for speed.
 
 Results are cached to avoid redundant LLM calls.
 
+## Engine Composition (omni)
+
+Inspired by [GEPA's omni composition model](https://gepa-ai.github.io/gepa/blog/2026/07/22/optimize-anything-omni/), one `OptimizationTask` bundles an agent, dataset, and metric. Select any registered optimizer with `engine=` and compose engines under one shared metric-call budget.
+
+| Engine | Role |
+| --- | --- |
+| `gepa` | Reflective pydantic-graph optimization loop. |
+| `coding_agent` | A caller-supplied proposer owns reflection; the library owns the loop and selection. |
+| `best_of_n` | A small reference engine that evaluates scripted or sampled variants. |
+
+```python
+from pydantic_ai_gepa import EngineConfig, OptimizationTask, optimize_best_of
+
+task = OptimizationTask(agent=agent, trainset=trainset, valset=valset, metric=metric)
+
+async def propose(seed):
+    return improved_candidate(seed)
+
+result = await optimize_best_of(
+    task,
+    [
+        EngineConfig(engine="best_of_n", engine_config={"n": 2, "propose": propose}),
+        EngineConfig(engine="gepa", max_metric_calls=20),
+    ],
+    max_metric_calls=40,
+)
+print(result.best.engine, result.fair_scores)
+```
+
+Use `optimize_parallel(...)` to keep every result, `optimize_sequential(...)` to chain engines without accepting a regression, or `optimize_vote(...)` to select by a fair evaluation vote.
+
+Custom engines are one class implementing the `OptimizationEngine` protocol plus a registration: `register_engine("my_engine", MyEngine)`. Every engine shares the same budget; `optimize_best_of` and `optimize_vote` re-evaluate finalists on the valset without charging that budget, so winner selection is comparable across engines.
+
 ## Example
 
 ### Basic Optimization
