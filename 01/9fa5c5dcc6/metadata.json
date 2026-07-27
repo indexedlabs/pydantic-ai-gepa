@@ -1,0 +1,9 @@
+{
+  "checkpoint_id": "019fa5c5dcc6",
+  "created_at": "2026-07-27T22:50:35.651613+00:00",
+  "branch_name": "eng/compose",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "36885cc2014f17ff6d415cc21eb50a4655f65b5c"
+  ]
+}
