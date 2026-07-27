@@ -1,0 +1,9 @@
+{
+  "checkpoint_id": "019fa5c03968",
+  "created_at": "2026-07-27T22:44:26.156851+00:00",
+  "branch_name": "eng/coding-agent",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "d5ee7fc04b9f1a3b42b35b1284fef79086e6d1ff"
+  ]
+}
