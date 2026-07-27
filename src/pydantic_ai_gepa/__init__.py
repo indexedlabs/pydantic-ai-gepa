@@ -18,6 +18,18 @@ from .inspection import (
 )
 from .exceptions import UsageBudgetExceeded
 from .runner import GepaOptimizationResult, optimize_agent
+from .engines import (
+    BudgetExhausted,
+    BudgetTracker,
+    EngineConfig,
+    EngineEvent,
+    EngineResult,
+    OptimizationEngine,
+    OptimizationTask,
+    get_engine,
+    list_engines,
+    register_engine,
+)
 from .input_type import (
     BoundInputSpec,
     InputSpec,
@@ -82,6 +94,16 @@ __all__ = [
     "InspectionAborted",
     "InspectionSnapshot",
     "UsageBudgetExceeded",
+    "OptimizationTask",
+    "EngineConfig",
+    "EngineResult",
+    "EngineEvent",
+    "BudgetTracker",
+    "BudgetExhausted",
+    "OptimizationEngine",
+    "register_engine",
+    "get_engine",
+    "list_engines",
 ]
 
 __version__ = "0.1.0"
