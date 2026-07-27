@@ -1,0 +1,9 @@
+{
+  "checkpoint_id": "019fa5d76c17",
+  "created_at": "2026-07-27T23:09:46.457206+00:00",
+  "branch_name": "eng/docs",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "0a14babdc7961132dd923824124245367702a2b4"
+  ]
+}
