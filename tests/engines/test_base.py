@@ -50,8 +50,9 @@ def test_budget_tracker_enforces_shared_limit() -> None:
 )
 def test_engine_config_requires_positive_limits(field: str, value: int) -> None:
     """Engine limits reject zero values."""
+    overrides: dict[str, Any] = {field: value}
     with pytest.raises(ValidationError):
-        EngineConfig(engine="test", **{field: value})
+        EngineConfig(engine="test", **overrides)
 
 
 @pytest.mark.asyncio
