@@ -2,9 +2,9 @@
 
 This command group keeps the coding agent in the reflector role while the CLI
 owns loop state. `start` evaluates minibatches until reflection is useful;
-`continue` evaluates the agent's edited components against the same
-mini-valset, compares against the pre-reflection baseline, and either pauses
-with discard guidance or advances to the next reflection point.
+`continue` evaluates the edited component baseline or git tree against the
+same mini-valset, compares against the pre-reflection baseline, and either
+pauses with discard guidance or advances to the next reflection point.
 """
 
 from __future__ import annotations
@@ -12,14 +12,19 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import json
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import typer
 
-from .candidates import candidate_id_from_components
+from .candidates import (
+    GitCandidateError,
+    candidate_id_from_components,
+    git_candidate_state,
+)
 from .eval import DEFAULT_FAILURE_THRESHOLD, EvalOutcome, run_eval_once
 from .layout import (
     GepaConfig,
+    CandidateSource,
     config_path,
     final_report_path,
     insert_repo_root_on_path,
@@ -57,11 +62,13 @@ class RunState:
     next_epoch: int
     concurrency: int
     threshold: float
+    candidate_source: CandidateSource
     iterations: int
     created_at: str
     updated_at: str
     reflection_minibatch_id: str | None = None
     reflection_baseline_candidate_id: str | None = None
+    reflection_baseline_commit_sha: str | None = None
     reflection_baseline_mean_score: float | None = None
     reflection_baseline_iteration: int | None = None
     reflection_baseline_report_path: str | None = None
@@ -72,6 +79,9 @@ class RunState:
     last_report_path: str | None = None
     last_trace_path: str | None = None
     last_comparison: dict[str, Any] | None = None
+    best_candidate_id: str | None = None
+    best_commit_sha: str | None = None
+    best_mean_score: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -83,11 +93,13 @@ class RunState:
             "next_epoch": self.next_epoch,
             "concurrency": self.concurrency,
             "threshold": self.threshold,
+            "candidate_source": self.candidate_source,
             "iterations": self.iterations,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "reflection_minibatch_id": self.reflection_minibatch_id,
             "reflection_baseline_candidate_id": self.reflection_baseline_candidate_id,
+            "reflection_baseline_commit_sha": self.reflection_baseline_commit_sha,
             "reflection_baseline_mean_score": self.reflection_baseline_mean_score,
             "reflection_baseline_iteration": self.reflection_baseline_iteration,
             "reflection_baseline_report_path": self.reflection_baseline_report_path,
@@ -98,6 +110,9 @@ class RunState:
             "last_report_path": self.last_report_path,
             "last_trace_path": self.last_trace_path,
             "last_comparison": self.last_comparison,
+            "best_candidate_id": self.best_candidate_id,
+            "best_commit_sha": self.best_commit_sha,
+            "best_mean_score": self.best_mean_score,
         }
 
     @staticmethod
@@ -111,6 +126,9 @@ class RunState:
             next_epoch=int(data["next_epoch"]),
             concurrency=int(data["concurrency"]),
             threshold=float(data["threshold"]),
+            candidate_source=cast(
+                CandidateSource, data.get("candidate_source", "components")
+            ),
             iterations=int(data["iterations"]),
             created_at=str(data["created_at"]),
             updated_at=str(data["updated_at"]),
@@ -118,6 +136,7 @@ class RunState:
             reflection_baseline_candidate_id=data.get(
                 "reflection_baseline_candidate_id"
             ),
+            reflection_baseline_commit_sha=data.get("reflection_baseline_commit_sha"),
             reflection_baseline_mean_score=(
                 float(data["reflection_baseline_mean_score"])
                 if data.get("reflection_baseline_mean_score") is not None
@@ -142,6 +161,13 @@ class RunState:
             last_comparison=(
                 dict(data["last_comparison"])
                 if isinstance(data.get("last_comparison"), dict)
+                else None
+            ),
+            best_candidate_id=data.get("best_candidate_id"),
+            best_commit_sha=data.get("best_commit_sha"),
+            best_mean_score=(
+                float(data["best_mean_score"])
+                if data.get("best_mean_score") is not None
                 else None
             ),
         )
@@ -200,22 +226,68 @@ def _with_last_outcome(state: RunState, outcome: EvalOutcome) -> RunState:
         last_trace_path=(
             str(summary["trace_path"]) if summary.get("trace_path") else None
         ),
+        best_candidate_id=state.best_candidate_id or str(summary["candidate_id"]),
+        best_commit_sha=(
+            state.best_commit_sha
+            or (
+                _summary_commit_sha(summary)
+                if state.candidate_source == "git"
+                else None
+            )
+        ),
+        best_mean_score=(
+            state.best_mean_score
+            if state.best_mean_score is not None
+            else float(summary["mean_score"])
+        ),
     )
 
 
 def _mark_reflection_pause(state: RunState, outcome: EvalOutcome) -> RunState:
     summary = outcome.summary
+    best_candidate_id = state.best_candidate_id or str(summary["candidate_id"])
+    best_commit_sha = state.best_commit_sha or (
+        _summary_commit_sha(summary) if state.candidate_source == "git" else None
+    )
+    best_mean_score = (
+        state.best_mean_score
+        if state.best_mean_score is not None
+        else float(summary["mean_score"])
+    )
     return _with_timestamp(
         _with_last_outcome(state, outcome),
         status="paused_for_reflection",
         reflection_minibatch_id=str(summary["minibatch_id"]),
         reflection_baseline_candidate_id=str(summary["candidate_id"]),
+        reflection_baseline_commit_sha=_summary_commit_sha(summary),
         reflection_baseline_mean_score=float(summary["mean_score"]),
         reflection_baseline_iteration=int(summary["iterations"]),
         reflection_baseline_report_path=str(summary["report_path"]),
         reflection_baseline_trace_path=(
             str(summary["trace_path"]) if summary.get("trace_path") else None
         ),
+        best_candidate_id=best_candidate_id,
+        best_commit_sha=best_commit_sha,
+        best_mean_score=best_mean_score,
+    )
+
+
+def _summary_commit_sha(summary: dict[str, Any]) -> str | None:
+    value = summary.get("commit_sha")
+    return str(value) if value else None
+
+
+def _mark_best_candidate(state: RunState, outcome: EvalOutcome) -> RunState:
+    summary = outcome.summary
+    return _with_timestamp(
+        state,
+        best_candidate_id=str(summary["candidate_id"]),
+        best_commit_sha=(
+            _summary_commit_sha(summary)
+            if state.candidate_source == "git"
+            else state.best_commit_sha
+        ),
+        best_mean_score=float(summary["mean_score"]),
     )
 
 
@@ -224,6 +296,7 @@ def _clear_reflection_baseline(state: RunState) -> RunState:
         state,
         reflection_minibatch_id=None,
         reflection_baseline_candidate_id=None,
+        reflection_baseline_commit_sha=None,
         reflection_baseline_mean_score=None,
         reflection_baseline_iteration=None,
         reflection_baseline_report_path=None,
@@ -248,6 +321,7 @@ def _fresh_baseline_outcome(state: RunState) -> tuple[RunState, EvalOutcome]:
         max_iterations=state.max_iterations,
         threshold=state.threshold,
         capture_traces=True,
+        candidate_source=state.candidate_source,
     )
     return _with_timestamp(state, next_epoch=epoch + 1), outcome
 
@@ -296,6 +370,7 @@ def _evaluate_reflected_candidate(
         max_iterations=state.max_iterations,
         threshold=state.threshold,
         capture_traces=True,
+        candidate_source=state.candidate_source,
     )
     state = _with_last_outcome(state, outcome)
     candidate_score = float(outcome.summary["mean_score"])
@@ -303,11 +378,13 @@ def _evaluate_reflected_candidate(
     comparison = {
         "minibatch_id": state.reflection_minibatch_id,
         "baseline_candidate_id": state.reflection_baseline_candidate_id,
+        "baseline_commit_sha": state.reflection_baseline_commit_sha,
         "baseline_iteration": state.reflection_baseline_iteration,
         "baseline_mean_score": baseline_score,
         "baseline_report_path": state.reflection_baseline_report_path,
         "baseline_trace_path": state.reflection_baseline_trace_path,
         "candidate_id": outcome.summary["candidate_id"],
+        "candidate_commit_sha": outcome.summary.get("commit_sha"),
         "candidate_iteration": outcome.summary["iterations"],
         "candidate_mean_score": candidate_score,
         "candidate_report_path": outcome.summary["report_path"],
@@ -316,15 +393,33 @@ def _evaluate_reflected_candidate(
         "improved": improved,
         "recommendation": "keep_and_advance" if improved else "discard_or_revise",
     }
+    if state.candidate_source == "git" and state.reflection_baseline_commit_sha:
+        comparison["discard_command"] = (
+            f"git reset --hard {state.reflection_baseline_commit_sha}"
+        )
     state = _with_timestamp(state, last_comparison=comparison)
     return state, outcome, comparison
 
 
-def _current_baseline_candidate_id() -> str:
-    """Return the candidate id for the currently confirmed component files."""
+def _current_baseline_candidate_id(
+    candidate_source: CandidateSource = "components",
+    *,
+    active_run_id: str | None = None,
+) -> str:
+    """Return the candidate id for the current component files or git tree."""
 
     cfg = GepaConfig.load(config_path())
     insert_repo_root_on_path()
+    if candidate_source == "git":
+        try:
+            state = git_candidate_state(
+                exclude_paths=[run_dir(active_run_id)] if active_run_id else []
+            )
+        except GitCandidateError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(code=1) from exc
+        return state.candidate_id
+
     agent = resolve_agent(cfg)
     skills_fs = resolve_skills(cfg)
     components = ComponentStore().effective_candidate(agent, skills_fs=skills_fs)
@@ -355,6 +450,14 @@ def _write_final_report(state: RunState) -> tuple[Path, str]:
                 f"- latest_mean_score: {latest.mean_score:.6f}",
             ]
         )
+    if state.best_candidate_id:
+        lines.append(f"- accepted_best_candidate_id: {state.best_candidate_id}")
+    if state.best_commit_sha:
+        lines.append(f"- accepted_best_commit_sha: {state.best_commit_sha}")
+        if state.candidate_source == "git":
+            lines.append(
+                f"- best_restore_command: git checkout {state.best_commit_sha}"
+            )
     if state.last_comparison:
         comparison = state.last_comparison
         lines.extend(
@@ -407,9 +510,14 @@ def _emit_status(
     final_report_text: str | None = None,
 ) -> None:
     if state.status == "paused_for_reflection":
+        editable_surface = (
+            "source/artifacts and commit the result"
+            if state.candidate_source == "git"
+            else "components or source"
+        )
         typer.echo(
             "Paused for reflection. Inspect the report and trace file, edit "
-            "components or source, then run:"
+            f"{editable_surface}, then run:"
         )
         typer.echo(f"  gepa run continue --run-id {state.run_id}")
         typer.echo(f"Report: {state.reflection_baseline_report_path}")
@@ -429,6 +537,12 @@ def _emit_status(
             )
             typer.echo(f"Candidate report: {comparison['candidate_report_path']}")
             typer.echo(f"Candidate trace: {comparison['candidate_trace_path']}")
+            if comparison.get("discard_command"):
+                typer.echo(
+                    "To discard the git candidate and restore the reflection "
+                    "baseline, run:"
+                )
+                typer.echo(f"  {comparison['discard_command']}")
     elif state.status == "done":
         typer.echo("Run complete.")
         if final_report_text:
@@ -469,9 +583,21 @@ def start(
         "--threshold",
         help="Score below which a case requires reflection.",
     ),
+    candidate_source: str | None = typer.Option(
+        None,
+        "--candidate-source",
+        help="Override gepa.toml candidate_source for this run: components or git.",
+    ),
 ) -> None:
     """Start a managed GEPA run and pause at the first reflection point."""
     _validate_max_iterations(max_iterations)
+    if candidate_source not in {None, "components", "git"}:
+        typer.echo("--candidate-source must be 'components' or 'git'.", err=True)
+        raise typer.Exit(code=2)
+    cfg = GepaConfig.load(config_path())
+    active_candidate_source = cast(
+        CandidateSource, candidate_source or cfg.candidate_source
+    )
     run_id = new_run_id()
     run_dir(run_id).mkdir(parents=True, exist_ok=True)
     now = utc_now_iso()
@@ -484,6 +610,7 @@ def start(
         next_epoch=epoch,
         concurrency=concurrency,
         threshold=threshold,
+        candidate_source=active_candidate_source,
         iterations=0,
         created_at=now,
         updated_at=now,
@@ -523,7 +650,10 @@ def continue_(
     if (
         state.status == "paused_after_candidate_eval"
         and state.reflection_baseline_candidate_id is not None
-        and _current_baseline_candidate_id() == state.reflection_baseline_candidate_id
+        and _current_baseline_candidate_id(
+            state.candidate_source, active_run_id=state.run_id
+        )
+        == state.reflection_baseline_candidate_id
     ):
         typer.echo(
             "Current components match the reflection baseline; discarding the "
@@ -547,6 +677,8 @@ def continue_(
         state, comparison_outcome, comparison = _evaluate_reflected_candidate(state)
         outcomes.append(comparison_outcome)
 
+        if comparison["improved"]:
+            state = _mark_best_candidate(state, comparison_outcome)
         if state.iterations >= state.max_iterations:
             state = _mark_done(state)
         elif comparison["improved"]:

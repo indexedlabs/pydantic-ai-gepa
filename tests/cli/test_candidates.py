@@ -3,11 +3,32 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from pydantic_ai_gepa.cli.candidates import Candidate
+from pydantic_ai_gepa.cli.candidates import Candidate, git_candidate_state
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _git_repo(tmp_path: Path) -> Path:
+    _git(tmp_path, "init")
+    _git(tmp_path, "config", "user.email", "tests@example.com")
+    _git(tmp_path, "config", "user.name", "GEPA Tests")
+    tracked = tmp_path / "pipeline.py"
+    tracked.write_text("VALUE = 1\n", encoding="utf-8")
+    _git(tmp_path, "add", "pipeline.py")
+    _git(tmp_path, "commit", "-m", "Seed pipeline")
+    return tmp_path
 
 
 def test_candidate_round_trip(tmp_path: Path) -> None:
@@ -55,3 +76,47 @@ def test_candidate_load_missing_components_field(tmp_path: Path) -> None:
 def test_candidate_load_missing_file(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         Candidate.load(tmp_path / "does_not_exist.json")
+
+
+def test_git_candidate_id_is_short_head_sha_when_clean(tmp_path: Path) -> None:
+    repo = _git_repo(tmp_path)
+
+    state = git_candidate_state(repo)
+
+    assert state.candidate_id == _git(repo, "rev-parse", "--short=12", "HEAD")
+    assert state.commit_sha == _git(repo, "rev-parse", "HEAD")
+    assert state.dirty is False
+    assert state.dirty_hash is None
+
+
+def test_git_candidate_dirty_hash_is_stable_and_content_sensitive(
+    tmp_path: Path,
+) -> None:
+    repo = _git_repo(tmp_path)
+    tracked = repo / "pipeline.py"
+    tracked.write_text("VALUE = 2\n", encoding="utf-8")
+    (repo / "prompt.md").write_text("first\n", encoding="utf-8")
+
+    first = git_candidate_state(repo)
+    repeated = git_candidate_state(repo)
+    (repo / "prompt.md").write_text("second\n", encoding="utf-8")
+    changed = git_candidate_state(repo)
+
+    assert first.dirty is True
+    assert first.dirty_hash is not None
+    assert first.candidate_id == repeated.candidate_id
+    assert first.candidate_id.startswith(f"{first.short_commit_sha}-dirty-")
+    assert changed.candidate_id != first.candidate_id
+
+
+def test_git_candidate_can_exclude_cli_run_artifacts(tmp_path: Path) -> None:
+    repo = _git_repo(tmp_path)
+    run_dir = repo / ".gepa" / "runs" / "run-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "state.json").write_text("{}\n", encoding="utf-8")
+
+    included = git_candidate_state(repo)
+    excluded = git_candidate_state(repo, exclude_paths=[run_dir])
+
+    assert included.dirty is True
+    assert excluded.dirty is False

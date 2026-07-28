@@ -35,13 +35,14 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 
 GEPA_DIRNAME = ".gepa"
 GEPA_DIR_ENV = "GEPA_DIR"
 CONFIG_FILENAME = "gepa.toml"
 JOURNAL_FILENAME = "journal.jsonl"
+CandidateSource = Literal["components", "git"]
 
 
 _explicit_gepa_dirname: str | None = None
@@ -90,8 +91,14 @@ class GepaConfigError(RuntimeError):
 class GepaConfig:
     """Configuration loaded from `.gepa/gepa.toml`."""
 
-    agent: str
-    """Module reference for the user's pydantic-ai agent, e.g. ``"mypkg.agents:my_agent"``."""
+    agent: str | None = None
+    """Optional module reference for the user's pydantic-ai agent."""
+
+    evaluate: str | None = None
+    """Optional plain ``module.path:attr`` evaluation callable for git mode."""
+
+    candidate_source: CandidateSource = "components"
+    """Candidate identity and application strategy. Component mode is the default."""
 
     dataset: str = ".gepa/dataset.jsonl"
     """Relative path (from repo root) to the dataset JSONL file.
@@ -124,14 +131,36 @@ class GepaConfig:
 
     @staticmethod
     def from_dict(data: dict[str, Any]) -> GepaConfig:
-        if "agent" not in data:
+        candidate_source = data.get("candidate_source", "components")
+        if candidate_source not in {"components", "git"}:
+            raise GepaConfigError(
+                "Invalid 'candidate_source' value: "
+                f"{candidate_source!r}. Expected 'components' or 'git'."
+            )
+        agent = data.get("agent")
+        evaluate = data.get("evaluate")
+        if candidate_source == "components" and agent is None:
             raise GepaConfigError(
                 "Missing required key 'agent' in gepa.toml (expected 'module.path:attr')."
             )
-        agent = data["agent"]
-        if not isinstance(agent, str) or ":" not in agent:
+        if candidate_source == "git" and agent is None and evaluate is None:
+            raise GepaConfigError(
+                "Git candidate mode requires either 'agent' or 'evaluate' in gepa.toml."
+            )
+        if agent is not None and (not isinstance(agent, str) or ":" not in agent):
             raise GepaConfigError(
                 f"Invalid 'agent' value: {agent!r}. Expected 'module.path:attr'."
+            )
+        if evaluate is not None and (
+            not isinstance(evaluate, str) or ":" not in evaluate
+        ):
+            raise GepaConfigError(
+                f"Invalid 'evaluate' value: {evaluate!r}. "
+                "Expected 'module.path:attr' or omit."
+            )
+        if candidate_source == "components" and evaluate is not None:
+            raise GepaConfigError(
+                "'evaluate' is only supported when candidate_source = \"git\"."
             )
         dataset = data.get("dataset", default_dataset_path())
         metric = data.get("metric")
@@ -159,6 +188,8 @@ class GepaConfig:
             )
         return GepaConfig(
             agent=agent,
+            evaluate=evaluate,
+            candidate_source=candidate_source,
             dataset=dataset,
             metric=metric,
             case_factory=case_factory,
@@ -292,7 +323,16 @@ def latest_run_id(root: Path | None = None) -> str | None:
 
 def resolve_agent(config: GepaConfig) -> Any:
     """Import ``config.agent`` (``module.path:attr``) and return the agent attribute."""
+    if not config.agent:
+        raise GepaConfigError("No 'agent' is configured in gepa.toml.")
     return resolve_module_attr(config.agent, kind="agent")
+
+
+def resolve_evaluate(config: GepaConfig) -> Any:
+    """Import the optional plain git-mode evaluation callable."""
+    if not config.evaluate:
+        return None
+    return resolve_module_attr(config.evaluate, kind="evaluate")
 
 
 def resolve_metric(config: GepaConfig) -> Any:
@@ -347,9 +387,11 @@ def resolve_module_attr(ref: str, *, kind: str = "object") -> Any:
 
 
 def write_default_config(
-    agent: str,
+    agent: str | None,
     dataset: str | None = None,
     *,
+    evaluate: str | None = None,
+    candidate_source: CandidateSource = "components",
     metric: str | None = None,
     case_factory: str | None = None,
     skills: str | None = None,
@@ -368,10 +410,17 @@ def write_default_config(
         raise GepaConfigError(f"{path} already exists. Pass --force to overwrite.")
     path.parent.mkdir(parents=True, exist_ok=True)
     resolved_dataset = dataset if dataset is not None else default_dataset_path()
-    lines = [
-        f'agent = "{agent}"',
-        f'dataset = "{resolved_dataset}"',
-    ]
+    lines = []
+    if agent:
+        lines.append(f'agent = "{agent}"')
+    if evaluate:
+        lines.append(f'evaluate = "{evaluate}"')
+    lines.extend(
+        [
+            f'candidate_source = "{candidate_source}"',
+            f'dataset = "{resolved_dataset}"',
+        ]
+    )
     if metric:
         lines.append(f'metric = "{metric}"')
     if case_factory:

@@ -4,8 +4,8 @@ External-reflection mode (per pydanticaigepa-spec-973) keeps the coding agent
 as the reflector. The library's job is to:
 
   * sample a fresh minibatch (or reuse one),
-  * evaluate either the current confirmed baseline (``.gepa/components/``) or
-    an explicit ``--candidate-file``,
+  * evaluate either the current confirmed component baseline, an explicit
+    ``--candidate-file``, or the current git tree,
   * enforce stage-and-confirm when the baseline is what's being evaluated and
     new component slots were discovered (per pydanticaigepa-dec-0ky),
   * append a ParetoRow + write a per-case failure report under
@@ -21,19 +21,32 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator, cast
 
 import typer
 
-from ..evaluation import EvaluationRecord, evaluate_candidate_dataset
+from ..evaluation import (
+    EvaluationRecord,
+    evaluate_callable_dataset,
+    evaluate_candidate_dataset,
+)
 from ._io import write_content_file
-from .candidates import Candidate, candidate_id_from_components
+from .candidates import (
+    Candidate,
+    GitCandidateError,
+    GitCandidateState,
+    candidate_id_from_components,
+    git_candidate_state,
+)
 from .dataset import case_ids as dataset_case_ids
 from .dataset import cases_by_id, load_dataset
 from .layout import (
     GepaConfig,
+    CandidateSource,
     config_path,
     insert_repo_root_on_path,
     latest_run_id,
@@ -41,6 +54,7 @@ from .layout import (
     repo_root,
     resolve_agent,
     resolve_case_factory,
+    resolve_evaluate,
     resolve_metric,
     resolve_skills,
     run_dir,
@@ -54,6 +68,9 @@ from .runs import (
     utc_now_iso,
 )
 from .store import ComponentStore
+
+
+GEPA_TRACE_FILE_ENV = "GEPA_TRACE_FILE"
 
 
 def _resolve_run_id(run_id: str | None) -> str:
@@ -84,15 +101,27 @@ class EvalOutcome:
         return int(self.summary["n_failures"])
 
 
-def _format_failures(records, threshold: float = DEFAULT_FAILURE_THRESHOLD) -> str:
+def _format_failures(
+    records,
+    threshold: float = DEFAULT_FAILURE_THRESHOLD,
+    *,
+    candidate_source: CandidateSource = "components",
+) -> str:
     lines = ["# Eval report", ""]
     failures = [r for r in records if r.score < threshold]
     if not failures:
         lines.append("Every case in this minibatch passed; nothing to act on.")
         return "\n".join(lines)
+    next_step = (
+        "Review per-case feedback and traces, edit the working-tree code or "
+        "artifacts, then commit the candidate."
+        if candidate_source == "git"
+        else "Review per-case feedback and edit slots in `.gepa/components/` "
+        "or change the agent's source."
+    )
     lines.append(
-        f"{len(failures)} of {len(records)} case(s) underperformed (score < {threshold}). "
-        "Review per-case feedback and edit slots in `.gepa/components/` or change the agent's source.\n"
+        f"{len(failures)} of {len(records)} case(s) underperformed "
+        f"(score < {threshold}). {next_step}\n"
     )
     for record in failures:
         lines.append(f"## {record.case_id} — score {record.score:.3f}")
@@ -113,12 +142,49 @@ def _json_default(value: Any) -> Any:
     return str(value)
 
 
-def _write_trace_file(
+def current_trace_path() -> Path | None:
+    """Return the trace JSONL path exposed for the current CLI evaluation."""
+
+    value = os.environ.get(GEPA_TRACE_FILE_ENV)
+    return Path(value) if value else None
+
+
+@contextmanager
+def _expose_trace_path(path: Path | None) -> Iterator[None]:
+    previous = os.environ.get(GEPA_TRACE_FILE_ENV)
+    if path is None:
+        os.environ.pop(GEPA_TRACE_FILE_ENV, None)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.environ[GEPA_TRACE_FILE_ENV] = str(path)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(GEPA_TRACE_FILE_ENV, None)
+        else:
+            os.environ[GEPA_TRACE_FILE_ENV] = previous
+
+
+def _trace_file_path(
     *,
     run_id: str,
     iteration: int,
     candidate_id: str,
     minibatch_id: str,
+) -> Path:
+    return (
+        run_dir(run_id)
+        / "traces"
+        / "minibatches"
+        / minibatch_id
+        / f"{iteration:04d}-{candidate_id}.jsonl"
+    )
+
+
+def _write_trace_file(
+    *,
+    path: Path,
     records: list[EvaluationRecord],
 ) -> Path | None:
     trace_rows: list[dict[str, Any]] = []
@@ -133,16 +199,12 @@ def _write_trace_file(
             trace_record["feedback"] = record.feedback
         trace_rows.append(trace_record)
 
-    if not trace_rows:
-        return None
-
-    trace_dir = run_dir(run_id) / "traces" / "minibatches" / minibatch_id
-    trace_dir.mkdir(parents=True, exist_ok=True)
-    path = trace_dir / f"{iteration:04d}-{candidate_id}.jsonl"
-    with path.open("w", encoding="utf-8") as fh:
-        for row in trace_rows:
-            fh.write(json.dumps(row, default=_json_default, sort_keys=True) + "\n")
-    return path
+    if trace_rows:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            for row in trace_rows:
+                fh.write(json.dumps(row, default=_json_default, sort_keys=True) + "\n")
+    return path if path.exists() and path.stat().st_size > 0 else None
 
 
 def run_eval_once(
@@ -157,12 +219,15 @@ def run_eval_once(
     max_iterations: int,
     threshold: float,
     capture_traces: bool = False,
+    candidate_source: CandidateSource | None = None,
 ) -> EvalOutcome:
     """Evaluate one baseline/candidate and append the standard run artifacts."""
     cfg = GepaConfig.load(config_path())
     insert_repo_root_on_path()
 
-    agent = resolve_agent(cfg)
+    source = candidate_source or cfg.candidate_source
+    agent = resolve_agent(cfg) if cfg.agent else None
+    evaluate = resolve_evaluate(cfg) if source == "git" else None
     metric = resolve_metric(cfg) or default_substring_metric
     case_factory = resolve_case_factory(cfg)
     skills_fs = resolve_skills(cfg)
@@ -173,56 +238,78 @@ def run_eval_once(
         typer.echo(f"Dataset {dataset_path} is empty.", err=True)
         raise typer.Exit(code=1)
 
-    # When evaluating the baseline (no explicit candidate), enforce the
-    # stage-and-confirm gate per pydanticaigepa-dec-0ky.
-    store = ComponentStore()
-    is_baseline_eval = candidate_file is None
-    if is_baseline_eval:
-        staged = store.detect_new_slots(agent, skills_fs=skills_fs)
-        if staged:
+    git_state: GitCandidateState | None = None
+    candidate: Candidate | None = None
+    candidate_overrides_id = ""
+    status = ""
+    if source == "git":
+        if candidate_file is not None:
             typer.echo(
-                "Found unconfirmed component slots; refusing to evaluate the baseline.",
+                "--candidate-file cannot be used with git candidates; "
+                "the current working tree is the candidate.",
                 err=True,
             )
-            typer.echo("Staged stubs:", err=True)
-            for slot in staged:
-                typer.echo(f"  {store.staged_path(slot)}", err=True)
-            typer.echo("Confirm with:", err=True)
-            for slot in staged:
-                typer.echo(f"  gepa components confirm {slot}", err=True)
             raise typer.Exit(code=2)
-
-        # Warn (don't fail) on orphan slots — files in .gepa/components/ that
-        # no longer correspond to an introspected slot. These are skipped by
-        # `effective_candidate`, but worth surfacing so the agent notices.
-        introspected_names = set(store.effective_candidate(agent, skills_fs=skills_fs))
-        orphans = sorted(
-            slot
-            for slot in store.list_confirmed_slots()
-            if slot not in introspected_names
-        )
-        if orphans:
-            typer.echo("Orphan slot files (no longer on the agent):", err=True)
-            for slot in orphans:
-                typer.echo(f"  {store.confirmed_path(slot)}", err=True)
+        if agent is None and evaluate is None:
             typer.echo(
-                "These files are ignored during eval. Delete them with "
-                "`rm` or re-init with --force to remove the cruft.",
+                "Git candidate mode requires an 'agent' or plain 'evaluate' "
+                "callable in gepa.toml.",
                 err=True,
             )
-
-        baseline_components = store.effective_candidate(agent, skills_fs=skills_fs)
-        candidate = Candidate(
-            id=candidate_id_from_components(baseline_components),
-            components=baseline_components,
-            metadata={"role": "baseline"},
-        )
-        candidate_overrides_id = "(baseline)"
-        status = "baseline"
+            raise typer.Exit(code=1)
     else:
-        candidate = Candidate.load(candidate_file)
-        candidate_overrides_id = str(candidate_file)
-        status = "evaluated"
+        if agent is None:
+            typer.echo(
+                "Component candidate mode requires 'agent' in gepa.toml.", err=True
+            )
+            raise typer.Exit(code=1)
+        store = ComponentStore()
+        is_baseline_eval = candidate_file is None
+        if is_baseline_eval:
+            staged = store.detect_new_slots(agent, skills_fs=skills_fs)
+            if staged:
+                typer.echo(
+                    "Found unconfirmed component slots; refusing to evaluate the baseline.",
+                    err=True,
+                )
+                typer.echo("Staged stubs:", err=True)
+                for slot in staged:
+                    typer.echo(f"  {store.staged_path(slot)}", err=True)
+                typer.echo("Confirm with:", err=True)
+                for slot in staged:
+                    typer.echo(f"  gepa components confirm {slot}", err=True)
+                raise typer.Exit(code=2)
+
+            introspected_names = set(
+                store.effective_candidate(agent, skills_fs=skills_fs)
+            )
+            orphans = sorted(
+                slot
+                for slot in store.list_confirmed_slots()
+                if slot not in introspected_names
+            )
+            if orphans:
+                typer.echo("Orphan slot files (no longer on the agent):", err=True)
+                for slot in orphans:
+                    typer.echo(f"  {store.confirmed_path(slot)}", err=True)
+                typer.echo(
+                    "These files are ignored during eval. Delete them with "
+                    "`rm` or re-init with --force to remove the cruft.",
+                    err=True,
+                )
+
+            baseline_components = store.effective_candidate(agent, skills_fs=skills_fs)
+            candidate = Candidate(
+                id=candidate_id_from_components(baseline_components),
+                components=baseline_components,
+                metadata={"role": "baseline"},
+            )
+            candidate_overrides_id = "(baseline)"
+            status = "baseline"
+        else:
+            candidate = Candidate.load(candidate_file)
+            candidate_overrides_id = str(candidate_file)
+            status = "evaluated"
 
     active_run_id = _resolve_run_id(run_id)
     prior_count = _count_evals_in_run(active_run_id)
@@ -233,6 +320,7 @@ def run_eval_once(
             err=True,
         )
         raise typer.Exit(code=70)
+    iteration = prior_count + 1
 
     run_dir(active_run_id).mkdir(parents=True, exist_ok=True)
     minibatch_store = MinibatchStore(active_run_id)
@@ -253,28 +341,75 @@ def run_eval_once(
         raise typer.Exit(code=1)
     subset = [by_id[cid] for cid in minibatch.case_ids]
 
-    records = asyncio.run(
-        evaluate_candidate_dataset(
-            agent=agent,
-            metric=metric,
-            dataset=subset,
-            candidate=candidate.to_candidate_map(),
-            concurrency=concurrency,
-            case_factory=case_factory,
-            capture_traces=capture_traces,
-            skills_fs=skills_fs,
+    if source == "git":
+        try:
+            git_state = git_candidate_state(
+                repo_root(), exclude_paths=[run_dir(active_run_id)]
+            )
+        except GitCandidateError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(code=1) from exc
+        candidate = Candidate(
+            id=git_state.candidate_id,
+            components={},
+            metadata={
+                "role": "baseline",
+                "commit_sha": git_state.commit_sha,
+                "dirty_hash": git_state.dirty_hash,
+            },
         )
+        candidate_overrides_id = "(git-tree)"
+        status = "baseline"
+
+    assert candidate is not None
+    planned_trace_path = (
+        _trace_file_path(
+            run_id=active_run_id,
+            iteration=iteration,
+            candidate_id=candidate.id,
+            minibatch_id=minibatch.id,
+        )
+        if capture_traces
+        else None
     )
+    with _expose_trace_path(planned_trace_path):
+        if evaluate is not None:
+            records = asyncio.run(
+                evaluate_callable_dataset(
+                    evaluate=evaluate,
+                    metric=metric,
+                    dataset=subset,
+                    concurrency=concurrency,
+                    case_factory=case_factory,
+                )
+            )
+        else:
+            assert agent is not None
+            records = asyncio.run(
+                evaluate_candidate_dataset(
+                    agent=agent,
+                    metric=metric,
+                    dataset=subset,
+                    candidate=({} if source == "git" else candidate.to_candidate_map()),
+                    concurrency=concurrency,
+                    case_factory=case_factory,
+                    capture_traces=capture_traces,
+                    skills_fs=skills_fs,
+                )
+            )
 
     per_case = {record.case_id: record.score for record in records}
     mean = sum(per_case.values()) / len(per_case) if per_case else 0.0
-    iteration = prior_count + 1
 
     pareto = ParetoLog(active_run_id)
     pareto.append(
         ParetoRow(
             candidate_id=candidate.id,
-            commit_sha=current_commit_sha(),
+            commit_sha=(
+                git_state.commit_sha
+                if git_state is not None
+                else current_commit_sha(repo_root())
+            ),
             component_overrides_id=candidate_overrides_id,
             minibatch_id=minibatch.id,
             per_case_scores=per_case,
@@ -290,23 +425,29 @@ def run_eval_once(
     reports_dir.mkdir(parents=True, exist_ok=True)
     report_path = reports_dir / f"{iteration:04d}-{candidate.id}.md"
     report_path.write_text(
-        _format_failures(records, threshold=threshold), encoding="utf-8"
+        _format_failures(records, threshold=threshold, candidate_source=source),
+        encoding="utf-8",
     )
     trace_path = (
         _write_trace_file(
-            run_id=active_run_id,
-            iteration=iteration,
-            candidate_id=candidate.id,
-            minibatch_id=minibatch.id,
+            path=planned_trace_path,
             records=records,
         )
-        if capture_traces
+        if planned_trace_path is not None
         else None
     )
 
     summary: dict[str, Any] = {
         "candidate_id": candidate.id,
         "candidate_role": status,
+        "candidate_source": source,
+        "commit_sha": (
+            git_state.commit_sha
+            if git_state is not None
+            else current_commit_sha(repo_root())
+        ),
+        "dirty_tree": git_state.dirty if git_state is not None else None,
+        "dirty_hash": git_state.dirty_hash if git_state is not None else None,
         "minibatch_id": minibatch.id,
         "run_id": active_run_id,
         "mean_score": mean,
@@ -394,8 +535,16 @@ def eval_(
         "--capture-traces",
         help="Persist reflective trace records for this minibatch under the run's traces directory.",
     ),
+    candidate_source: str | None = typer.Option(
+        None,
+        "--candidate-source",
+        help="Override gepa.toml candidate_source for this eval: components or git.",
+    ),
 ) -> None:
     """Evaluate the current baseline (default) or an explicit candidate file."""
+    if candidate_source not in {None, "components", "git"}:
+        typer.echo("--candidate-source must be 'components' or 'git'.", err=True)
+        raise typer.Exit(code=2)
     outcome = run_eval_once(
         candidate_file=candidate_file,
         minibatch_id=minibatch_id,
@@ -407,6 +556,7 @@ def eval_(
         max_iterations=max_iterations,
         threshold=threshold,
         capture_traces=capture_traces,
+        candidate_source=cast(CandidateSource | None, candidate_source),
     )
 
     write_content_file(output_file, _format_output_lines(outcome))

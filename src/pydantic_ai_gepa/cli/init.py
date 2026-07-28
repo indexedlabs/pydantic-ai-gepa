@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import importlib.resources
 from pathlib import Path
+from typing import cast
 
 import typer
 
 from .layout import (
     GepaConfigError,
+    CandidateSource,
     current_gepa_dirname,
     default_dataset_path,
     ensure_layout,
@@ -51,8 +53,20 @@ def _install_packaged_skill(dest: Path, *, force: bool) -> Path | None:
 
 
 def init(
-    agent: str = typer.Option(
-        ..., "--agent", help='Agent module ref, e.g. "mypkg.agents:my_agent".'
+    agent: str | None = typer.Option(
+        None,
+        "--agent",
+        help='Agent module ref, e.g. "mypkg.agents:my_agent". Required in component mode; optional in git mode when --evaluate is set.',
+    ),
+    evaluate: str | None = typer.Option(
+        None,
+        "--evaluate",
+        help='Plain evaluation callable for git mode, e.g. "mypkg.eval:evaluate". It receives each Case (or case_factory result) and returns the pipeline output.',
+    ),
+    candidate_source: str = typer.Option(
+        "components",
+        "--candidate-source",
+        help="Candidate source: components (default) or git.",
     ),
     dataset: str | None = typer.Option(
         None,
@@ -96,10 +110,29 @@ def init(
     """Bootstrap the workspace in the current repo: write gepa.toml + seed components."""
     insert_repo_root_on_path()
 
+    if candidate_source not in {"components", "git"}:
+        typer.echo("--candidate-source must be 'components' or 'git'.", err=True)
+        raise typer.Exit(code=2)
+    if candidate_source == "components" and agent is None:
+        typer.echo("--agent is required in component candidate mode.", err=True)
+        raise typer.Exit(code=2)
+    if candidate_source == "git" and agent is None and evaluate is None:
+        typer.echo(
+            "Git candidate mode requires either --agent or --evaluate.", err=True
+        )
+        raise typer.Exit(code=2)
+    if candidate_source == "components" and evaluate is not None:
+        typer.echo("--evaluate is only supported in git candidate mode.", err=True)
+        raise typer.Exit(code=2)
+
     # Sanity-check the agent ref (and metric / case_factory refs, when
     # provided) before persisting config.
+    agent_obj = None
     try:
-        agent_obj = resolve_module_attr(agent, kind="agent")
+        if agent:
+            agent_obj = resolve_module_attr(agent, kind="agent")
+        if evaluate:
+            resolve_module_attr(evaluate, kind="evaluate")
         if metric:
             resolve_module_attr(metric, kind="metric")
         if case_factory:
@@ -114,6 +147,8 @@ def init(
         cfg_path = write_default_config(
             agent,
             resolved_dataset,
+            evaluate=evaluate,
+            candidate_source=cast(CandidateSource, candidate_source),
             metric=metric,
             case_factory=case_factory,
             force=force,
@@ -128,7 +163,11 @@ def init(
     # alone — those represent in-progress confirmations the user hasn't
     # finalized yet, and silently destroying them on --force was confusing.
     store = ComponentStore()
-    seeds = introspect_agent(agent_obj)
+    seeds = (
+        introspect_agent(agent_obj)
+        if candidate_source == "components" and agent_obj is not None
+        else {}
+    )
     reseeded = 0
     for slot, text in seeds.items():
         if force or store.read(slot) is None:
@@ -136,7 +175,7 @@ def init(
             reseeded += 1
 
     orphans_removed = 0
-    if force:
+    if force and candidate_source == "components":
         introspected_names = set(seeds)
         for slot in store.list_confirmed_slots():
             if slot not in introspected_names:
@@ -144,7 +183,12 @@ def init(
                     orphans_removed += 1
 
     typer.echo(f"Wrote {cfg_path}")
-    typer.echo(f"Seeded {len(seeds)} component slot(s) under {store.components_dir}")
+    if candidate_source == "components":
+        typer.echo(
+            f"Seeded {len(seeds)} component slot(s) under {store.components_dir}"
+        )
+    else:
+        typer.echo("Configured git-native candidates; component slots were bypassed.")
     if force and reseeded > 0:
         typer.echo(f"  Re-seeded {reseeded} slot(s) from introspection.")
     if orphans_removed:

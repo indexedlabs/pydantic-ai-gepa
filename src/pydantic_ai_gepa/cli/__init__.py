@@ -61,12 +61,12 @@ def _gepa_root(
         load_dotenv()
 
 
-app.command(name="init", help="Scaffold .gepa/ and seed components from the agent.")(
+app.command(name="init", help="Scaffold a component-backed or git-native workspace.")(
     init_cmd.init
 )
 app.command(
     name="eval",
-    help="Evaluate the current baseline (default) or an explicit --candidate-file.",
+    help="Evaluate the configured component baseline or current git tree.",
 )(eval_cmd.eval_)
 app.command(
     name="apply", help="Apply a candidate's component overrides into .gepa/components/."

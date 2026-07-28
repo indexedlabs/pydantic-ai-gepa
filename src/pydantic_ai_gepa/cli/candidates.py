@@ -1,7 +1,9 @@
-"""Read/write candidate JSON files for the gepa CLI.
+"""Candidate identities and candidate-JSON files for the gepa CLI.
 
-A candidate file captures the component overrides applied to the agent during
-one evaluation. Schema::
+Component candidates use a JSON file containing agent overrides. Git-native
+candidates use the current commit plus an optional dirty-tree hash.
+
+Candidate JSON schema::
 
     {
         "id": "candidate-abc123",
@@ -17,6 +19,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
+import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -90,3 +96,129 @@ def _hash_components(components: dict[str, str]) -> str:
 def candidate_id_from_components(components: dict[str, str]) -> str:
     """Return a stable id derived from the component text content."""
     return _hash_components(components)
+
+
+class GitCandidateError(RuntimeError):
+    """Raised when a git-backed candidate cannot be identified."""
+
+
+@dataclass(frozen=True, slots=True)
+class GitCandidateState:
+    """Identity of the repository state used as a git-backed candidate."""
+
+    candidate_id: str
+    commit_sha: str
+    short_commit_sha: str
+    dirty: bool
+    dirty_hash: str | None = None
+
+
+def git_candidate_state(
+    root: Path | None = None,
+    *,
+    exclude_paths: Sequence[Path] = (),
+) -> GitCandidateState:
+    """Return the HEAD-based identity of the current repository tree.
+
+    Tracked changes are represented by ``git diff HEAD``. Untracked,
+    non-ignored files are added by path, mode, and content so identical dirty
+    trees have stable identities while any candidate-relevant change produces
+    a distinct id.
+    """
+
+    repository = (root or Path.cwd()).resolve()
+    excluded = _relative_exclusions(repository, exclude_paths)
+    pathspecs = [".", *(f":(exclude){path}" for path in excluded)]
+    commit_sha = _git_output(repository, "rev-parse", "HEAD").decode().strip()
+    short_commit_sha = (
+        _git_output(repository, "rev-parse", "--short=12", "HEAD").decode().strip()
+    )
+    tracked_diff = _git_output(
+        repository,
+        "diff",
+        "--binary",
+        "--full-index",
+        "HEAD",
+        "--",
+        *pathspecs,
+    )
+    untracked_output = _git_output(
+        repository,
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        "--",
+        *pathspecs,
+    )
+    untracked_paths = [path for path in untracked_output.split(b"\0") if path]
+    dirty = bool(tracked_diff or untracked_paths)
+    if not dirty:
+        return GitCandidateState(
+            candidate_id=short_commit_sha,
+            commit_sha=commit_sha,
+            short_commit_sha=short_commit_sha,
+            dirty=False,
+        )
+
+    digest = hashlib.sha256()
+    digest.update(b"tracked-diff\0")
+    digest.update(tracked_diff)
+    for raw_path in sorted(untracked_paths):
+        path = repository / os.fsdecode(raw_path)
+        file_stat = path.lstat()
+        digest.update(b"untracked\0")
+        digest.update(raw_path)
+        digest.update(b"\0")
+        digest.update(_git_mode(file_stat.st_mode).encode())
+        digest.update(b"\0")
+        if stat.S_ISLNK(file_stat.st_mode):
+            digest.update(os.fsencode(os.readlink(path)))
+        else:
+            digest.update(path.read_bytes())
+        digest.update(b"\0")
+
+    dirty_hash = digest.hexdigest()[:12]
+    return GitCandidateState(
+        candidate_id=f"{short_commit_sha}-dirty-{dirty_hash}",
+        commit_sha=commit_sha,
+        short_commit_sha=short_commit_sha,
+        dirty=True,
+        dirty_hash=dirty_hash,
+    )
+
+
+def _git_output(repository: Path, *args: str) -> bytes:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(repository), *args],
+            check=True,
+            capture_output=True,
+        ).stdout
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        detail = (
+            exc.stderr.decode(errors="replace").strip()
+            if isinstance(exc, subprocess.CalledProcessError)
+            else str(exc)
+        )
+        raise GitCandidateError(
+            f"Could not identify git candidate at {repository}: {detail}"
+        ) from exc
+
+
+def _git_mode(mode: int) -> str:
+    if stat.S_ISLNK(mode):
+        return "120000"
+    return "100755" if mode & stat.S_IXUSR else "100644"
+
+
+def _relative_exclusions(repository: Path, paths: Sequence[Path]) -> list[str]:
+    excluded: list[str] = []
+    for path in paths:
+        candidate = path if path.is_absolute() else repository / path
+        try:
+            relative = candidate.resolve().relative_to(repository)
+        except ValueError:
+            continue
+        excluded.append(relative.as_posix())
+    return sorted(excluded)

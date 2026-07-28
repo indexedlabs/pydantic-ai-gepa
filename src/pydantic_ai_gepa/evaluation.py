@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -17,6 +19,7 @@ from .gepa_graph.models import CandidateMap, candidate_texts
 from .input_type import InputSpec
 from .skills import SkillsFS
 from .skills.models import SkillCapability
+from .types import MetricResult, RolloutOutput
 
 
 @dataclass(slots=True)
@@ -135,7 +138,93 @@ async def evaluate_candidate_dataset(
     return records
 
 
+PlainEvaluate = Callable[
+    [Any],
+    Any | Awaitable[Any],
+]
+
+
+async def evaluate_callable_dataset(
+    *,
+    evaluate: PlainEvaluate,
+    metric: Callable[..., Any],
+    dataset: Sequence[Case[Any, Any, Any]] | Dataset[Any, Any],
+    concurrency: int = 20,
+    case_factory: CaseFactory | None = None,
+) -> list[EvaluationRecord]:
+    """Evaluate cases through a plain working-tree callable.
+
+    This is the git-native counterpart to :func:`evaluate_candidate_dataset`.
+    The callable receives the complete ``Case`` by default, or the value
+    returned by ``case_factory(case)`` when a factory is configured. It
+    returns the task output; no component candidate or agent override is
+    constructed or applied.
+    """
+
+    cases = dataset.cases if isinstance(dataset, Dataset) else dataset
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+    records: list[EvaluationRecord] = []
+
+    async def run_case(index: int, case: Case[Any, Any, Any]) -> None:
+        case_id = case.name or f"case-{index}"
+        async with semaphore:
+            try:
+                evaluate_input: Any = case
+                if case_factory is not None:
+                    evaluate_input = case_factory(case)
+                    if inspect.isawaitable(evaluate_input):
+                        evaluate_input = await evaluate_input
+                output = evaluate(evaluate_input)
+                if inspect.isawaitable(output):
+                    output = await output
+                metric_result = metric(case, output)
+                if inspect.isawaitable(metric_result):
+                    metric_result = await metric_result
+                score, feedback, side_info = _coerce_metric_result(metric_result)
+                payload: dict[str, Any] = {
+                    "output": output,
+                    "score": score,
+                    "feedback": feedback,
+                }
+                if side_info is not None:
+                    payload["side_info"] = side_info
+            except Exception as exc:
+                output = RolloutOutput.from_error(exc, kind="system")
+                score = 0.0
+                feedback = f"Evaluate callable failed: {exc}"
+                payload = {
+                    "output": output,
+                    "score": score,
+                    "feedback": feedback,
+                }
+            records.append(
+                EvaluationRecord(
+                    case_id=case_id,
+                    score=score,
+                    feedback=feedback,
+                    payload=payload,
+                )
+            )
+
+    await asyncio.gather(*(run_case(index, case) for index, case in enumerate(cases)))
+    return records
+
+
+def _coerce_metric_result(
+    result: MetricResult | float | int,
+) -> tuple[float, str | None, dict[str, Any] | None]:
+    if isinstance(result, MetricResult):
+        return float(result.score), result.feedback, result.side_info
+    if isinstance(result, (int, float)):
+        return float(result), None, None
+    raise TypeError(
+        f"Metric must return MetricResult or float, got {type(result).__name__}."
+    )
+
+
 __all__ = [
     "EvaluationRecord",
+    "PlainEvaluate",
+    "evaluate_callable_dataset",
     "evaluate_candidate_dataset",
 ]
