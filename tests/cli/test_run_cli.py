@@ -85,7 +85,7 @@ def test_managed_run_pauses_for_reflection_and_writes_trace_paths(repo: Path) ->
     assert run_state_path(str(payload["run_id"]), repo).exists()
 
 
-def test_continue_recommends_discard_when_candidate_does_not_improve(
+def test_continue_reports_equivalent_when_candidate_does_not_change(
     repo: Path,
 ) -> None:
     start = _run("run", "start", "--size", "2", "--max-iterations", "3")
@@ -94,15 +94,58 @@ def test_continue_recommends_discard_when_candidate_does_not_improve(
     result = _run("run", "continue", "--run-id", run_id)
 
     assert result.exit_code == 0, result.output
-    assert "discard or revise" in result.output
+    assert "equivalent" in result.output
     payload = _run_payload(result.output)
     assert payload["status"] == "paused_after_candidate_eval"
     assert payload["iterations"] == 2
     comparison = payload["last_comparison"]
     assert isinstance(comparison, dict)
-    assert comparison["recommendation"] == "discard_or_revise"
+    assert comparison["verdict"] == "equivalent"
+    assert comparison["recommendation"] == "discard_no_material_change"
     assert comparison["delta"] == pytest.approx(0.0)
     assert Path(str(comparison["candidate_trace_path"])).exists()
+
+
+def test_managed_run_repeats_baseline_and_candidate_on_saved_minibatch(
+    repo: Path,
+) -> None:
+    start = _run(
+        "run",
+        "start",
+        "--size",
+        "2",
+        "--max-iterations",
+        "10",
+        "--acceptance-repetitions",
+        "3",
+        "--acceptance-max-repetitions",
+        "5",
+    )
+
+    assert start.exit_code == 0, start.output
+    start_payload = _run_payload(start.output)
+    assert start_payload["status"] == "paused_for_reflection"
+    assert start_payload["iterations"] == 5
+    baseline_samples = start_payload["reflection_baseline_samples"]
+    baseline_report_paths = start_payload["reflection_baseline_report_paths"]
+    assert isinstance(baseline_samples, list)
+    assert isinstance(baseline_report_paths, list)
+    assert len(baseline_samples) == 5
+    assert len(set(baseline_report_paths)) == 5
+
+    result = _run("run", "continue", "--run-id", str(start_payload["run_id"]))
+
+    assert result.exit_code == 0, result.output
+    payload = _run_payload(result.output)
+    comparison = payload["last_comparison"]
+    assert isinstance(comparison, dict)
+    assert comparison["verdict"] == "equivalent"
+    assert comparison["baseline_sample_count"] == 3
+    assert comparison["candidate_sample_count"] == 3
+    candidate_report_paths = comparison["candidate_report_paths"]
+    assert isinstance(candidate_report_paths, list)
+    assert len(set(candidate_report_paths)) == 3
+    assert payload["iterations"] == 8
 
 
 def test_continue_after_revert_discards_candidate_and_advances(repo: Path) -> None:

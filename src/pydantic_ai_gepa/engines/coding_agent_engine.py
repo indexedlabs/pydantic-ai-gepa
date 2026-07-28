@@ -9,6 +9,7 @@ from typing import Any, TypeAlias, cast
 
 from pydantic_evals import Case
 
+from ..acceptance import compare_candidate_samples
 from ..evaluation import EvaluationRecord, evaluate_candidate_dataset
 from ..gepa_graph.models import CandidateMap
 from .base import (
@@ -71,6 +72,19 @@ class CodingAgentEngine:
         concurrency = self._positive_int_option("concurrency", 5)
         max_proposals = self._positive_int_option("max_proposals_per_run", 10)
         failure_threshold = float(self._option("failure_threshold", 0.999))
+        acceptance_repetitions = self._positive_int_option("acceptance_repetitions", 1)
+        acceptance_max_repetitions = self._positive_int_option(
+            "acceptance_max_repetitions", acceptance_repetitions
+        )
+        if acceptance_max_repetitions < acceptance_repetitions:
+            raise ValueError(
+                "engine_config['acceptance_max_repetitions'] must be greater "
+                "than or equal to engine_config['acceptance_repetitions']."
+            )
+        acceptance_confidence = self._confidence_option("acceptance_confidence", 0.9)
+        acceptance_min_delta = self._nonnegative_float_option(
+            "acceptance_min_delta", 0.0
+        )
 
         best = _copy_candidate(await task.seed_candidate())
         train_loader = await task.train_loader()
@@ -97,24 +111,39 @@ class CodingAgentEngine:
             )
             epoch += 1
             minibatch = await train_loader.fetch(minibatch_ids)
-            baseline_records = await self._evaluate_minibatch(
-                task=task,
-                candidate=best,
-                minibatch=minibatch,
-                concurrency=concurrency,
+            effective_max_repetitions = _affordable_repetitions(
+                requested=acceptance_max_repetitions,
+                case_count=len(minibatch),
+                shared_remaining=budget.remaining,
+                engine_remaining=engine_budget.remaining,
             )
+            baseline_batches: list[list[EvaluationRecord]] = []
+            baseline_budget_exhausted = False
+            for _ in range(effective_max_repetitions):
+                baseline_records = await self._evaluate_minibatch(
+                    task=task,
+                    candidate=best,
+                    minibatch=minibatch,
+                    concurrency=concurrency,
+                )
+                if not self._spend_or_record_overshoot(
+                    budget=budget,
+                    engine_budget=engine_budget,
+                    history=history,
+                    stage="baseline_minibatch",
+                    records=baseline_records,
+                ):
+                    baseline_budget_exhausted = True
+                    break
+                baseline_batches.append(baseline_records)
             iterations += 1
-            if not self._spend_or_record_overshoot(
-                budget=budget,
-                engine_budget=engine_budget,
-                history=history,
-                stage="baseline_minibatch",
-                records=baseline_records,
-            ):
+            if baseline_budget_exhausted or not baseline_batches:
                 stop_reason = "budget_overshoot"
                 break
 
-            baseline_score = _mean_score(baseline_records)
+            baseline_records = baseline_batches[0]
+            baseline_samples = [_mean_score(records) for records in baseline_batches]
+            baseline_score = sum(baseline_samples) / len(baseline_samples)
             if (
                 config.stop_at_score is not None
                 and baseline_score >= config.stop_at_score
@@ -155,39 +184,65 @@ class CodingAgentEngine:
             proposal = await self._propose(context)
             proposals += 1
 
-            try:
-                proposal_records = await self._evaluate_minibatch(
-                    task=task,
-                    candidate=proposal,
-                    minibatch=minibatch,
-                    concurrency=concurrency,
+            proposal_samples: list[float] = []
+            comparison_result = None
+            initial_repetitions = min(acceptance_repetitions, len(baseline_samples))
+            for _ in range(len(baseline_samples)):
+                try:
+                    proposal_records = await self._evaluate_minibatch(
+                        task=task,
+                        candidate=proposal,
+                        minibatch=minibatch,
+                        concurrency=concurrency,
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Coding-agent proposal evaluation failed."
+                    ) from exc
+
+                if not self._spend_or_record_overshoot(
+                    budget=budget,
+                    engine_budget=engine_budget,
+                    history=history,
+                    stage="proposal_minibatch",
+                    records=proposal_records,
+                ):
+                    stop_reason = "budget_overshoot"
+                    break
+                proposal_samples.append(_mean_score(proposal_records))
+                if len(proposal_samples) < initial_repetitions:
+                    continue
+                comparison_result = compare_candidate_samples(
+                    baseline_samples[: len(proposal_samples)],
+                    proposal_samples,
+                    confidence=acceptance_confidence,
+                    min_delta=acceptance_min_delta,
                 )
-            except Exception as exc:
-                raise RuntimeError("Coding-agent proposal evaluation failed.") from exc
+                if comparison_result.verdict != "inconclusive":
+                    break
 
-            if not self._spend_or_record_overshoot(
-                budget=budget,
-                engine_budget=engine_budget,
-                history=history,
-                stage="proposal_minibatch",
-                records=proposal_records,
-            ):
-                stop_reason = "budget_overshoot"
-                break
+            if comparison_result is None:
+                if stop_reason == "budget_overshoot":
+                    break
+                raise RuntimeError(
+                    "Coding-agent comparison did not collect enough proposal samples."
+                )
 
-            proposal_score = _mean_score(proposal_records)
+            proposal_score = comparison_result.candidate_mean
             comparison = {
                 "iteration": iterations,
-                "baseline_score": baseline_score,
+                "baseline_score": comparison_result.baseline_mean,
                 "proposal_score": proposal_score,
-                "delta": proposal_score - baseline_score,
                 "minibatch_case_ids": [record.case_id for record in baseline_records],
+                **comparison_result.to_dict(),
             }
-            if proposal_score > baseline_score:
+            if comparison_result.improved:
                 best = _copy_candidate(proposal)
                 history.append(EngineEvent(kind="accepted", data=comparison))
             else:
-                history.append(EngineEvent(kind="rejected", data=comparison))
+                history.append(
+                    EngineEvent(kind=comparison_result.verdict, data=comparison)
+                )
 
         if (budget.exhausted or engine_budget.exhausted) and stop_reason == "completed":
             stop_reason = "budget_exhausted"
@@ -352,6 +407,24 @@ class CodingAgentEngine:
             raise ValueError(f"engine_config[{name!r}] must be a positive integer.")
         return value
 
+    def _confidence_option(self, name: str, default: float) -> float:
+        """Read a confidence level strictly between zero and one."""
+
+        value = float(self._option(name, default))
+        if not 0.0 < value < 1.0:
+            raise ValueError(f"engine_config[{name!r}] must be between 0 and 1.")
+        return value
+
+    def _nonnegative_float_option(self, name: str, default: float) -> float:
+        """Read a non-negative numeric engine option."""
+
+        value = float(self._option(name, default))
+        if value < 0.0:
+            raise ValueError(
+                f"engine_config[{name!r}] must be greater than or equal to zero."
+            )
+        return value
+
 
 def _sample_minibatch(
     all_ids: Sequence[Any],
@@ -362,6 +435,22 @@ def _sample_minibatch(
 ) -> list[Any]:
     """Return a deterministic, without-replacement minibatch for one epoch."""
     return random.Random(seed + epoch).sample(list(all_ids), k=min(size, len(all_ids)))
+
+
+def _affordable_repetitions(
+    *,
+    requested: int,
+    case_count: int,
+    shared_remaining: int,
+    engine_remaining: int,
+) -> int:
+    """Reserve equal baseline/candidate samples when repeated evals are affordable."""
+
+    if case_count < 1:
+        return 1
+    available = min(shared_remaining, engine_remaining)
+    paired_repetitions = available // (2 * case_count)
+    return min(requested, max(1, paired_repetitions))
 
 
 def _mean_score(records: Sequence[EvaluationRecord]) -> float:

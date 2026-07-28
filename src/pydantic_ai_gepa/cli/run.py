@@ -16,6 +16,7 @@ from typing import Any, Literal, cast
 
 import typer
 
+from ..acceptance import AcceptanceComparison, compare_candidate_samples
 from .candidates import (
     GitCandidateError,
     candidate_id_from_components,
@@ -62,6 +63,10 @@ class RunState:
     next_epoch: int
     concurrency: int
     threshold: float
+    acceptance_repetitions: int
+    acceptance_max_repetitions: int
+    acceptance_confidence: float
+    acceptance_min_delta: float
     candidate_source: CandidateSource
     iterations: int
     created_at: str
@@ -70,9 +75,12 @@ class RunState:
     reflection_baseline_candidate_id: str | None = None
     reflection_baseline_commit_sha: str | None = None
     reflection_baseline_mean_score: float | None = None
+    reflection_baseline_samples: tuple[float, ...] = ()
     reflection_baseline_iteration: int | None = None
     reflection_baseline_report_path: str | None = None
+    reflection_baseline_report_paths: tuple[str, ...] = ()
     reflection_baseline_trace_path: str | None = None
+    reflection_baseline_trace_paths: tuple[str, ...] = ()
     last_candidate_id: str | None = None
     last_minibatch_id: str | None = None
     last_mean_score: float | None = None
@@ -93,6 +101,10 @@ class RunState:
             "next_epoch": self.next_epoch,
             "concurrency": self.concurrency,
             "threshold": self.threshold,
+            "acceptance_repetitions": self.acceptance_repetitions,
+            "acceptance_max_repetitions": self.acceptance_max_repetitions,
+            "acceptance_confidence": self.acceptance_confidence,
+            "acceptance_min_delta": self.acceptance_min_delta,
             "candidate_source": self.candidate_source,
             "iterations": self.iterations,
             "created_at": self.created_at,
@@ -101,9 +113,16 @@ class RunState:
             "reflection_baseline_candidate_id": self.reflection_baseline_candidate_id,
             "reflection_baseline_commit_sha": self.reflection_baseline_commit_sha,
             "reflection_baseline_mean_score": self.reflection_baseline_mean_score,
+            "reflection_baseline_samples": list(self.reflection_baseline_samples),
             "reflection_baseline_iteration": self.reflection_baseline_iteration,
             "reflection_baseline_report_path": self.reflection_baseline_report_path,
+            "reflection_baseline_report_paths": list(
+                self.reflection_baseline_report_paths
+            ),
             "reflection_baseline_trace_path": self.reflection_baseline_trace_path,
+            "reflection_baseline_trace_paths": list(
+                self.reflection_baseline_trace_paths
+            ),
             "last_candidate_id": self.last_candidate_id,
             "last_minibatch_id": self.last_minibatch_id,
             "last_mean_score": self.last_mean_score,
@@ -126,6 +145,15 @@ class RunState:
             next_epoch=int(data["next_epoch"]),
             concurrency=int(data["concurrency"]),
             threshold=float(data["threshold"]),
+            acceptance_repetitions=int(data.get("acceptance_repetitions", 1)),
+            acceptance_max_repetitions=int(
+                data.get(
+                    "acceptance_max_repetitions",
+                    data.get("acceptance_repetitions", 1),
+                )
+            ),
+            acceptance_confidence=float(data.get("acceptance_confidence", 0.9)),
+            acceptance_min_delta=float(data.get("acceptance_min_delta", 0.0)),
             candidate_source=cast(
                 CandidateSource, data.get("candidate_source", "components")
             ),
@@ -142,13 +170,46 @@ class RunState:
                 if data.get("reflection_baseline_mean_score") is not None
                 else None
             ),
+            reflection_baseline_samples=tuple(
+                float(value)
+                for value in data.get(
+                    "reflection_baseline_samples",
+                    (
+                        [data["reflection_baseline_mean_score"]]
+                        if data.get("reflection_baseline_mean_score") is not None
+                        else []
+                    ),
+                )
+            ),
             reflection_baseline_iteration=(
                 int(data["reflection_baseline_iteration"])
                 if data.get("reflection_baseline_iteration") is not None
                 else None
             ),
             reflection_baseline_report_path=data.get("reflection_baseline_report_path"),
+            reflection_baseline_report_paths=tuple(
+                str(value)
+                for value in data.get(
+                    "reflection_baseline_report_paths",
+                    (
+                        [data["reflection_baseline_report_path"]]
+                        if data.get("reflection_baseline_report_path")
+                        else []
+                    ),
+                )
+            ),
             reflection_baseline_trace_path=data.get("reflection_baseline_trace_path"),
+            reflection_baseline_trace_paths=tuple(
+                str(value)
+                for value in data.get(
+                    "reflection_baseline_trace_paths",
+                    (
+                        [data["reflection_baseline_trace_path"]]
+                        if data.get("reflection_baseline_trace_path")
+                        else []
+                    ),
+                )
+            ),
             last_candidate_id=data.get("last_candidate_id"),
             last_minibatch_id=data.get("last_minibatch_id"),
             last_mean_score=(
@@ -243,28 +304,45 @@ def _with_last_outcome(state: RunState, outcome: EvalOutcome) -> RunState:
     )
 
 
-def _mark_reflection_pause(state: RunState, outcome: EvalOutcome) -> RunState:
-    summary = outcome.summary
-    best_candidate_id = state.best_candidate_id or str(summary["candidate_id"])
+def _mark_reflection_pause(state: RunState, outcomes: list[EvalOutcome]) -> RunState:
+    if not outcomes:
+        raise ValueError("A reflection pause requires at least one baseline outcome.")
+    first_summary = outcomes[0].summary
+    baseline_samples = tuple(
+        float(outcome.summary["mean_score"]) for outcome in outcomes
+    )
+    baseline_mean_score = sum(baseline_samples) / len(baseline_samples)
+    best_candidate_id = state.best_candidate_id or str(first_summary["candidate_id"])
     best_commit_sha = state.best_commit_sha or (
-        _summary_commit_sha(summary) if state.candidate_source == "git" else None
+        _summary_commit_sha(first_summary) if state.candidate_source == "git" else None
     )
     best_mean_score = (
         state.best_mean_score
         if state.best_mean_score is not None
-        else float(summary["mean_score"])
+        else baseline_mean_score
     )
     return _with_timestamp(
-        _with_last_outcome(state, outcome),
+        _with_last_outcome(state, outcomes[-1]),
         status="paused_for_reflection",
-        reflection_minibatch_id=str(summary["minibatch_id"]),
-        reflection_baseline_candidate_id=str(summary["candidate_id"]),
-        reflection_baseline_commit_sha=_summary_commit_sha(summary),
-        reflection_baseline_mean_score=float(summary["mean_score"]),
-        reflection_baseline_iteration=int(summary["iterations"]),
-        reflection_baseline_report_path=str(summary["report_path"]),
+        reflection_minibatch_id=str(first_summary["minibatch_id"]),
+        reflection_baseline_candidate_id=str(first_summary["candidate_id"]),
+        reflection_baseline_commit_sha=_summary_commit_sha(first_summary),
+        reflection_baseline_mean_score=baseline_mean_score,
+        reflection_baseline_samples=baseline_samples,
+        reflection_baseline_iteration=int(first_summary["iterations"]),
+        reflection_baseline_report_path=str(first_summary["report_path"]),
+        reflection_baseline_report_paths=tuple(
+            str(outcome.summary["report_path"]) for outcome in outcomes
+        ),
         reflection_baseline_trace_path=(
-            str(summary["trace_path"]) if summary.get("trace_path") else None
+            str(first_summary["trace_path"])
+            if first_summary.get("trace_path")
+            else None
+        ),
+        reflection_baseline_trace_paths=tuple(
+            str(outcome.summary["trace_path"])
+            for outcome in outcomes
+            if outcome.summary.get("trace_path")
         ),
         best_candidate_id=best_candidate_id,
         best_commit_sha=best_commit_sha,
@@ -277,7 +355,9 @@ def _summary_commit_sha(summary: dict[str, Any]) -> str | None:
     return str(value) if value else None
 
 
-def _mark_best_candidate(state: RunState, outcome: EvalOutcome) -> RunState:
+def _mark_best_candidate(
+    state: RunState, outcome: EvalOutcome, *, mean_score: float | None = None
+) -> RunState:
     summary = outcome.summary
     return _with_timestamp(
         state,
@@ -287,7 +367,9 @@ def _mark_best_candidate(state: RunState, outcome: EvalOutcome) -> RunState:
             if state.candidate_source == "git"
             else state.best_commit_sha
         ),
-        best_mean_score=float(summary["mean_score"]),
+        best_mean_score=(
+            float(summary["mean_score"]) if mean_score is None else mean_score
+        ),
     )
 
 
@@ -298,9 +380,12 @@ def _clear_reflection_baseline(state: RunState) -> RunState:
         reflection_baseline_candidate_id=None,
         reflection_baseline_commit_sha=None,
         reflection_baseline_mean_score=None,
+        reflection_baseline_samples=(),
         reflection_baseline_iteration=None,
         reflection_baseline_report_path=None,
+        reflection_baseline_report_paths=(),
         reflection_baseline_trace_path=None,
+        reflection_baseline_trace_paths=(),
     )
 
 
@@ -326,6 +411,45 @@ def _fresh_baseline_outcome(state: RunState) -> tuple[RunState, EvalOutcome]:
     return _with_timestamp(state, next_epoch=epoch + 1), outcome
 
 
+def _capture_reflection_baseline(
+    state: RunState, first_outcome: EvalOutcome
+) -> tuple[RunState, list[EvalOutcome]]:
+    """Measure the stochastic baseline before yielding the tree for edits."""
+
+    remaining_iterations = state.max_iterations - state.iterations
+    affordable_repetitions = max(1, (remaining_iterations + 1) // 2)
+    target_repetitions = min(state.acceptance_max_repetitions, affordable_repetitions)
+    outcomes = [first_outcome]
+    expected_candidate_id = str(first_outcome.summary["candidate_id"])
+    minibatch_id = str(first_outcome.summary["minibatch_id"])
+
+    while len(outcomes) < target_repetitions:
+        outcome = run_eval_once(
+            candidate_file=None,
+            minibatch_id=minibatch_id,
+            size=state.size,
+            seed=state.seed,
+            epoch=state.next_epoch,
+            run_id=state.run_id,
+            concurrency=state.concurrency,
+            max_iterations=state.max_iterations,
+            threshold=state.threshold,
+            capture_traces=True,
+            candidate_source=state.candidate_source,
+        )
+        if str(outcome.summary["candidate_id"]) != expected_candidate_id:
+            typer.echo(
+                "The baseline candidate changed while collecting repeated "
+                "evaluations; refusing to compare mixed candidates.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        outcomes.append(outcome)
+        state = _with_last_outcome(state, outcome)
+
+    return _mark_reflection_pause(state, outcomes), outcomes
+
+
 def _advance_to_reflection_or_done(
     state: RunState,
 ) -> tuple[RunState, list[EvalOutcome]]:
@@ -340,65 +464,124 @@ def _advance_to_reflection_or_done(
             return _mark_done(state), outcomes
 
         if outcome.n_failures > 0:
-            return _mark_reflection_pause(state, outcome), outcomes
+            state, baseline_outcomes = _capture_reflection_baseline(state, outcome)
+            outcomes.extend(baseline_outcomes[1:])
+            return state, outcomes
 
     return _mark_done(state), outcomes
 
 
 def _evaluate_reflected_candidate(
     state: RunState,
-) -> tuple[RunState, EvalOutcome, dict[str, Any]]:
+) -> tuple[RunState, list[EvalOutcome], dict[str, Any]]:
     if state.reflection_minibatch_id is None:
         typer.echo(
             "Run is not waiting on a reflection minibatch; use `gepa run status`.",
             err=True,
         )
         raise typer.Exit(code=1)
-    if state.reflection_baseline_mean_score is None:
-        typer.echo("Run state is missing the reflection baseline score.", err=True)
+    if not state.reflection_baseline_samples:
+        typer.echo("Run state is missing reflection baseline samples.", err=True)
         raise typer.Exit(code=1)
 
-    baseline_score = state.reflection_baseline_mean_score
-    outcome = run_eval_once(
-        candidate_file=None,
-        minibatch_id=state.reflection_minibatch_id,
-        size=state.size,
-        seed=state.seed,
-        epoch=state.next_epoch,
-        run_id=state.run_id,
-        concurrency=state.concurrency,
-        max_iterations=state.max_iterations,
-        threshold=state.threshold,
-        capture_traces=True,
-        candidate_source=state.candidate_source,
+    max_candidate_samples = min(
+        len(state.reflection_baseline_samples),
+        state.max_iterations - state.iterations,
     )
-    state = _with_last_outcome(state, outcome)
-    candidate_score = float(outcome.summary["mean_score"])
-    improved = candidate_score > baseline_score
+    if max_candidate_samples < 1:
+        typer.echo(
+            "No evaluation budget remains for the reflected candidate.", err=True
+        )
+        raise typer.Exit(code=70)
+    initial_candidate_samples = min(state.acceptance_repetitions, max_candidate_samples)
+
+    outcomes: list[EvalOutcome] = []
+    candidate_samples: list[float] = []
+    candidate_id: str | None = None
+    comparison_result: AcceptanceComparison | None = None
+    while len(candidate_samples) < max_candidate_samples:
+        outcome = run_eval_once(
+            candidate_file=None,
+            minibatch_id=state.reflection_minibatch_id,
+            size=state.size,
+            seed=state.seed,
+            epoch=state.next_epoch,
+            run_id=state.run_id,
+            concurrency=state.concurrency,
+            max_iterations=state.max_iterations,
+            threshold=state.threshold,
+            capture_traces=True,
+            candidate_source=state.candidate_source,
+        )
+        state = _with_last_outcome(state, outcome)
+        outcomes.append(outcome)
+        current_candidate_id = str(outcome.summary["candidate_id"])
+        if candidate_id is None:
+            candidate_id = current_candidate_id
+        elif current_candidate_id != candidate_id:
+            typer.echo(
+                "The reflected candidate changed while collecting repeated "
+                "evaluations; refusing to compare mixed candidates.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        candidate_samples.append(float(outcome.summary["mean_score"]))
+
+        if len(candidate_samples) < initial_candidate_samples:
+            continue
+        comparison_result = compare_candidate_samples(
+            state.reflection_baseline_samples[: len(candidate_samples)],
+            candidate_samples,
+            confidence=state.acceptance_confidence,
+            min_delta=state.acceptance_min_delta,
+        )
+        if comparison_result.verdict != "inconclusive":
+            break
+
+    assert comparison_result is not None
+    first_outcome = outcomes[0]
+    last_outcome = outcomes[-1]
+    recommendation = {
+        "accepted": "keep_and_advance",
+        "rejected": "discard_or_revise",
+        "equivalent": "discard_no_material_change",
+        "inconclusive": "inconclusive_revise_or_end",
+    }[comparison_result.verdict]
     comparison = {
         "minibatch_id": state.reflection_minibatch_id,
         "baseline_candidate_id": state.reflection_baseline_candidate_id,
         "baseline_commit_sha": state.reflection_baseline_commit_sha,
         "baseline_iteration": state.reflection_baseline_iteration,
-        "baseline_mean_score": baseline_score,
+        "baseline_mean_score": comparison_result.baseline_mean,
+        "baseline_samples": list(comparison_result.baseline_samples),
         "baseline_report_path": state.reflection_baseline_report_path,
+        "baseline_report_paths": list(state.reflection_baseline_report_paths),
         "baseline_trace_path": state.reflection_baseline_trace_path,
-        "candidate_id": outcome.summary["candidate_id"],
-        "candidate_commit_sha": outcome.summary.get("commit_sha"),
-        "candidate_iteration": outcome.summary["iterations"],
-        "candidate_mean_score": candidate_score,
-        "candidate_report_path": outcome.summary["report_path"],
-        "candidate_trace_path": outcome.summary["trace_path"],
-        "delta": candidate_score - baseline_score,
-        "improved": improved,
-        "recommendation": "keep_and_advance" if improved else "discard_or_revise",
+        "baseline_trace_paths": list(state.reflection_baseline_trace_paths),
+        "candidate_id": first_outcome.summary["candidate_id"],
+        "candidate_commit_sha": first_outcome.summary.get("commit_sha"),
+        "candidate_iteration": first_outcome.summary["iterations"],
+        "candidate_mean_score": comparison_result.candidate_mean,
+        "candidate_samples": list(comparison_result.candidate_samples),
+        "candidate_report_path": last_outcome.summary["report_path"],
+        "candidate_report_paths": [
+            outcome.summary["report_path"] for outcome in outcomes
+        ],
+        "candidate_trace_path": last_outcome.summary["trace_path"],
+        "candidate_trace_paths": [
+            outcome.summary["trace_path"]
+            for outcome in outcomes
+            if outcome.summary.get("trace_path")
+        ],
+        **comparison_result.to_dict(),
+        "recommendation": recommendation,
     }
     if state.candidate_source == "git" and state.reflection_baseline_commit_sha:
         comparison["discard_command"] = (
             f"git reset --hard {state.reflection_baseline_commit_sha}"
         )
     state = _with_timestamp(state, last_comparison=comparison)
-    return state, outcome, comparison
+    return state, outcomes, comparison
 
 
 def _current_baseline_candidate_id(
@@ -469,9 +652,19 @@ def _write_final_report(state: RunState) -> tuple[Path, str]:
                 f"- baseline_mean_score: {comparison['baseline_mean_score']:.6f}",
                 f"- candidate_mean_score: {comparison['candidate_mean_score']:.6f}",
                 f"- delta: {comparison['delta']:.6f}",
+                f"- verdict: {comparison.get('verdict', 'unknown')}",
                 f"- recommendation: {comparison['recommendation']}",
             ]
         )
+        if "lower_bound" in comparison and "upper_bound" in comparison:
+            lines.extend(
+                [
+                    f"- confidence: {comparison['confidence']:.3f}",
+                    f"- confidence_interval: "
+                    f"[{comparison['lower_bound']:.6f}, "
+                    f"{comparison['upper_bound']:.6f}]",
+                ]
+            )
     if rows:
         lines.extend(["", "## History", ""])
         for row in rows[-10:]:
@@ -524,10 +717,22 @@ def _emit_status(
         typer.echo(f"Trace: {state.reflection_baseline_trace_path}")
     elif state.status == "paused_after_candidate_eval":
         comparison = state.last_comparison or {}
-        typer.echo(
-            "Candidate did not beat the reflection baseline. Recommendation: "
-            "discard or revise the edits, then run:"
-        )
+        verdict = comparison.get("verdict", "rejected")
+        if verdict == "inconclusive":
+            typer.echo(
+                "Candidate comparison remains inconclusive after the configured "
+                "repetitions. Revise the candidate or restore the baseline, then run:"
+            )
+        elif verdict == "equivalent":
+            typer.echo(
+                "Candidate is equivalent within the configured practical delta. "
+                "Restore the baseline or revise the candidate, then run:"
+            )
+        else:
+            typer.echo(
+                "Candidate did not beat the reflection baseline. Recommendation: "
+                "discard or revise the edits, then run:"
+            )
         typer.echo(f"  gepa run continue --run-id {state.run_id}")
         if comparison:
             typer.echo(
@@ -535,6 +740,13 @@ def _emit_status(
                 f"candidate {comparison['candidate_mean_score']:.6f}; "
                 f"delta {comparison['delta']:.6f}."
             )
+            if "lower_bound" in comparison and "upper_bound" in comparison:
+                typer.echo(
+                    f"{comparison['confidence']:.0%} interval "
+                    f"[{comparison['lower_bound']:.6f}, "
+                    f"{comparison['upper_bound']:.6f}]; "
+                    f"verdict {verdict}."
+                )
             typer.echo(f"Candidate report: {comparison['candidate_report_path']}")
             typer.echo(f"Candidate trace: {comparison['candidate_trace_path']}")
             if comparison.get("discard_command"):
@@ -563,6 +775,30 @@ def _validate_max_iterations(max_iterations: int) -> None:
         raise typer.Exit(code=2)
 
 
+def _validate_acceptance_options(
+    *,
+    repetitions: int,
+    max_repetitions: int,
+    confidence: float,
+    min_delta: float,
+) -> None:
+    if repetitions < 1:
+        typer.echo("--acceptance-repetitions must be >= 1.", err=True)
+        raise typer.Exit(code=2)
+    if max_repetitions < repetitions:
+        typer.echo(
+            "--acceptance-max-repetitions must be >= --acceptance-repetitions.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if not 0.0 < confidence < 1.0:
+        typer.echo("--acceptance-confidence must be between 0 and 1.", err=True)
+        raise typer.Exit(code=2)
+    if min_delta < 0.0:
+        typer.echo("--acceptance-min-delta must be >= 0.", err=True)
+        raise typer.Exit(code=2)
+
+
 @app.command("start")
 def start(
     max_iterations: int = typer.Option(
@@ -583,6 +819,32 @@ def start(
         "--threshold",
         help="Score below which a case requires reflection.",
     ),
+    acceptance_repetitions: int = typer.Option(
+        1,
+        "--acceptance-repetitions",
+        help=(
+            "Initial repeated evaluations per candidate on the saved mini-valset. "
+            "Use more than one for stochastic pipelines."
+        ),
+    ),
+    acceptance_max_repetitions: int | None = typer.Option(
+        None,
+        "--acceptance-max-repetitions",
+        help=(
+            "Maximum repetitions used when the initial comparison is inconclusive. "
+            "Defaults to --acceptance-repetitions."
+        ),
+    ),
+    acceptance_confidence: float = typer.Option(
+        0.9,
+        "--acceptance-confidence",
+        help="Confidence level for the candidate delta interval.",
+    ),
+    acceptance_min_delta: float = typer.Option(
+        0.0,
+        "--acceptance-min-delta",
+        help="Smallest practical score improvement required for acceptance.",
+    ),
     candidate_source: str | None = typer.Option(
         None,
         "--candidate-source",
@@ -591,6 +853,17 @@ def start(
 ) -> None:
     """Start a managed GEPA run and pause at the first reflection point."""
     _validate_max_iterations(max_iterations)
+    resolved_max_repetitions = (
+        acceptance_repetitions
+        if acceptance_max_repetitions is None
+        else acceptance_max_repetitions
+    )
+    _validate_acceptance_options(
+        repetitions=acceptance_repetitions,
+        max_repetitions=resolved_max_repetitions,
+        confidence=acceptance_confidence,
+        min_delta=acceptance_min_delta,
+    )
     if candidate_source not in {None, "components", "git"}:
         typer.echo("--candidate-source must be 'components' or 'git'.", err=True)
         raise typer.Exit(code=2)
@@ -610,6 +883,10 @@ def start(
         next_epoch=epoch,
         concurrency=concurrency,
         threshold=threshold,
+        acceptance_repetitions=acceptance_repetitions,
+        acceptance_max_repetitions=resolved_max_repetitions,
+        acceptance_confidence=acceptance_confidence,
+        acceptance_min_delta=acceptance_min_delta,
         candidate_source=active_candidate_source,
         iterations=0,
         created_at=now,
@@ -646,7 +923,6 @@ def continue_(
         return
 
     outcomes: list[EvalOutcome] = []
-    comparison_outcome: EvalOutcome | None = None
     if (
         state.status == "paused_after_candidate_eval"
         and state.reflection_baseline_candidate_id is not None
@@ -674,11 +950,15 @@ def continue_(
         return
 
     if state.reflection_minibatch_id is not None:
-        state, comparison_outcome, comparison = _evaluate_reflected_candidate(state)
-        outcomes.append(comparison_outcome)
+        state, comparison_outcomes, comparison = _evaluate_reflected_candidate(state)
+        outcomes.extend(comparison_outcomes)
 
         if comparison["improved"]:
-            state = _mark_best_candidate(state, comparison_outcome)
+            state = _mark_best_candidate(
+                state,
+                comparison_outcomes[-1],
+                mean_score=float(comparison["candidate_mean_score"]),
+            )
         if state.iterations >= state.max_iterations:
             state = _mark_done(state)
         elif comparison["improved"]:

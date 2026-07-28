@@ -177,7 +177,7 @@ def test_git_managed_run_advances_best_commit_on_improvement(
     assert comparison["candidate_commit_sha"] == improved_sha
 
 
-def test_git_managed_run_reports_reset_then_detects_discard(
+def test_git_managed_run_reports_reset_then_detects_equivalent_discard(
     git_repo: Path,
 ) -> None:
     start = _run("run", "start", "--size", "1", "--max-iterations", "3")
@@ -196,7 +196,8 @@ def test_git_managed_run_reports_reset_then_detects_discard(
     comparison = losing_payload["last_comparison"]
     assert isinstance(comparison, dict)
     reset_command = f"git reset --hard {baseline_sha}"
-    assert comparison["recommendation"] == "discard_or_revise"
+    assert comparison["verdict"] == "equivalent"
+    assert comparison["recommendation"] == "discard_no_material_change"
     assert comparison["discard_command"] == reset_command
     assert reset_command in losing.output
 

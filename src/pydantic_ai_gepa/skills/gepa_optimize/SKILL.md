@@ -163,11 +163,13 @@ same file and can then filter failures by stage.
 Prefer the managed loop when you want a real max-iteration optimization run:
 
 ```text
-gepa run start --max-iterations 100 --size 5
+gepa run start --max-iterations 100 --size 5 --acceptance-repetitions 3 --acceptance-max-repetitions 5
 read the printed report_path and trace_path
 reflect on the failures; edit .gepa/components/<slot>.md or source code
 gepa run continue --run-id <run_id>
-if it says discard_or_revise, discard/revise your edits and continue again
+if verdict=accepted, keep the candidate and let the run advance
+if verdict=rejected or equivalent, discard/revise your edits and continue again
+if verdict=inconclusive, do not count it as a failed hypothesis; revise it or end without a false decision
 if it pauses_for_reflection, inspect the new report/trace and reflect again
 repeat until the JSON summary says status=done and prints final_report_path
 ```
@@ -175,13 +177,29 @@ repeat until the JSON summary says status=done and prints final_report_path
 `gepa run start` evaluates sampled mini-valsets until at least one case falls below `--threshold`, then pauses and writes:
 
 - `reflection_baseline_report_path`
+- `reflection_baseline_report_paths`
 - `reflection_baseline_trace_path`
+- `reflection_baseline_trace_paths`
+- `reflection_baseline_samples`
 - `state_path`
 - `next_command`
 
-`gepa run continue` evaluates your edited baseline against the same mini-valset. If the candidate mean is not higher than the reflection baseline, it pauses with `recommendation=discard_or_revise`; you handle the discard or revision because code/components live in git and `.gepa/components/`. If it improves, the CLI advances to the next mini-valset and pauses again when reflection is useful. At `--max-iterations`, it prints and writes `final_report.md`.
+`gepa run continue` evaluates your edited baseline against the same saved
+mini-valset. With repeated acceptance enabled, it compares rollout-level mean
+samples and reports the observed variance, confidence interval, practical
+minimum delta, and `accepted`, `rejected`, `equivalent`, or `inconclusive`
+verdict. Only `accepted` advances the baseline. Repetitions remain full
+end-to-end evaluations; they do not freeze intermediate pipeline output or
+pretend model randomness is seeded. At `--max-iterations`, the CLI prints and
+writes `final_report.md`.
 
-Use one-off `gepa eval` for manual probes or clean A/B checks:
+Use `--acceptance-repetitions 3 --acceptance-max-repetitions 5` as a practical
+starting point for stochastic agent pipelines. Set
+`--acceptance-min-delta <score>` when tiny positive changes are not worth
+adopting. A value of one repetition preserves the old exact single-rollout
+comparison for deterministic or compatibility-sensitive suites.
+
+Use one-off `gepa eval` for manual probes or deterministic A/B checks:
 
 ```text
 gepa eval                                       # score the current baseline + write per-case report
@@ -198,7 +216,9 @@ The eval summary you parse is **the last JSON line on stdout** — it carries `r
 
 ```bash
 # Start a managed optimization run.
-gepa run start --size 5 --seed 0 --epoch 0 --max-iterations 50
+gepa run start --size 5 --seed 0 --epoch 0 --max-iterations 50 \
+  --acceptance-repetitions 3 --acceptance-max-repetitions 5 \
+  --acceptance-confidence 0.9 --acceptance-min-delta 0.01
 
 # Continue after editing components/source.
 gepa run continue --run-id <run_id>
@@ -235,7 +255,11 @@ Minibatch sampling is deterministic in `(seed, epoch)` over the dataset. Use the
 
 ### `--max-iterations`
 
-Hard cap on eval rows in a single run. In the managed loop, `gepa run start` persists the budget and each `gepa run continue` advances until it either pauses for reflection or reaches `status=done`. In one-off `gepa eval`, exceeding the cap exits with code 70.
+Hard cap on eval rows in a single run. Repeated baseline and candidate
+evaluations each consume rows from this same budget. In the managed loop,
+`gepa run start` persists the budget and each `gepa run continue` advances
+until it either pauses for reflection or reaches `status=done`. In one-off
+`gepa eval`, exceeding the cap exits with code 70.
 
 ## Candidate JSON schema
 

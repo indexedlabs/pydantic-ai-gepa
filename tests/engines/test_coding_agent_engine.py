@@ -87,8 +87,8 @@ async def test_coding_agent_engine_accepts_an_improving_proposal() -> None:
 
 
 @pytest.mark.asyncio
-async def test_coding_agent_engine_rejects_equal_or_worse_proposals() -> None:
-    """Only a strict minibatch improvement can replace the current best candidate."""
+async def test_coding_agent_engine_classifies_equal_proposal_as_equivalent() -> None:
+    """An unchanged deterministic proposal is not treated as a failed hypothesis."""
 
     async def propose(context: ReflectionContext) -> CandidateMap:
         return _candidate("still wrong")
@@ -109,7 +109,89 @@ async def test_coding_agent_engine_rejects_equal_or_worse_proposals() -> None:
 
     assert result.best_candidate["instructions"].text == "seed"
     assert result.best_score == 0.0
-    assert any(event.kind == "rejected" for event in result.history)
+    assert any(event.kind == "equivalent" for event in result.history)
+
+
+@pytest.mark.asyncio
+async def test_coding_agent_engine_repeats_matched_case_evaluations() -> None:
+    """Configured repetitions are charged and exposed in comparison history."""
+
+    async def propose(context: ReflectionContext) -> CandidateMap:
+        return _candidate("correct")
+
+    config = EngineConfig(
+        engine="coding_agent",
+        max_metric_calls=7,
+        engine_config={
+            "propose": propose,
+            "minibatch_size": 1,
+            "max_proposals_per_run": 1,
+            "acceptance_repetitions": 3,
+            "acceptance_max_repetitions": 3,
+        },
+    )
+    budget = BudgetTracker(7)
+
+    result = await get_engine("coding_agent", config).run(
+        _task(case_count=1), config, budget
+    )
+
+    accepted = next(event for event in result.history if event.kind == "accepted")
+    assert accepted.data["baseline_sample_count"] == 3
+    assert accepted.data["candidate_sample_count"] == 3
+    assert accepted.data["verdict"] == "accepted"
+    assert result.num_metric_calls == budget.spent == 7
+
+
+@pytest.mark.asyncio
+async def test_coding_agent_engine_preserves_noisy_overlap_as_inconclusive() -> None:
+    """A positive sample mean inside rollout variance is not accepted or rejected."""
+    agent = Agent(TestModel(custom_output_text="response"), instructions="seed")
+    case = Case(name="case-noisy", inputs="input", expected_output="response")
+    samples = {
+        "seed": iter([0.40, 0.60, 0.50, 0.50]),
+        "proposal": iter([0.45, 0.65, 0.55]),
+    }
+
+    def metric(case: Case[str, str, Any], output: RolloutOutput[Any]) -> MetricResult:
+        del case, output
+        override = agent._override_instructions.get()
+        instructions = override.value if override is not None else agent._instructions
+        key = (
+            "proposal"
+            if "proposal" in "\n".join(str(item) for item in instructions)
+            else "seed"
+        )
+        return MetricResult(score=next(samples[key]), feedback="noisy")
+
+    task = OptimizationTask(agent=agent, trainset=[case], metric=metric, valset=[case])
+
+    async def propose(context: ReflectionContext) -> CandidateMap:
+        return _candidate("proposal")
+
+    config = EngineConfig(
+        engine="coding_agent",
+        max_metric_calls=7,
+        engine_config={
+            "propose": propose,
+            "minibatch_size": 1,
+            "max_proposals_per_run": 1,
+            "acceptance_repetitions": 3,
+            "acceptance_max_repetitions": 3,
+        },
+    )
+
+    result = await get_engine("coding_agent", config).run(
+        task, config, BudgetTracker(7)
+    )
+
+    inconclusive = next(
+        event for event in result.history if event.kind == "inconclusive"
+    )
+    assert inconclusive.data["delta"] == pytest.approx(0.05)
+    assert inconclusive.data["lower_bound"] < 0.0
+    assert inconclusive.data["upper_bound"] > 0.0
+    assert result.best_candidate["instructions"].text == "seed"
 
 
 @pytest.mark.asyncio

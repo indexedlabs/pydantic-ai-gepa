@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .adapter import Adapter
+from .acceptance import AcceptanceComparison, compare_candidate_samples
 from .adapters.agent_adapter import (
     AgentAdapter,
     AgentAdapterTrajectory,
@@ -67,6 +68,8 @@ from .types import (
 
 __all__ = [
     "optimize_agent",
+    "AcceptanceComparison",
+    "compare_candidate_samples",
     "optimize_parallel",
     "optimize_best_of",
     "optimize_sequential",
