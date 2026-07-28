@@ -231,8 +231,7 @@ def _trace_tools_enabled(component_toolsets: Sequence[AbstractToolset[None]]) ->
     # Trace tools are only attached when the run has span files on disk; their
     # absence means the adapter produced no instrumented traces.
     return any(
-        _toolset_has_tool(toolset, "run_python_repl")
-        for toolset in component_toolsets
+        _toolset_has_tool(toolset, "run_python_repl") for toolset in component_toolsets
     )
 
 

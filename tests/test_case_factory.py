@@ -30,8 +30,6 @@ from pydantic_ai import Agent
 from pydantic_ai.models.test import TestModel
 from pydantic_evals import Case
 
-asyncio_mark = pytest.mark.asyncio(loop_scope="function")
-
 from pydantic_ai_gepa import MetricResult, SignatureAgent
 from pydantic_ai_gepa.adapters.agent_adapter import (
     SignatureAgentAdapter,
@@ -42,6 +40,9 @@ from pydantic_ai_gepa.cli.layout import (
     GepaConfigError,
     resolve_case_factory,
 )
+
+
+asyncio_mark = pytest.mark.asyncio(loop_scope="function")
 
 
 class _Input(BaseModel):
@@ -150,7 +151,9 @@ async def test_materialize_inputs_rejects_non_basemodel_factory_return() -> None
         case_factory=_broken_factory,
     )
     case = Case(name="broken", inputs={})
-    with pytest.raises(TypeError, match="case_factory must return a pydantic BaseModel"):
+    with pytest.raises(
+        TypeError, match="case_factory must return a pydantic BaseModel"
+    ):
         await adapter._materialize_inputs(case)
 
 
