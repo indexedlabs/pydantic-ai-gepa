@@ -23,3 +23,6 @@ def test_bundled_skill_is_importable_resource() -> None:
     text = source.read_text(encoding="utf-8")
     assert "name: gepa-optimize" in text
     assert "content-file" in text.lower()
+    assert "## Git-native candidates" in text
+    assert "GEPA_TRACE_FILE" in text
+    assert "git reset --hard <reflection_baseline_commit_sha>" in text

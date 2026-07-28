@@ -20,7 +20,12 @@ gepa init \
 
 What each flag does:
 
-- `--agent MODULE:ATTR` — required, points at the pydantic-ai `Agent` instance.
+- `--agent MODULE:ATTR` — points at the pydantic-ai `Agent` instance; required
+  in component mode and optional in git mode.
+- `--candidate-source components|git` — selects text-slot candidates (default)
+  or whole-working-tree candidates.
+- `--evaluate MODULE:ATTR` — git-mode alternative to `--agent`; points at a
+  plain task callable.
 - `--metric MODULE:ATTR` — optional. An async (or sync) callable `(case, output) -> MetricResult | float`. Omit it to use the default substring/equality scorer, which is only useful for trivial expected-output strings.
 - `--install-skill` — drops this SKILL.md into `<repo>/.agents/skills/gepa-optimize/` so coding agents auto-discover it. Pass it the first time.
 
@@ -30,11 +35,128 @@ Then write the dataset cases at `.gepa/dataset.jsonl` — one JSON object per li
 {"name": "case-1", "inputs": "...", "expected_output": "...", "metadata": {}}
 ```
 
-`gepa init` introspects the agent, writes `.gepa/gepa.toml`, and pre-seeds `.gepa/components/<slot>.md` from each slot's docstring / declared description.
+In component mode, `gepa init` introspects the agent, writes
+`.gepa/gepa.toml`, and pre-seeds `.gepa/components/<slot>.md` from each slot's
+docstring / declared description. Git mode writes the config without
+introspection or component seeding.
 
 **Slot names use colons** — you type them with colons everywhere: `instructions`, `tool:foo:description`, `tool:foo:param:query`, etc. The CLI handles disk encoding for you (the on-disk filename uses `__` instead of `:`, but you never have to type that — `gepa components set tool:foo:description --content-file ...` and `gepa components show tool:foo:description` both Just Work).
 
 `gepa` auto-loads `.env` from the repo root, so `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / etc. are picked up automatically. Pass `--no-dotenv` to skip.
+
+## Git-native candidates
+
+Use git mode when the candidate is the whole working tree — code plus
+instruction artifacts or other tracked program files — rather than a set of
+SignatureAgent text slots:
+
+```bash
+gepa init \
+  --candidate-source git \
+  --evaluate mypkg.eval:evaluate \
+  --metric mypkg.eval:metric \
+  --install-skill
+```
+
+This writes the following top-level configuration:
+
+```toml
+candidate_source = "git"
+evaluate = "mypkg.eval:evaluate"
+dataset = ".gepa/dataset.jsonl"
+metric = "mypkg.eval:metric"
+```
+
+`evaluate` is a sync or async callable invoked once per case. By default it
+receives the complete `pydantic_evals.Case`; when `case_factory` is configured,
+it receives the factory's materialized value instead. It returns the pipeline
+output passed to `metric`. This is a plain task hook: it does not need to be a
+`SignatureAgent`, expose components, or accept a candidate override. You may
+configure `agent` instead of `evaluate` when a normal pydantic-ai agent already
+runs the working-tree pipeline; git mode invokes that agent with an empty
+component override map.
+
+`--candidate-source git` on `gepa eval` or `gepa run start` overrides the
+configured source for that invocation/run. Managed runs persist the selected
+source, so later `gepa run continue` calls use the same mode.
+
+### Candidate identity and evaluation
+
+- A clean candidate id is the first 12 hexadecimal characters of `HEAD`.
+- A dirty candidate id is `<short-sha>-dirty-<content-hash>`. The hash covers
+  tracked diffs plus non-ignored untracked file paths, modes, and contents, so
+  an uncommitted tree has a stable, distinct identity.
+- The Pareto row and managed state also record the full `commit_sha`.
+- `.gepa/components/*.md`, component introspection, stage-and-confirm, and
+  candidate-file overrides are bypassed. The files currently on disk are what
+  evaluation runs.
+- `--candidate-file` is intentionally incompatible with git mode.
+
+The CLI records the tree identity immediately before evaluation. CLI-owned
+artifacts for the active run are excluded from the dirty hash; repositories
+should still ignore generated run directories.
+
+### Reflector contract
+
+Drive the managed loop as a commit-producing coding reflector:
+
+```text
+gepa run start --candidate-source git --size 5 --max-iterations 50
+read reflection_baseline_report_path and reflection_baseline_trace_path
+analyze gold-miss feedback and spans from every pipeline stage
+edit code/artifacts in the allowed scope
+git diff; git add <files>; git commit -m "Improve ..."
+gepa run continue --run-id <run_id>
+```
+
+`continue` evaluates the new commit on the same minibatch as the reflection
+baseline. When it improves, `best_candidate_id` and `best_commit_sha` advance
+to that commit and the run moves to the next reflection point. When it does
+not improve, the CLI pauses with:
+
+```text
+git reset --hard <reflection_baseline_commit_sha>
+```
+
+The CLI reports this destructive command but never executes it. Review the
+target and run it yourself to discard the losing candidate; the next
+`continue` recognizes the restored baseline and advances. To restore the best
+accepted result after the run, use the final report's value:
+
+```bash
+git checkout <best_commit_sha>
+```
+
+### Per-stage trace file contract
+
+Before each trace-enabled evaluation, the CLI exports `GEPA_TRACE_FILE` with
+the absolute path:
+
+```text
+<gepa-dir>/runs/<run_id>/traces/minibatches/<minibatch_id>/<iteration:04d>-<candidate_id>.jsonl
+```
+
+Task code may also read it with
+`pydantic_ai_gepa.cli.eval.current_trace_path()`. Append one compact
+OpenTelemetry span JSON object per line; do not truncate the file. For
+Logfire/OpenTelemetry spans, use the serializer consumed by
+`StructuredTraceStore`:
+
+```python
+import os
+from pathlib import Path
+
+from pydantic_ai_gepa.gepa_graph.proposal.trace_store import span_to_jsonl_line
+
+trace_path = Path(os.environ["GEPA_TRACE_FILE"])
+with trace_path.open("a", encoding="utf-8") as trace_file:
+    for span in finished_spans:
+        trace_file.write(span_to_jsonl_line(span))
+```
+
+Tag each span with a stage attribute such as `stage=classify`, `research`,
+`resolve`, or `extract`. The reflector's structured trace tools load this
+same file and can then filter failures by stage.
 
 ## Standard loop
 
@@ -240,19 +362,25 @@ gepa run status --run-id <run_id>
     └── traces/minibatches/<mb_id>/<iteration>-<candidate_id>.jsonl
 ```
 
-Slot identity always comes from the live agent (introspection); slot values always come from `.gepa/components/<slot>.md` (or the introspected seed when no file exists yet).
+In the default component mode, slot identity comes from live-agent
+introspection and slot values come from `.gepa/components/<slot>.md` (or the
+introspected seed when no file exists yet). Git mode bypasses both directories;
+the repository tree is its source of truth.
 
 ## `gepa.toml` schema
 
 ```toml
 agent = "mypkg.agents:my_agent"
+candidate_source = "components"                # optional; "components" (default) or "git"
+evaluate = "mypkg.eval:evaluate"               # git mode alternative to agent
 dataset = ".gepa/dataset.jsonl"
 metric = "mypkg.metrics:my_metric"           # optional; (case, output) -> MetricResult | float
 case_factory = "mypkg.eval:my_case_factory"  # optional; (case) -> BaseModel (sync or async)
 skills = "path/to/skills"                    # optional; enables list/search/load_skill tools
 ```
 
-All keys are top-level — `metric` / `case_factory` / `skills` MUST NOT be nested under any `[section]`.
+All keys are top-level — `candidate_source` / `evaluate` / `metric` /
+`case_factory` / `skills` MUST NOT be nested under any `[section]`.
 
 The metric callable signature:
 
