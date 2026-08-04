@@ -12,8 +12,10 @@ import pytest
 from click.testing import Result
 from typer.testing import CliRunner
 
+from pydantic_ai_gepa.adapters.agent_adapter import AgentAdapterTrajectory
 from pydantic_ai_gepa.cli import app as gepa_app
 from pydantic_ai_gepa.cli.candidates import Candidate
+from pydantic_ai_gepa.cli.eval import _write_trace_file
 from pydantic_ai_gepa.cli.layout import (
     ensure_layout,
     latest_run_id,
@@ -21,6 +23,7 @@ from pydantic_ai_gepa.cli.layout import (
     write_default_config,
 )
 from pydantic_ai_gepa.cli.runs import ParetoLog
+from pydantic_ai_gepa.evaluation import EvaluationRecord
 
 
 # A tiny agent module written to disk. The TestModel always echoes "Paris" so
@@ -100,6 +103,41 @@ def _candidate_file(tmp_path: Path, components: dict[str, str]) -> Path:
 
 def _run(*argv: str) -> Result:
     return CliRunner().invoke(gepa_app, list(argv))
+
+
+def test_trace_writer_persists_metric_side_info(repo: Path) -> None:
+    with_side_info = AgentAdapterTrajectory(
+        messages=[],
+        final_output="structured",
+        metric_side_info={"identity": {"match_kind": "email"}},
+    )
+    without_side_info = AgentAdapterTrajectory(messages=[], final_output="plain")
+
+    path = _write_trace_file(
+        run_id="run-side-info",
+        iteration=0,
+        candidate_id="candidate-side-info",
+        minibatch_id="minibatch-side-info",
+        records=[
+            EvaluationRecord(
+                case_id="structured",
+                score=0.5,
+                feedback=None,
+                payload={"trajectory": with_side_info},
+            ),
+            EvaluationRecord(
+                case_id="plain",
+                score=1.0,
+                feedback=None,
+                payload={"trajectory": without_side_info},
+            ),
+        ],
+    )
+
+    assert path is not None
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert rows[0]["metric_side_info"] == {"identity": {"match_kind": "email"}}
+    assert "metric_side_info" not in rows[1]
 
 
 def test_eval_writes_pareto_row(repo: Path, tmp_path: Path) -> None:
