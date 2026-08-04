@@ -197,6 +197,9 @@ def _write_trace_file(
         trace_record["score"] = record.score
         if record.feedback:
             trace_record["feedback"] = record.feedback
+        metric_side_info = getattr(trajectory, "metric_side_info", None)
+        if metric_side_info:
+            trace_record["metric_side_info"] = metric_side_info
         trace_rows.append(trace_record)
 
     if trace_rows:
