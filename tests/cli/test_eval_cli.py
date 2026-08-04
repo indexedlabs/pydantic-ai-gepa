@@ -114,7 +114,10 @@ def test_trace_writer_persists_metric_side_info(repo: Path) -> None:
     without_side_info = AgentAdapterTrajectory(messages=[], final_output="plain")
 
     path = _write_trace_file(
-        path=repo / ".gepa" / "runs" / "run-side-info" / "trace.jsonl",
+        run_id="run-side-info",
+        iteration=0,
+        candidate_id="candidate-side-info",
+        minibatch_id="minibatch-side-info",
         records=[
             EvaluationRecord(
                 case_id="structured",
