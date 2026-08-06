@@ -65,6 +65,7 @@ from .runs import (
     ParetoLog,
     ParetoRow,
     current_commit_sha,
+    new_eval_id,
     utc_now_iso,
 )
 from .store import ComponentStore
@@ -170,15 +171,18 @@ def _trace_file_path(
     *,
     run_id: str,
     iteration: int,
+    eval_id: str,
     candidate_id: str,
     minibatch_id: str,
 ) -> Path:
+    # eval_id guarantees uniqueness: identical candidate trees evaluated by
+    # concurrent lanes share an iteration ordinal and candidate_id (dec-msy).
     return (
         run_dir(run_id)
         / "traces"
         / "minibatches"
         / minibatch_id
-        / f"{iteration:04d}-{candidate_id}.jsonl"
+        / f"{iteration:04d}-{eval_id}-{candidate_id}.jsonl"
     )
 
 
@@ -223,8 +227,15 @@ def run_eval_once(
     threshold: float,
     capture_traces: bool = False,
     candidate_source: CandidateSource | None = None,
+    lane: str | None = None,
 ) -> EvalOutcome:
-    """Evaluate one baseline/candidate and append the standard run artifacts."""
+    """Evaluate one baseline/candidate and append the standard run artifacts.
+
+    ``lane`` marks the eval as belonging to a reflection lane (spec-1do): the
+    pareto row records it, and the ``max_iterations`` check becomes advisory —
+    for lane runs the budget stop is enforced at select, not per-eval
+    (pydanticaigepa-dec-msy).
+    """
     cfg = GepaConfig.load(config_path())
     insert_repo_root_on_path()
 
@@ -317,13 +328,23 @@ def run_eval_once(
     active_run_id = _resolve_run_id(run_id)
     prior_count = _count_evals_in_run(active_run_id)
     if prior_count >= max_iterations:
+        if lane is None:
+            typer.echo(
+                f"Max iterations reached ({prior_count}/{max_iterations}). "
+                "Start a new run (omit --run-id) or raise --max-iterations.",
+                err=True,
+            )
+            raise typer.Exit(code=70)
+        # Lane runs check-then-append without a lock, so a per-eval hard stop
+        # here would race; the lockstep select step enforces the budget instead
+        # (pydanticaigepa-dec-msy). Warn and continue.
         typer.echo(
-            f"Max iterations reached ({prior_count}/{max_iterations}). "
-            "Start a new run (omit --run-id) or raise --max-iterations.",
+            f"Eval budget reached ({prior_count}/{max_iterations}); "
+            "continuing — lane-run budgets are enforced at `gepa run select`.",
             err=True,
         )
-        raise typer.Exit(code=70)
     iteration = prior_count + 1
+    eval_id = new_eval_id()
 
     run_dir(active_run_id).mkdir(parents=True, exist_ok=True)
     minibatch_store = MinibatchStore(active_run_id)
@@ -369,6 +390,7 @@ def run_eval_once(
         _trace_file_path(
             run_id=active_run_id,
             iteration=iteration,
+            eval_id=eval_id,
             candidate_id=candidate.id,
             minibatch_id=minibatch.id,
         )
@@ -420,13 +442,15 @@ def run_eval_once(
             status=status,
             summary=f"{status} eval of {candidate.id} on minibatch {minibatch.id} (mean={mean:.3f})",
             timestamp=utc_now_iso(),
+            lane=lane,
+            extra={"eval_id": eval_id},
         )
     )
 
     # Write the per-case report next to the pareto log.
     reports_dir = run_dir(active_run_id) / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
-    report_path = reports_dir / f"{iteration:04d}-{candidate.id}.md"
+    report_path = reports_dir / f"{iteration:04d}-{eval_id}-{candidate.id}.md"
     report_path.write_text(
         _format_failures(records, threshold=threshold, candidate_source=source),
         encoding="utf-8",
@@ -453,6 +477,8 @@ def run_eval_once(
         "dirty_hash": git_state.dirty_hash if git_state is not None else None,
         "minibatch_id": minibatch.id,
         "run_id": active_run_id,
+        "lane": lane,
+        "eval_id": eval_id,
         "mean_score": mean,
         "n_cases": len(records),
         "n_failures": len([record for record in records if record.score < threshold]),

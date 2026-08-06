@@ -77,6 +77,79 @@ def test_minibatch_list_ids(tmp_path: Path) -> None:
     assert len(store.list_ids()) == 2
 
 
+# ---------- lane-aware ledger (task ae6 / dec-msy) ----------
+
+
+def _ledger_row(candidate_id: str = "cand", lane: str | None = None) -> ParetoRow:
+    return ParetoRow(
+        candidate_id=candidate_id,
+        commit_sha=None,
+        component_overrides_id=None,
+        minibatch_id="mb-1",
+        per_case_scores={"case-a": 1.0},
+        mean_score=1.0,
+        status="evaluated",
+        summary="summary",
+        timestamp=utc_now_iso(),
+        lane=lane,
+    )
+
+
+def test_pareto_row_lane_round_trip() -> None:
+    row = _ledger_row(lane="lane-a")
+    loaded = ParetoRow.from_dict(row.to_dict())
+    assert loaded.lane == "lane-a"
+    assert row.to_dict()["lane"] == "lane-a"
+
+
+def test_pareto_row_single_path_lane_is_null() -> None:
+    row = _ledger_row()
+    assert row.to_dict()["lane"] is None
+    assert ParetoRow.from_dict(row.to_dict()).lane is None
+
+
+def test_pareto_row_pre_lane_rows_parse(tmp_path: Path) -> None:
+    """Rows appended before lanes existed (no "lane" key) still load."""
+    ensure_layout(tmp_path)
+    run = new_run_id()
+    log = ParetoLog(run, tmp_path)
+    payload = _ledger_row().to_dict()
+    del payload["lane"]
+    log.path.parent.mkdir(parents=True, exist_ok=True)
+    log.path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    rows = log.iter_rows()
+    assert len(rows) == 1
+    assert rows[0].lane is None
+
+
+def test_pareto_log_concurrent_appends(tmp_path: Path) -> None:
+    """N producers appending concurrently: row count equals completed evals."""
+    import threading
+
+    ensure_layout(tmp_path)
+    run = new_run_id()
+    log = ParetoLog(run, tmp_path)
+
+    def append_n(lane: str, n: int) -> None:
+        for i in range(n):
+            log.append(_ledger_row(candidate_id=f"{lane}-{i}", lane=lane))
+
+    threads = [
+        threading.Thread(target=append_n, args=(f"lane-{t}", 10)) for t in range(4)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert log.count_rows() == 40
+    rows = log.iter_rows()
+    assert len(rows) == 40
+    lanes = {row.lane for row in rows}
+    assert lanes == {"lane-0", "lane-1", "lane-2", "lane-3"}
+
+
 # ---------- Pareto log ----------
 
 

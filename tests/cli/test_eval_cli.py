@@ -365,3 +365,115 @@ def test_eval_gepa_toml_skills_reach_model_request(
     assert "search_skills" in tool_names
     assert "load_skill" in tool_names
     assert "load_skill_file" in tool_names
+
+
+# ---------- lane-aware ledger (task ae6 / dec-msy) ----------
+
+
+def _summary_of(result: Result) -> dict:
+    return next(
+        json.loads(line)
+        for line in result.output.splitlines()
+        if line.startswith("{") and '"summary"' in line
+    )["summary"]
+
+
+def test_eval_artifact_names_are_collision_free(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two evals of the same candidate at the same iteration ordinal must not
+    overwrite each other's report/trace files (concurrent lane evals can
+    observe identical prior counts and identical git-tree candidate ids)."""
+    from pydantic_ai_gepa.cli import eval as eval_module
+
+    cand_path = _candidate_file(tmp_path, {"instructions": "Override text."})
+    first = _run("eval", "--candidate-file", str(cand_path), "--size", "2")
+    assert first.exit_code == 0, first.output
+    run_id = _summary_of(first)["run_id"]
+
+    # Force both evals to observe the same iteration ordinal, simulating the
+    # check-then-append race between concurrent lane evals.
+    monkeypatch.setattr(eval_module, "_count_evals_in_run", lambda _run_id: 0)
+
+    second = _run(
+        "eval",
+        "--candidate-file",
+        str(cand_path),
+        "--run-id",
+        run_id,
+        "--size",
+        "2",
+    )
+    third = _run(
+        "eval",
+        "--candidate-file",
+        str(cand_path),
+        "--run-id",
+        run_id,
+        "--size",
+        "2",
+    )
+    assert second.exit_code == 0, second.output
+    assert third.exit_code == 0, third.output
+
+    second_summary = _summary_of(second)
+    third_summary = _summary_of(third)
+    assert second_summary["iterations"] == third_summary["iterations"] == 1
+    assert second_summary["candidate_id"] == third_summary["candidate_id"]
+    assert second_summary["eval_id"] != third_summary["eval_id"]
+    assert second_summary["report_path"] != third_summary["report_path"]
+    assert Path(second_summary["report_path"]).exists()
+    assert Path(third_summary["report_path"]).exists()
+
+
+def test_eval_single_path_budget_cap_still_hard(repo: Path, tmp_path: Path) -> None:
+    cand_path = _candidate_file(tmp_path, {"instructions": "Override text."})
+    first = _run("eval", "--candidate-file", str(cand_path), "--size", "2")
+    assert first.exit_code == 0, first.output
+    run_id = _summary_of(first)["run_id"]
+
+    capped = _run(
+        "eval",
+        "--candidate-file",
+        str(cand_path),
+        "--run-id",
+        run_id,
+        "--size",
+        "2",
+        "--max-iterations",
+        "1",
+    )
+    assert capped.exit_code == 70
+    assert ParetoLog(run_id, repo).count_rows() == 1
+
+
+def test_eval_lane_budget_cap_is_advisory(repo: Path, tmp_path: Path) -> None:
+    """In a lane run the per-eval cap is advisory (warning only); enforcement
+    moves to select (task-vso / dec-msy)."""
+    from pydantic_ai_gepa.cli.eval import run_eval_once
+
+    cand_path = _candidate_file(tmp_path, {"instructions": "Override text."})
+    first = _run("eval", "--candidate-file", str(cand_path), "--size", "2")
+    assert first.exit_code == 0, first.output
+    run_id = _summary_of(first)["run_id"]
+
+    outcome = run_eval_once(
+        candidate_file=cand_path,
+        minibatch_id=None,
+        size=2,
+        seed=0,
+        epoch=0,
+        run_id=run_id,
+        concurrency=1,
+        max_iterations=1,  # already exhausted by the first eval
+        threshold=0.999,
+        lane="lane-a",
+    )
+    assert outcome.summary["lane"] == "lane-a"
+    assert outcome.summary["eval_id"]
+
+    rows = ParetoLog(run_id, repo).iter_rows()
+    assert len(rows) == 2
+    assert rows[0].lane is None
+    assert rows[1].lane == "lane-a"
+    assert rows[1].extra["eval_id"] == outcome.summary["eval_id"]

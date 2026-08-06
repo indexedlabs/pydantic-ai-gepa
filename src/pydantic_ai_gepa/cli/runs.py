@@ -184,6 +184,7 @@ class ParetoRow:
     status: ParetoStatus
     summary: str
     timestamp: str
+    lane: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -197,6 +198,7 @@ class ParetoRow:
             "status": self.status,
             "summary": self.summary,
             "timestamp": self.timestamp,
+            "lane": self.lane,
         }
         if self.extra:
             out["extra"] = dict(self.extra)
@@ -204,6 +206,7 @@ class ParetoRow:
 
     @staticmethod
     def from_dict(data: dict[str, Any]) -> ParetoRow:
+        # Rows written before lanes existed carry no "lane" key; default to None.
         return ParetoRow(
             candidate_id=str(data["candidate_id"]),
             commit_sha=data.get("commit_sha"),
@@ -216,6 +219,7 @@ class ParetoRow:
             status=str(data["status"]),
             summary=str(data.get("summary", "")),
             timestamp=str(data["timestamp"]),
+            lane=data.get("lane"),
             extra=dict(data.get("extra", {})),
         )
 
@@ -223,6 +227,16 @@ class ParetoRow:
 def new_candidate_id() -> str:
     """Return a short stable identifier suitable for a candidate or proposal."""
     return uuid.uuid4().hex[:12]
+
+
+def new_eval_id() -> str:
+    """Return a unique per-eval identifier.
+
+    Report and trace artifacts are keyed by ``(eval_id, candidate_id)`` rather
+    than the global iteration ordinal so concurrent lane evals of identical
+    candidate trees can never collide on filenames (pydanticaigepa-dec-msy).
+    """
+    return uuid.uuid4().hex[:8]
 
 
 class ParetoLog:
