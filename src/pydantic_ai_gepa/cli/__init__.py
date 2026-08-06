@@ -15,6 +15,7 @@ from . import eval as eval_cmd
 from . import events as events_cmd
 from . import init as init_cmd
 from . import journal as journal_cmd
+from . import lanes as lanes_cmd
 from . import pareto as pareto_cmd
 from . import run as run_cmd
 from .layout import load_dotenv, set_gepa_dirname
@@ -77,6 +78,11 @@ app.command(name="pareto", help="Show Pareto front or full history (json or tsv)
 )
 app.command(name="next")(events_cmd.next_command)
 app.command(name="ack")(events_cmd.ack_command)
+app.add_typer(
+    lanes_cmd.app,
+    name="lane",
+    help="Drive reflection lanes: lease, continue (background eval), reset.",
+)
 app.add_typer(
     run_cmd.app,
     name="run",

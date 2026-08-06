@@ -30,6 +30,7 @@ from .layout import (
     final_report_path,
     insert_repo_root_on_path,
     new_run_id,
+    repo_root,
     resolve_agent,
     resolve_skills,
     run_dir,
@@ -90,6 +91,14 @@ class RunState:
     best_candidate_id: str | None = None
     best_commit_sha: str | None = None
     best_mean_score: float | None = None
+    # Lane-run fields (spec-1do). All defaulted so run state files written
+    # before lanes existed load unchanged.
+    lanes: int = 0
+    heartbeat_interval_secs: float = 10.0
+    reflection_lease_secs: float = 1800.0
+    eval_stall_timeout_secs: float = 600.0
+    straggler_timeout_secs: float = 900.0
+    journal_tail_lines: int = 20
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -132,6 +141,12 @@ class RunState:
             "best_candidate_id": self.best_candidate_id,
             "best_commit_sha": self.best_commit_sha,
             "best_mean_score": self.best_mean_score,
+            "lanes": self.lanes,
+            "heartbeat_interval_secs": self.heartbeat_interval_secs,
+            "reflection_lease_secs": self.reflection_lease_secs,
+            "eval_stall_timeout_secs": self.eval_stall_timeout_secs,
+            "straggler_timeout_secs": self.straggler_timeout_secs,
+            "journal_tail_lines": self.journal_tail_lines,
         }
 
     @staticmethod
@@ -231,6 +246,12 @@ class RunState:
                 if data.get("best_mean_score") is not None
                 else None
             ),
+            lanes=int(data.get("lanes", 0)),
+            heartbeat_interval_secs=float(data.get("heartbeat_interval_secs", 10.0)),
+            reflection_lease_secs=float(data.get("reflection_lease_secs", 1800.0)),
+            eval_stall_timeout_secs=float(data.get("eval_stall_timeout_secs", 600.0)),
+            straggler_timeout_secs=float(data.get("straggler_timeout_secs", 900.0)),
+            journal_tail_lines=int(data.get("journal_tail_lines", 20)),
         )
 
     def save(self) -> Path:
@@ -688,9 +709,12 @@ def _public_state(
     payload = state.to_dict()
     payload["state_path"] = str(run_state_path(state.run_id))
     payload["final_report_path"] = str(final_report) if final_report else None
-    payload["next_command"] = (
-        None if state.status == "done" else f"gepa run continue --run-id {state.run_id}"
-    )
+    if state.status == "done":
+        payload["next_command"] = None
+    elif state.lanes > 0:
+        payload["next_command"] = f"gepa next --wait --run-id {state.run_id}"
+    else:
+        payload["next_command"] = f"gepa run continue --run-id {state.run_id}"
     payload["evaluations_this_call"] = [outcome.summary for outcome in outcomes]
     return payload
 
@@ -850,9 +874,42 @@ def start(
         "--candidate-source",
         help="Override gepa.toml candidate_source for this run: components or git.",
     ),
+    lanes: int = typer.Option(
+        0,
+        "--lanes",
+        help="Number of parallel reflection lanes (git candidate mode only). 0 keeps the synchronous single-path loop.",
+    ),
+    heartbeat_interval_secs: float = typer.Option(
+        10.0,
+        "--heartbeat-interval-secs",
+        help="Lane runs: heartbeat refresh interval for background lane evals.",
+    ),
+    reflection_lease_secs: float = typer.Option(
+        1800.0,
+        "--reflection-lease-secs",
+        help="Lane runs: dispatch lease expiry; a leased lane that never reaches `gepa lane continue` is stalled after this.",
+    ),
+    eval_stall_timeout_secs: float = typer.Option(
+        600.0,
+        "--eval-stall-timeout-secs",
+        help="Lane runs: a lane eval whose heartbeat is older than this (with a dead pid) is stalled.",
+    ),
+    straggler_timeout_secs: float = typer.Option(
+        900.0,
+        "--straggler-timeout-secs",
+        help="Lane runs: selection fires once every lane resolves or this timeout elapses.",
+    ),
+    journal_tail_lines: int = typer.Option(
+        20,
+        "--journal-tail-lines",
+        help="Lane runs: how many journal entries each reflection packet carries.",
+    ),
 ) -> None:
     """Start a managed GEPA run and pause at the first reflection point."""
     _validate_max_iterations(max_iterations)
+    if lanes < 0:
+        typer.echo("--lanes must be >= 0.", err=True)
+        raise typer.Exit(code=2)
     resolved_max_repetitions = (
         acceptance_repetitions
         if acceptance_max_repetitions is None
@@ -871,6 +928,39 @@ def start(
     active_candidate_source = cast(
         CandidateSource, candidate_source or cfg.candidate_source
     )
+    if lanes > 0:
+        if active_candidate_source != "git":
+            typer.echo(
+                "--lanes requires git candidate mode (component-mode lanes share "
+                "one process-global agent and are out of scope, spec-1do).",
+                err=True,
+            )
+            raise typer.Exit(code=2)
+        # Lane branches are always cut from a clean commit; a dirty primary
+        # tree is rejected (spec-1do constraint).
+        from .lanes import ensure_worktrees_ignored, worktrees_root
+
+        workspace_root = repo_root()
+        ensure_worktrees_ignored(workspace_root)
+        try:
+            primary_state = git_candidate_state(
+                workspace_root,
+                exclude_paths=[
+                    runs_dir(workspace_root),
+                    worktrees_root(workspace_root),
+                ],
+            )
+        except GitCandidateError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(code=1) from exc
+        if primary_state.dirty:
+            typer.echo(
+                "`gepa run start --lanes` requires a clean primary tree; "
+                "commit or stash your changes first (lane branches are cut "
+                "from a clean commit).",
+                err=True,
+            )
+            raise typer.Exit(code=1)
     run_id = new_run_id()
     run_dir(run_id).mkdir(parents=True, exist_ok=True)
     now = utc_now_iso()
@@ -891,10 +981,24 @@ def start(
         iterations=0,
         created_at=now,
         updated_at=now,
+        lanes=lanes,
+        heartbeat_interval_secs=heartbeat_interval_secs,
+        reflection_lease_secs=reflection_lease_secs,
+        eval_stall_timeout_secs=eval_stall_timeout_secs,
+        straggler_timeout_secs=straggler_timeout_secs,
+        journal_tail_lines=journal_tail_lines,
     )
     state.save()
     state, outcomes = _advance_to_reflection_or_done(state)
     state.save()
+    if lanes > 0 and state.status == "paused_for_reflection":
+        # Fan out: worktrees + packets + lane_ready events. The run-level
+        # status returns to "running" — lanes carry the reflection pause.
+        from .lanes import fan_out_lanes
+
+        fan_out_lanes(state, repo_root())
+        state = _with_timestamp(state, status="running")
+        state.save()
 
     final_path: Path | None = None
     final_text: str | None = None
@@ -915,6 +1019,14 @@ def continue_(
 ) -> None:
     """Resume after reflection edits and advance to the next pause or completion."""
     state = _load_state(run_id)
+    if state.lanes > 0:
+        typer.echo(
+            "`gepa run continue` does not drive lane runs. Evaluate a lane with "
+            "`gepa lane continue <lane>` and commit the iteration with "
+            "`gepa run select`.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
     if state.status == "done":
         final_path, final_text = _write_final_report(state)
         _emit_status(
@@ -987,12 +1099,23 @@ def status(
         help="Managed run id. Omit to use the latest run with a state file.",
     ),
 ) -> None:
-    """Print the managed run state as JSON."""
+    """Print the managed run state as JSON (lane runs include the lane board)."""
     state = _load_state(run_id)
     final_path = final_report_path(state.run_id) if state.status == "done" else None
-    typer.echo(
-        json.dumps({"run": _public_state(state, outcomes=[], final_report=final_path)})
-    )
+    payload: dict[str, Any] = {
+        "run": _public_state(state, outcomes=[], final_report=final_path)
+    }
+    if state.lanes > 0:
+        # Consumer verbs run the lazy reaper first (dec-pm3).
+        from .lanes import load_all_lane_states, reaper_pass_for_run
+
+        workspace_root = repo_root()
+        reaper_pass_for_run(workspace_root, state)
+        payload["lanes"] = [
+            lane_state.to_dict()
+            for lane_state in load_all_lane_states(workspace_root, state.run_id)
+        ]
+    typer.echo(json.dumps(payload))
 
 
 __all__ = ["app"]

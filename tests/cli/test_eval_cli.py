@@ -393,7 +393,9 @@ def test_eval_artifact_names_are_collision_free(
 
     # Force both evals to observe the same iteration ordinal, simulating the
     # check-then-append race between concurrent lane evals.
-    monkeypatch.setattr(eval_module, "_count_evals_in_run", lambda _run_id: 0)
+    monkeypatch.setattr(
+        eval_module, "_count_evals_in_run", lambda _run_id, root=None: 0
+    )
 
     second = _run(
         "eval",
