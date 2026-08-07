@@ -278,6 +278,17 @@ coordinates everything through an event stream. You play two roles: a thin
 **reflector subagents** (and occasionally a merge subagent) that do the actual
 reflection in isolated context.
 
+Two operational notes from dogfooding:
+
+- **Run the orchestrator where it can spawn children.** In Prime Agent /
+  RLM-style runtimes the orchestrator must sit at depth 0 (or dispatch through
+  the host) — a depth-capped nested orchestrator cannot spawn reflectors
+  itself.
+- **`.gepa/` inside the candidate repo means the committed tree snapshots
+  journal state.** Restoring the best commit (`git checkout <best_commit_sha>`
+  after `run_done`) leaves `.gepa/journal.jsonl` modified in the working tree
+  — expected and harmless; commit or ignore it.
+
 Requires `candidate_source = "git"` and a clean primary checkout — lane
 branches are always cut from a clean commit. Component mode stays on the
 single-path loop.
@@ -329,6 +340,9 @@ loop:
             note remaining_evals; steer new dispatches toward cheap edits
         run_done:
             read final_report_path; stop the loop
+            # a selection_due for a later iteration may arrive AFTER run_done
+            # (the reaper synthesizes it before noticing done) — just ack it;
+            # `gepa run select` on a done run refuses cleanly.
     gepa ack <event.id> --run-id <run_id>
 ```
 
