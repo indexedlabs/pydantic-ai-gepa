@@ -1,0 +1,17 @@
+{
+  "checkpoint_id": "019fd998b7bc",
+  "created_at": "2026-08-07T00:21:32.325213+00:00",
+  "branch_name": "lanes/1-pareto-ledger",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "a0598520e6a59fa83be378b315b869f69af9d595"
+  ],
+  "entity_touches": [
+    ".mighty/loro/edges/019fd998-8e85-7f32-bad8-4ef89f91c2ce.loro",
+    ".mighty/loro/edges/019fd998-8ec4-7cb1-8f8e-3f65ed3f1ce7.loro",
+    ".mighty/loro/messages/019fd998-8e4c-7451-80a9-71875ab9e774.loro",
+    ".mighty/loro/records/019fd92e-7ec0-7b60-bb16-59daefea74d0.loro",
+    ".mighty/loro/records/019fd998-8e87-7d40-8f1c-bfe7ae04fbe2.loro",
+    ".mighty/loro/records/019fd998-8ec5-7473-b307-e0440020f28c.loro"
+  ]
+}
