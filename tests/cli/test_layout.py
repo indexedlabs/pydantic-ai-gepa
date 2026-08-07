@@ -14,6 +14,7 @@ from pydantic_ai_gepa.cli.layout import (
     GepaConfig,
     GepaConfigError,
     _module_source_paths,
+    candidate_import_context,
     candidate_project_root,
     candidate_dir,
     components_dir,
@@ -45,6 +46,19 @@ from pydantic_ai_gepa.cli.layout import (
 class _BrokenNamespacePath:
     def __iter__(self):
         raise KeyError("opentelemetry")
+
+
+class _ParentBackedNamespacePath:
+    def __init__(self, parent_name: str, path: Path) -> None:
+        self.parent_name = parent_name
+        self.path = path
+
+    def __iter__(self):
+        import sys
+
+        if self.parent_name not in sys.modules:
+            raise KeyError(self.parent_name)
+        yield str(self.path)
 
 
 def test_config_parse_minimal(tmp_path: Path) -> None:
@@ -277,6 +291,72 @@ def test_module_source_paths_ignores_broken_dynamic_namespace_path(
     )
 
     assert _module_source_paths(module) == (module_file.resolve(),)
+
+
+def test_candidate_import_context_preserves_repo_local_environment_modules(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+    import sys
+
+    primary = tmp_path / "primary"
+    candidate = tmp_path / "candidate"
+    for project in (primary, candidate):
+        (project / "src" / "runtime_pkg").mkdir(parents=True)
+        (project / "eval_pkg").mkdir()
+        subprocess.run(["git", "init", str(project)], check=True, capture_output=True)
+
+    environment = primary / ".venv"
+    site_packages = environment / "lib" / "python3.13" / "site-packages"
+    site_packages.mkdir(parents=True)
+    project_module = SimpleNamespace(
+        __file__=str(primary / "src" / "runtime_pkg" / "tool.py")
+    )
+    namespace_module = SimpleNamespace(
+        __file__=None,
+        __path__=_ParentBackedNamespacePath(
+            "runtime_pkg.layout_test",
+            primary / "src" / "runtime_pkg" / "namespace",
+        ),
+    )
+    configured_module = SimpleNamespace(
+        __file__=str(primary / "eval_pkg" / "evaluation.py")
+    )
+    import_hook = SimpleNamespace(
+        __file__=str(site_packages / "beartype" / "claw" / "__init__.py")
+    )
+    monkeypatch.setitem(sys.modules, "runtime_pkg.layout_test", project_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "runtime_pkg.layout_test.namespace",
+        namespace_module,
+    )
+    monkeypatch.setitem(sys.modules, "eval_pkg.layout_test", configured_module)
+    monkeypatch.setitem(sys.modules, "beartype.claw.layout_test", import_hook)
+    monkeypatch.setattr(sys, "prefix", str(environment))
+    monkeypatch.setattr(sys, "exec_prefix", str(environment))
+    monkeypatch.setattr(
+        sys,
+        "path",
+        [str(primary / "src"), str(site_packages), *sys.path],
+    )
+
+    with candidate_import_context(
+        primary_project_root=primary,
+        candidate_project_root=candidate,
+        refs=("eval_pkg.evaluation:evaluate",),
+    ):
+        assert "runtime_pkg.layout_test" not in sys.modules
+        assert "runtime_pkg.layout_test.namespace" not in sys.modules
+        assert "eval_pkg.layout_test" not in sys.modules
+        assert sys.modules["beartype.claw.layout_test"] is import_hook
+        assert str(candidate / "src") in sys.path
+        assert str(site_packages) in sys.path
+
+    assert sys.modules["runtime_pkg.layout_test"] is project_module
+    assert sys.modules["runtime_pkg.layout_test.namespace"] is namespace_module
+    assert sys.modules["eval_pkg.layout_test"] is configured_module
+    assert sys.modules["beartype.claw.layout_test"] is import_hook
 
 
 # ---------- --gepa-dir override ----------
