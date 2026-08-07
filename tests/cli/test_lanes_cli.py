@@ -149,7 +149,7 @@ def test_run_start_lanes_fans_out(git_repo: Path) -> None:
 
     # lane_ready events emitted with packet + worktree paths.
     events_dir = git_repo / ".gepa" / "runs" / run_id / "events"
-    ids = sorted(p.name for p in events_dir.iterdir())
+    ids = sorted(p.name for p in events_dir.iterdir() if p.is_file())
     assert len(ids) == 2
     events = [json.loads((events_dir / eid).read_text()) for eid in ids]
     assert {event["type"] for event in events} == {"lane_ready"}
@@ -311,11 +311,12 @@ def test_lane_continue_evaluates_and_emits_verdict(git_repo: Path) -> None:
     assert Path(str(state.comparison_path)).exists()
 
     # Verdict event + lane-scoped ledger row with collision-free artifacts.
-    events_dir = git_repo / ".gepa" / "runs" / run_id / "events"
+    from pydantic_ai_gepa.cli.events import list_events
+
     verdict_events = [
-        json.loads(p.read_text())
-        for p in events_dir.iterdir()
-        if json.loads(p.read_text())["type"] == "verdict"
+        event.to_dict()
+        for event in list_events(run_id, git_repo)
+        if event.type == "verdict"
     ]
     assert len(verdict_events) == 1
     assert verdict_events[0]["lane"] == "lane-1"
@@ -473,23 +474,20 @@ def test_run_status_renders_lane_board_and_reaps(git_repo: Path) -> None:
     assert lanes["lane-1"]["status"] == "evaluating"
     assert lanes["lane-2"]["status"] == "paused_for_reflection"
 
-    events_dir = git_repo / ".gepa" / "runs" / run_id / "events"
+    from pydantic_ai_gepa.cli.events import list_events
+
     stalled = [
-        json.loads(p.read_text())
-        for p in events_dir.iterdir()
-        if json.loads(p.read_text())["type"] == "lane_stalled"
+        event for event in list_events(run_id, git_repo) if event.type == "lane_stalled"
     ]
     assert len(stalled) == 1
-    assert stalled[0]["lane"] == "lane-1"
-    assert "dead" in stalled[0]["payload"]["reason"]
+    assert stalled[0].lane == "lane-1"
+    assert "dead" in stalled[0].payload["reason"]
 
     # A second status pass re-synthesizes nothing for the same lease epoch.
     second = _run("run", "status", "--run-id", run_id)
     assert second.exit_code == 0, second.output
     stalled = [
-        json.loads(p.read_text())
-        for p in events_dir.iterdir()
-        if json.loads(p.read_text())["type"] == "lane_stalled"
+        event for event in list_events(run_id, git_repo) if event.type == "lane_stalled"
     ]
     assert len(stalled) == 1
 
