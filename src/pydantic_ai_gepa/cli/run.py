@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import json
+import os
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -103,6 +104,12 @@ class RunState:
     # Set at fan-out/re-fan: the straggler-timeout clock starts here, immune
     # to unrelated run-state saves refreshing updated_at (spec-er3).
     iteration_started_at: str | None = None
+    # Select-phase resumption markers (spec-er3). ``select_phase`` is the
+    # in-flight marker: non-None while a `gepa run select` is between phase
+    # checkpoints; ``select_context`` carries the resumption record (pid,
+    # winner, per-lane progress) so an interrupted select resumes idempotently.
+    select_phase: str | None = None
+    select_context: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -152,6 +159,8 @@ class RunState:
             "straggler_timeout_secs": self.straggler_timeout_secs,
             "journal_tail_lines": self.journal_tail_lines,
             "iteration_started_at": self.iteration_started_at,
+            "select_phase": self.select_phase,
+            "select_context": self.select_context,
         }
 
     @staticmethod
@@ -258,12 +267,37 @@ class RunState:
             straggler_timeout_secs=float(data.get("straggler_timeout_secs", 900.0)),
             journal_tail_lines=int(data.get("journal_tail_lines", 20)),
             iteration_started_at=data.get("iteration_started_at"),
+            select_phase=(
+                str(data["select_phase"])
+                if data.get("select_phase") is not None
+                else None
+            ),
+            select_context=(
+                dict(data["select_context"])
+                if isinstance(data.get("select_context"), dict)
+                else None
+            ),
         )
 
-    def save(self) -> Path:
-        path = run_state_path(self.run_id)
+    def save(self, root: Path | None = None) -> Path:
+        path = run_state_path(self.run_id, root)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+        # Atomic (tmpfile + os.replace): lane evals, select checkpoints, and
+        # operator verbs all write this file; a kill mid-write must never
+        # leave torn JSON for the resume logic to trip over.
+        import tempfile
+
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(self.to_dict(), handle, indent=2)
+                handle.write("\n")
+            os.replace(tmp_name, path)
+        except BaseException:
+            os.unlink(tmp_name)
+            raise
         return path
 
 
@@ -636,9 +670,11 @@ def _current_baseline_candidate_id(
     return candidate_id_from_components(components)
 
 
-def _write_final_report(state: RunState) -> tuple[Path, str]:
-    rows = ParetoLog(state.run_id).iter_rows()
-    path = final_report_path(state.run_id)
+def _write_final_report(
+    state: RunState, *, overshoot: int | None = None, root: Path | None = None
+) -> tuple[Path, str]:
+    rows = ParetoLog(state.run_id, root).iter_rows()
+    path = final_report_path(state.run_id, root)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     lines = [
@@ -647,8 +683,14 @@ def _write_final_report(state: RunState) -> tuple[Path, str]:
         f"- run_id: {state.run_id}",
         f"- status: {state.status}",
         f"- iterations: {state.iterations}/{state.max_iterations}",
-        f"- pareto_log: {ParetoLog(state.run_id).path}",
+        f"- pareto_log: {ParetoLog(state.run_id, root).path}",
     ]
+    if overshoot:
+        lines.append(
+            f"- budget_overshoot: {overshoot} eval row(s) beyond "
+            f"--max-iterations (in-flight lane evals; bounded by "
+            f"lanes x --acceptance-max-repetitions, pydanticaigepa-dec-msy)"
+        )
     if rows:
         best = max(rows, key=lambda row: row.mean_score)
         latest = rows[-1]
@@ -1160,6 +1202,38 @@ def continue_(
     _emit_status(
         state, outcomes=outcomes, final_report=final_path, final_report_text=final_text
     )
+
+
+@app.command("select")
+def select(
+    run_id: str | None = typer.Option(
+        None,
+        "--run-id",
+        help="Managed run id. Omit to use the latest run with a state file.",
+    ),
+) -> None:
+    """Commit one lockstep lane iteration: pick the winner and re-fan lanes.
+
+    Select is the single sequential authority for lane runs
+    (pydanticaigepa-spec-er3). It consumes the memoized lane verdicts (never
+    re-deriving them), invalidates stragglers, promotes the best accepted lane
+    to the run's best, journals every non-promoted lane before deleting its
+    branch, emits merge_opportunity for accepted lanes with disjoint diffs
+    (never auto-merges), enforces the evaluation budget (run_done + overshoot
+    in the final report), and — when budget remains — re-fans every lane onto
+    the new best with a fresh shared baseline and lane_ready events.
+
+    Select records phase progress (promote, journal, re-fan, re-baseline,
+    emit) in run state; a second invocation while one is in flight is
+    rejected, and an interrupted select resumes idempotently from the recorded
+    phase.
+
+    Exit codes: 0 selection committed; 1 not a lane run / not due / already
+    in flight / already done.
+    """
+    from .select import run_select
+
+    run_select(run_id)
 
 
 @app.command("status")
