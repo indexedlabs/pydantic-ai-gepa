@@ -787,6 +787,11 @@ def lane_continue(
         "--foreground",
         help="Run the acceptance eval in-process instead of detaching (used by the detached wrapper and by tests).",
     ),
+    handoff_lease_epoch: int | None = typer.Option(
+        None,
+        "--handoff-lease-epoch",
+        hidden=True,
+    ),
 ) -> None:
     """Auto-commit the lane worktree and evaluate the candidate in the background.
 
@@ -802,7 +807,9 @@ def lane_continue(
     any continue that does not consume its lease. The claim and the handoff
     are serialized by an flock on the lane state dir, and the handoff lease
     expires after --eval-stall-timeout-secs so a child that dies before its
-    first heartbeat is reaped.
+    first heartbeat is reaped. The detached child carries the handoff lease
+    epoch and must claim that exact lease under the lock; a late child cannot
+    revive a lane after the reaper/reset path has replaced it.
     """
     _validate_lane_id(lane)
     workspace_root, run_state = _resolve_lane_run(run_id)
@@ -810,32 +817,70 @@ def lane_continue(
 
     with _lane_lock(workspace_root, run_state.run_id, lane):
         state = load_lane_state(workspace_root, run_state.run_id, lane)
+        claimed_handoff = False
 
-        if state.status == "evaluating":
-            typer.echo(
-                f"Lane {lane} is already evaluating (pid {state.eval_pid}); a "
-                "second concurrent `gepa lane continue` is rejected. If the "
-                f"eval is dead, run `gepa lane reset {lane}`.",
-                err=True,
-            )
-            raise typer.Exit(code=1)
-        if state.status == "leased" and not foreground:
-            if state.lease_purpose == "handoff":
-                # A detached eval child was already spawned for this lease —
-                # a second parent-mode continue would double-spawn.
+        if foreground and handoff_lease_epoch is not None:
+            # A detached child is fenced by the epoch its parent created.  It
+            # must claim that exact handoff while holding the lane lock: after
+            # expiry/reset/re-dispatch an old child is not allowed to revive a
+            # lane or overwrite the replacement eval's state.
+            if (
+                state.status != "leased"
+                or state.lease_purpose != "handoff"
+                or state.lease_epoch != handoff_lease_epoch
+                or state.lease_expires_at is None
+                or _parse_iso(state.lease_expires_at) <= now
+            ):
                 typer.echo(
-                    f"Lane {lane} is leased (epoch {state.lease_epoch}) with "
-                    "an eval handoff in flight; a second `gepa lane continue` "
-                    "is rejected until the child starts (evaluating), the "
-                    "lease expires, or you run `gepa lane reset`.",
+                    f"Lane {lane}'s handoff lease epoch {handoff_lease_epoch} "
+                    "is no longer current; refusing stale detached eval.",
                     err=True,
                 )
                 raise typer.Exit(code=1)
-            # A dispatch lease (from `gepa lane lease`) is CONSUMED by this
-            # continue — the reflector's terminal act is the whole point of
-            # the lease. The flock + the evaluating check above serialize any
-            # true double-continue race.
-        if state.status not in {"paused_for_reflection", "leased", "stalled"}:
+            state = LaneState(
+                **{
+                    **state.to_dict(),
+                    "status": "evaluating",
+                    "eval_pid": os.getpid(),
+                    "heartbeat_at": utc_now_iso(),
+                    "lease_expires_at": None,
+                    "lease_purpose": None,
+                    "updated_at": utc_now_iso(),
+                }
+            )
+            state.save(workspace_root, run_state.run_id)
+            claimed_handoff = True
+        if state.status == "evaluating":
+            if claimed_handoff:
+                # The fenced child has already claimed the handoff above.
+                pass
+            else:
+                typer.echo(
+                    f"Lane {lane} is already evaluating (pid {state.eval_pid}); a "
+                    "second concurrent `gepa lane continue` is rejected. If the "
+                    f"eval is dead, run `gepa lane reset {lane}`.",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+        if state.status == "leased" and state.lease_purpose == "handoff":
+            # A detached eval child was already spawned for this lease. Only
+            # that child, carrying the matching handoff epoch, may consume it.
+            typer.echo(
+                f"Lane {lane} is leased (epoch {state.lease_epoch}) with "
+                "an eval handoff in flight; a second `gepa lane continue` "
+                "is rejected until the child starts (evaluating), the lease "
+                "expires, or you run `gepa lane reset`.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        # A dispatch lease (from `gepa lane lease`) is CONSUMED by this
+        # continue — the reflector's terminal act is the whole point of the
+        # lease. The flock + the evaluating check above serialize any true
+        # double-continue race.
+        allowed_states = {"paused_for_reflection", "leased", "stalled"}
+        if claimed_handoff:
+            allowed_states.add("evaluating")
+        if state.status not in allowed_states:
             typer.echo(
                 f"Lane {lane} is {state.status}; `gepa lane continue` expects a "
                 "paused_for_reflection (or leased) lane.",
@@ -893,6 +938,8 @@ def lane_continue(
         "--run-id",
         run_state.run_id,
         "--foreground",
+        "--handoff-lease-epoch",
+        str(state.lease_epoch),
     ]
     worktree_path = str(state.worktree_path)
     try:
@@ -1187,6 +1234,6 @@ def scan_run_lanes(run_id: str, root: Path | None = None) -> LaneScan | None:
     from .run import RunState  # lazy: run.py imports lanes lazily
 
     run_state = RunState.from_dict(json.loads(state_path.read_text(encoding="utf-8")))
-    if run_state.lanes < 1:
+    if run_state.lanes < 1 or run_state.status == "done":
         return None
     return scan_lane_states(workspace_root, run_id, run_state)

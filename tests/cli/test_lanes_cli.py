@@ -549,6 +549,16 @@ def test_lane_verbs_reject_done_runs(git_repo: Path) -> None:
     assert lease.exit_code == 1
     assert "done" in lease.output
 
+    # Once run_done is consumed, terminal lane state must not synthesize a
+    # new selection_due event on the next poll.
+    first = _run("--gepa-dir", gepa_dir, "next", "--run-id", run_id, "--json")
+    assert first.exit_code == 0, first.output
+    done_id = json.loads(first.output)["id"]
+    ack = _run("--gepa-dir", gepa_dir, "ack", str(done_id), "--run-id", run_id)
+    assert ack.exit_code == 0, ack.output
+    second = _run("--gepa-dir", gepa_dir, "next", "--run-id", run_id, "--json")
+    assert second.exit_code == 3, second.output
+
 
 def test_dispatch_lease_is_consumed_by_continue(git_repo: Path) -> None:
     """The whole point of `lane lease` is the reflector's continue: a lane
@@ -617,6 +627,55 @@ def test_handoff_lease_rejects_second_continue(git_repo: Path) -> None:
     )
     assert result.exit_code == 1
     assert "handoff in flight" in result.output
+
+
+def test_stale_detached_child_cannot_claim_replaced_handoff(git_repo: Path) -> None:
+    """A delayed child is fenced by its original handoff epoch.
+
+    This models the child starting after its lease expired, the reaper stalled
+    the lane, and reset/re-dispatch created a replacement lease. It must not
+    turn the replacement lane into evaluating or emit an obsolete verdict.
+    """
+    run = _start_lane_run(git_repo, lanes=1)
+    run_id = str(run["run_id"])
+    gepa_dir = str(git_repo / ".gepa")
+    state = _lane_state(git_repo, run_id, "lane-1")
+    replacement = LaneState(
+        **{
+            **state.to_dict(),
+            "status": "leased",
+            "lease_epoch": 5,
+            "lease_purpose": "dispatch",
+            "lease_expires_at": "2999-01-01T00:00:00+00:00",
+        }
+    )
+    replacement.save(git_repo, run_id)
+
+    stale = _run(
+        "--gepa-dir",
+        gepa_dir,
+        "lane",
+        "continue",
+        "lane-1",
+        "--run-id",
+        run_id,
+        "--foreground",
+        "--handoff-lease-epoch",
+        "3",
+    )
+    assert stale.exit_code == 1
+    assert "no longer current" in stale.output
+    current = _lane_state(git_repo, run_id, "lane-1")
+    assert current.status == "leased"
+    assert current.lease_epoch == 5
+    assert current.lease_purpose == "dispatch"
+    assert current.lease_expires_at == "2999-01-01T00:00:00+00:00"
+
+    from pydantic_ai_gepa.cli.events import list_events
+
+    assert not [
+        event for event in list_events(run_id, git_repo) if event.type == "verdict"
+    ]
 
 
 def test_lane_reset_refuses_awaiting_selection(git_repo: Path) -> None:
