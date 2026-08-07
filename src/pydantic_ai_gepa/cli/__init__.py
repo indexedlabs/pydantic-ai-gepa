@@ -12,6 +12,7 @@ import typer
 from . import apply as apply_cmd
 from . import components as components_cmd
 from . import eval as eval_cmd
+from . import events as events_cmd
 from . import init as init_cmd
 from . import journal as journal_cmd
 from . import pareto as pareto_cmd
@@ -74,6 +75,8 @@ app.command(
 app.command(name="pareto", help="Show Pareto front or full history (json or tsv).")(
     pareto_cmd.pareto
 )
+app.command(name="next")(events_cmd.next_command)
+app.command(name="ack")(events_cmd.ack_command)
 app.add_typer(
     run_cmd.app,
     name="run",
