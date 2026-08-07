@@ -29,13 +29,15 @@ from __future__ import annotations
 import importlib
 import os
 import re
+import subprocess
 import sys
 import tomllib
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Iterator, Literal, Sequence
 
 
 GEPA_DIRNAME = ".gepa"
@@ -229,6 +231,77 @@ def repo_root(start: Path | None = None) -> Path:
     return Path.cwd().resolve()
 
 
+def git_root(start: Path | None = None) -> Path:
+    """Return the Git top-level containing ``start``.
+
+    A Python project may be nested inside a monorepo, so this is deliberately
+    separate from :func:`repo_root`, which identifies the import/config root.
+    """
+
+    cursor = (start or repo_root()).resolve()
+    try:
+        value = subprocess.run(
+            ["git", "-C", str(cursor), "rev-parse", "--show-toplevel"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        detail = (
+            exc.stderr.strip()
+            if isinstance(exc, subprocess.CalledProcessError)
+            else str(exc)
+        )
+        raise GepaConfigError(
+            f"Could not resolve Git top-level from {cursor}: {detail}"
+        ) from exc
+    return Path(value).resolve()
+
+
+def project_root_for_workspace(workspace: Path) -> Path:
+    """Resolve the primary Python project that owns an explicit workspace.
+
+    Nested workspaces such as ``api/evals/foo/.gepa/rlm`` belong to the
+    nearest ancestor containing ``pyproject.toml``. Flat repositories without
+    a Python project marker retain the historical Git-top-level behavior.
+    """
+
+    resolved = workspace.resolve()
+    for candidate in [resolved.parent, *resolved.parent.parents]:
+        if (candidate / "pyproject.toml").is_file():
+            return candidate
+    return git_root(resolved.parent)
+
+
+def project_prefix(project: Path, repository: Path | None = None) -> Path:
+    """Return the project path relative to its Git top-level."""
+
+    resolved_project = project.resolve()
+    resolved_repository = (repository or git_root(resolved_project)).resolve()
+    try:
+        return resolved_project.relative_to(resolved_repository)
+    except ValueError as exc:
+        raise GepaConfigError(
+            f"Python project {resolved_project} is outside Git root "
+            f"{resolved_repository}."
+        ) from exc
+
+
+def candidate_project_root(
+    primary_project_root: Path, candidate_git_root: Path
+) -> Path:
+    """Map a primary monorepo project into a candidate Git worktree."""
+
+    prefix = project_prefix(primary_project_root)
+    candidate = (candidate_git_root.resolve() / prefix).resolve()
+    if not candidate.is_dir():
+        raise GepaConfigError(
+            f"Candidate project root does not exist: {candidate} "
+            f"(project prefix {prefix.as_posix()!r})."
+        )
+    return candidate
+
+
 def gepa_dir(root: Path | None = None) -> Path:
     return (root or repo_root()) / current_gepa_dirname()
 
@@ -321,28 +394,34 @@ def latest_run_id(root: Path | None = None) -> str | None:
     return candidates[0] if candidates else None
 
 
-def resolve_agent(config: GepaConfig) -> Any:
+def resolve_agent(config: GepaConfig, *, expected_root: Path | None = None) -> Any:
     """Import ``config.agent`` (``module.path:attr``) and return the agent attribute."""
     if not config.agent:
         raise GepaConfigError("No 'agent' is configured in gepa.toml.")
-    return resolve_module_attr(config.agent, kind="agent")
+    return resolve_module_attr(config.agent, kind="agent", expected_root=expected_root)
 
 
-def resolve_evaluate(config: GepaConfig) -> Any:
+def resolve_evaluate(config: GepaConfig, *, expected_root: Path | None = None) -> Any:
     """Import the optional plain git-mode evaluation callable."""
     if not config.evaluate:
         return None
-    return resolve_module_attr(config.evaluate, kind="evaluate")
+    return resolve_module_attr(
+        config.evaluate, kind="evaluate", expected_root=expected_root
+    )
 
 
-def resolve_metric(config: GepaConfig) -> Any:
+def resolve_metric(config: GepaConfig, *, expected_root: Path | None = None) -> Any:
     """Import the configured metric, or return ``None`` to fall back to the CLI default."""
     if not config.metric:
         return None
-    return resolve_module_attr(config.metric, kind="metric")
+    return resolve_module_attr(
+        config.metric, kind="metric", expected_root=expected_root
+    )
 
 
-def resolve_case_factory(config: GepaConfig) -> Any:
+def resolve_case_factory(
+    config: GepaConfig, *, expected_root: Path | None = None
+) -> Any:
     """Import the configured case factory, or return ``None`` if absent.
 
     The returned callable (when set) is invoked by the adapter at rollout
@@ -351,22 +430,26 @@ def resolve_case_factory(config: GepaConfig) -> Any:
     """
     if not config.case_factory:
         return None
-    return resolve_module_attr(config.case_factory, kind="case_factory")
+    return resolve_module_attr(
+        config.case_factory, kind="case_factory", expected_root=expected_root
+    )
 
 
-def resolve_skills(config: GepaConfig) -> Any:
+def resolve_skills(config: GepaConfig, *, root: Path | None = None) -> Any:
     """Resolve the optional ``skills`` directory from ``gepa.toml``."""
     if not config.skills:
         return None
     from pydantic_ai_gepa.skills import SkillsFS
 
-    skills_path = repo_root() / config.skills
+    skills_path = (root or repo_root()) / config.skills
     if not skills_path.exists():
         raise GepaConfigError(f"Skills directory does not exist: {skills_path}")
     return SkillsFS.from_disk(skills_path)
 
 
-def resolve_module_attr(ref: str, *, kind: str = "object") -> Any:
+def resolve_module_attr(
+    ref: str, *, kind: str = "object", expected_root: Path | None = None
+) -> Any:
     """Resolve a ``module.path:attr`` reference to the named attribute."""
     if ":" not in ref:
         raise GepaConfigError(
@@ -383,6 +466,21 @@ def resolve_module_attr(ref: str, *, kind: str = "object") -> Any:
         raise GepaConfigError(
             f"Module {module_path!r} has no attribute {attr!r} ({kind} ref {ref!r})."
         )
+    if expected_root is not None:
+        module_file = getattr(module, "__file__", None)
+        if module_file is None:
+            raise GepaConfigError(
+                f"Resolved {kind} module {module_path!r} has no source file; "
+                f"expected it under candidate project {expected_root.resolve()}."
+            )
+        resolved_file = Path(module_file).resolve()
+        try:
+            resolved_file.relative_to(expected_root.resolve())
+        except ValueError as exc:
+            raise GepaConfigError(
+                f"Resolved {kind} ref {ref!r} outside the candidate project: "
+                f"{resolved_file} is not under {expected_root.resolve()}."
+            ) from exc
     return getattr(module, attr)
 
 
@@ -440,9 +538,121 @@ def insert_repo_root_on_path(root: Path | None = None) -> None:
     ``sys.path`` so ``importlib.import_module`` can resolve those modules
     without requiring an editable install.
     """
-    root_path = str((root or repo_root()).resolve())
-    if root_path not in sys.path:
-        sys.path.insert(0, root_path)
+    project = (root or repo_root()).resolve()
+    for import_root in reversed((project / "src", project)):
+        if not import_root.is_dir():
+            continue
+        path_text = str(import_root)
+        if path_text in sys.path:
+            sys.path.remove(path_text)
+        sys.path.insert(0, path_text)
+
+
+def _module_source_paths(module: Any) -> tuple[Path, ...]:
+    """Return file and namespace-package locations for an imported module."""
+
+    raw_paths: list[Any] = []
+    module_file = getattr(module, "__file__", None)
+    if module_file is not None:
+        raw_paths.append(module_file)
+    module_path = getattr(module, "__path__", None)
+    if module_path is not None:
+        try:
+            raw_paths.extend(module_path)
+        except TypeError:
+            pass
+    resolved: list[Path] = []
+    for raw in raw_paths:
+        try:
+            path = Path(raw).resolve()
+        except (OSError, RuntimeError, TypeError):
+            continue
+        if path not in resolved:
+            resolved.append(path)
+    return tuple(resolved)
+
+
+def _is_below(path: Path | None, root: Path) -> bool:
+    if path is None:
+        return False
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _module_is_below(module: Any, root: Path) -> bool:
+    return any(_is_below(path, root) for path in _module_source_paths(module))
+
+
+@contextmanager
+def candidate_import_context(
+    *,
+    primary_project_root: Path,
+    candidate_project_root: Path,
+    refs: Sequence[str | None],
+) -> Iterator[None]:
+    """Isolate configured and transitive imports to one candidate project.
+
+    Managed lane evaluation can run in a process that previously evaluated
+    the primary checkout. Evicting project-owned modules before resolution is
+    therefore as important as changing ``sys.path``: otherwise Python reuses
+    the primary module object and silently evaluates the wrong candidate.
+    """
+
+    primary = primary_project_root.resolve()
+    candidate = candidate_project_root.resolve()
+    primary_repository = git_root(primary)
+    candidate_repository = git_root(candidate)
+    configured_roots = {ref.split(":", 1)[0].split(".", 1)[0] for ref in refs if ref}
+    removed: dict[str, Any] = {}
+    for name, module in list(sys.modules.items()):
+        if name == "pydantic_ai_gepa" or name.startswith("pydantic_ai_gepa."):
+            continue
+        top_level = name.split(".", 1)[0]
+        if (
+            _module_is_below(module, primary_repository)
+            or _module_is_below(module, candidate_repository)
+            or top_level in configured_roots
+        ):
+            removed[name] = module
+            sys.modules.pop(name, None)
+
+    original_path = list(sys.path)
+    original_cwd = Path.cwd()
+    translated_paths: list[str] = []
+    external_paths: list[str] = []
+    for entry in sys.path:
+        try:
+            resolved_entry = Path(entry or original_cwd).resolve()
+            suffix = resolved_entry.relative_to(primary_repository)
+        except (OSError, ValueError):
+            external_paths.append(entry)
+            continue
+        translated = (candidate_repository / suffix).resolve()
+        if translated.exists():
+            translated_text = str(translated)
+            if translated_text not in translated_paths:
+                translated_paths.append(translated_text)
+    sys.path[:] = [*translated_paths, *external_paths]
+    insert_repo_root_on_path(candidate)
+    os.chdir(candidate)
+    try:
+        yield
+    finally:
+        os.chdir(original_cwd)
+        for name, module in list(sys.modules.items()):
+            if name == "pydantic_ai_gepa" or name.startswith("pydantic_ai_gepa."):
+                continue
+            top_level = name.split(".", 1)[0]
+            if (
+                _module_is_below(module, candidate_repository)
+                or top_level in configured_roots
+            ):
+                sys.modules.pop(name, None)
+        sys.modules.update(removed)
+        sys.path[:] = original_path
 
 
 _DOTENV_INTERPOLATION_RE = re.compile(

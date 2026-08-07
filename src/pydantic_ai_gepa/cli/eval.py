@@ -36,6 +36,10 @@ from ..evaluation import (
     evaluate_callable_dataset,
     evaluate_candidate_dataset,
 )
+from ..evaluation_health import (
+    append_infrastructure_failures_to_report,
+    evaluation_infrastructure_failures,
+)
 from ._io import write_content_file
 from .candidates import (
     Candidate,
@@ -49,6 +53,7 @@ from .dataset import cases_by_id, load_dataset
 from .layout import (
     GepaConfig,
     CandidateSource,
+    candidate_import_context,
     config_path,
     insert_repo_root_on_path,
     latest_run_id,
@@ -241,22 +246,29 @@ def run_eval_once(
     for lane runs the budget stop is enforced at select, not per-eval
     (pydanticaigepa-dec-msy).
 
-    Lane evals also pass ``workspace_root`` (the primary checkout holding the
-    ``.gepa`` workspace — config, dataset, ledger, and artifacts all resolve
-    there per pydanticaigepa-dec-780) and ``candidate_root`` (the lane
-    worktree — candidate identity and module imports resolve there).
+    Lane evals also pass ``workspace_root`` (the primary Python project owning
+    the ``.gepa`` workspace — config, dataset, ledger, and artifacts all
+    resolve there per pydanticaigepa-dec-780) and ``candidate_root`` (the
+    corresponding Python project inside the lane worktree — candidate
+    identity, cwd, and module imports resolve there).
     """
-    cfg = GepaConfig.load(config_path(workspace_root))
-    insert_repo_root_on_path(candidate_root)
-
+    primary_project_root = (workspace_root or repo_root()).resolve()
+    active_candidate_project = (candidate_root or primary_project_root).resolve()
+    cfg = GepaConfig.load(config_path(primary_project_root))
     source = candidate_source or cfg.candidate_source
-    agent = resolve_agent(cfg) if cfg.agent else None
-    evaluate = resolve_evaluate(cfg) if source == "git" else None
-    metric = resolve_metric(cfg) or default_substring_metric
-    case_factory = resolve_case_factory(cfg)
-    skills_fs = resolve_skills(cfg)
+    agent = None
+    evaluate = None
+    metric = None
+    case_factory = None
+    skills_fs = None
+    if source != "git":
+        insert_repo_root_on_path(active_candidate_project)
+        agent = resolve_agent(cfg) if cfg.agent else None
+        metric = resolve_metric(cfg) or default_substring_metric
+        case_factory = resolve_case_factory(cfg)
+        skills_fs = resolve_skills(cfg, root=active_candidate_project)
 
-    dataset_path = (workspace_root or repo_root()) / cfg.dataset
+    dataset_path = primary_project_root / cfg.dataset
     cases = load_dataset(dataset_path)
     if not cases:
         typer.echo(f"Dataset {dataset_path} is empty.", err=True)
@@ -274,7 +286,7 @@ def run_eval_once(
                 err=True,
             )
             raise typer.Exit(code=2)
-        if agent is None and evaluate is None:
+        if cfg.agent is None and cfg.evaluate is None:
             typer.echo(
                 "Git candidate mode requires an 'agent' or plain 'evaluate' "
                 "callable in gepa.toml.",
@@ -378,7 +390,7 @@ def run_eval_once(
     if source == "git":
         try:
             git_state = git_candidate_state(
-                candidate_root or repo_root(),
+                active_candidate_project,
                 exclude_paths=[run_dir(active_run_id, workspace_root)],
             )
         except GitCandidateError as exc:
@@ -409,25 +421,63 @@ def run_eval_once(
         if capture_traces
         else None
     )
-    with _expose_trace_path(planned_trace_path):
-        if evaluate is not None:
-            records = asyncio.run(
-                evaluate_callable_dataset(
-                    evaluate=evaluate,
-                    metric=metric,
-                    dataset=subset,
-                    concurrency=concurrency,
-                    case_factory=case_factory,
-                )
+    if source == "git":
+        configured_refs = (cfg.agent, cfg.evaluate, cfg.metric, cfg.case_factory)
+        with candidate_import_context(
+            primary_project_root=primary_project_root,
+            candidate_project_root=active_candidate_project,
+            refs=configured_refs,
+        ):
+            agent = (
+                resolve_agent(cfg, expected_root=active_candidate_project)
+                if cfg.agent
+                else None
             )
-        else:
+            evaluate = resolve_evaluate(cfg, expected_root=active_candidate_project)
+            metric = (
+                resolve_metric(cfg, expected_root=active_candidate_project)
+                if cfg.metric
+                else default_substring_metric
+            )
+            case_factory = resolve_case_factory(
+                cfg, expected_root=active_candidate_project
+            )
+            skills_fs = resolve_skills(cfg, root=active_candidate_project)
+            with _expose_trace_path(planned_trace_path):
+                if evaluate is not None:
+                    records = asyncio.run(
+                        evaluate_callable_dataset(
+                            evaluate=evaluate,
+                            metric=metric,
+                            dataset=subset,
+                            concurrency=concurrency,
+                            case_factory=case_factory,
+                        )
+                    )
+                else:
+                    assert agent is not None
+                    records = asyncio.run(
+                        evaluate_candidate_dataset(
+                            agent=agent,
+                            metric=metric,
+                            dataset=subset,
+                            candidate={},
+                            concurrency=concurrency,
+                            case_factory=case_factory,
+                            capture_traces=capture_traces,
+                            skills_fs=skills_fs,
+                        )
+                    )
+    else:
+        assert metric is not None
+        with _expose_trace_path(planned_trace_path):
             assert agent is not None
             records = asyncio.run(
                 evaluate_candidate_dataset(
                     agent=agent,
                     metric=metric,
                     dataset=subset,
-                    candidate=({} if source == "git" else candidate.to_candidate_map()),
+                    candidate=candidate.to_candidate_map(),
                     concurrency=concurrency,
                     case_factory=case_factory,
                     capture_traces=capture_traces,
@@ -437,6 +487,12 @@ def run_eval_once(
 
     per_case = {record.case_id: record.score for record in records}
     mean = sum(per_case.values()) / len(per_case) if per_case else 0.0
+    infrastructure_failures = evaluation_infrastructure_failures(records)
+    evaluation_outcome = (
+        "infrastructure_failure" if infrastructure_failures else "valid"
+    )
+    selectable = not infrastructure_failures
+    pareto_status = "infrastructure_failure" if infrastructure_failures else status
 
     pareto = ParetoLog(active_run_id, workspace_root)
     pareto.append(
@@ -445,17 +501,24 @@ def run_eval_once(
             commit_sha=(
                 git_state.commit_sha
                 if git_state is not None
-                else current_commit_sha(candidate_root or repo_root())
+                else current_commit_sha(active_candidate_project)
             ),
             component_overrides_id=candidate_overrides_id,
             minibatch_id=minibatch.id,
             per_case_scores=per_case,
             mean_score=mean,
-            status=status,
-            summary=f"{status} eval of {candidate.id} on minibatch {minibatch.id} (mean={mean:.3f})",
+            status=pareto_status,
+            summary=f"{pareto_status} eval of {candidate.id} on minibatch {minibatch.id} (mean={mean:.3f})",
             timestamp=utc_now_iso(),
             lane=lane,
-            extra={"eval_id": eval_id},
+            extra={
+                "eval_id": eval_id,
+                "outcome": evaluation_outcome,
+                "selectable": selectable,
+                "evaluation_errors": [
+                    failure.to_dict() for failure in infrastructure_failures
+                ],
+            },
         )
     )
 
@@ -467,6 +530,8 @@ def run_eval_once(
         _format_failures(records, threshold=threshold, candidate_source=source),
         encoding="utf-8",
     )
+    if infrastructure_failures:
+        append_infrastructure_failures_to_report(report_path, infrastructure_failures)
     trace_path = (
         _write_trace_file(
             path=planned_trace_path,
@@ -483,7 +548,7 @@ def run_eval_once(
         "commit_sha": (
             git_state.commit_sha
             if git_state is not None
-            else current_commit_sha(candidate_root or repo_root())
+            else current_commit_sha(active_candidate_project)
         ),
         "dirty_tree": git_state.dirty if git_state is not None else None,
         "dirty_hash": git_state.dirty_hash if git_state is not None else None,
@@ -491,6 +556,9 @@ def run_eval_once(
         "run_id": active_run_id,
         "lane": lane,
         "eval_id": eval_id,
+        "evaluation_outcome": evaluation_outcome,
+        "selectable": selectable,
+        "evaluation_errors": [failure.to_dict() for failure in infrastructure_failures],
         "mean_score": mean,
         "n_cases": len(records),
         "n_failures": len([record for record in records if record.score < threshold]),

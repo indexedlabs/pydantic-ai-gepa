@@ -12,11 +12,13 @@ import pytest
 from pydantic_ai_gepa.cli.layout import (
     GepaConfig,
     GepaConfigError,
+    candidate_project_root,
     candidate_dir,
     components_dir,
     config_path,
     ensure_layout,
     gepa_dir,
+    git_root,
     is_run_id,
     journal_path,
     latest_run_id,
@@ -25,8 +27,11 @@ from pydantic_ai_gepa.cli.layout import (
     new_run_id,
     pareto_log_path,
     proposal_dir,
+    project_prefix,
+    project_root_for_workspace,
     repo_root,
     resolve_agent,
+    resolve_module_attr,
     run_dir,
     runs_dir,
     staged_dir,
@@ -225,6 +230,34 @@ def test_repo_root_falls_back_to_pyproject(tmp_path: Path) -> None:
     nested = tmp_path / "src" / "pkg"
     nested.mkdir(parents=True)
     assert repo_root(nested) == tmp_path.resolve()
+
+
+def test_nested_workspace_distinguishes_git_and_project_roots(tmp_path: Path) -> None:
+    import subprocess
+
+    repository = tmp_path / "monorepo"
+    project = repository / "api"
+    workspace = project / "evals" / "agent" / ".gepa" / "rlm"
+    workspace.mkdir(parents=True)
+    (project / "pyproject.toml").touch()
+    subprocess.run(["git", "init", str(repository)], check=True, capture_output=True)
+
+    assert git_root(project) == repository.resolve()
+    assert project_root_for_workspace(workspace) == project.resolve()
+    assert project_prefix(project, repository) == Path("api")
+
+    candidate_git = tmp_path / "candidate"
+    (candidate_git / "api").mkdir(parents=True)
+    assert candidate_project_root(project, candidate_git) == candidate_git / "api"
+
+
+def test_resolve_module_attr_rejects_source_outside_candidate_project(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(GepaConfigError, match="outside the candidate project"):
+        resolve_module_attr(
+            "pydantic_ai_gepa.cli.layout:repo_root", expected_root=tmp_path
+        )
 
 
 # ---------- --gepa-dir override ----------

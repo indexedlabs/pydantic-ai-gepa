@@ -64,6 +64,7 @@ import typer
 from .candidates import GitCandidateError, git_candidate_state
 from .eval import run_eval_once
 from .events import EventDraft, emit, list_events
+from ..evaluation_health import evaluation_infrastructure_failures
 from .lanes import (
     LaneState,
     _git,
@@ -78,7 +79,13 @@ from .lanes import (
     scan_lane_states,
     write_packet,
 )
-from .layout import final_report_path, journal_path, run_dir, run_state_path
+from .layout import (
+    candidate_project_root,
+    final_report_path,
+    journal_path,
+    run_dir,
+    run_state_path,
+)
 from .runs import ParetoLog, utc_now_iso
 
 SELECT_PRODUCER_ID = "select"
@@ -443,7 +450,7 @@ def _emit_merge_opportunities(
         if lane_state.candidate_sha
     }
     existing = list_events(run_id, workspace_root)
-    pairs: list[list[str]] = []
+    pairs: list[dict[str, list[str]]] = []
     for first, second in combinations(
         sorted(accepted, key=lambda lane_state: lane_state.lane), 2
     ):
@@ -820,6 +827,9 @@ def _refan_lane(
             "iteration": new_iteration,
             "branch": new_branch,
             "worktree_path": str(worktree),
+            "candidate_project_path": str(
+                candidate_project_root(workspace_root, worktree)
+            ),
             "packet_path": None,
             "lease_epoch": lane_state.lease_epoch + 1,
             "lease_expires_at": None,
@@ -896,7 +906,13 @@ def _phase_rebaseline(
         baseline_root = workspace_root
     else:
         lane_states = load_all_lane_states(workspace_root, run_id)
-        baseline_root = Path(str(lane_states[0].worktree_path))
+        lane_state = lane_states[0]
+        worktree = Path(str(lane_state.worktree_path))
+        baseline_root = (
+            Path(lane_state.candidate_project_path)
+            if lane_state.candidate_project_path
+            else candidate_project_root(workspace_root, worktree)
+        )
         typer.echo(
             "Primary checkout does not carry the new best; measuring the "
             f"shared baseline in {baseline_root} (same commit).",
@@ -909,6 +925,35 @@ def _phase_rebaseline(
     target_repetitions = min(state.acceptance_max_repetitions, affordable_repetitions)
 
     outcomes: list[Any] = []
+
+    def fail_on_infrastructure_error(outcome: Any) -> None:
+        failures = evaluation_infrastructure_failures(outcome.records)
+        if not failures:
+            return
+        diagnostic = {
+            "outcome": "infrastructure_failure",
+            "selectable": False,
+            "retryable": True,
+            "reason_code": "required_rollout_failed",
+            "valid_samples_before_failure": [
+                float(item.summary["mean_score"]) for item in outcomes[:-1]
+            ],
+            "report_path": str(outcome.summary["report_path"]),
+            "trace_path": outcome.summary.get("trace_path"),
+            "evaluation_errors": [failure.to_dict() for failure in failures],
+        }
+        history = list(ctx.get("rebaseline_infrastructure_failures", []))
+        history.append(diagnostic)
+        ctx["rebaseline_infrastructure_failures"] = history
+        _checkpoint(state, workspace_root, "rebaseline", ctx)
+        typer.echo(
+            "Shared baseline re-evaluation hit an infrastructure failure; "
+            f"incumbent preserved. Inspect {outcome.summary['report_path']} and "
+            "retry `gepa run select` after recovery.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
     with _chdir(baseline_root):
         first = run_eval_once(
             candidate_file=None,
@@ -929,6 +974,7 @@ def _phase_rebaseline(
         state = _with_timestamp(state, next_epoch=state.next_epoch + 1)
         state = _with_last_outcome(state, first)
         outcomes.append(first)
+        fail_on_infrastructure_error(first)
         expected_candidate_id = str(first.summary["candidate_id"])
         minibatch_id = str(first.summary["minibatch_id"])
         while len(outcomes) < target_repetitions:
@@ -957,6 +1003,7 @@ def _phase_rebaseline(
                 raise typer.Exit(code=1)
             state = _with_last_outcome(state, outcome)
             outcomes.append(outcome)
+            fail_on_infrastructure_error(outcome)
 
     state = _mark_reflection_pause(state, outcomes)
     # Lane runs stay "running" — lanes carry the reflection pause.

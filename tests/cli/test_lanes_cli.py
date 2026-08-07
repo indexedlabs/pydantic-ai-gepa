@@ -27,7 +27,10 @@ EVALUATE_MODULE_SOURCE = textwrap.dedent("""
     async def evaluate(case):
         from pathlib import Path
 
-        return Path("score.txt").read_text(encoding="utf-8").strip()
+        value = Path("score.txt").read_text(encoding="utf-8").strip()
+        if value == "error":
+            raise RuntimeError("simulated evaluator outage")
+        return value
 """).lstrip()
 
 
@@ -231,9 +234,11 @@ def test_packet_is_self_contained(git_repo: Path) -> None:
     state = _lane_state(git_repo, str(run["run_id"]), "lane-1")
     packet = json.loads(Path(str(state.packet_path)).read_text(encoding="utf-8"))
 
-    assert packet["packet_version"] == 1
+    assert packet["packet_version"] == 2
     assert packet["lane"] == "lane-1"
     assert Path(packet["worktree_path"]).is_dir()
+    assert Path(packet["candidate_project_root"]).is_dir()
+    assert packet["project_prefix"] == "."
     baseline = packet["baseline"]
     assert baseline["samples"] == [0.0]
     assert baseline["minibatch_id"]
@@ -244,6 +249,243 @@ def test_packet_is_self_contained(git_repo: Path) -> None:
     assert f"--run-id {run['run_id']}" in invocation
     # The invocation carries the absolute workspace explicitly (dec-780).
     assert f"--gepa-dir {git_repo}/.gepa" in invocation
+    assert packet["continue_cwd"] == packet["candidate_project_root"]
+    assert packet["continue_argv"][0] == sys.executable
+    assert packet["continue_argv"][1] == "-I"
+    assert invocation.startswith(f"cd {git_repo}/worktrees/")
+
+
+def test_nested_monorepo_lane_uses_candidate_project_and_src_imports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Evaluator, metric, factory, and runtime all come from candidate /api."""
+    from pydantic_ai_gepa.cli import layout
+
+    saved_dirname = layout._explicit_gepa_dirname
+    saved_env = os.environ.get("GEPA_DIR")
+    monkeypatch.delenv("GEPA_DIR", raising=False)
+
+    repository = tmp_path / "monorepo"
+    project = repository / "api"
+    workspace_relative = Path("evals/agent/.gepa/rlm")
+    workspace = project / workspace_relative
+    (project / "eval_pkg").mkdir(parents=True)
+    (project / "src" / "runtime_pkg").mkdir(parents=True)
+    (project / "src" / "namespace_runtime").mkdir(parents=True)
+    workspace.mkdir(parents=True)
+    (project / "pyproject.toml").write_text(
+        "[project]\nname = 'nested-eval'\nversion = '0.0.0'\n",
+        encoding="utf-8",
+    )
+    (project / "eval_pkg" / "__init__.py").touch()
+    (project / "src" / "runtime_pkg" / "__init__.py").write_text(
+        "from pathlib import Path\n"
+        "MARKER = 'primary-runtime'\n"
+        "ORIGIN = str(Path(__file__).resolve())\n",
+        encoding="utf-8",
+    )
+    (project / "src" / "namespace_runtime" / "tool.py").write_text(
+        "from pathlib import Path\n"
+        "MARKER = 'primary-namespace'\n"
+        "ORIGIN = str(Path(__file__).resolve())\n",
+        encoding="utf-8",
+    )
+    (project / "eval_pkg" / "factory.py").write_text(
+        "from runtime_pkg import MARKER\n"
+        "def make_case(case):\n"
+        "    return f'primary-factory:{MARKER}'\n",
+        encoding="utf-8",
+    )
+    (project / "eval_pkg" / "evaluation.py").write_text(
+        "from runtime_pkg import MARKER\n"
+        "from namespace_runtime.tool import MARKER as NAMESPACE_MARKER\n"
+        "async def evaluate(value):\n"
+        "    return f'primary-eval:{MARKER}:{NAMESPACE_MARKER}:{value}'\n",
+        encoding="utf-8",
+    )
+    (project / "eval_pkg" / "metric.py").write_text(
+        "def metric(case, output):\n    return 0.0\n",
+        encoding="utf-8",
+    )
+    (repository / ".gitignore").write_text(
+        "__pycache__/\n/worktrees/\napi/evals/agent/.gepa/rlm/runs/\n",
+        encoding="utf-8",
+    )
+
+    _git(repository, "init")
+    _git(repository, "config", "user.email", "tests@example.com")
+    _git(repository, "config", "user.name", "GEPA Tests")
+    monkeypatch.chdir(project)
+    init_result = _run(
+        "--gepa-dir",
+        str(workspace_relative),
+        "init",
+        "--candidate-source",
+        "git",
+        "--evaluate",
+        "eval_pkg.evaluation:evaluate",
+        "--metric",
+        "eval_pkg.metric:metric",
+        "--case-factory",
+        "eval_pkg.factory:make_case",
+    )
+    assert init_result.exit_code == 0, init_result.output
+    (workspace / "dataset.jsonl").write_text(
+        json.dumps({"name": "case-1", "inputs": "x", "expected_output": "good"}) + "\n",
+        encoding="utf-8",
+    )
+    _git(repository, "add", ".")
+    _git(repository, "commit", "-m", "Seed nested candidate")
+
+    try:
+        start = _run(
+            "--gepa-dir",
+            str(workspace),
+            "run",
+            "start",
+            "--lanes",
+            "1",
+            "--size",
+            "1",
+            "--acceptance-repetitions",
+            "1",
+        )
+        assert start.exit_code == 0, start.output
+        run = _run_payload(start.output)
+        run_id = str(run["run_id"])
+        candidate_git = repository / "worktrees" / run_id / "lane-1"
+        candidate_project = candidate_git / "api"
+        assert candidate_project.is_dir()
+        assert not (project / ".git").exists()
+
+        origin_recorder = textwrap.dedent("""
+            import os
+            from pathlib import Path
+
+            def record(kind, module_file, runtime_origin):
+                target = Path(os.environ["GEPA_TRACE_FILE"] + ".origins")
+                with target.open("a", encoding="utf-8") as handle:
+                    handle.write(f"{kind}:{Path(module_file).resolve()}|runtime:{runtime_origin}\\n")
+        """).lstrip()
+        (candidate_project / "eval_pkg" / "origin.py").write_text(
+            origin_recorder, encoding="utf-8"
+        )
+        (candidate_project / "src" / "runtime_pkg" / "__init__.py").write_text(
+            "from pathlib import Path\n"
+            "MARKER = 'candidate-runtime'\n"
+            "ORIGIN = str(Path(__file__).resolve())\n",
+            encoding="utf-8",
+        )
+        (candidate_project / "src" / "namespace_runtime" / "tool.py").write_text(
+            "from pathlib import Path\n"
+            "MARKER = 'candidate-namespace'\n"
+            "ORIGIN = str(Path(__file__).resolve())\n",
+            encoding="utf-8",
+        )
+        (candidate_project / "eval_pkg" / "factory.py").write_text(
+            "from runtime_pkg import MARKER, ORIGIN\n"
+            "from .origin import record\n"
+            "def make_case(case):\n"
+            "    record('factory', __file__, ORIGIN)\n"
+            "    return f'candidate-factory:{MARKER}'\n",
+            encoding="utf-8",
+        )
+        (candidate_project / "eval_pkg" / "evaluation.py").write_text(
+            "from runtime_pkg import MARKER, ORIGIN\n"
+            "from namespace_runtime.tool import MARKER as NAMESPACE_MARKER, ORIGIN as NAMESPACE_ORIGIN\n"
+            "from .origin import record\n"
+            "async def evaluate(value):\n"
+            "    record('evaluate', __file__, ORIGIN + ',' + NAMESPACE_ORIGIN)\n"
+            "    return f'candidate-eval:{MARKER}:{NAMESPACE_MARKER}:{value}'\n",
+            encoding="utf-8",
+        )
+        (candidate_project / "eval_pkg" / "metric.py").write_text(
+            "from runtime_pkg import MARKER, ORIGIN\n"
+            "from namespace_runtime.tool import MARKER as NAMESPACE_MARKER, ORIGIN as NAMESPACE_ORIGIN\n"
+            "from .origin import record\n"
+            "def metric(case, output):\n"
+            "    record('metric', __file__, ORIGIN + ',' + NAMESPACE_ORIGIN)\n"
+            "    expected = 'candidate-eval:candidate-runtime:candidate-namespace:'\n"
+            "    expected += 'candidate-factory:candidate-runtime'\n"
+            "    markers_ok = MARKER == 'candidate-runtime' and NAMESPACE_MARKER == 'candidate-namespace'\n"
+            "    return 1.0 if markers_ok and output == expected else 0.0\n",
+            encoding="utf-8",
+        )
+
+        result = _run(
+            "--gepa-dir",
+            str(workspace),
+            "lane",
+            "continue",
+            "lane-1",
+            "--run-id",
+            run_id,
+            "--foreground",
+        )
+        assert result.exit_code == 0, result.output
+        assert "accepted" in result.output
+        state = load_lane_state(project, run_id, "lane-1")
+        assert Path(str(state.worktree_path)) == candidate_git
+        assert Path(str(state.candidate_project_path)) == candidate_project
+
+        origin_files = list((workspace / "runs" / run_id / "traces").rglob("*.origins"))
+        assert origin_files
+        candidate_lines = [
+            line
+            for path in origin_files
+            for line in path.read_text(encoding="utf-8").splitlines()
+        ]
+        assert {line.split(":", 1)[0] for line in candidate_lines} == {
+            "factory",
+            "evaluate",
+            "metric",
+        }
+        assert all(str(candidate_project) in line for line in candidate_lines)
+
+        # Keep the primary checkout dirty so select must rebaseline from the
+        # re-fanned candidate worktree rather than silently importing primary.
+        (project / "eval_pkg" / "metric.py").write_text(
+            "def metric(case, output):\n    return 0.0  # dirty primary\n",
+            encoding="utf-8",
+        )
+        selected = _run(
+            "--gepa-dir",
+            str(workspace),
+            "run",
+            "select",
+            "--run-id",
+            run_id,
+        )
+        assert selected.exit_code == 0, selected.output
+        assert "Shared baseline re-measured" in selected.output
+        state = load_lane_state(project, run_id, "lane-1")
+        assert Path(str(state.candidate_project_path)) == candidate_project
+
+        all_origin_lines = [
+            line
+            for path in (workspace / "runs" / run_id / "traces").rglob("*.origins")
+            for line in path.read_text(encoding="utf-8").splitlines()
+        ]
+        assert len(all_origin_lines) >= 6
+        assert all(str(candidate_project) in line for line in all_origin_lines)
+
+        packet = json.loads(Path(str(state.packet_path)).read_text(encoding="utf-8"))
+        assert packet["git_root"] == str(repository)
+        assert packet["project_root"] == str(project)
+        assert packet["project_prefix"] == "api"
+        assert packet["candidate_project_root"] == str(candidate_project)
+        assert packet["continue_cwd"] == str(candidate_project)
+        assert packet["continue_argv"][0] == sys.executable
+        assert packet["continue_argv"][1] == "-I"
+    finally:
+        layout._explicit_gepa_dirname = saved_dirname
+        if saved_env is None:
+            os.environ.pop("GEPA_DIR", None)
+        else:
+            os.environ["GEPA_DIR"] = saved_env
+        for name in list(sys.modules):
+            if name.startswith(("eval_pkg", "runtime_pkg", "namespace_runtime")):
+                sys.modules.pop(name, None)
 
 
 def test_lane_lease_and_double_lease_rejected(git_repo: Path) -> None:
@@ -329,6 +571,81 @@ def test_lane_continue_evaluates_and_emits_verdict(git_repo: Path) -> None:
     lane_rows = [row for row in rows if row.lane == "lane-1"]
     assert len(lane_rows) == 1
     assert lane_rows[0].mean_score == pytest.approx(1.0)
+
+
+def test_lane_evaluation_failure_stalls_without_verdict_or_selection(
+    git_repo: Path,
+) -> None:
+    run = _start_lane_run(git_repo, lanes=1)
+    run_id = str(run["run_id"])
+    gepa_dir = str(git_repo / ".gepa")
+    baseline_sha = str(run["best_commit_sha"])
+    worktree = git_repo / "worktrees" / run_id / "lane-1"
+    (worktree / "score.txt").write_text("error\n", encoding="utf-8")
+
+    result = _run(
+        "--gepa-dir",
+        gepa_dir,
+        "lane",
+        "continue",
+        "lane-1",
+        "--run-id",
+        run_id,
+        "--foreground",
+    )
+    assert result.exit_code == 0, result.output
+    assert "required rollout failed" in result.output
+
+    state = _lane_state(git_repo, run_id, "lane-1")
+    assert state.status == "stalled"
+    assert state.verdict is None
+    assert state.verdict_delta is None
+    assert state.eval_samples == ()
+    comparison = json.loads(
+        Path(str(state.comparison_path)).read_text(encoding="utf-8")
+    )
+    assert comparison["outcome"] == "infrastructure_failure"
+    assert comparison["selectable"] is False
+    assert comparison["verdict"] is None
+    assert comparison["reason_code"] == "required_rollout_failed"
+    assert comparison["valid_samples_before_failure"] == []
+    assert comparison["evaluation_errors"] == [
+        {
+            "case_id": "case-1",
+            "error_message": "simulated evaluator outage",
+            "error_kind": "system",
+        }
+    ]
+    report = Path(comparison["candidate_report_paths"][-1]).read_text(encoding="utf-8")
+    assert "## Evaluation infrastructure failure" in report
+    assert "simulated evaluator outage" in report
+    assert report.count("## Evaluation infrastructure failure") == 1
+
+    from pydantic_ai_gepa.cli.runs import ParetoLog
+
+    failed_row = ParetoLog(run_id, git_repo).iter_rows()[-1]
+    assert failed_row.status == "infrastructure_failure"
+    assert failed_row.extra["outcome"] == "infrastructure_failure"
+    assert failed_row.extra["selectable"] is False
+    assert failed_row.extra["evaluation_errors"] == comparison["evaluation_errors"]
+
+    from pydantic_ai_gepa.cli.events import list_events
+
+    event_types = [event.type for event in list_events(run_id, git_repo)]
+    assert "lane_stalled" in event_types
+    assert "verdict" not in event_types
+
+    selected = _run("run", "select", "--run-id", run_id)
+    assert selected.exit_code == 1
+    assert "no lanes in awaiting_selection" in selected.output
+    managed_state = RunState.from_dict(
+        json.loads(
+            (git_repo / ".gepa" / "runs" / run_id / "state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+    )
+    assert managed_state.best_commit_sha == baseline_sha
 
 
 def test_two_lanes_evaluate_in_distinct_worktrees(git_repo: Path) -> None:
