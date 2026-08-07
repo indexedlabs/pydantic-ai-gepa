@@ -271,7 +271,7 @@ until it either pauses for reflection or reaches `status=done`. In one-off
 Use lanes when you want to explore several independent reflection directions
 at once in git candidate mode. `gepa run start --lanes N` fans the run out
 into N git worktrees — one per lane, each on branch
-`gepa/lane/<lane>/<iteration>` cut from the current best — evaluates every
+`gepa/lane/<run_id>/<lane>/<iteration>` cut from the current best — evaluates every
 lane candidate in the background against one frozen shared baseline, and
 coordinates everything through an event stream. You play two roles: a thin
 **orchestrator** that consumes events and dispatches work, and short-lived
@@ -294,22 +294,34 @@ without reading any other state.
 
 ### Orchestrator event loop
 
+Lane verbs resolve the workspace explicitly (never from cwd) — export the
+absolute workspace once and every orchestrator verb inherits it:
+
+```bash
+export GEPA_DIR="$(pwd)/.gepa"   # absolute; lane lease/continue/reset and run select require this
+```
+
 Drive the run by long-polling `gepa next` and dispatching on the event type:
 
 ```text
 loop:
     event = gepa next --wait --timeout 300 --json --run-id <run_id>
-    # exit 0: event delivered; exit 3: none pending; exit 4: timeout (retry the loop)
+    # exit 0: event delivered; exit 4: timeout (retry the loop)
+    # (without --wait, exit 3 means none pending)
     match event.type:
         lane_ready:
             gepa lane lease <lane> --run-id <run_id>
+            # lease-refused (exit 1) means already dispatched — wait for the
+            # lease to expire (lane_stalled) or `gepa lane reset` to reclaim
             dispatch reflector subagent with the packet/worktree paths
         verdict:
             record it (verdict, delta, comparison_path); nothing to dispatch
         selection_due:
             gepa run select --run-id <run_id>
         merge_opportunity:
-            dispatch a merge subagent for the two named branches
+            dispatch a merge subagent for the two named branches (select keeps
+            merge-pair branches until the next select; candidate SHAs are in
+            the journal's lane_outcome entries if you need them)
         lane_stalled:
             gepa lane reset <lane> --run-id <run_id>
             re-dispatch the reflector with the same packet path
@@ -333,8 +345,11 @@ Rules that keep the loop correct:
   compact, or restart, `gepa next` redelivers unacked events verbatim; replay
   them to reconstruct exactly the pending work.
 - **Lease before dispatch.** `gepa lane lease <lane>` records the dispatch in
-  lane state; a leased lane rejects re-dispatch and a second `gepa lane
-  continue` until the lease is released or `--reflection-lease-secs` expires.
+  lane state; a leased lane rejects re-dispatch and (for a fresh spawn) a
+  second `gepa lane continue` until the lease is consumed by the reflector's
+  continue, reclaimed with `gepa lane reset`, or `--reflection-lease-secs`
+  expires. There is no release verb — the lease ends via continue, reset, or
+  expiry.
 - **One orchestrator per run.** The event bus has a single consumer cursor;
   never run two orchestrator loops against the same run.
 - Use `gepa run status --run-id <run_id>` for the lane board (status,
