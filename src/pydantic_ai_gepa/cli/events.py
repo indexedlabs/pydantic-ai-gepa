@@ -509,12 +509,17 @@ class LaneScan:
 def scan_lanes(run_id: str, root: Path | None = None) -> LaneScan:
     """Scan lane leases, heartbeat freshness, and recorded pids.
 
-    Stubbed seam: lane state lands with the lane lifecycle
-    (pydanticaigepa-task-xcb), so until then every scan reports no lanes and
-    no selection pressure. The reaper pass consumes this result object; tests
-    and slice 3 inject real scans the same way.
+    Delegates to the lane-lifecycle scanner (pydanticaigepa-task-xcb) when the
+    run has lanes; single-path runs (and runs without lane state) scan as
+    empty. Imported lazily to avoid a module cycle (lanes imports this module
+    for ``emit``).
     """
-    return LaneScan()
+    try:
+        from .lanes import scan_run_lanes
+    except ImportError:
+        return LaneScan()
+    scan = scan_run_lanes(run_id, root=root)
+    return scan if scan is not None else LaneScan()
 
 
 def _claim_reaper_key(events_path: Path, key: str) -> bool:

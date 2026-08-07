@@ -76,17 +76,17 @@ from .store import ComponentStore
 GEPA_TRACE_FILE_ENV = "GEPA_TRACE_FILE"
 
 
-def _resolve_run_id(run_id: str | None) -> str:
+def _resolve_run_id(run_id: str | None, root: Path | None = None) -> str:
     if run_id:
         return run_id
-    latest = latest_run_id()
+    latest = latest_run_id(root)
     if latest:
         return latest
     return new_run_id()
 
 
-def _count_evals_in_run(run_id: str) -> int:
-    return ParetoLog(run_id).count_rows()
+def _count_evals_in_run(run_id: str, root: Path | None = None) -> int:
+    return ParetoLog(run_id, root).count_rows()
 
 
 DEFAULT_FAILURE_THRESHOLD = 0.999
@@ -176,11 +176,12 @@ def _trace_file_path(
     eval_id: str,
     candidate_id: str,
     minibatch_id: str,
+    root: Path | None = None,
 ) -> Path:
     # eval_id guarantees uniqueness: identical candidate trees evaluated by
     # concurrent lanes share an iteration ordinal and candidate_id (dec-msy).
     return (
-        run_dir(run_id)
+        run_dir(run_id, root)
         / "traces"
         / "minibatches"
         / minibatch_id
@@ -230,6 +231,8 @@ def run_eval_once(
     capture_traces: bool = False,
     candidate_source: CandidateSource | None = None,
     lane: str | None = None,
+    candidate_root: Path | None = None,
+    workspace_root: Path | None = None,
 ) -> EvalOutcome:
     """Evaluate one baseline/candidate and append the standard run artifacts.
 
@@ -237,9 +240,14 @@ def run_eval_once(
     pareto row records it, and the ``max_iterations`` check becomes advisory —
     for lane runs the budget stop is enforced at select, not per-eval
     (pydanticaigepa-dec-msy).
+
+    Lane evals also pass ``workspace_root`` (the primary checkout holding the
+    ``.gepa`` workspace — config, dataset, ledger, and artifacts all resolve
+    there per pydanticaigepa-dec-780) and ``candidate_root`` (the lane
+    worktree — candidate identity and module imports resolve there).
     """
-    cfg = GepaConfig.load(config_path())
-    insert_repo_root_on_path()
+    cfg = GepaConfig.load(config_path(workspace_root))
+    insert_repo_root_on_path(candidate_root)
 
     source = candidate_source or cfg.candidate_source
     agent = resolve_agent(cfg) if cfg.agent else None
@@ -248,7 +256,7 @@ def run_eval_once(
     case_factory = resolve_case_factory(cfg)
     skills_fs = resolve_skills(cfg)
 
-    dataset_path = repo_root() / cfg.dataset
+    dataset_path = (workspace_root or repo_root()) / cfg.dataset
     cases = load_dataset(dataset_path)
     if not cases:
         typer.echo(f"Dataset {dataset_path} is empty.", err=True)
@@ -327,8 +335,8 @@ def run_eval_once(
             candidate_overrides_id = str(candidate_file)
             status = "evaluated"
 
-    active_run_id = _resolve_run_id(run_id)
-    prior_count = _count_evals_in_run(active_run_id)
+    active_run_id = _resolve_run_id(run_id, root=workspace_root)
+    prior_count = _count_evals_in_run(active_run_id, root=workspace_root)
     if prior_count >= max_iterations:
         if not lane:  # None (single path) or empty: hard cap; lane str: advisory
             typer.echo(
@@ -348,8 +356,8 @@ def run_eval_once(
     iteration = prior_count + 1
     eval_id = new_eval_id()
 
-    run_dir(active_run_id).mkdir(parents=True, exist_ok=True)
-    minibatch_store = MinibatchStore(active_run_id)
+    run_dir(active_run_id, workspace_root).mkdir(parents=True, exist_ok=True)
+    minibatch_store = MinibatchStore(active_run_id, workspace_root)
     if minibatch_id:
         minibatch = minibatch_store.load(minibatch_id)
     else:
@@ -370,7 +378,8 @@ def run_eval_once(
     if source == "git":
         try:
             git_state = git_candidate_state(
-                repo_root(), exclude_paths=[run_dir(active_run_id)]
+                candidate_root or repo_root(),
+                exclude_paths=[run_dir(active_run_id, workspace_root)],
             )
         except GitCandidateError as exc:
             typer.echo(str(exc), err=True)
@@ -395,6 +404,7 @@ def run_eval_once(
             eval_id=eval_id,
             candidate_id=candidate.id,
             minibatch_id=minibatch.id,
+            root=workspace_root,
         )
         if capture_traces
         else None
@@ -428,14 +438,14 @@ def run_eval_once(
     per_case = {record.case_id: record.score for record in records}
     mean = sum(per_case.values()) / len(per_case) if per_case else 0.0
 
-    pareto = ParetoLog(active_run_id)
+    pareto = ParetoLog(active_run_id, workspace_root)
     pareto.append(
         ParetoRow(
             candidate_id=candidate.id,
             commit_sha=(
                 git_state.commit_sha
                 if git_state is not None
-                else current_commit_sha(repo_root())
+                else current_commit_sha(candidate_root or repo_root())
             ),
             component_overrides_id=candidate_overrides_id,
             minibatch_id=minibatch.id,
@@ -450,7 +460,7 @@ def run_eval_once(
     )
 
     # Write the per-case report next to the pareto log.
-    reports_dir = run_dir(active_run_id) / "reports"
+    reports_dir = run_dir(active_run_id, workspace_root) / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
     report_path = reports_dir / f"{iteration:04d}-{eval_id}-{candidate.id}.md"
     report_path.write_text(
@@ -473,7 +483,7 @@ def run_eval_once(
         "commit_sha": (
             git_state.commit_sha
             if git_state is not None
-            else current_commit_sha(repo_root())
+            else current_commit_sha(candidate_root or repo_root())
         ),
         "dirty_tree": git_state.dirty if git_state is not None else None,
         "dirty_hash": git_state.dirty_hash if git_state is not None else None,
