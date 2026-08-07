@@ -559,7 +559,7 @@ def _module_source_paths(module: Any) -> tuple[Path, ...]:
     if module_path is not None:
         try:
             raw_paths.extend(module_path)
-        except TypeError:
+        except (KeyError, TypeError):
             pass
     resolved: list[Path] = []
     for raw in raw_paths:

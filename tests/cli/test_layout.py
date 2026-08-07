@@ -6,12 +6,14 @@ import textwrap
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from pydantic_ai_gepa.cli.layout import (
     GepaConfig,
     GepaConfigError,
+    _module_source_paths,
     candidate_project_root,
     candidate_dir,
     components_dir,
@@ -38,6 +40,11 @@ from pydantic_ai_gepa.cli.layout import (
     traces_dir,
     write_default_config,
 )
+
+
+class _BrokenNamespacePath:
+    def __iter__(self):
+        raise KeyError("opentelemetry")
 
 
 def test_config_parse_minimal(tmp_path: Path) -> None:
@@ -258,6 +265,18 @@ def test_resolve_module_attr_rejects_source_outside_candidate_project(
         resolve_module_attr(
             "pydantic_ai_gepa.cli.layout:repo_root", expected_root=tmp_path
         )
+
+
+def test_module_source_paths_ignores_broken_dynamic_namespace_path(
+    tmp_path: Path,
+) -> None:
+    module_file = tmp_path / "opentelemetry" / "trace.py"
+    module = SimpleNamespace(
+        __file__=str(module_file),
+        __path__=_BrokenNamespacePath(),
+    )
+
+    assert _module_source_paths(module) == (module_file.resolve(),)
 
 
 # ---------- --gepa-dir override ----------
