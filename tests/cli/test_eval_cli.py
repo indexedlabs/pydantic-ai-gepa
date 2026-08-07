@@ -426,6 +426,43 @@ def test_eval_artifact_names_are_collision_free(
     assert Path(third_summary["report_path"]).exists()
 
 
+def test_eval_trace_names_are_collision_free(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same as the report-path test, but for trace files (spec-1do verifies
+    no report/trace filename collisions)."""
+    from pydantic_ai_gepa.cli import eval as eval_module
+
+    cand_path = _candidate_file(tmp_path, {"instructions": "Override text."})
+    first = _run("eval", "--candidate-file", str(cand_path), "--size", "2")
+    assert first.exit_code == 0, first.output
+    run_id = _summary_of(first)["run_id"]
+    monkeypatch.setattr(
+        eval_module, "_count_evals_in_run", lambda _run_id, root=None: 0
+    )
+
+    results = [
+        _run(
+            "eval",
+            "--candidate-file",
+            str(cand_path),
+            "--run-id",
+            run_id,
+            "--size",
+            "2",
+            "--capture-traces",
+        )
+        for _ in range(2)
+    ]
+    for result in results:
+        assert result.exit_code == 0, result.output
+    summaries = [_summary_of(result) for result in results]
+    trace_paths = [summary["trace_path"] for summary in summaries]
+    assert all(trace_paths)
+    assert trace_paths[0] != trace_paths[1]
+    assert all(Path(path).exists() for path in trace_paths)
+
+
 def test_eval_single_path_budget_cap_still_hard(repo: Path, tmp_path: Path) -> None:
     cand_path = _candidate_file(tmp_path, {"instructions": "Override text."})
     first = _run("eval", "--candidate-file", str(cand_path), "--size", "2")

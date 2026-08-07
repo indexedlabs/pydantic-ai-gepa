@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import random
 import subprocess
+import sys
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -254,35 +256,81 @@ class ParetoLog:
     def append(self, row: ParetoRow) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(row.to_dict(), sort_keys=True)
-        with self._path.open("a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
+        # One unbuffered O_APPEND write per row: concurrent writers never
+        # interleave bytes within a row, and a killed writer can only ever
+        # leave one trailing partial line (which readers tolerate below) —
+        # never poison the rows that follow (spec-1do: the append is the sole
+        # budget authority; row count must equal completed evals).
+        # Defensive newline: if a previous writer was killed mid-row (the
+        # file does not end in a newline), terminate its partial line first
+        # so the torn bytes can never merge with and destroy this row. A race
+        # between two writers doing this yields at worst a blank line, which
+        # readers skip.
+        prefix = b""
+        try:
+            probe = os.open(self._path, os.O_RDONLY)
+            try:
+                size = os.fstat(probe).st_size
+                if size > 0 and os.pread(probe, 1, size - 1) != b"\n":
+                    prefix = b"\n"
+            finally:
+                os.close(probe)
+        except FileNotFoundError:
+            pass
+        fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, prefix + (line + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
 
-    def iter_rows(self) -> list[ParetoRow]:
+    @staticmethod
+    def _parse_line(line: str) -> ParetoRow | None:
+        stripped = line.strip()
+        if not stripped:
+            return None
+        try:
+            return ParetoRow.from_dict(json.loads(stripped))
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _is_valid_row_line(line: str) -> bool:
+        return ParetoLog._parse_line(line) is not None
+
+    def _read_lines(self) -> list[str]:
         if not self._path.exists():
             return []
+        return self._path.read_text(encoding="utf-8").splitlines()
+
+    def iter_rows(self) -> list[ParetoRow]:
         rows: list[ParetoRow] = []
-        for line in self._path.read_text(encoding="utf-8").splitlines():
-            stripped = line.strip()
-            if not stripped:
+        # Unparseable lines (a writer killed mid-append leaves a torn partial
+        # row) are skipped with a warning, never fatal: the ledger stays
+        # readable for `gepa pareto`, final reports, and select.
+        for line in self._read_lines():
+            row = self._parse_line(line)
+            if row is None:
+                if line.strip():
+                    print(
+                        f"warning: ignoring unparseable pareto row in "
+                        f"{self._path} (a writer was likely killed mid-append)",
+                        file=sys.stderr,
+                    )
                 continue
-            rows.append(ParetoRow.from_dict(json.loads(stripped)))
+            rows.append(row)
         return rows
 
     def count_rows(self) -> int:
-        """Count appended rows without parsing each row's JSON.
+        """Count completed evals: the number of parseable rows in the log.
 
-        ``gepa eval`` calls this every invocation to enforce the
-        ``--max-iterations`` cap; parsing the whole log on each call grew the
-        per-eval cost as the log grew. Counting non-blank lines is O(n) in
-        bytes but skips the JSON decode + dataclass construction.
+        A torn partial row from a killed writer does not count — the eval did
+        not complete, so it did not finalize its budget spend. This is the
+        single budget count source (pydanticaigepa-dec-msy).
         """
-        if not self._path.exists():
-            return 0
         count = 0
-        with self._path.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                if line.strip():
-                    count += 1
+        for line in self._read_lines():
+            if self._is_valid_row_line(line):
+                count += 1
         return count
 
     def front(self) -> list[ParetoRow]:

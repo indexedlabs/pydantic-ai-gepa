@@ -10,7 +10,9 @@ as the reflector. The library's job is to:
     new component slots were discovered (per pydanticaigepa-dec-0ky),
   * append a ParetoRow + write a per-case failure report under
     ``.gepa/runs/<run_id>/reports/``,
-  * enforce ``--max-iterations`` as a hard cap (per pydanticaigepa-dec-xd6).
+  * enforce ``--max-iterations`` as a hard cap for single-path evals (per
+    pydanticaigepa-dec-xd6); lane evals treat it as advisory — lane-run
+    budget stops are enforced at select (pydanticaigepa-dec-msy).
 
 The coding agent reads the report, edits component slots or source code, and
 re-runs ``gepa eval`` — there is no separate ``propose`` verb because the
@@ -328,7 +330,7 @@ def run_eval_once(
     active_run_id = _resolve_run_id(run_id)
     prior_count = _count_evals_in_run(active_run_id)
     if prior_count >= max_iterations:
-        if lane is None:
+        if not lane:  # None (single path) or empty: hard cap; lane str: advisory
             typer.echo(
                 f"Max iterations reached ({prior_count}/{max_iterations}). "
                 "Start a new run (omit --run-id) or raise --max-iterations.",
@@ -552,7 +554,7 @@ def eval_(
     max_iterations: int = typer.Option(
         100,
         "--max-iterations",
-        help="Hard cap on eval rows in this run (per pydanticaigepa-dec-xd6). Exits 70 when exceeded.",
+        help="Hard cap on eval rows in this run (per pydanticaigepa-dec-xd6). Exits 70 when exceeded; advisory only for lane evals (dec-msy).",
     ),
     threshold: float = typer.Option(
         DEFAULT_FAILURE_THRESHOLD,

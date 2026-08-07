@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from pydantic_ai_gepa.cli.layout import ensure_layout, new_run_id, run_dir
 from pydantic_ai_gepa.cli.runs import (
     MinibatchStore,
@@ -121,6 +123,113 @@ def test_pareto_row_pre_lane_rows_parse(tmp_path: Path) -> None:
     rows = log.iter_rows()
     assert len(rows) == 1
     assert rows[0].lane is None
+
+
+def test_pareto_log_tolerates_trailing_torn_line(tmp_path: Path) -> None:
+    """A writer killed mid-append leaves one trailing partial line: readers
+    skip it (with a warning) and count_rows excludes it — the incomplete eval
+    did not spend budget."""
+    ensure_layout(tmp_path)
+    run = new_run_id()
+    log = ParetoLog(run, tmp_path)
+    log.append(_ledger_row("cand-a"))
+    log.append(_ledger_row("cand-b"))
+
+    # Simulate a killed writer: half a row with no trailing newline.
+    with log.path.open("a", encoding="utf-8") as fh:
+        fh.write('{"candidate_id": "cand-torn", "mean_sc')
+
+    assert log.count_rows() == 2  # the torn line is not a completed eval
+    rows = log.iter_rows()
+    assert [row.candidate_id for row in rows] == ["cand-a", "cand-b"]
+
+
+def test_pareto_log_torn_line_never_poisons_next_append(tmp_path: Path) -> None:
+    """The append after a torn line terminates the partial row first, so the
+    healthy rows before and after stay readable and correctly counted."""
+    ensure_layout(tmp_path)
+    run = new_run_id()
+    log = ParetoLog(run, tmp_path)
+    log.append(_ledger_row("cand-a"))
+    log.append(_ledger_row("cand-b"))
+    with log.path.open("a", encoding="utf-8") as fh:
+        fh.write('{"candidate_id": "cand-torn", "mean_sc')
+
+    log.append(_ledger_row("cand-c"))
+
+    # The torn fragment is quarantined on its own line and skipped; every
+    # healthy row — before AND after the kill — survives.
+    assert log.count_rows() == 3
+    rows = log.iter_rows()
+    assert [row.candidate_id for row in rows] == ["cand-a", "cand-b", "cand-c"]
+
+
+def test_pareto_log_unparseable_lines_are_skipped_with_warning(
+    tmp_path: Path, capsys: "pytest.CaptureFixture[str]"
+) -> None:
+    """Corrupt or non-row lines anywhere in the log are skipped with a
+    stderr warning, never fatal — the ledger must stay readable."""
+    ensure_layout(tmp_path)
+    run = new_run_id()
+    log = ParetoLog(run, tmp_path)
+    log.append(_ledger_row("cand-a"))
+    with log.path.open("a", encoding="utf-8") as fh:
+        fh.write("{not json}\n")
+        fh.write('{"unrelated": "valid json, not a row"}\n')
+    log.append(_ledger_row("cand-b"))
+
+    rows = log.iter_rows()
+    assert [row.candidate_id for row in rows] == ["cand-a", "cand-b"]
+    assert log.count_rows() == 2
+    err = capsys.readouterr().err
+    assert err.count("ignoring unparseable pareto row") == 2
+
+
+def test_pareto_row_maps_to_artifact_paths(tmp_path: Path) -> None:
+    """Slice-4 contract: a row's fields alone reconstruct its report/trace
+    artifacts (glob on eval_id + candidate_id), no iteration field needed."""
+    ensure_layout(tmp_path)
+    run = new_run_id()
+    eval_id = "abc123de"
+    candidate_id = "cand-x"
+    row = ParetoRow(
+        candidate_id=candidate_id,
+        commit_sha=None,
+        component_overrides_id=None,
+        minibatch_id="mb-1",
+        per_case_scores={"case-a": 1.0},
+        mean_score=1.0,
+        status="evaluated",
+        summary="s",
+        timestamp=utc_now_iso(),
+        lane="lane-1",
+        extra={"eval_id": eval_id},
+    )
+    log = ParetoLog(run, tmp_path)
+    log.append(row)
+
+    reports = run_dir(run, tmp_path) / "reports"
+    reports.mkdir(parents=True)
+    report = reports / f"0007-{eval_id}-{candidate_id}.md"
+    report.write_text("report", encoding="utf-8")
+    traces = run_dir(run, tmp_path) / "traces" / "minibatches" / "mb-1"
+    traces.mkdir(parents=True)
+    trace = traces / f"0007-{eval_id}-{candidate_id}.jsonl"
+    trace.write_text("{}\n", encoding="utf-8")
+
+    loaded = log.iter_rows()[0]
+    report_hits = list(
+        (run_dir(run, tmp_path) / "reports").glob(
+            f"*-{loaded.extra['eval_id']}-{loaded.candidate_id}.md"
+        )
+    )
+    trace_hits = list(
+        (run_dir(run, tmp_path) / "traces" / "minibatches" / loaded.minibatch_id).glob(
+            f"*-{loaded.extra['eval_id']}-{loaded.candidate_id}.jsonl"
+        )
+    )
+    assert report_hits == [report]
+    assert trace_hits == [trace]
 
 
 def test_pareto_log_concurrent_appends(tmp_path: Path) -> None:
