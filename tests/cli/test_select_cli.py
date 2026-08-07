@@ -212,7 +212,11 @@ def _events(
     repo: Path, run_id: str, type_: str | None = None
 ) -> list[dict[str, object]]:
     events_dir = repo / ".gepa" / "runs" / run_id / "events"
-    events = [json.loads(p.read_text()) for p in sorted(events_dir.iterdir())]
+    events = [
+        json.loads(p.read_text())
+        for p in sorted(events_dir.iterdir())
+        if p.is_file()
+    ]
     if type_ is not None:
         events = [event for event in events if event["type"] == type_]
     return events
