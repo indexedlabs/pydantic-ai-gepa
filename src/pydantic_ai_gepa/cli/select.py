@@ -95,10 +95,26 @@ _PID_KILL_GRACE_SECS = 2.0
 
 
 def _save_state(state: Any, workspace_root: Path) -> None:
-    """Persist run state at the explicit workspace (never derived from cwd)."""
+    """Persist run state at the explicit workspace (never derived from cwd).
+
+    Atomic (tmpfile + os.replace): select's entire idempotent-resume contract
+    rests on this file, so a kill mid-write must never leave torn JSON.
+    """
+    import tempfile
+
     path = run_state_path(state.run_id, workspace_root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state.to_dict(), indent=2), encoding="utf-8")
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(state.to_dict(), handle, indent=2)
+            handle.write("\n")
+        os.replace(tmp_name, path)
+    except BaseException:
+        os.unlink(tmp_name)
+        raise
 
 
 def _checkpoint(
@@ -274,7 +290,10 @@ def _invalidate_straggler(
     """
     run_id = state.run_id
     pid = lane_state.eval_pid
-    if pid is not None and _pid_alive(pid):
+    # Only signal when the lane claims to be mid-eval: a stale pid on a lane
+    # in any other status may have been recycled by the OS onto an unrelated
+    # process, and killing by bare number must never hit an innocent owner.
+    if pid is not None and lane_state.status == "evaluating" and _pid_alive(pid):
         typer.echo(f"Terminating straggler lane {lane_state.lane} eval (pid {pid}).")
         _terminate_eval_pid(pid, lane=lane_state.lane)
 
@@ -319,7 +338,7 @@ def _invalidate_cross_baseline(
     """
     run_id = state.run_id
     pid = lane_state.eval_pid
-    if pid is not None and _pid_alive(pid):
+    if pid is not None and lane_state.status == "evaluating" and _pid_alive(pid):
         _terminate_eval_pid(pid, lane=lane_state.lane)
     baseline_sha = str(state.reflection_baseline_commit_sha)
     diff_summary = (
@@ -468,7 +487,13 @@ def _emit_merge_opportunities(
                 ),
                 root=workspace_root,
             )
-        pairs.append([first.lane, second.lane])
+        pairs.append(
+            {
+                "lanes": [first.lane, second.lane],
+                "branches": [str(first.branch), str(second.branch)],
+                "shas": [str(first.candidate_sha), str(second.candidate_sha)],
+            }
+        )
         typer.echo(
             f"merge_opportunity: {first.lane} and {second.lane} touched disjoint "
             f"files; resolve with a real git merge (never auto-merged). "
@@ -623,6 +648,11 @@ def _phase_promote(
     )
     ctx["primary_promoted"] = primary_promoted
     ctx["winner_mean"] = winner_mean
+    # Checkpoint immediately after the promotion decision: the recorded phase
+    # state must always be a prefix of externally visible side effects
+    # (primary reset, journal entry), so a crash here never leaves the
+    # on-disk ctx claiming primary_promoted=False for a reset that happened.
+    state = _checkpoint(state, workspace_root, "promote", ctx)
     typer.echo(
         f"Promoted lane {winner.lane} (delta {(winner.verdict_delta or 0.0):+.4f}) "
         f"as the run's best: {winner_sha[:12]}"
@@ -676,16 +706,61 @@ def _phase_journal(
     rows = ParetoLog(run_id, workspace_root).count_rows()
     ctx["budget_rows"] = rows
     ctx["overshoot"] = max(0, rows - state.max_iterations)
+    overshoot_bound = state.lanes * state.acceptance_max_repetitions
+    if ctx["overshoot"] > overshoot_bound:
+        typer.echo(
+            f"Warning: budget overshoot {ctx['overshoot']} exceeds the "
+            f"lockstep bound {overshoot_bound} (lanes x acceptance "
+            "max-repetitions); investigate eval accounting.",
+            err=True,
+        )
+    # budget_low early warning (dec-d0d): emitted once per iteration while
+    # remaining budget is below lanes x acceptance max-repetitions.
+    remaining = state.max_iterations - rows
+    if 0 < remaining < overshoot_bound:
+        existing = list_events(run_id, workspace_root)
+        already = any(
+            event.type == "budget_low"
+            and event.payload.get("remaining_evals") == remaining
+            for event in existing
+        )
+        if not already:
+            emit(
+                run_id,
+                SELECT_PRODUCER_ID,
+                EventDraft(
+                    type="budget_low",
+                    lane=None,
+                    payload={"remaining_evals": remaining},
+                ),
+                root=workspace_root,
+            )
+            typer.echo(
+                f"budget_low: {remaining} evals remain (threshold {overshoot_bound})."
+            )
     if rows >= state.max_iterations:
         return state, ctx, "finalize"
     return state, ctx, "refan"
 
 
-def _keep_branch(ctx: dict[str, Any]) -> str | None:
-    """The winner's branch survives only while it is the commit's sole ref."""
+def _keep_branches(ctx: dict[str, Any]) -> frozenset[str]:
+    """Branches that survive re-fan deletion.
+
+    The winner's branch survives while it is the commit's sole ref (primary
+    not promoted), and every merge-opportunity branch pair survives until the
+    next select — the event names branches for the orchestrator to merge, so
+    deleting them in the same select would make the documented merge workflow
+    unexecutable (the payload carries branch names, not SHAs).
+    """
+    keep: set[str] = set()
     if ctx.get("winner") and not ctx.get("primary_promoted"):
-        return ctx.get("winner_branch")
-    return None
+        winner_branch = ctx.get("winner_branch")
+        if winner_branch:
+            keep.add(str(winner_branch))
+    for pair in ctx.get("merge_pairs") or []:
+        for branch in pair.get("branches", ()):  # type: ignore[union-attr]
+            keep.add(str(branch))
+    return frozenset(keep)
 
 
 def _delete_branch(workspace_root: Path, branch: str) -> None:
@@ -703,7 +778,7 @@ def _refan_lane(
     new_branch: str,
     new_iteration: int,
     new_best: str,
-    keep_branch: str | None,
+    keep_branches: frozenset[str],
 ) -> LaneState:
     """Reset one lane worktree onto the new best with a fresh branch.
 
@@ -715,7 +790,7 @@ def _refan_lane(
     worktree = (
         Path(lane_state.worktree_path)
         if lane_state.worktree_path
-        else lane_worktree_path(workspace_root, lane_state.lane)
+        else lane_worktree_path(workspace_root, run_id, lane_state.lane)
     )
     if worktree.exists():
         on_new_branch = (
@@ -736,7 +811,7 @@ def _refan_lane(
             workspace_root, run_id, lane_state.lane, new_iteration, new_best
         )
         worktree = path
-    if old_branch and old_branch != new_branch and old_branch != keep_branch:
+    if old_branch and old_branch != new_branch and old_branch not in keep_branches:
         _delete_branch(workspace_root, old_branch)
     return LaneState(
         **{
@@ -773,12 +848,12 @@ def _phase_refan(
         )
         raise typer.Exit(code=1)
     new_iteration = int(ctx.get("new_lane_iteration", 0)) or 1
-    keep_branch = _keep_branch(ctx)
+    keep_branches = _keep_branches(ctx)
     refanned: list[str] = list(ctx.get("refanned_lanes", []))
     for lane_state in load_all_lane_states(workspace_root, run_id):
         if lane_state.lane in refanned:
             continue
-        new_branch = lane_branch(lane_state.lane, new_iteration)
+        new_branch = lane_branch(run_id, lane_state.lane, new_iteration)
         fresh = _refan_lane(
             workspace_root,
             state,
@@ -786,7 +861,7 @@ def _phase_refan(
             new_branch=new_branch,
             new_iteration=new_iteration,
             new_best=str(new_best),
-            keep_branch=keep_branch,
+            keep_branches=keep_branches,
         )
         fresh.save(workspace_root, run_id)
         refanned.append(lane_state.lane)
@@ -966,7 +1041,7 @@ def _phase_finalize(
     overshoot = max(0, rows - state.max_iterations)
     state = replace(state, iterations=rows, status="done")
 
-    keep_branch = _keep_branch(ctx)
+    keep_branches = _keep_branches(ctx)
     _git(workspace_root, "worktree", "prune")
     for lane_state in load_all_lane_states(workspace_root, run_id):
         worktree = Path(lane_state.worktree_path) if lane_state.worktree_path else None
@@ -976,7 +1051,7 @@ def _phase_finalize(
             except subprocess.CalledProcessError:
                 pass
         branch = lane_state.branch
-        if branch and branch != keep_branch:
+        if branch and branch not in keep_branches:
             _delete_branch(workspace_root, branch)
 
     final_path, final_text = _write_final_report(
@@ -1034,9 +1109,37 @@ def _preselect_check(workspace_root: Path, state: Any) -> None:
         raise typer.Exit(code=1)
 
 
+@contextmanager
+def _select_lock(workspace_root: Path, run_id: str) -> Iterator[None]:
+    """Exclusive flock serializing select for a run (spec-er3: select never
+    runs concurrently with itself).
+
+    Held for the whole verb: two fresh selects serialize instead of both
+    seeing select_phase=None (the pid guard alone raced on that window), and
+    a crashed holder auto-releases — so a recycled pid can never wedge the
+    run the way the pid-only guard could.
+    """
+    import fcntl
+
+    lock_path = run_dir(run_id, workspace_root) / "select.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def run_select(run_id: str | None) -> Any:
     """Execute `gepa run select` (see module docstring for the phase model)."""
     workspace_root, run_state = _resolve_lane_run(run_id)
+    with _select_lock(workspace_root, run_state.run_id):
+        return _run_select_locked(workspace_root, run_state)
+
+
+def _run_select_locked(workspace_root: Path, run_state: Any) -> Any:
     if run_state.status == "done":
         typer.echo(
             f"Run {run_state.run_id} is done; there is nothing to select.",

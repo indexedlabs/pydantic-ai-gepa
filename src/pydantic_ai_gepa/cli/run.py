@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import json
+import os
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -278,10 +279,25 @@ class RunState:
             ),
         )
 
-    def save(self) -> Path:
-        path = run_state_path(self.run_id)
+    def save(self, root: Path | None = None) -> Path:
+        path = run_state_path(self.run_id, root)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+        # Atomic (tmpfile + os.replace): lane evals, select checkpoints, and
+        # operator verbs all write this file; a kill mid-write must never
+        # leave torn JSON for the resume logic to trip over.
+        import tempfile
+
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(self.to_dict(), handle, indent=2)
+                handle.write("\n")
+            os.replace(tmp_name, path)
+        except BaseException:
+            os.unlink(tmp_name)
+            raise
         return path
 
 
