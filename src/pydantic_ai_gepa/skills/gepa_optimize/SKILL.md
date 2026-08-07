@@ -133,7 +133,10 @@ Before each trace-enabled evaluation, the CLI exports `GEPA_TRACE_FILE` with
 the absolute path:
 
 ```text
-<gepa-dir>/runs/<run_id>/traces/minibatches/<minibatch_id>/<iteration:04d>-<candidate_id>.jsonl
+<gepa-dir>/runs/<run_id>/traces/minibatches/<minibatch_id>/<iteration:04d>-<eval_id>-<candidate_id>.jsonl
+
+(The eval summary JSON printed by `gepa eval` / `gepa run` carries the exact
+`report_path`/`trace_path` — prefer those over constructing paths by hand.)
 ```
 
 Task code may also read it with
@@ -226,8 +229,10 @@ gepa run continue --run-id <run_id>
 # Manual: score the current confirmed baseline once.
 gepa eval --size 5 --seed 0 --epoch 0 --max-iterations 50 --capture-traces
 
-# Read the report path printed in the summary line.
-cat .gepa/runs/<run_id>/reports/<iteration>-<candidate_id>.md
+# Read the report at the exact path printed in the summary line's report_path
+# (filenames are <iteration:04d>-<eval_id>-<candidate_id>.md; eval_id is unique
+# per eval, so never construct the path by hand).
+cat .gepa/runs/<run_id>/reports/<iteration>-<eval_id>-<candidate_id>.md
 
 # Edit a component slot. Content always comes from a file or stdin.
 echo "Refined instructions about geography." > /tmp/new_instr.md
@@ -382,8 +387,8 @@ gepa run status --run-id <run_id>
     ├── final_report.md        # written when managed run reaches done
     ├── pareto.jsonl           # append-only ParetoRow history (one row per eval)
     ├── minibatches/<mb_id>.json
-    ├── reports/<iteration>-<candidate_id>.md
-    └── traces/minibatches/<mb_id>/<iteration>-<candidate_id>.jsonl
+    ├── reports/<iteration>-<eval_id>-<candidate_id>.md
+    └── traces/minibatches/<mb_id>/<iteration>-<eval_id>-<candidate_id>.jsonl
 ```
 
 In the default component mode, slot identity comes from live-agent

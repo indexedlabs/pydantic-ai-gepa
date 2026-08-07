@@ -136,7 +136,7 @@ def test_git_eval_uses_plain_callable_and_exposes_trace_path(
         / "traces"
         / "minibatches"
         / summary["minibatch_id"]
-        / f"0001-{summary['candidate_id']}.jsonl"
+        / f"0001-{summary['eval_id']}-{summary['candidate_id']}.jsonl"
     )
     trace = json.loads(trace_path.read_text(encoding="utf-8").splitlines()[0])
     assert trace["attributes"]["stage"] == "classify"
