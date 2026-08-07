@@ -1,0 +1,9 @@
+{
+  "checkpoint_id": "019fdbb8698e",
+  "created_at": "2026-08-07T10:15:23.842239+00:00",
+  "branch_name": "mh/nested-gepa-lane-isolation",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "52c98f241c01458673aff90e972c0b7dda67d81e"
+  ]
+}
