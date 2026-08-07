@@ -146,6 +146,10 @@ class LaneState:
     packet_path: str | None = None
     lease_epoch: int = 0
     lease_expires_at: str | None = None
+    # "dispatch" (orchestrator leased for a reflector) vs "handoff" (continue
+    # spawned the detached eval): a handoff lease rejects parent-mode
+    # continues; a dispatch lease is CONSUMED by the reflector's continue.
+    lease_purpose: str | None = None
     candidate_sha: str | None = None
     eval_samples: tuple[float, ...] = ()
     verdict: str | None = None
@@ -165,6 +169,7 @@ class LaneState:
             "packet_path": self.packet_path,
             "lease_epoch": self.lease_epoch,
             "lease_expires_at": self.lease_expires_at,
+            "lease_purpose": self.lease_purpose,
             "candidate_sha": self.candidate_sha,
             "eval_samples": list(self.eval_samples),
             "verdict": self.verdict,
@@ -186,6 +191,7 @@ class LaneState:
             packet_path=data.get("packet_path"),
             lease_epoch=int(data.get("lease_epoch", 0)),
             lease_expires_at=data.get("lease_expires_at"),
+            lease_purpose=data.get("lease_purpose"),
             candidate_sha=data.get("candidate_sha"),
             eval_samples=tuple(float(v) for v in data.get("eval_samples", [])),
             verdict=data.get("verdict"),
@@ -536,6 +542,7 @@ def _run_lane_eval_loop(
             "verdict_delta": None,
             "comparison_path": None,
             "lease_expires_at": None,  # the handoff lease is consumed
+            "lease_purpose": None,
         }
     )
     lane_state = _touch_heartbeat(workspace_root, run_id, lane_state, pid)
@@ -760,6 +767,7 @@ def lane_lease(
                 "status": "leased",
                 "lease_epoch": state.lease_epoch + 1,
                 "lease_expires_at": expires_at,
+                "lease_purpose": "dispatch",
                 "updated_at": utc_now_iso(),
             }
         )
@@ -811,18 +819,22 @@ def lane_continue(
                 err=True,
             )
             raise typer.Exit(code=1)
-        if state.status == "leased":
-            if foreground:
-                # The detached child consumes the handoff lease.
-                pass
-            else:
+        if state.status == "leased" and not foreground:
+            if state.lease_purpose == "handoff":
+                # A detached eval child was already spawned for this lease —
+                # a second parent-mode continue would double-spawn.
                 typer.echo(
-                    f"Lane {lane} is leased (epoch {state.lease_epoch}); a "
-                    "leased lane rejects a second `gepa lane continue` until "
-                    "the lease is consumed, reset, or expires.",
+                    f"Lane {lane} is leased (epoch {state.lease_epoch}) with "
+                    "an eval handoff in flight; a second `gepa lane continue` "
+                    "is rejected until the child starts (evaluating), the "
+                    "lease expires, or you run `gepa lane reset`.",
                     err=True,
                 )
                 raise typer.Exit(code=1)
+            # A dispatch lease (from `gepa lane lease`) is CONSUMED by this
+            # continue — the reflector's terminal act is the whole point of
+            # the lease. The flock + the evaluating check above serialize any
+            # true double-continue race.
         if state.status not in {"paused_for_reflection", "leased", "stalled"}:
             typer.echo(
                 f"Lane {lane} is {state.status}; `gepa lane continue` expects a "
@@ -850,6 +862,7 @@ def lane_continue(
                     "lease_expires_at": datetime.fromtimestamp(
                         handoff_expiry, timezone.utc
                     ).isoformat(),
+                    "lease_purpose": "handoff",
                     "updated_at": utc_now_iso(),
                 }
             )
@@ -968,6 +981,7 @@ def lane_reset(
                 "status": "paused_for_reflection",
                 "lease_epoch": state.lease_epoch + 1,
                 "lease_expires_at": None,
+                "lease_purpose": None,
                 "eval_pid": None,
                 "heartbeat_at": None,
                 "verdict": None,
@@ -1081,6 +1095,7 @@ def reaper_pass_for_run(workspace_root: Path, run_state: Any) -> list[str]:
                         "status": "stalled",
                         "eval_pid": None,
                         "lease_expires_at": None,
+                        "lease_purpose": None,
                         "updated_at": utc_now_iso(),
                     }
                 ).save(workspace_root, run_state.run_id)

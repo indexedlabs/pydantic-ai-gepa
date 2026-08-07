@@ -266,6 +266,198 @@ evaluations each consume rows from this same budget. In the managed loop,
 until it either pauses for reflection or reaches `status=done`. In one-off
 `gepa eval`, exceeding the cap exits with code 70.
 
+## Parallel reflection lanes
+
+Use lanes when you want to explore several independent reflection directions
+at once in git candidate mode. `gepa run start --lanes N` fans the run out
+into N git worktrees — one per lane, each on branch
+`gepa/lane/<run_id>/<lane>/<iteration>` cut from the current best — evaluates every
+lane candidate in the background against one frozen shared baseline, and
+coordinates everything through an event stream. You play two roles: a thin
+**orchestrator** that consumes events and dispatches work, and short-lived
+**reflector subagents** (and occasionally a merge subagent) that do the actual
+reflection in isolated context.
+
+Two operational notes from dogfooding:
+
+- **Run the orchestrator where it can spawn children.** In Prime Agent /
+  RLM-style runtimes the orchestrator must sit at depth 0 (or dispatch through
+  the host) — a depth-capped nested orchestrator cannot spawn reflectors
+  itself.
+- **`.gepa/` inside the candidate repo means the committed tree snapshots
+  journal state.** Restoring the best commit (`git checkout <best_commit_sha>`
+  after `run_done`) leaves `.gepa/journal.jsonl` modified in the working tree
+  — expected and harmless; commit or ignore it.
+
+Requires `candidate_source = "git"` and a clean primary checkout — lane
+branches are always cut from a clean commit. Component mode stays on the
+single-path loop.
+
+```bash
+gepa run start --candidate-source git --lanes 3 --max-iterations 200 \
+  --acceptance-repetitions 3 --acceptance-max-repetitions 5 \
+  --straggler-timeout-secs 900 --reflection-lease-secs 1800
+```
+
+Start emits one `lane_ready` event per lane. Each event payload carries
+`packet_path` and `worktree_path` — everything needed to dispatch a reflector
+without reading any other state.
+
+### Orchestrator event loop
+
+Lane verbs resolve the workspace explicitly (never from cwd) — export the
+absolute workspace once and every orchestrator verb inherits it:
+
+```bash
+export GEPA_DIR="$(pwd)/.gepa"   # absolute; lane lease/continue/reset and run select require this
+```
+
+Drive the run by long-polling `gepa next` and dispatching on the event type:
+
+```text
+loop:
+    event = gepa next --wait --timeout 300 --json --run-id <run_id>
+    # exit 0: event delivered; exit 4: timeout (retry the loop)
+    # (without --wait, exit 3 means none pending)
+    match event.type:
+        lane_ready:
+            gepa lane lease <lane> --run-id <run_id>
+            # lease-refused (exit 1) means already dispatched — wait for the
+            # lease to expire (lane_stalled) or `gepa lane reset` to reclaim
+            dispatch reflector subagent with the packet/worktree paths
+        verdict:
+            record it (verdict, delta, comparison_path); nothing to dispatch
+        selection_due:
+            gepa run select --run-id <run_id>
+        merge_opportunity:
+            dispatch a merge subagent for the two named branches (select keeps
+            merge-pair branches until the next select; candidate SHAs are in
+            the journal's lane_outcome entries if you need them)
+        lane_stalled:
+            gepa lane reset <lane> --run-id <run_id>
+            re-dispatch the reflector with the same packet path
+        budget_low:
+            note remaining_evals; steer new dispatches toward cheap edits
+        run_done:
+            read final_report_path; stop the loop
+            # a selection_due for a later iteration may arrive AFTER run_done
+            # (the reaper synthesizes it before noticing done) — just ack it;
+            # `gepa run select` on a done run refuses cleanly.
+    gepa ack <event.id> --run-id <run_id>
+```
+
+Rules that keep the loop correct:
+
+- **Route, never read.** Reflection content — traces, reports, diffs — never
+  enters orchestrator context. Event payloads carry paths and scalars only.
+  Dispatch subagents with those paths; do not open the packet, reports, or
+  traces yourself.
+- **Ack discipline.** `gepa ack <event_id>` only AFTER you have durably
+  recorded your dispatch or decision (e.g. noted it in a scratch file or the
+  subagent is launched). Events must be acked in delivery order — acking
+  anything but the oldest unacked event is rejected (exit 5). If you crash,
+  compact, or restart, `gepa next` redelivers unacked events verbatim; replay
+  them to reconstruct exactly the pending work.
+- **Lease before dispatch.** `gepa lane lease <lane>` records the dispatch in
+  lane state; a leased lane rejects re-dispatch and (for a fresh spawn) a
+  second `gepa lane continue` until the lease is consumed by the reflector's
+  continue, reclaimed with `gepa lane reset`, or `--reflection-lease-secs`
+  expires. There is no release verb — the lease ends via continue, reset, or
+  expiry.
+- **One orchestrator per run.** The event bus has a single consumer cursor;
+  never run two orchestrator loops against the same run.
+- Use `gepa run status --run-id <run_id>` for the lane board (status,
+  candidate, verdict, progress per lane — always printed as JSON) whenever
+  you need a ground-truth snapshot.
+
+### Reflector subagent dispatch template
+
+The reflector gets exactly three inputs — the packet path, the worktree path,
+and an optional one-line steer. Never paste conversation history, other
+lanes' work, or your own analysis into the dispatch:
+
+```text
+You are a reflection subagent for GEPA lane <lane>.
+
+Inputs:
+- Reflection packet: <packet_path> (read this first)
+- Lane worktree: <worktree_path> (all edits happen here, on the lane branch)
+- Steer: <one line, e.g. "focus on tool:lookup_order argument formatting">
+
+The packet carries the baseline candidate's samples with report/trace paths,
+metric side info, a journal tail of prior reflections, and the exact
+`gepa lane continue` invocation. Work only from the packet plus the repo.
+
+Do:
+1. Read the packet, then the baseline reports/traces it points at.
+2. Form one hypothesis and edit code/artifacts inside <worktree_path> ONLY.
+3. Run the packet's continue_invocation verbatim as your terminal act:
+   `gepa --gepa-dir <abs> lane continue <lane> --run-id <id>`
+   It auto-commits the worktree onto the lane branch and starts the
+   background acceptance eval. Your job ends there — do not report results
+   back; the verdict arrives as an event.
+
+Never:
+- Touch the primary checkout or any other lane's worktree.
+- Edit files under .gepa/ (run state, events, journal) by hand.
+- Run `gepa run continue` / `gepa run select` — those belong to the
+  orchestrator (and `run continue` errors out in a lane run by design).
+```
+
+The subagent's terminal act is `gepa lane continue` — it never relays
+completion by hand. The background eval streams progress into lane state and
+emits the `verdict` event; you will see it from `gepa next`.
+
+### Selection, merges, and stalls
+
+- **`selection_due` → `gepa run select --run-id <run_id>`.** Select is the
+  single sequential authority: it promotes the best accepted lane to the
+  run's best, journals every loser (diff summary, verdict, delta) before
+  deleting its branch, invalidates stragglers, enforces the budget, and
+  re-fans every lane onto the new best with a fresh shared baseline and new
+  `lane_ready` events. Never run `gepa run continue` in a lane run — it
+  errors and points you at `lane continue` / `run select`.
+- **`merge_opportunity` → dispatch a merge subagent.** When two accepted
+  lanes' diffs touch disjoint file sets, select names the pair
+  (`branch_a`, `branch_b`, plus a `diff_stat_path`). Dispatch a subagent to
+  resolve a real `git merge` of the two branches — merging needs code
+  understanding, so the CLI never auto-merges. The merged tree enters the
+  NEXT iteration as a lane candidate, never as an auto-accepted best: land
+  the merge result in one lane's worktree after the re-fan (a normal
+  reflector dispatch can start from it), so it goes through the same
+  `lane continue` acceptance eval as any other candidate.
+- **`lane_stalled` → reset and re-dispatch.** A lane stalls when its
+  reflection lease expires (reflector never ran `lane continue`) or its
+  background eval died (stale heartbeat, dead pid). Run `gepa lane reset
+  <lane> --run-id <run_id>` — it terminates a live recorded eval pid and
+  returns the lane to paused; uncommitted worktree content is never
+  auto-deleted. Then re-dispatch the reflector with the same packet path.
+- **`budget_low` → tighten dispatches.** Emitted when remaining evals fall
+  below lanes × `--acceptance-max-repetitions`. Prefer cheap, high-confidence
+  edits from here and expect `run_done` soon.
+- **`run_done` → stop.** Read `final_report_path` for the outcome (including
+  any budget overshoot) and restore the best commit with `git checkout
+  <best_commit_sha>`.
+
+### Lanes vs the single-path loop
+
+Prefer lanes when ALL of these hold:
+
+- The candidate source is git (component mode has one process-global agent
+  and stays single-path).
+- You have several independent reflection directions worth trying against the
+  same baseline — lanes pay the baseline evals once per iteration and overlap
+  reflection with evaluation, so wall-clock per accepted candidate approaches
+  `max(reflection time, eval time / N)` instead of their sum.
+- You can afford the coordination overhead: one orchestrator loop, N
+  subagent dispatches per iteration, and a straggler timeout.
+
+Stay on the single-path loop (`gepa run start` / `gepa run continue` without
+`--lanes`) when the budget is tight (lanes spend up to N ×
+`--acceptance-max-repetitions` evals in flight per iteration), when
+reflections are sequential by nature (each depends on the last verdict), or
+when you are in component mode.
+
 ## Candidate JSON schema
 
 When you write a candidate file by hand (or read one produced by `gepa eval` history), use this shape:

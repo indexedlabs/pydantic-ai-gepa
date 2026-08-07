@@ -550,25 +550,73 @@ def test_lane_verbs_reject_done_runs(git_repo: Path) -> None:
     assert "done" in lease.output
 
 
-def test_second_continue_on_leased_lane_rejected(git_repo: Path) -> None:
-    """A leased lane rejects a concurrent `lane continue` until the lease is
-    consumed, reset, or expires (spec-1do mutual exclusion)."""
+def test_dispatch_lease_is_consumed_by_continue(git_repo: Path) -> None:
+    """The whole point of `lane lease` is the reflector's continue: a lane
+    leased for dispatch ACCEPTS the reflector's continue (consuming the
+    lease), while a second lease is rejected."""
     run = _start_lane_run(git_repo, lanes=1)
     run_id = str(run["run_id"])
     gepa_dir = str(git_repo / ".gepa")
 
     leased = _run("--gepa-dir", gepa_dir, "lane", "lease", "lane-1", "--run-id", run_id)
     assert leased.exit_code == 0, leased.output
+    state = _lane_state(git_repo, run_id, "lane-1")
+    assert state.lease_purpose == "dispatch"
 
-    # A parent-mode continue (spawn path) is rejected while leased.
+    # A second dispatch lease is rejected while the first is unexpired.
+    again = _run("--gepa-dir", gepa_dir, "lane", "lease", "lane-1", "--run-id", run_id)
+    assert again.exit_code == 1
+    assert "already leased" in again.output
+
+    # The reflector's continue consumes the dispatch lease and evaluates.
+    worktree = git_repo / "worktrees" / run_id / "lane-1"
+    (worktree / "score.txt").write_text("good\n", encoding="utf-8")
+    import os
+
+    old_cwd = Path.cwd()
+    os.chdir(worktree)
+    try:
+        result = _run(
+            "--gepa-dir",
+            gepa_dir,
+            "lane",
+            "continue",
+            "lane-1",
+            "--run-id",
+            run_id,
+            "--foreground",
+        )
+    finally:
+        os.chdir(old_cwd)
+    assert result.exit_code == 0, result.output
+    state = _lane_state(git_repo, run_id, "lane-1")
+    assert state.status == "awaiting_selection"
+    assert state.lease_purpose is None  # consumed
+
+
+def test_handoff_lease_rejects_second_continue(git_repo: Path) -> None:
+    """A handoff lease (detached eval spawned) rejects a second parent-mode
+    continue — the double-spawn race the lease exists to prevent."""
+    run = _start_lane_run(git_repo, lanes=1)
+    run_id = str(run["run_id"])
+    gepa_dir = str(git_repo / ".gepa")
+
+    state = _lane_state(git_repo, run_id, "lane-1")
+    LaneState(
+        **{
+            **state.to_dict(),
+            "status": "leased",
+            "lease_epoch": 1,
+            "lease_purpose": "handoff",
+            "lease_expires_at": "2999-01-01T00:00:00+00:00",
+        }
+    ).save(git_repo, run_id)
+
     result = _run(
         "--gepa-dir", gepa_dir, "lane", "continue", "lane-1", "--run-id", run_id
     )
     assert result.exit_code == 1
-    assert "leased" in result.output
-    state = _lane_state(git_repo, run_id, "lane-1")
-    assert state.status == "leased"
-    assert state.lease_epoch == 1
+    assert "handoff in flight" in result.output
 
 
 def test_lane_reset_refuses_awaiting_selection(git_repo: Path) -> None:
