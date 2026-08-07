@@ -15,16 +15,19 @@ from pydantic_ai_gepa.cli.events import (
     EXIT_ACK_REJECTED,
     EXIT_NONE_PENDING,
     EXIT_TIMEOUT,
+    AckRejected,
     EventDraft,
     EventError,
     LaneScan,
     LaneScanResult,
     SelectionDueSignal,
     ack,
+    cursor_path,
     emit,
     events_dir,
     list_events,
     load_cursor,
+    next_event,
     run_reaper_pass,
     scan_lanes,
 )
@@ -400,3 +403,168 @@ def test_help_documents_exit_codes() -> None:
         assert "Exit codes:" in result.output
     assert "4" in _run("next", "--help").output  # timeout code documented
     assert "5" in _run("ack", "--help").output  # rejected-ack code documented
+
+
+# ---------- adversarial-review hardening (PR #28 review) ----------
+
+
+def _draft(event_type: str = "verdict", lane: str | None = "lane-1") -> EventDraft:
+    payload = {"verdict": "accepted", "delta": 0.5, "comparison_path": "/tmp/c.json"}
+    return EventDraft(type=event_type, lane=lane, payload=payload)
+
+
+def test_partial_event_file_does_not_wedge_bus(tmp_path: Path) -> None:
+    """A producer killed mid-emit leaves an ignored tmpfile / quarantined
+    file — next, ack, and the reaper keep working."""
+    ensure_layout(tmp_path)
+    run = new_run_id()
+    events_base = events_dir(run, tmp_path)
+    events_base.mkdir(parents=True)
+
+    # Torn event file with a valid event-id name (SIGKILL between create and flush).
+    (events_base / "1786000000000-lane-1-000000").write_text('{"type": "verd')
+    # Stray non-event files.
+    (events_base / ".emit-xyz.tmp").write_text("{}")
+    (events_base / "notes.txt").write_text("hello")
+
+    good = emit(run, "lane-1", _draft(), root=tmp_path)
+    event = next_event(run, tmp_path)
+    assert event is not None and event.id == good
+    assert ack(run, good, root=tmp_path) is True
+    assert next_event(run, tmp_path) is None
+
+
+def test_embedded_id_mismatch_loses_to_filename(tmp_path: Path) -> None:
+    """The filename is the id (spec-fmc); a mismatched embedded id never
+    hijacks delivery order."""
+    ensure_layout(tmp_path)
+    run = new_run_id()
+    events_base = events_dir(run, tmp_path)
+    events_base.mkdir(parents=True)
+    (events_base / "1786000000000-lane-1-000000").write_text(
+        json.dumps(
+            {
+                "id": "9999999999999-evil-000000",
+                "type": "verdict",
+                "ts": "2026-01-01T00:00:00+00:00",
+                "lane": "lane-1",
+                "payload": {
+                    "verdict": "accepted",
+                    "delta": 1.0,
+                    "comparison_path": "/tmp/c.json",
+                },
+            }
+        )
+    )
+    event = next_event(run, tmp_path)
+    assert event is not None
+    assert event.id == "1786000000000-lane-1-000000"
+
+
+def test_corrupt_cursor_resets_to_start(tmp_path: Path) -> None:
+    ensure_layout(tmp_path)
+    run = new_run_id()
+    event_id = emit(run, "lane-1", _draft(), root=tmp_path)
+    cursor_path(run, tmp_path).write_text("{torn", encoding="utf-8")
+
+    # The event is redelivered instead of the bus wedging.
+    event = next_event(run, tmp_path)
+    assert event is not None and event.id == event_id
+
+
+def test_ack_nonexistent_id_below_cursor_rejected(tmp_path: Path) -> None:
+    ensure_layout(tmp_path)
+    run = new_run_id()
+    first = emit(run, "lane-1", _draft(), root=tmp_path)
+    assert ack(run, first, root=tmp_path) is True
+
+    import pytest as _pytest
+
+    bogus = (
+        first[:-6] + "999999"
+    )  # same prefix, never existed, sorts at/after cursor...
+    # craft an id that sorts below the cursor
+    bogus = "1000000000000-lane-1-000000"
+    assert bogus < first
+    with _pytest.raises(AckRejected):
+        ack(run, bogus, root=tmp_path)
+    # The real cursor id remains an idempotent no-op.
+    assert ack(run, first, root=tmp_path) is False
+
+
+def test_nonfinite_float_payload_rejected() -> None:
+    import pytest as _pytest
+
+    with _pytest.raises(EventError):
+        EventDraft(
+            type="verdict",
+            lane="lane-1",
+            payload={
+                "verdict": "accepted",
+                "delta": float("nan"),
+                "comparison_path": "/tmp/c.json",
+            },
+        )
+    with _pytest.raises(EventError):
+        EventDraft(
+            type="verdict",
+            lane="lane-1",
+            payload={
+                "verdict": "accepted",
+                "delta": float("inf"),
+                "comparison_path": "/tmp/c.json",
+            },
+        )
+
+
+def test_invalid_lane_id_rejected() -> None:
+    import pytest as _pytest
+
+    with _pytest.raises(EventError):
+        EventDraft(
+            type="verdict",
+            lane="../../etc",
+            payload={
+                "verdict": "accepted",
+                "delta": 0.1,
+                "comparison_path": "/tmp/c.json",
+            },
+        )
+
+
+def test_reaper_sentinel_dedupes_concurrent_passes(tmp_path: Path) -> None:
+    """Two concurrent reaper passes over the same scan emit exactly one
+    lane_stalled — the dedupe key is an exclusive-create sentinel, not a
+    read (spec-fmc: no duplicate no matter how many passes run)."""
+    import threading
+
+    ensure_layout(tmp_path)
+    run = new_run_id()
+    scan = LaneScan(
+        lanes=(LaneScanResult(lane="lane-1", lease_epoch=3, stalled_reason="pid dead"),)
+    )
+
+    emitted: list[list[str]] = []
+
+    def pass_() -> None:
+        emitted.append(run_reaper_pass(run, scan, root=tmp_path))
+
+    threads = [threading.Thread(target=pass_) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    total = [event_id for batch in emitted for event_id in batch]
+    assert len(total) == 1
+    stalled = [
+        event for event in list_events(run, tmp_path) if event.type == "lane_stalled"
+    ]
+    assert len(stalled) == 1
+    assert stalled[0].payload["lease_epoch"] == 3
+
+    # A fresh lease epoch re-emits (new sentinel key).
+    scan2 = LaneScan(
+        lanes=(LaneScanResult(lane="lane-1", lease_epoch=4, stalled_reason="pid dead"),)
+    )
+    assert len(run_reaper_pass(run, scan2, root=tmp_path)) == 1

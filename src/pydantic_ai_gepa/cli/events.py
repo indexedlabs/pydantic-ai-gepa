@@ -22,8 +22,10 @@ or ack accepted, 1 run resolution/usage error, 3 no pending events, 4
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
+import sys
 import tempfile
 import threading
 import time
@@ -90,7 +92,9 @@ _TIMESTAMP_WIDTH = 13  # zero-padded epoch milliseconds
 _SEQ_WIDTH = 6
 _PRODUCER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _EVENT_ID_RE = re.compile(
-    rf"^(\d{{{_TIMESTAMP_WIDTH}}})-([A-Za-z0-9][A-Za-z0-9._-]*)-(\d{{{_SEQ_WIDTH}}})$"
+    # Seq is zero-padded to _SEQ_WIDTH but allowed to overflow it: ordering
+    # stays lexicographic within one ms-timestamp bucket.
+    rf"^(\d{{{_TIMESTAMP_WIDTH}}})-([A-Za-z0-9][A-Za-z0-9._-]*)-(\d{{{_SEQ_WIDTH},}})$"
 )
 
 # Per-process (run dir, producer id) -> next sequence number, guarded by a lock
@@ -115,6 +119,11 @@ def _validate_scalar_or_scalar_list(value: Any, *, field_name: str) -> None:
         for item in value:
             _validate_scalar_or_scalar_list(item, field_name=field_name)
         return
+    if isinstance(value, float) and not math.isfinite(value):
+        raise EventError(
+            f"Payload field {field_name!r} must be a finite number; got "
+            f"{value!r}. Non-finite floats are not JSON-representable."
+        )
     if value is None or isinstance(value, (str, int, float, bool)):
         return
     raise EventError(
@@ -149,6 +158,11 @@ def _validate_draft(type: str, lane: str | None, payload: dict[str, Any]) -> Non
             raise EventError(f"Run-scoped event {type!r} must carry lane=None.")
     elif lane is None:
         raise EventError(f"Lane-scoped event {type!r} requires a lane id.")
+    if lane is not None and not _PRODUCER_ID_RE.match(lane):
+        raise EventError(
+            f"Invalid lane id {lane!r}; expected filename-safe "
+            f"{_PRODUCER_ID_RE.pattern!r} (lane ids flow into paths downstream)."
+        )
 
 
 @dataclass(frozen=True)
@@ -204,10 +218,40 @@ def cursor_path(run_id: str, root: Path | None = None) -> Path:
     return run_dir(run_id, root) / CURSOR_FILENAME
 
 
-def _read_event(path: Path) -> Event:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    data.setdefault("id", path.name)
-    return Event.from_dict(data)
+def _read_event(path: Path) -> Event | None:
+    """Read one event file; unparseable files quarantine as ``None``.
+
+    The filename *is* the event id (spec-fmc Interface block) — an embedded
+    ``id`` field that disagrees with the filename is corruption, so the
+    filename wins unconditionally. Producer tmpfiles (``.emit-*.tmp``) and
+    any other non-conforming names are not events.
+    """
+    if not _EVENT_ID_RE.match(path.name):
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        print(
+            f"warning: ignoring unparseable event file {path.name} "
+            "(a producer was likely killed mid-emit)",
+            file=sys.stderr,
+        )
+        return None
+    if not isinstance(data, dict):
+        return None
+    embedded = data.get("id")
+    if embedded is not None and embedded != path.name:
+        print(
+            f"warning: event file {path.name} carries mismatched embedded id "
+            f"{embedded!r}; the filename is authoritative",
+            file=sys.stderr,
+        )
+    data["id"] = path.name
+    try:
+        return Event.from_dict(data)
+    except (KeyError, TypeError, ValueError):
+        print(f"warning: ignoring malformed event file {path.name}", file=sys.stderr)
+        return None
 
 
 def list_events(run_id: str, root: Path | None = None) -> list[Event]:
@@ -215,9 +259,11 @@ def list_events(run_id: str, root: Path | None = None) -> list[Event]:
     base = events_dir(run_id, root)
     if not base.is_dir():
         return []
-    events = [
-        _read_event(path) for path in sorted(base.iterdir(), key=lambda p: p.name)
-    ]
+    events = []
+    for path in sorted(base.iterdir(), key=lambda p: p.name):
+        event = _read_event(path)
+        if event is not None:
+            events.append(event)
     events.sort(key=lambda event: event.id)
     return events
 
@@ -226,11 +272,26 @@ def list_events(run_id: str, root: Path | None = None) -> list[Event]:
 
 
 def load_cursor(run_id: str, root: Path | None = None) -> str | None:
-    """Return the highest acked event id, or ``None`` when nothing was acked."""
+    """Return the highest acked event id, or ``None`` when nothing was acked.
+
+    A torn cursor (consumer killed mid-write) resets to ``None`` with a
+    warning — every event is redelivered, which at-least-once delivery makes
+    safe. A crashed cursor never wedges the bus.
+    """
     path = cursor_path(run_id, root)
     if not path.exists():
         return None
-    data = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        print(
+            f"warning: cursor file {path} is unreadable; resetting to "
+            "start-of-stream (unacked events will be redelivered)",
+            file=sys.stderr,
+        )
+        return None
+    if not isinstance(data, dict):
+        return None
     acked = data.get("acked_id")
     return str(acked) if acked else None
 
@@ -335,15 +396,24 @@ def emit(
         event_id = f"{ts_ms}-{producer_id}-{seq:0{_SEQ_WIDTH}d}"
         file_path = path / event_id
         record = {"id": event_id, **body}
+        # Write to a sibling tmp file first, then exclusive-link into place:
+        # a producer killed mid-write leaves an ignored tmpfile, never a
+        # torn event file that would wedge every consumer (dec-f1s).
+        fd, tmp_name = tempfile.mkstemp(dir=str(path), prefix=".emit-", suffix=".tmp")
         try:
-            with file_path.open("x", encoding="utf-8") as handle:
-                json.dump(record, handle, indent=2)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(record, handle, indent=2, allow_nan=False)
                 handle.write("\n")
+            os.link(tmp_name, file_path)  # atomic + exclusive: EEXIST on collision
+            os.unlink(tmp_name)
             return event_id
         except FileExistsError:
+            os.unlink(tmp_name)
             # Timestamp collision with another emit: retry with the seq bumped.
             _bump_seq_past(path, producer_id, seq)
-        except OSError:
+        except BaseException:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
             _release_seq(path, producer_id, seq)
             raise
 
@@ -354,8 +424,16 @@ def emit(
 def next_event(run_id: str, root: Path | None = None) -> Event | None:
     """Return the oldest unacked event (id > cursor), or ``None`` if none."""
     cursor = load_cursor(run_id, root)
-    for event in list_events(run_id, root):
-        if cursor is None or event.id > cursor:
+    base = events_dir(run_id, root)
+    if not base.is_dir():
+        return None
+    # Filenames are ids (spec-fmc), so acked events are skipped by name
+    # without parsing — the poll path stays O(pending), not O(total).
+    for name in sorted(p.name for p in base.iterdir()):
+        if cursor is not None and name <= cursor:
+            continue
+        event = _read_event(base / name)
+        if event is not None:
             return event
     return None
 
@@ -369,6 +447,14 @@ def ack(run_id: str, event_id: str, root: Path | None = None) -> bool:
     """
     cursor = load_cursor(run_id, root)
     if cursor is not None and event_id <= cursor:
+        # Idempotent no-op only for events that actually exist — acking a
+        # never-existent id below the cursor (e.g. a mangled id) is an error
+        # the exit-code contract exists to catch.
+        if event_id != cursor and not (events_dir(run_id, root) / event_id).exists():
+            raise AckRejected(
+                f"Refusing to ack {event_id!r}: no such event on the bus "
+                "(and it is not the recorded cursor position)."
+            )
         return False
     pending = next_event(run_id, root)
     if pending is None:
@@ -431,6 +517,25 @@ def scan_lanes(run_id: str, root: Path | None = None) -> LaneScan:
     return LaneScan()
 
 
+def _claim_reaper_key(events_path: Path, key: str) -> bool:
+    """Atomically claim a reaper dedupe key; False when already claimed.
+
+    The dedupe key is a filesystem fact, not a read: exclusive-creating a
+    sentinel file per key makes synthesis idempotent across CONCURRENT
+    consumer verbs (gepa next / run status / select all reap), where a
+    scan-then-emit check would race (spec-fmc: no duplicate for the same
+    (lane, lease epoch) "no matter how many passes run").
+    """
+    sentinels = events_path / ".reaped"
+    sentinels.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(sentinels / key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        return False
+    os.close(fd)
+    return True
+
+
 def run_reaper_pass(
     run_id: str,
     scan: LaneScan | None = None,
@@ -440,26 +545,21 @@ def run_reaper_pass(
 ) -> list[str]:
     """Synthesize ``lane_stalled`` / ``selection_due`` events from a scan result.
 
-    Idempotent: before emitting, existing event files are checked for an event
-    with the same key — ``(lane_stalled, lane, payload.lease_epoch)`` or
-    ``(selection_due, lane=None, payload.iteration)`` — so no matter how many
-    passes run, a (lane, lease epoch) pair never produces a duplicate.
-    Returns the ids of events emitted by this pass.
+    Idempotent under both sequential and concurrent passes: each synthesis
+    first exclusive-creates a sentinel keyed ``(lane_stalled, lane,
+    lease_epoch)`` or ``(selection_due, iteration)``; only the pass that
+    wins the create emits. Returns the ids of events emitted by this pass.
     """
     if scan is None:
         scan = scan_lanes(run_id, root)
-    existing = list_events(run_id, root)
+    events_path = events_dir(run_id, root)
+    events_path.mkdir(parents=True, exist_ok=True)
     emitted: list[str] = []
     for lane in scan.lanes:
         if lane.stalled_reason is None:
             continue
-        duplicate = any(
-            event.type == "lane_stalled"
-            and event.lane == lane.lane
-            and event.payload.get("lease_epoch") == lane.lease_epoch
-            for event in existing
-        )
-        if duplicate:
+        key = f"lane_stalled-{lane.lane}-e{lane.lease_epoch}"
+        if not _claim_reaper_key(events_path, key):
             continue
         emitted.append(
             emit(
@@ -478,13 +578,8 @@ def run_reaper_pass(
         )
     if scan.selection_due is not None:
         signal = scan.selection_due
-        duplicate = any(
-            event.type == "selection_due"
-            and event.lane is None
-            and event.payload.get("iteration") == signal.iteration
-            for event in existing
-        )
-        if not duplicate:
+        key = f"selection_due-i{signal.iteration}"
+        if _claim_reaper_key(events_path, key):
             emitted.append(
                 emit(
                     run_id,
