@@ -24,6 +24,7 @@ Key contracts:
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -32,6 +33,7 @@ import signal
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -71,8 +73,10 @@ def lane_ids(count: int) -> list[str]:
     return [f"lane-{i}" for i in range(1, count + 1)]
 
 
-def lane_branch(lane: str, iteration: int) -> str:
-    return f"{LANE_BRANCH_PREFIX}/{lane}/{iteration}"
+def lane_branch(run_id: str, lane: str, iteration: int) -> str:
+    """Run-scoped lane branch (dec-jh6): lane refs from different runs never
+    collide, and an abandoned run can never poison a future one."""
+    return f"{LANE_BRANCH_PREFIX}/{run_id}/{lane}/{iteration}"
 
 
 # ----------------------------- workspace resolution ---------------------
@@ -201,8 +205,28 @@ class LaneState:
     def save(self, workspace_root: Path, run_id: str) -> Path:
         path = lane_state_path(workspace_root, run_id, self.lane)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+        _atomic_write_json(path, self.to_dict())
         return path
+
+
+@contextmanager
+def _lane_lock(workspace_root: Path, run_id: str, lane: str) -> Any:
+    """Exclusive flock on the lane's state dir (dec-l95).
+
+    Lease claims, the leased -> evaluating handoff, resets, and select's
+    re-fan all hold this lock, so concurrent verbs serialize on the
+    filesystem instead of racing read-then-write on state.json. The lock
+    auto-releases if the holder dies.
+    """
+    path = lane_state_path(workspace_root, run_id, lane)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path.parent / ".lane.lock", os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def lanes_dir(workspace_root: Path, run_id: str) -> Path:
@@ -213,13 +237,38 @@ def lane_state_path(workspace_root: Path, run_id: str, lane: str) -> Path:
     return lanes_dir(workspace_root, run_id) / lane / "state.json"
 
 
+def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    """Write JSON via sibling tmpfile + os.replace — a torn state file can
+    never wedge the verbs that read it."""
+    import tempfile
+
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+            handle.write("\n")
+        os.replace(tmp_name, path)
+    except BaseException:
+        os.unlink(tmp_name)
+        raise
+
+
 def load_lane_state(workspace_root: Path, run_id: str, lane: str) -> LaneState:
     path = lane_state_path(workspace_root, run_id, lane)
     if not path.exists():
         raise typer.BadParameter(
             f"No lane state at {path}. Was this run started with --lanes?"
         )
-    return LaneState.from_dict(json.loads(path.read_text(encoding="utf-8")))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise typer.BadParameter(
+            f"Lane state at {path} is corrupt ({exc.msg}); recover with "
+            f"`gepa lane reset {lane}` after verifying no eval is running."
+        ) from exc
+    return LaneState.from_dict(data)
 
 
 def load_all_lane_states(workspace_root: Path, run_id: str) -> list[LaneState]:
@@ -243,8 +292,9 @@ def worktrees_root(workspace_root: Path) -> Path:
     return workspace_root / WORKTREES_DIRNAME
 
 
-def lane_worktree_path(workspace_root: Path, lane: str) -> Path:
-    return worktrees_root(workspace_root) / lane
+def lane_worktree_path(workspace_root: Path, run_id: str, lane: str) -> Path:
+    """Run-scoped worktree path (dec-jh6)."""
+    return worktrees_root(workspace_root) / run_id / lane
 
 
 def ensure_worktrees_ignored(workspace_root: Path) -> None:
@@ -254,7 +304,16 @@ def ensure_worktrees_ignored(workspace_root: Path) -> None:
     and untracked, so `git ls-files --others --exclude-standard` (used by git
     candidate identity) skips lane worktrees automatically.
     """
-    info_dir = workspace_root / ".git" / "info"
+    git_path = workspace_root / ".git"
+    if git_path.is_file():
+        # Linked worktree as primary: .git is a gitdir pointer file; resolve
+        # the real git dir before writing info/exclude.
+        content = git_path.read_text(encoding="utf-8").strip()
+        if content.startswith("gitdir:"):
+            git_path = Path(content.split(":", 1)[1].strip())
+            if not git_path.is_absolute():
+                git_path = (workspace_root / git_path).resolve()
+    info_dir = git_path / "info"
     info_dir.mkdir(parents=True, exist_ok=True)
     exclude = info_dir / "exclude"
     entry = f"/{WORKTREES_DIRNAME}/"
@@ -277,8 +336,8 @@ def create_lane_worktree(
     workspace_root: Path, run_id: str, lane: str, iteration: int, base_sha: str
 ) -> tuple[Path, str]:
     """Create the lane worktree + branch cut from ``base_sha`` (the run's best)."""
-    branch = lane_branch(lane, iteration)
-    path = lane_worktree_path(workspace_root, lane)
+    branch = lane_branch(run_id, lane, iteration)
+    path = lane_worktree_path(workspace_root, run_id, lane)
     path.parent.mkdir(parents=True, exist_ok=True)
     _git(workspace_root, "worktree", "add", str(path), "-b", branch, base_sha)
     return path, branch
@@ -376,6 +435,14 @@ def _auto_commit_worktree(worktree: Path, branch: str, lane: str) -> str:
     Lane candidates are always clean commits because continue auto-commits
     (dec-tlz).
     """
+    current_branch = _git(worktree, "rev-parse", "--abbrev-ref", "HEAD")
+    if current_branch != branch:
+        # Check BEFORE committing: a commit on a rogue branch would silently
+        # lose the candidate from the lane's lineage.
+        raise typer.BadParameter(
+            f"Lane worktree {worktree} is on branch {current_branch!r}, "
+            f"expected {branch!r}; run `gepa lane reset {lane}` to recover."
+        )
     _git(worktree, "add", "-A")
     status = _git(worktree, "status", "--porcelain")
     if status:
@@ -388,12 +455,6 @@ def _auto_commit_worktree(worktree: Path, branch: str, lane: str) -> str:
             "commit",
             "-m",
             f"gepa lane continue: {lane} candidate",
-        )
-    current_branch = _git(worktree, "rev-parse", "--abbrev-ref", "HEAD")
-    if current_branch != branch:
-        raise typer.BadParameter(
-            f"Lane worktree {worktree} is on branch {current_branch!r}, "
-            f"expected {branch!r}; run `gepa lane reset {lane}` to recover."
         )
     return _git(worktree, "rev-parse", "HEAD")
 
@@ -474,6 +535,7 @@ def _run_lane_eval_loop(
             "verdict": None,
             "verdict_delta": None,
             "comparison_path": None,
+            "lease_expires_at": None,  # the handoff lease is consumed
         }
     )
     lane_state = _touch_heartbeat(workspace_root, run_id, lane_state, pid)
@@ -482,50 +544,60 @@ def _run_lane_eval_loop(
     max_candidate_samples = len(baseline_samples)
     initial_samples = min(run_state.acceptance_repetitions, max_candidate_samples)
 
+    # The candidate tree is the cwd for evaluation: `evaluate` callables and
+    # user metric code routinely read files by relative path, and those reads
+    # must observe the lane worktree, not the primary checkout (detached
+    # children are spawned with cwd=worktree; foreground callers are switched
+    # here so both paths evaluate the same tree).
+    previous_cwd = Path.cwd()
+    os.chdir(worktree)
     samples: list[float] = []
     outcomes: list[Any] = []
     comparison_result = None
-    for _ in range(max_candidate_samples):
-        outcome = run_eval_once(
-            candidate_file=None,
-            minibatch_id=run_state.reflection_minibatch_id,
-            size=run_state.size,
-            seed=run_state.seed,
-            epoch=run_state.next_epoch,
-            run_id=run_id,
-            concurrency=run_state.concurrency,
-            max_iterations=run_state.max_iterations,
-            threshold=run_state.threshold,
-            capture_traces=True,
-            candidate_source="git",
-            lane=lane,
-            candidate_root=worktree,
-            workspace_root=workspace_root,
-        )
-        outcomes.append(outcome)
-        current_id = str(outcome.summary["candidate_id"])
-        if current_id != git_state.candidate_id:
-            raise typer.BadParameter(
-                "The lane candidate changed mid-evaluation "
-                f"({git_state.candidate_id} -> {current_id}); refusing to "
-                "compare mixed candidates."
+    try:
+        for _ in range(max_candidate_samples):
+            outcome = run_eval_once(
+                candidate_file=None,
+                minibatch_id=run_state.reflection_minibatch_id,
+                size=run_state.size,
+                seed=run_state.seed,
+                epoch=run_state.next_epoch,
+                run_id=run_id,
+                concurrency=run_state.concurrency,
+                max_iterations=run_state.max_iterations,
+                threshold=run_state.threshold,
+                capture_traces=True,
+                candidate_source="git",
+                lane=lane,
+                candidate_root=worktree,
+                workspace_root=workspace_root,
             )
-        samples.append(float(outcome.summary["mean_score"]))
-        lane_state = LaneState(
-            **{**lane_state.to_dict(), "eval_samples": tuple(samples)}
-        )
-        lane_state = _touch_heartbeat(workspace_root, run_id, lane_state, pid)
+            outcomes.append(outcome)
+            current_id = str(outcome.summary["candidate_id"])
+            if current_id != git_state.candidate_id:
+                raise typer.BadParameter(
+                    "The lane candidate changed mid-evaluation "
+                    f"({git_state.candidate_id} -> {current_id}); refusing to "
+                    "compare mixed candidates."
+                )
+            samples.append(float(outcome.summary["mean_score"]))
+            lane_state = LaneState(
+                **{**lane_state.to_dict(), "eval_samples": tuple(samples)}
+            )
+            lane_state = _touch_heartbeat(workspace_root, run_id, lane_state, pid)
 
-        if len(samples) < initial_samples:
-            continue
-        comparison_result = compare_candidate_samples(
-            baseline_samples[: len(samples)],
-            tuple(samples),
-            confidence=run_state.acceptance_confidence,
-            min_delta=run_state.acceptance_min_delta,
-        )
-        if comparison_result.verdict != "inconclusive":
-            break
+            if len(samples) < initial_samples:
+                continue
+            comparison_result = compare_candidate_samples(
+                baseline_samples[: len(samples)],
+                tuple(samples),
+                confidence=run_state.acceptance_confidence,
+                min_delta=run_state.acceptance_min_delta,
+            )
+            if comparison_result.verdict != "inconclusive":
+                break
+    finally:
+        os.chdir(previous_cwd)
 
     assert comparison_result is not None
     comparison = {
@@ -550,6 +622,22 @@ def _run_lane_eval_loop(
     comparison_path = _write_comparison(
         workspace_root, run_id, lane, lane_state.iteration, comparison
     )
+    # State lands before the event: a crash between them must leave the
+    # verdict in lane state (select reads verdicts from state, not the bus),
+    # with the event redeliverable rather than a verdict event pointing at a
+    # lane that looks mid-eval.
+    lane_state = LaneState(
+        **{
+            **lane_state.to_dict(),
+            "status": "awaiting_selection",
+            "verdict": comparison_result.verdict,
+            "verdict_delta": comparison_result.delta,
+            "comparison_path": str(comparison_path),
+            "eval_pid": None,
+            "updated_at": utc_now_iso(),
+        }
+    )
+    lane_state.save(workspace_root, run_id)
     verdict_id = emit(
         run_id,
         lane,
@@ -564,18 +652,6 @@ def _run_lane_eval_loop(
         ),
         root=workspace_root,
     )
-    lane_state = LaneState(
-        **{
-            **lane_state.to_dict(),
-            "status": "awaiting_selection",
-            "verdict": comparison_result.verdict,
-            "verdict_delta": comparison_result.delta,
-            "comparison_path": str(comparison_path),
-            "eval_pid": None,
-            "updated_at": utc_now_iso(),
-        }
-    )
-    lane_state.save(workspace_root, run_id)
     typer.echo(
         f"Lane {lane} verdict: {comparison_result.verdict} "
         f"(delta={comparison_result.delta:+.4f}); event {verdict_id}."
@@ -615,6 +691,13 @@ def _resolve_lane_run(run_id: str | None) -> tuple[Path, Any]:
             typer.echo("No runs found. Start one with `gepa run start`.", err=True)
             raise typer.Exit(code=1)
     run_state = _load_run_state(workspace_root, run_id)
+    if run_state.status == "done":
+        typer.echo(
+            f"Run {run_state.run_id} is done; lane verbs no longer apply "
+            "(a lane is re-fanned at select or removed when the run completes).",
+            err=True,
+        )
+        raise typer.Exit(code=1)
     if run_state.lanes < 1:
         typer.echo(
             f"Run {run_state.run_id} is not a lane run (started without --lanes); "
@@ -644,35 +727,43 @@ def lane_lease(
     """
     _validate_lane_id(lane)
     workspace_root, run_state = _resolve_lane_run(run_id)
-    state = load_lane_state(workspace_root, run_state.run_id, lane)
-    now = datetime.now(timezone.utc)
-    if state.status == "leased" and state.lease_expires_at:
-        if _parse_iso(state.lease_expires_at) > now:
+    with _lane_lock(workspace_root, run_state.run_id, lane):
+        state = load_lane_state(workspace_root, run_state.run_id, lane)
+        now = datetime.now(timezone.utc)
+        if state.status == "leased" and state.lease_expires_at:
+            if _parse_iso(state.lease_expires_at) > now:
+                typer.echo(
+                    f"Lane {lane} is already leased until {state.lease_expires_at} "
+                    f"(lease epoch {state.lease_epoch}); refusing re-dispatch.",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+        if state.status == "evaluating":
             typer.echo(
-                f"Lane {lane} is already leased until {state.lease_expires_at} "
-                f"(lease epoch {state.lease_epoch}); refusing re-dispatch.",
+                f"Lane {lane} is evaluating (pid {state.eval_pid}); it cannot "
+                "be leased for dispatch.",
                 err=True,
             )
             raise typer.Exit(code=1)
-    if state.status not in {"paused_for_reflection", "leased"}:
-        typer.echo(
-            f"Lane {lane} is {state.status}; only paused_for_reflection lanes "
-            "can be leased for dispatch.",
-            err=True,
+        if state.status not in {"paused_for_reflection", "leased", "stalled"}:
+            typer.echo(
+                f"Lane {lane} is {state.status}; only paused_for_reflection "
+                "lanes can be leased for dispatch.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        expires = now.timestamp() + run_state.reflection_lease_secs
+        expires_at = datetime.fromtimestamp(expires, timezone.utc).isoformat()
+        state = LaneState(
+            **{
+                **state.to_dict(),
+                "status": "leased",
+                "lease_epoch": state.lease_epoch + 1,
+                "lease_expires_at": expires_at,
+                "updated_at": utc_now_iso(),
+            }
         )
-        raise typer.Exit(code=1)
-    expires = now.timestamp() + run_state.reflection_lease_secs
-    expires_at = datetime.fromtimestamp(expires, timezone.utc).isoformat()
-    state = LaneState(
-        **{
-            **state.to_dict(),
-            "status": "leased",
-            "lease_epoch": state.lease_epoch + 1,
-            "lease_expires_at": expires_at,
-            "updated_at": utc_now_iso(),
-        }
-    )
-    state.save(workspace_root, run_state.run_id)
+        state.save(workspace_root, run_state.run_id)
     typer.echo(
         f"Lane {lane} leased (epoch {state.lease_epoch}, expires {expires_at}). "
         f"Dispatch a reflector with the packet at {state.packet_path}."
@@ -696,52 +787,83 @@ def lane_continue(
     repeated-evaluation acceptance policy as a detached process that streams
     progress + heartbeat into lane state and emits a `verdict` event on
     resolution.
+
+    Lease discipline (dec-l95): continue requires a lease — an unexpired one
+    from `gepa lane lease`, or it auto-claims one for a paused/stalled lane.
+    A lane already evaluating rejects a second continue; a leased lane rejects
+    any continue that does not consume its lease. The claim and the handoff
+    are serialized by an flock on the lane state dir, and the handoff lease
+    expires after --eval-stall-timeout-secs so a child that dies before its
+    first heartbeat is reaped.
     """
     _validate_lane_id(lane)
     workspace_root, run_state = _resolve_lane_run(run_id)
-    state = load_lane_state(workspace_root, run_state.run_id, lane)
+    now = datetime.now(timezone.utc)
 
-    if state.status == "evaluating":
-        typer.echo(
-            f"Lane {lane} is already evaluating (pid {state.eval_pid}); a "
-            "leased/evaluating lane rejects a second concurrent "
-            "`gepa lane continue`.",
-            err=True,
-        )
-        raise typer.Exit(code=1)
-    if state.status not in {"paused_for_reflection", "leased", "stalled"}:
-        typer.echo(
-            f"Lane {lane} is {state.status}; `gepa lane continue` expects a "
-            "paused_for_reflection (or leased) lane.",
-            err=True,
-        )
-        raise typer.Exit(code=1)
-    if not state.worktree_path or not state.branch:
-        typer.echo(
-            f"Lane {lane} has no worktree/branch recorded; run "
-            f"`gepa lane reset {lane}` to re-fan it.",
-            err=True,
-        )
-        raise typer.Exit(code=1)
+    with _lane_lock(workspace_root, run_state.run_id, lane):
+        state = load_lane_state(workspace_root, run_state.run_id, lane)
 
-    if foreground:
-        if state.status == "paused_for_reflection":
+        if state.status == "evaluating":
+            typer.echo(
+                f"Lane {lane} is already evaluating (pid {state.eval_pid}); a "
+                "second concurrent `gepa lane continue` is rejected. If the "
+                f"eval is dead, run `gepa lane reset {lane}`.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        if state.status == "leased":
+            if foreground:
+                # The detached child consumes the handoff lease.
+                pass
+            else:
+                typer.echo(
+                    f"Lane {lane} is leased (epoch {state.lease_epoch}); a "
+                    "leased lane rejects a second `gepa lane continue` until "
+                    "the lease is consumed, reset, or expires.",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+        if state.status not in {"paused_for_reflection", "leased", "stalled"}:
+            typer.echo(
+                f"Lane {lane} is {state.status}; `gepa lane continue` expects a "
+                "paused_for_reflection (or leased) lane.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        if not state.worktree_path or not state.branch:
+            typer.echo(
+                f"Lane {lane} has no worktree/branch recorded; run "
+                f"`gepa lane reset {lane}` to re-fan it.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
+        if not foreground:
+            # Handoff lease with a REAL expiry: if the detached child dies
+            # before its first heartbeat, the reaper can stall the lane.
+            handoff_expiry = now.timestamp() + run_state.eval_stall_timeout_secs
             state = LaneState(
                 **{
                     **state.to_dict(),
                     "status": "leased",
                     "lease_epoch": state.lease_epoch + 1,
+                    "lease_expires_at": datetime.fromtimestamp(
+                        handoff_expiry, timezone.utc
+                    ).isoformat(),
                     "updated_at": utc_now_iso(),
                 }
             )
             state.save(workspace_root, run_state.run_id)
+
+    if foreground:
         _run_lane_eval_loop(
             workspace_root=workspace_root, run_state=run_state, lane_state=state
         )
         return
 
     # Detached background eval: the child re-invokes this verb with
-    # --foreground, records its own pid, and refreshes the lane heartbeat.
+    # --foreground, consumes the handoff lease, records its own pid, and
+    # refreshes the lane heartbeat.
     gepa_abs = str(gepa_dir(workspace_root).resolve())
     lane_dir = lanes_dir(workspace_root, run_state.run_id) / lane
     lane_dir.mkdir(parents=True, exist_ok=True)
@@ -760,28 +882,31 @@ def lane_continue(
         "--foreground",
     ]
     worktree_path = str(state.worktree_path)
-    # Lease the lane for the eval; the detached child performs the
-    # leased -> evaluating transition itself (recording its pid) so a second
-    # `gepa lane continue` is rejected at every point in the handoff.
-    state = LaneState(
-        **{
-            **state.to_dict(),
-            "status": "leased",
-            "lease_epoch": state.lease_epoch + 1,
-            "lease_expires_at": None,
-            "updated_at": utc_now_iso(),
-        }
-    )
-    state.save(workspace_root, run_state.run_id)
-    with log_path.open("ab") as log_handle:
-        process = subprocess.Popen(  # noqa: S603
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            cwd=worktree_path,
-        )
+    try:
+        with log_path.open("ab") as log_handle:
+            process = subprocess.Popen(  # noqa: S603
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                cwd=worktree_path,
+            )
+    except OSError as exc:
+        # Spawn failed: release the handoff lease so the lane stays dispatchable.
+        with _lane_lock(workspace_root, run_state.run_id, lane):
+            current = load_lane_state(workspace_root, run_state.run_id, lane)
+            if current.status == "leased":
+                LaneState(
+                    **{
+                        **current.to_dict(),
+                        "status": "paused_for_reflection",
+                        "lease_expires_at": None,
+                        "updated_at": utc_now_iso(),
+                    }
+                ).save(workspace_root, run_state.run_id)
+        typer.echo(f"Failed to spawn lane eval: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
     typer.echo(
         f"Lane {lane} eval detached (pid {process.pid}); log: {log_path}. "
         f"Watch `gepa next` for the verdict event."
@@ -796,51 +921,62 @@ def lane_reset(
     """Recover a stalled lane: terminate a dead/alive eval, reset to paused.
 
     A live recorded eval pid is terminated first (SIGTERM); uncommitted
-    worktree content is never auto-deleted.
+    worktree content is never auto-deleted. Lanes holding a resolved verdict
+    (awaiting_selection) cannot be reset — only `gepa run select` consumes
+    them, so a completed candidate is never destroyed unrecorded.
     """
     _validate_lane_id(lane)
     workspace_root, run_state = _resolve_lane_run(run_id)
-    state = load_lane_state(workspace_root, run_state.run_id, lane)
-    if state.eval_pid is not None and _pid_alive(state.eval_pid):
-        typer.echo(
-            f"Terminating lane {lane} eval process (pid {state.eval_pid}).",
-            err=True,
-        )
-        os.kill(state.eval_pid, signal.SIGTERM)
-        deadline = time.monotonic() + 5.0
-        while _pid_alive(state.eval_pid) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if _pid_alive(state.eval_pid):
+    with _lane_lock(workspace_root, run_state.run_id, lane):
+        state = load_lane_state(workspace_root, run_state.run_id, lane)
+        if state.status == "awaiting_selection":
             typer.echo(
-                f"Lane {lane} eval pid {state.eval_pid} did not exit after "
-                "SIGTERM; refusing to reset a live lane.",
+                f"Lane {lane} is awaiting_selection with verdict "
+                f"{state.verdict!r}; only `gepa run select` consumes it. "
+                "Refusing to reset (its outcome would be lost unrecorded).",
                 err=True,
             )
             raise typer.Exit(code=1)
-    worktree = Path(state.worktree_path) if state.worktree_path else None
-    if worktree is not None and worktree.exists():
-        dirty = _git(worktree, "status", "--porcelain")
-        if dirty:
+        if state.eval_pid is not None and _pid_alive(state.eval_pid):
             typer.echo(
-                f"Note: lane worktree {worktree} has uncommitted content; "
-                "it is preserved (never auto-deleted).",
+                f"Terminating lane {lane} eval process (pid {state.eval_pid}).",
                 err=True,
             )
-    state = LaneState(
-        **{
-            **state.to_dict(),
-            "status": "paused_for_reflection",
-            "lease_epoch": state.lease_epoch + 1,
-            "lease_expires_at": None,
-            "eval_pid": None,
-            "heartbeat_at": None,
-            "verdict": None,
-            "verdict_delta": None,
-            "eval_samples": (),
-            "updated_at": utc_now_iso(),
-        }
-    )
-    state.save(workspace_root, run_state.run_id)
+            os.kill(state.eval_pid, signal.SIGTERM)
+            deadline = time.monotonic() + 5.0
+            while _pid_alive(state.eval_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if _pid_alive(state.eval_pid):
+                typer.echo(
+                    f"Lane {lane} eval pid {state.eval_pid} did not exit after "
+                    "SIGTERM; refusing to reset a live lane.",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+        worktree = Path(state.worktree_path) if state.worktree_path else None
+        if worktree is not None and worktree.exists():
+            dirty = _git(worktree, "status", "--porcelain")
+            if dirty:
+                typer.echo(
+                    f"Note: lane worktree {worktree} has uncommitted content; "
+                    "it is preserved (never auto-deleted).",
+                    err=True,
+                )
+        state = LaneState(
+            **{
+                **state.to_dict(),
+                "status": "paused_for_reflection",
+                "lease_epoch": state.lease_epoch + 1,
+                "lease_expires_at": None,
+                "eval_pid": None,
+                "heartbeat_at": None,
+                "verdict": None,
+                "verdict_delta": None,
+                "eval_samples": (),
+                "updated_at": utc_now_iso(),
+            }
+        )
+        state.save(workspace_root, run_state.run_id)
     typer.echo(
         f"Lane {lane} reset to paused_for_reflection (lease epoch "
         f"{state.lease_epoch}). Re-dispatch with the packet at "
@@ -876,12 +1012,14 @@ def scan_lane_states(workspace_root: Path, run_id: str, run_state: Any) -> LaneS
                 )
             else:
                 heartbeat_stale = True
+            # spec-1do: eval death is stale heartbeat PLUS dead pid — a stale
+            # heartbeat with a live pid is a slow eval, not a dead one (the
+            # documented response to lane_stalled is `lane reset`, which
+            # SIGTERMs the pid; false positives would kill healthy evals).
             if pid_dead:
                 stalled_reason = f"eval process pid {state.eval_pid} is dead"
-            elif heartbeat_stale:
-                stalled_reason = (
-                    f"eval heartbeat stale (>{run_state.eval_stall_timeout_secs:g}s)"
-                )
+                if heartbeat_stale:
+                    stalled_reason += " with a stale heartbeat"
         elif state.status == "leased":
             if state.lease_expires_at and _parse_iso(state.lease_expires_at) <= now:
                 stalled_reason = "reflection lease expired"
@@ -903,7 +1041,11 @@ def scan_lane_states(workspace_root: Path, run_id: str, run_state: Any) -> LaneS
 
     selection_due: SelectionDueSignal | None = None
     if resolved:
-        started = _parse_iso(run_state.updated_at)
+        # The straggler clock starts at fan-out/re-fan, not from
+        # run_state.updated_at — unrelated verb saves refresh that field and
+        # would otherwise starve the timeout indefinitely (spec-er3).
+        started_raw = run_state.iteration_started_at or run_state.updated_at
+        started = _parse_iso(started_raw)
         elapsed = (now - started).total_seconds()
         all_resolved = not stragglers
         if all_resolved or elapsed > run_state.straggler_timeout_secs:
@@ -916,9 +1058,33 @@ def scan_lane_states(workspace_root: Path, run_id: str, run_state: Any) -> LaneS
 
 
 def reaper_pass_for_run(workspace_root: Path, run_state: Any) -> list[str]:
-    """Run the lazy reaper with the real lane scanner for a lane run."""
+    """Run the lazy reaper with the real lane scanner for a lane run.
+
+    Stalled lanes are transitioned in state (dec-l95), not just reported on
+    the bus: the lane board shows `stalled`, and the status machine rows
+    leased/evaluating → stalled become reachable outside select.
+    """
     scan = scan_lane_states(workspace_root, run_state.run_id, run_state)
-    return run_reaper_pass(run_state.run_id, scan, root=workspace_root)
+    emitted = run_reaper_pass(run_state.run_id, scan, root=workspace_root)
+    for lane_scan in scan.lanes:
+        if lane_scan.stalled_reason is None:
+            continue
+        with _lane_lock(workspace_root, run_state.run_id, lane_scan.lane):
+            state = load_lane_state(workspace_root, run_state.run_id, lane_scan.lane)
+            if (
+                state.status in {"leased", "evaluating"}
+                and state.lease_epoch == lane_scan.lease_epoch
+            ):
+                LaneState(
+                    **{
+                        **state.to_dict(),
+                        "status": "stalled",
+                        "eval_pid": None,
+                        "lease_expires_at": None,
+                        "updated_at": utc_now_iso(),
+                    }
+                ).save(workspace_root, run_state.run_id)
+    return emitted
 
 
 # ----------------------------- fan-out (run start) ----------------------
@@ -930,6 +1096,10 @@ def fan_out_lanes(run_state: Any, workspace_root: Path) -> None:
     Called by `gepa run start --lanes N` after the shared baseline pause: all
     lanes branch from the frozen baseline commit (the run's best), so every
     lane in an iteration shares one branch point and one frozen baseline.
+
+    Fan-out failure is rolled back — worktrees, branches, lane states, and
+    lane_ready events created so far are removed — so a crash mid-fan-out
+    never leaves a zombie run (dec-jh6).
     """
     base_sha = run_state.reflection_baseline_commit_sha
     if not base_sha:
@@ -938,36 +1108,59 @@ def fan_out_lanes(run_state: Any, workspace_root: Path) -> None:
             err=True,
         )
         raise typer.Exit(code=1)
-    for lane in lane_ids(run_state.lanes):
-        path, branch = create_lane_worktree(
-            workspace_root, run_state.run_id, lane, run_state.iterations, base_sha
-        )
-        packet_path = write_packet(
-            workspace_root, run_state, lane, run_state.iterations, path, branch
-        )
-        LaneState(
-            lane=lane,
-            status="paused_for_reflection",
-            iteration=run_state.iterations,
-            branch=branch,
-            worktree_path=str(path),
-            packet_path=str(packet_path),
-            updated_at=utc_now_iso(),
-        ).save(workspace_root, run_state.run_id)
-        emit(
-            run_state.run_id,
-            "run",
-            EventDraft(
-                type="lane_ready",
+    created: list[tuple[Path, str, str]] = []  # (worktree path, branch, lane)
+    try:
+        for lane in lane_ids(run_state.lanes):
+            path, branch = create_lane_worktree(
+                workspace_root, run_state.run_id, lane, run_state.iterations, base_sha
+            )
+            created.append((path, branch, lane))
+            packet_path = write_packet(
+                workspace_root, run_state, lane, run_state.iterations, path, branch
+            )
+            LaneState(
                 lane=lane,
-                payload={
-                    "packet_path": str(packet_path),
-                    "worktree_path": str(path),
-                },
-            ),
-            root=workspace_root,
+                status="paused_for_reflection",
+                iteration=run_state.iterations,
+                branch=branch,
+                worktree_path=str(path),
+                packet_path=str(packet_path),
+                updated_at=utc_now_iso(),
+            ).save(workspace_root, run_state.run_id)
+            emit(
+                run_state.run_id,
+                "run",
+                EventDraft(
+                    type="lane_ready",
+                    lane=lane,
+                    payload={
+                        "packet_path": str(packet_path),
+                        "worktree_path": str(path),
+                    },
+                ),
+                root=workspace_root,
+            )
+            typer.echo(f"Lane {lane} ready: worktree {path}, packet {packet_path}.")
+    except Exception:
+        for path, branch, lane in reversed(created):
+            try:
+                _git(workspace_root, "worktree", "remove", "--force", str(path))
+            except Exception:
+                pass
+            try:
+                _git(workspace_root, "branch", "-D", branch)
+            except Exception:
+                pass
+            lane_dir = lanes_dir(workspace_root, run_state.run_id) / lane
+            if lane_dir.exists():
+                import shutil
+
+                shutil.rmtree(lane_dir, ignore_errors=True)
+        typer.echo(
+            "Lane fan-out failed; rolled back created worktrees/branches.",
+            err=True,
         )
-        typer.echo(f"Lane {lane} ready: worktree {path}, packet {packet_path}.")
+        raise
 
 
 def scan_run_lanes(run_id: str, root: Path | None = None) -> LaneScan | None:

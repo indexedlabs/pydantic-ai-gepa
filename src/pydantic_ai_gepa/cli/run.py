@@ -29,6 +29,7 @@ from .layout import (
     config_path,
     final_report_path,
     insert_repo_root_on_path,
+    journal_path,
     new_run_id,
     repo_root,
     resolve_agent,
@@ -99,6 +100,9 @@ class RunState:
     eval_stall_timeout_secs: float = 600.0
     straggler_timeout_secs: float = 900.0
     journal_tail_lines: int = 20
+    # Set at fan-out/re-fan: the straggler-timeout clock starts here, immune
+    # to unrelated run-state saves refreshing updated_at (spec-er3).
+    iteration_started_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -147,6 +151,7 @@ class RunState:
             "eval_stall_timeout_secs": self.eval_stall_timeout_secs,
             "straggler_timeout_secs": self.straggler_timeout_secs,
             "journal_tail_lines": self.journal_tail_lines,
+            "iteration_started_at": self.iteration_started_at,
         }
 
     @staticmethod
@@ -252,6 +257,7 @@ class RunState:
             eval_stall_timeout_secs=float(data.get("eval_stall_timeout_secs", 600.0)),
             straggler_timeout_secs=float(data.get("straggler_timeout_secs", 900.0)),
             journal_tail_lines=int(data.get("journal_tail_lines", 20)),
+            iteration_started_at=data.get("iteration_started_at"),
         )
 
     def save(self) -> Path:
@@ -937,7 +943,9 @@ def start(
             )
             raise typer.Exit(code=2)
         # Lane branches are always cut from a clean commit; a dirty primary
-        # tree is rejected (spec-1do constraint).
+        # tree is rejected (spec-1do constraint). The journal is tracked
+        # bookkeeping the CLI itself appends to — exclude it like select does
+        # (one dirtiness definition across verbs).
         from .lanes import ensure_worktrees_ignored, worktrees_root
 
         workspace_root = repo_root()
@@ -948,6 +956,7 @@ def start(
                 exclude_paths=[
                     runs_dir(workspace_root),
                     worktrees_root(workspace_root),
+                    journal_path(workspace_root),
                 ],
             )
         except GitCandidateError as exc:
@@ -961,6 +970,30 @@ def start(
                 err=True,
             )
             raise typer.Exit(code=1)
+        # One active lane run per workspace (dec-jh6): an existing lane run
+        # that never reached `done` still owns its lane refs and events.
+        from .layout import is_run_id
+
+        for entry in sorted(runs_dir(workspace_root).iterdir()):
+            if not (entry.is_dir() and is_run_id(entry.name)):
+                continue
+            prior_state_path = entry / "state.json"
+            if not prior_state_path.exists():
+                continue
+            try:
+                prior = RunState.from_dict(
+                    json.loads(prior_state_path.read_text(encoding="utf-8"))
+                )
+            except (json.JSONDecodeError, KeyError, ValueError):
+                continue
+            if prior.lanes > 0 and prior.status != "done":
+                typer.echo(
+                    f"Lane run {prior.run_id} is still active "
+                    f"(status {prior.status}); finish it (`gepa run select`) "
+                    "or abandon it before starting another lane run.",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
     run_id = new_run_id()
     run_dir(run_id).mkdir(parents=True, exist_ok=True)
     now = utc_now_iso()
@@ -992,18 +1025,56 @@ def start(
     state, outcomes = _advance_to_reflection_or_done(state)
     state.save()
     if lanes > 0 and state.status == "paused_for_reflection":
+        # Lane branches are cut from the CURRENT best commit — re-check the
+        # primary hasn't moved since the (possibly minutes-old) clean check.
+        fresh_state = git_candidate_state(
+            workspace_root,
+            exclude_paths=[
+                runs_dir(workspace_root),
+                worktrees_root(workspace_root),
+                journal_path(workspace_root),
+            ],
+        )
+        if (
+            fresh_state.commit_sha != state.reflection_baseline_commit_sha
+            or fresh_state.dirty
+        ):
+            # The baseline was measured against a HEAD that has since moved;
+            # advance again so lanes branch off the code actually scored.
+            state = _with_timestamp(state, status="running")
+            state.save()
+            state, extra_outcomes = _advance_to_reflection_or_done(state)
+            outcomes.extend(extra_outcomes)
+            state.save()
+    if lanes > 0 and state.status == "paused_for_reflection":
         # Fan out: worktrees + packets + lane_ready events. The run-level
         # status returns to "running" — lanes carry the reflection pause.
         from .lanes import fan_out_lanes
 
         fan_out_lanes(state, repo_root())
         state = _with_timestamp(state, status="running")
+        state = replace(state, iteration_started_at=state.updated_at)
         state.save()
 
     final_path: Path | None = None
     final_text: str | None = None
     if state.status == "done":
         final_path, final_text = _write_final_report(state)
+        if lanes > 0:
+            # A lane run can finish during the baseline advance; the
+            # orchestrator loop terminates on run_done, so emit it here too.
+            from .events import EventDraft, emit
+
+            emit(
+                state.run_id,
+                "run",
+                EventDraft(
+                    type="run_done",
+                    lane=None,
+                    payload={"final_report_path": str(final_path)},
+                ),
+                root=workspace_root,
+            )
     _emit_status(
         state, outcomes=outcomes, final_report=final_path, final_report_text=final_text
     )

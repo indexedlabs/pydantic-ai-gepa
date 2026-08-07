@@ -18,6 +18,7 @@ from typer.testing import CliRunner
 from pydantic_ai_gepa.cli import app as gepa_app
 from pydantic_ai_gepa.cli.lanes import (
     LaneState,
+    lane_state_path,
     load_lane_state,
 )
 from pydantic_ai_gepa.cli.run import RunState
@@ -139,12 +140,12 @@ def test_run_start_lanes_fans_out(git_repo: Path) -> None:
     # Worktrees + branches cut from the frozen baseline commit.
     base_sha = _git(git_repo, "rev-parse", "HEAD")
     for lane in ("lane-1", "lane-2"):
-        worktree = git_repo / "worktrees" / lane
+        worktree = git_repo / "worktrees" / run_id / lane
         assert worktree.is_dir()
         assert _git(worktree, "rev-parse", "HEAD") == base_sha
         state = _lane_state(git_repo, run_id, lane)
         assert state.status == "paused_for_reflection"
-        assert state.branch == f"gepa/lane/{lane}/{state.iteration}"
+        assert state.branch == f"gepa/lane/{run_id}/{lane}/{state.iteration}"
         assert Path(str(state.packet_path)).exists()
 
     # lane_ready events emitted with packet + worktree paths.
@@ -270,7 +271,7 @@ def test_lane_continue_evaluates_and_emits_verdict(git_repo: Path) -> None:
     primary_head = _git(git_repo, "rev-parse", "HEAD")
 
     # The reflector improves the candidate inside the lane worktree only.
-    worktree = git_repo / "worktrees" / "lane-1"
+    worktree = git_repo / "worktrees" / run_id / "lane-1"
     (worktree / "score.txt").write_text("good\n", encoding="utf-8")
 
     # Invoke from inside the worktree using only the packet's invocation
@@ -343,7 +344,7 @@ def test_two_lanes_evaluate_in_distinct_worktrees(git_repo: Path) -> None:
     old_cwd = Path.cwd()
     try:
         for lane, content in edits.items():
-            worktree = git_repo / "worktrees" / lane
+            worktree = git_repo / "worktrees" / run_id / lane
             (worktree / "score.txt").write_text(content, encoding="utf-8")
             os.chdir(worktree)
             result = _run(
@@ -414,7 +415,7 @@ def test_lane_reset_terminates_live_eval_and_preserves_worktree(
     run_id = str(run["run_id"])
     gepa_dir = str(git_repo / ".gepa")
 
-    worktree = git_repo / "worktrees" / "lane-1"
+    worktree = git_repo / "worktrees" / run_id / "lane-1"
     (worktree / "notes.txt").write_text("uncommitted work\n", encoding="utf-8")
 
     sleeper = subprocess.Popen(["sleep", "30"])
@@ -471,7 +472,10 @@ def test_run_status_renders_lane_board_and_reaps(git_repo: Path) -> None:
     payload = json.loads(first.output)
     lanes = {lane["lane"]: lane for lane in payload["lanes"]}
     assert set(lanes) == {"lane-1", "lane-2"}
-    assert lanes["lane-1"]["status"] == "evaluating"
+    # The reaper transitions the dead-pid lane's STATE to stalled (dec-l95),
+    # not just an event on the bus.
+    assert lanes["lane-1"]["status"] == "stalled"
+    assert lanes["lane-1"]["eval_pid"] is None
     assert lanes["lane-2"]["status"] == "paused_for_reflection"
 
     from pydantic_ai_gepa.cli.events import list_events
@@ -497,3 +501,177 @@ def test_lane_verb_requires_explicit_absolute_workspace(git_repo: Path) -> None:
     result = _run("lane", "reset", "lane-1", "--run-id", str(run["run_id"]))
     assert result.exit_code != 0
     assert "absolute workspace" in result.output or "GEPA_DIR" in result.output
+
+
+# ---------- adversarial-review hardening (PR #29 review) ----------
+
+
+def test_second_lane_run_rejected(git_repo: Path) -> None:
+    """One active lane run per workspace (dec-jh6): a second `run start
+    --lanes` while the first is active is refused before any fan-out."""
+    _start_lane_run(git_repo, lanes=1)
+    result = _run("run", "start", "--lanes", "1", "--size", "1")
+    assert result.exit_code == 1
+    assert "still active" in result.output
+    # No second run dir was created with lanes.
+    runs = [p for p in (git_repo / ".gepa" / "runs").iterdir() if p.is_dir()]
+    assert len(runs) == 1
+
+
+def test_lane_verbs_reject_done_runs(git_repo: Path) -> None:
+    """Lane verbs refuse to run on completed runs (spec-1do: lanes are
+    re-fanned at select or removed when the run completes)."""
+    result = _run(
+        "run",
+        "start",
+        "--lanes",
+        "1",
+        "--size",
+        "1",
+        "--acceptance-repetitions",
+        "1",
+        "--max-iterations",
+        "1",
+    )
+    assert result.exit_code == 0, result.output
+    run = _run_payload(result.output)
+    assert run["status"] == "done"  # budget exhausted by the baseline eval
+    run_id = str(run["run_id"])
+    gepa_dir = str(git_repo / ".gepa")
+
+    # run_done is emitted even though no select ever ran.
+    from pydantic_ai_gepa.cli.events import list_events
+
+    done_events = [e for e in list_events(run_id, git_repo) if e.type == "run_done"]
+    assert len(done_events) == 1
+
+    lease = _run("--gepa-dir", gepa_dir, "lane", "lease", "lane-1", "--run-id", run_id)
+    assert lease.exit_code == 1
+    assert "done" in lease.output
+
+
+def test_second_continue_on_leased_lane_rejected(git_repo: Path) -> None:
+    """A leased lane rejects a concurrent `lane continue` until the lease is
+    consumed, reset, or expires (spec-1do mutual exclusion)."""
+    run = _start_lane_run(git_repo, lanes=1)
+    run_id = str(run["run_id"])
+    gepa_dir = str(git_repo / ".gepa")
+
+    leased = _run("--gepa-dir", gepa_dir, "lane", "lease", "lane-1", "--run-id", run_id)
+    assert leased.exit_code == 0, leased.output
+
+    # A parent-mode continue (spawn path) is rejected while leased.
+    result = _run(
+        "--gepa-dir", gepa_dir, "lane", "continue", "lane-1", "--run-id", run_id
+    )
+    assert result.exit_code == 1
+    assert "leased" in result.output
+    state = _lane_state(git_repo, run_id, "lane-1")
+    assert state.status == "leased"
+    assert state.lease_epoch == 1
+
+
+def test_lane_reset_refuses_awaiting_selection(git_repo: Path) -> None:
+    """A resolved lane's verdict is never destroyed unrecorded."""
+    run = _start_lane_run(git_repo, lanes=1)
+    run_id = str(run["run_id"])
+    gepa_dir = str(git_repo / ".gepa")
+    worktree = git_repo / "worktrees" / run_id / "lane-1"
+    (worktree / "score.txt").write_text("good\n", encoding="utf-8")
+
+    import os
+
+    old_cwd = Path.cwd()
+    os.chdir(worktree)
+    try:
+        result = _run(
+            "--gepa-dir",
+            gepa_dir,
+            "lane",
+            "continue",
+            "lane-1",
+            "--run-id",
+            run_id,
+            "--foreground",
+        )
+    finally:
+        os.chdir(old_cwd)
+    assert result.exit_code == 0, result.output
+    assert _lane_state(git_repo, run_id, "lane-1").status == "awaiting_selection"
+
+    reset = _run("--gepa-dir", gepa_dir, "lane", "reset", "lane-1", "--run-id", run_id)
+    assert reset.exit_code == 1
+    assert "awaiting_selection" in reset.output
+    # Verdict intact.
+    state = _lane_state(git_repo, run_id, "lane-1")
+    assert state.verdict == "accepted"
+    assert state.status == "awaiting_selection"
+
+
+def test_foreground_continue_evaluates_worktree_not_primary(git_repo: Path) -> None:
+    """Foreground continue invoked from the PRIMARY checkout still evaluates
+    the lane worktree's tree (the loop chdirs to the candidate root)."""
+    run = _start_lane_run(git_repo, lanes=1)
+    run_id = str(run["run_id"])
+    gepa_dir = str(git_repo / ".gepa")
+    worktree = git_repo / "worktrees" / run_id / "lane-1"
+    (worktree / "score.txt").write_text("good\n", encoding="utf-8")
+    # Primary still scores "bad".
+    assert (git_repo / "score.txt").read_text(encoding="utf-8") == "bad\n"
+
+    result = _run(
+        "--gepa-dir",
+        gepa_dir,
+        "lane",
+        "continue",
+        "lane-1",
+        "--run-id",
+        run_id,
+        "--foreground",
+    )
+    assert result.exit_code == 0, result.output
+    assert "accepted" in result.output
+    state = _lane_state(git_repo, run_id, "lane-1")
+    assert state.verdict == "accepted"
+
+
+def test_stale_heartbeat_with_live_pid_is_not_stalled(git_repo: Path) -> None:
+    """spec-1do: eval death = stale heartbeat PLUS dead pid. A slow but alive
+    eval is never reaped (the documented response kills the pid)."""
+    run = _start_lane_run(git_repo, lanes=1)
+    run_id = str(run["run_id"])
+
+    sleeper = subprocess.Popen(["sleep", "30"])
+    try:
+        state = _lane_state(git_repo, run_id, "lane-1")
+        LaneState(
+            **{
+                **state.to_dict(),
+                "status": "evaluating",
+                "eval_pid": sleeper.pid,
+                "heartbeat_at": "2020-01-01T00:00:00+00:00",  # ancient
+            }
+        ).save(git_repo, run_id)
+
+        result = _run("run", "status", "--run-id", run_id)
+        assert result.exit_code == 0, result.output
+        from pydantic_ai_gepa.cli.events import list_events
+
+        stalled = [e for e in list_events(run_id, git_repo) if e.type == "lane_stalled"]
+        assert stalled == []
+        lanes = {lane["lane"]: lane for lane in json.loads(result.output)["lanes"]}
+        assert lanes["lane-1"]["status"] == "evaluating"
+    finally:
+        sleeper.terminate()
+        sleeper.wait()
+
+
+def test_corrupt_lane_state_gives_actionable_error(git_repo: Path) -> None:
+    started = _start_lane_run(git_repo, lanes=1)
+    run_id = str(started["run_id"])
+    path = lane_state_path(git_repo, run_id, "lane-1")
+    path.write_text("{torn", encoding="utf-8")
+    gepa_dir = str(git_repo / ".gepa")
+    result = _run("--gepa-dir", gepa_dir, "lane", "lease", "lane-1", "--run-id", run_id)
+    assert result.exit_code != 0
+    assert "corrupt" in result.output or "lane reset" in result.output
