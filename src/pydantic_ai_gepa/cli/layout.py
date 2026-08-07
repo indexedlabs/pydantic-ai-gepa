@@ -582,22 +582,6 @@ def _is_below(path: Path | None, root: Path) -> bool:
     return True
 
 
-def _project_source_roots(
-    project: Path, configured_roots: set[str]
-) -> tuple[Path, ...]:
-    """Return import roots whose modules belong to a candidate project."""
-
-    roots: list[Path] = []
-    source_root = project / "src"
-    if source_root.is_dir():
-        roots.append(source_root)
-    for name in sorted(configured_roots):
-        package_root = project / name
-        if package_root.exists() and package_root not in roots:
-            roots.append(package_root)
-    return tuple(roots)
-
-
 def _interpreter_roots() -> tuple[Path, ...]:
     """Return active interpreter roots that may live inside a checkout."""
 
@@ -612,18 +596,24 @@ def _interpreter_roots() -> tuple[Path, ...]:
     return tuple(roots)
 
 
-def _module_is_project_owned(module: Any, source_roots: Sequence[Path]) -> bool:
+def _module_is_repository_owned(
+    module: Any,
+    repository_roots: Sequence[Path],
+    interpreter_roots: Sequence[Path],
+) -> bool:
     return any(
-        _is_below(path, source_root)
+        not any(_is_below(path, root) for root in interpreter_roots)
+        and any(_is_below(path, root) for root in repository_roots)
         for path in _module_source_paths(module)
-        for source_root in source_roots
     )
 
 
-def _project_modules_to_evict(
-    source_roots: Sequence[Path], configured_roots: set[str]
+def _repository_modules_to_evict(
+    repository_roots: Sequence[Path],
+    interpreter_roots: Sequence[Path],
+    configured_roots: set[str],
 ) -> tuple[tuple[str, Any], ...]:
-    """Discover project modules without invalidating namespace parents mid-scan."""
+    """Discover repository modules without invalidating namespace parents mid-scan."""
 
     matches: list[tuple[str, Any]] = []
     for name, module in list(sys.modules.items()):
@@ -631,7 +621,9 @@ def _project_modules_to_evict(
             continue
         top_level = name.split(".", 1)[0]
         if (
-            _module_is_project_owned(module, source_roots)
+            _module_is_repository_owned(
+                module, repository_roots, interpreter_roots
+            )
             or top_level in configured_roots
         ):
             matches.append((name, module))
@@ -658,12 +650,13 @@ def candidate_import_context(
     primary_repository = git_root(primary)
     candidate_repository = git_root(candidate)
     configured_roots = {ref.split(":", 1)[0].split(".", 1)[0] for ref in refs if ref}
-    primary_source_roots = _project_source_roots(primary, configured_roots)
-    candidate_source_roots = _project_source_roots(candidate, configured_roots)
     interpreter_roots = _interpreter_roots()
     removed: dict[str, Any] = {}
-    source_roots = (*primary_source_roots, *candidate_source_roots)
-    for name, module in _project_modules_to_evict(source_roots, configured_roots):
+    repositories = (primary_repository, candidate_repository)
+    modules_to_remove = _repository_modules_to_evict(
+        repositories, interpreter_roots, configured_roots
+    )
+    for name, module in modules_to_remove:
         if sys.modules.get(name) is module:
             removed[name] = module
             sys.modules.pop(name, None)
@@ -694,8 +687,8 @@ def candidate_import_context(
         yield
     finally:
         os.chdir(original_cwd)
-        candidate_modules = _project_modules_to_evict(
-            candidate_source_roots, configured_roots
+        candidate_modules = _repository_modules_to_evict(
+            (candidate_repository,), interpreter_roots, configured_roots
         )
         for name, module in candidate_modules:
             if sys.modules.get(name) is module:

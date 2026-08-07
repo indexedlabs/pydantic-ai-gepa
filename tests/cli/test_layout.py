@@ -304,7 +304,19 @@ def test_candidate_import_context_preserves_repo_local_environment_modules(
     for project in (primary, candidate):
         (project / "src" / "runtime_pkg").mkdir(parents=True)
         (project / "eval_pkg").mkdir()
+        (project / "shared_pkg").mkdir()
         subprocess.run(["git", "init", str(project)], check=True, capture_output=True)
+    (candidate / "eval_pkg" / "__init__.py").touch()
+    (candidate / "eval_pkg" / "evaluation.py").write_text(
+        "from shared_pkg import MARKER\n"
+        "def evaluate():\n"
+        "    return MARKER\n",
+        encoding="utf-8",
+    )
+    (candidate / "shared_pkg" / "__init__.py").write_text(
+        "MARKER = 'candidate-flat-sibling'\n",
+        encoding="utf-8",
+    )
 
     environment = primary / ".venv"
     site_packages = environment / "lib" / "python3.13" / "site-packages"
@@ -322,6 +334,10 @@ def test_candidate_import_context_preserves_repo_local_environment_modules(
     configured_module = SimpleNamespace(
         __file__=str(primary / "eval_pkg" / "evaluation.py")
     )
+    flat_sibling_module = SimpleNamespace(
+        __file__=str(primary / "shared_pkg" / "__init__.py"),
+        MARKER="primary-flat-sibling",
+    )
     import_hook = SimpleNamespace(
         __file__=str(site_packages / "beartype" / "claw" / "__init__.py")
     )
@@ -331,7 +347,8 @@ def test_candidate_import_context_preserves_repo_local_environment_modules(
         "runtime_pkg.layout_test.namespace",
         namespace_module,
     )
-    monkeypatch.setitem(sys.modules, "eval_pkg.layout_test", configured_module)
+    monkeypatch.setitem(sys.modules, "eval_pkg.evaluation", configured_module)
+    monkeypatch.setitem(sys.modules, "shared_pkg", flat_sibling_module)
     monkeypatch.setitem(sys.modules, "beartype.claw.layout_test", import_hook)
     monkeypatch.setattr(sys, "prefix", str(environment))
     monkeypatch.setattr(sys, "exec_prefix", str(environment))
@@ -348,14 +365,23 @@ def test_candidate_import_context_preserves_repo_local_environment_modules(
     ):
         assert "runtime_pkg.layout_test" not in sys.modules
         assert "runtime_pkg.layout_test.namespace" not in sys.modules
-        assert "eval_pkg.layout_test" not in sys.modules
+        assert "eval_pkg.evaluation" not in sys.modules
+        assert "shared_pkg" not in sys.modules
         assert sys.modules["beartype.claw.layout_test"] is import_hook
         assert str(candidate / "src") in sys.path
         assert str(site_packages) in sys.path
+        evaluate = resolve_module_attr(
+            "eval_pkg.evaluation:evaluate", expected_root=candidate
+        )
+        assert evaluate() == "candidate-flat-sibling"
+        candidate_shared_file = sys.modules["shared_pkg"].__file__
+        assert candidate_shared_file is not None
+        assert Path(candidate_shared_file).is_relative_to(candidate)
 
     assert sys.modules["runtime_pkg.layout_test"] is project_module
     assert sys.modules["runtime_pkg.layout_test.namespace"] is namespace_module
-    assert sys.modules["eval_pkg.layout_test"] is configured_module
+    assert sys.modules["eval_pkg.evaluation"] is configured_module
+    assert sys.modules["shared_pkg"] is flat_sibling_module
     assert sys.modules["beartype.claw.layout_test"] is import_hook
 
 
