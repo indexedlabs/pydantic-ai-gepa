@@ -577,8 +577,14 @@ def test_dispatch_lease_is_consumed_by_continue(git_repo: Path) -> None:
     os.chdir(worktree)
     try:
         result = _run(
-            "--gepa-dir", gepa_dir, "lane", "continue", "lane-1",
-            "--run-id", run_id, "--foreground",
+            "--gepa-dir",
+            gepa_dir,
+            "lane",
+            "continue",
+            "lane-1",
+            "--run-id",
+            run_id,
+            "--foreground",
         )
     finally:
         os.chdir(old_cwd)
@@ -606,7 +612,9 @@ def test_handoff_lease_rejects_second_continue(git_repo: Path) -> None:
         }
     ).save(git_repo, run_id)
 
-    result = _run("--gepa-dir", gepa_dir, "lane", "continue", "lane-1", "--run-id", run_id)
+    result = _run(
+        "--gepa-dir", gepa_dir, "lane", "continue", "lane-1", "--run-id", run_id
+    )
     assert result.exit_code == 1
     assert "handoff in flight" in result.output
 
