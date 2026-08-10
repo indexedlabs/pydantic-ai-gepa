@@ -85,6 +85,19 @@ def test_managed_run_pauses_for_reflection_and_writes_trace_paths(repo: Path) ->
     assert run_state_path(str(payload["run_id"]), repo).exists()
 
 
+def test_run_start_defaults_match_minibatch_evaluation(repo: Path) -> None:
+    result = _run("run", "start", "--size", "2", "--max-iterations", "8")
+
+    assert result.exit_code == 0, result.output
+    payload = _run_payload(result.output)
+    assert payload["concurrency"] == 2
+    assert payload["acceptance_repetitions"] == 3
+    assert payload["acceptance_max_repetitions"] == 3
+    baseline_samples = payload["reflection_baseline_samples"]
+    assert isinstance(baseline_samples, list)
+    assert len(baseline_samples) == 3
+
+
 def test_continue_reports_equivalent_when_candidate_does_not_change(
     repo: Path,
 ) -> None:

@@ -48,6 +48,8 @@ app = typer.Typer(
     help="Start and resume a managed pause-for-reflection GEPA run.",
 )
 
+DEFAULT_STRAGGLER_TIMEOUT_SECS = 3600.0
+
 RunStatus = Literal[
     "running",
     "paused_for_reflection",
@@ -99,7 +101,7 @@ class RunState:
     heartbeat_interval_secs: float = 10.0
     reflection_lease_secs: float = 1800.0
     eval_stall_timeout_secs: float = 600.0
-    straggler_timeout_secs: float = 900.0
+    straggler_timeout_secs: float = DEFAULT_STRAGGLER_TIMEOUT_SECS
     journal_tail_lines: int = 20
     # Set at fan-out/re-fan: the straggler-timeout clock starts here, immune
     # to unrelated run-state saves refreshing updated_at (spec-er3).
@@ -264,7 +266,9 @@ class RunState:
             heartbeat_interval_secs=float(data.get("heartbeat_interval_secs", 10.0)),
             reflection_lease_secs=float(data.get("reflection_lease_secs", 1800.0)),
             eval_stall_timeout_secs=float(data.get("eval_stall_timeout_secs", 600.0)),
-            straggler_timeout_secs=float(data.get("straggler_timeout_secs", 900.0)),
+            straggler_timeout_secs=float(
+                data.get("straggler_timeout_secs", DEFAULT_STRAGGLER_TIMEOUT_SECS)
+            ),
             journal_tail_lines=int(data.get("journal_tail_lines", 20)),
             iteration_started_at=data.get("iteration_started_at"),
             select_phase=(
@@ -883,8 +887,10 @@ def start(
     ),
     seed: int = typer.Option(0, "--seed", help="Deterministic minibatch seed."),
     epoch: int = typer.Option(0, "--epoch", help="Initial minibatch epoch."),
-    concurrency: int = typer.Option(
-        5, "--concurrency", help="Max parallel agent calls during evaluation."
+    concurrency: int | None = typer.Option(
+        None,
+        "--concurrency",
+        help="Max parallel agent calls during evaluation. Defaults to --size.",
     ),
     threshold: float = typer.Option(
         DEFAULT_FAILURE_THRESHOLD,
@@ -892,7 +898,7 @@ def start(
         help="Score below which a case requires reflection.",
     ),
     acceptance_repetitions: int = typer.Option(
-        1,
+        3,
         "--acceptance-repetitions",
         help=(
             "Initial repeated evaluations per candidate on the saved mini-valset. "
@@ -943,7 +949,7 @@ def start(
         help="Lane runs: a lane eval whose heartbeat is older than this (with a dead pid) is stalled.",
     ),
     straggler_timeout_secs: float = typer.Option(
-        900.0,
+        DEFAULT_STRAGGLER_TIMEOUT_SECS,
         "--straggler-timeout-secs",
         help="Lane runs: selection fires once every lane resolves or this timeout elapses.",
     ),
@@ -963,6 +969,7 @@ def start(
         if acceptance_max_repetitions is None
         else acceptance_max_repetitions
     )
+    resolved_concurrency = size if concurrency is None else concurrency
     _validate_acceptance_options(
         repetitions=acceptance_repetitions,
         max_repetitions=resolved_max_repetitions,
@@ -1046,7 +1053,7 @@ def start(
         size=size,
         seed=seed,
         next_epoch=epoch,
-        concurrency=concurrency,
+        concurrency=resolved_concurrency,
         threshold=threshold,
         acceptance_repetitions=acceptance_repetitions,
         acceptance_max_repetitions=resolved_max_repetitions,

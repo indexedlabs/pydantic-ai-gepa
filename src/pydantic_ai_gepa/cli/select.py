@@ -979,6 +979,14 @@ def _phase_emit(
     started_ms = int(ctx.get("started_ms", 0))
     existing = list_events(run_id, workspace_root)
     emitted: list[str] = list(ctx.get("emitted_lanes", []))
+    if "iteration_started_at" not in ctx:
+        # Reset once, immediately before the next iteration becomes visible.
+        # Persist the timestamp in the resume context so an interrupted emit
+        # cannot extend the straggler window on every retry (spec-er3).
+        iteration_started_at = utc_now_iso()
+        ctx["iteration_started_at"] = iteration_started_at
+        state = replace(state, iteration_started_at=iteration_started_at)
+        state = _checkpoint(state, workspace_root, "emit", ctx)
     for lane_state in load_all_lane_states(workspace_root, run_id):
         if lane_state.lane in emitted:
             continue

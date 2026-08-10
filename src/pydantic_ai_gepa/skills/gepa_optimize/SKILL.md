@@ -296,7 +296,7 @@ single-path loop.
 ```bash
 gepa run start --candidate-source git --lanes 3 --max-iterations 200 \
   --acceptance-repetitions 3 --acceptance-max-repetitions 5 \
-  --straggler-timeout-secs 900 --reflection-lease-secs 1800
+  --straggler-timeout-secs 3600 --reflection-lease-secs 1800
 ```
 
 Start emits one `lane_ready` event per lane. Each event payload carries
@@ -366,6 +366,10 @@ Rules that keep the loop correct:
   expiry.
 - **One orchestrator per run.** The event bus has a single consumer cursor;
   never run two orchestrator loops against the same run.
+- **Stop on operator-required provider failures.** If an evaluating verb
+  reports expired credentials or a provider billing/quota code
+  (`insufficient_quota` or `credit_balance_exhausted`), record the reason and
+  stop the loop. Do not retry until a human restores credentials or credit.
 - Use `gepa run status --run-id <run_id>` for the lane board (status,
   candidate, verdict, progress per lane — always printed as JSON) whenever
   you need a ground-truth snapshot.

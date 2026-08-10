@@ -53,6 +53,7 @@ from ..evaluation_models import EvaluationBatch
 from ..gepa_graph.models import CandidateMap, candidate_texts
 from ..inspection import InspectionAborted
 from ..input_type import BoundInputSpec, InputSpec, build_input_spec
+from ..provider_errors import is_provider_stop_error
 from ..signature_agent import SignatureAgent
 from ..skill_components import apply_candidate_to_skills
 from ..skills import SkillsFS
@@ -874,6 +875,8 @@ class _BaseAgentAdapter(
         except UsageBudgetExceeded:
             raise
         except Exception as exc:
+            if is_provider_stop_error(exc):
+                raise
             error_kind = _classify_exception(exc)
             logfire.error(
                 "AgentAdapter failed to process case",
@@ -1037,6 +1040,8 @@ class _BaseAgentAdapter(
             output = RolloutOutput.from_error(exc, kind="system")
             return trajectory, output
         except Exception as exc:
+            if is_provider_stop_error(exc):
+                raise
             error_kind = _classify_exception(exc)
             logfire.error(
                 "AgentAdapter run_with_trace failed",
@@ -1126,6 +1131,8 @@ class _BaseAgentAdapter(
             logfire.warn("Agent run usage limit reached", case_id=case_name)
             return RolloutOutput.from_error(exc, kind="system")
         except Exception as exc:
+            if is_provider_stop_error(exc):
+                raise
             error_kind = _classify_exception(exc)
             logfire.error(
                 "AgentAdapter run_simple failed",

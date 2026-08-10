@@ -60,3 +60,5 @@ def test_bundled_skill_documents_parallel_lanes() -> None:
     # The reflector contract: packet-only inputs, terminal act is continue.
     assert "packet" in text
     assert "continue_invocation" in text
+    assert "insufficient_quota" in text
+    assert "credit_balance_exhausted" in text
