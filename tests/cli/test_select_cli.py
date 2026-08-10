@@ -336,6 +336,28 @@ def test_select_consumes_memoized_verdicts_without_comparing(
     assert result.exit_code == 0, result.output
 
 
+def test_select_refan_resets_iteration_started_at(git_repo: Path) -> None:
+    run = _start_lane_run(git_repo, lanes=2)
+    run_id = _run_id(run)
+    _drive_lane(git_repo, run_id, "lane-1", {"out_case-2.txt": "b\n"})
+    _drive_lane(git_repo, run_id, "lane-2", {"out_case-3.txt": "c\n"})
+    stale_timestamp = "2000-01-01T00:00:00+00:00"
+    _write_state(
+        git_repo,
+        RunState(
+            **{
+                **_state(git_repo, run_id).to_dict(),
+                "iteration_started_at": stale_timestamp,
+            }
+        ),
+    )
+
+    result = _select(git_repo, run_id)
+
+    assert result.exit_code == 0, result.output
+    assert _state(git_repo, run_id).iteration_started_at != stale_timestamp
+
+
 def test_straggler_terminated_journaled_and_refanned(git_repo: Path) -> None:
     """spec-er3 + dec-4tw: a lane still evaluating when select runs (after the
     straggler timeout) is terminated, its partial result and diff journaled,

@@ -17,6 +17,7 @@ from pydantic_evals import Case, Dataset
 from .adapters.agent_adapter import CaseFactory, create_adapter
 from .gepa_graph.models import CandidateMap, candidate_texts
 from .input_type import InputSpec
+from .provider_errors import is_provider_stop_error
 from .skills import SkillsFS
 from .skills.models import SkillCapability
 from .types import MetricResult, RolloutOutput
@@ -189,6 +190,8 @@ async def evaluate_callable_dataset(
                 if side_info is not None:
                     payload["side_info"] = side_info
             except Exception as exc:
+                if is_provider_stop_error(exc):
+                    raise
                 output = RolloutOutput.from_error(exc, kind="system")
                 score = 0.0
                 feedback = f"Evaluate callable failed: {exc}"

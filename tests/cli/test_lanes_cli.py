@@ -222,7 +222,7 @@ def test_pre_lane_state_loads_with_lane_defaults(git_repo: Path) -> None:
     assert state.heartbeat_interval_secs == 10.0
     assert state.reflection_lease_secs == 1800.0
     assert state.eval_stall_timeout_secs == 600.0
-    assert state.straggler_timeout_secs == 900.0
+    assert state.straggler_timeout_secs == 3600.0
     assert state.journal_tail_lines == 20
 
 
