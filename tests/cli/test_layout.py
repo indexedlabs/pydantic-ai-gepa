@@ -6,17 +6,22 @@ import textwrap
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from pydantic_ai_gepa.cli.layout import (
     GepaConfig,
     GepaConfigError,
+    _module_source_paths,
+    candidate_import_context,
+    candidate_project_root,
     candidate_dir,
     components_dir,
     config_path,
     ensure_layout,
     gepa_dir,
+    git_root,
     is_run_id,
     journal_path,
     latest_run_id,
@@ -25,14 +30,35 @@ from pydantic_ai_gepa.cli.layout import (
     new_run_id,
     pareto_log_path,
     proposal_dir,
+    project_prefix,
+    project_root_for_workspace,
     repo_root,
     resolve_agent,
+    resolve_module_attr,
     run_dir,
     runs_dir,
     staged_dir,
     traces_dir,
     write_default_config,
 )
+
+
+class _BrokenNamespacePath:
+    def __iter__(self):
+        raise KeyError("opentelemetry")
+
+
+class _ParentBackedNamespacePath:
+    def __init__(self, parent_name: str, path: Path) -> None:
+        self.parent_name = parent_name
+        self.path = path
+
+    def __iter__(self):
+        import sys
+
+        if self.parent_name not in sys.modules:
+            raise KeyError(self.parent_name)
+        yield str(self.path)
 
 
 def test_config_parse_minimal(tmp_path: Path) -> None:
@@ -225,6 +251,136 @@ def test_repo_root_falls_back_to_pyproject(tmp_path: Path) -> None:
     nested = tmp_path / "src" / "pkg"
     nested.mkdir(parents=True)
     assert repo_root(nested) == tmp_path.resolve()
+
+
+def test_nested_workspace_distinguishes_git_and_project_roots(tmp_path: Path) -> None:
+    import subprocess
+
+    repository = tmp_path / "monorepo"
+    project = repository / "api"
+    workspace = project / "evals" / "agent" / ".gepa" / "rlm"
+    workspace.mkdir(parents=True)
+    (project / "pyproject.toml").touch()
+    subprocess.run(["git", "init", str(repository)], check=True, capture_output=True)
+
+    assert git_root(project) == repository.resolve()
+    assert project_root_for_workspace(workspace) == project.resolve()
+    assert project_prefix(project, repository) == Path("api")
+
+    candidate_git = tmp_path / "candidate"
+    (candidate_git / "api").mkdir(parents=True)
+    assert candidate_project_root(project, candidate_git) == candidate_git / "api"
+
+
+def test_resolve_module_attr_rejects_source_outside_candidate_project(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(GepaConfigError, match="outside the candidate project"):
+        resolve_module_attr(
+            "pydantic_ai_gepa.cli.layout:repo_root", expected_root=tmp_path
+        )
+
+
+def test_module_source_paths_ignores_broken_dynamic_namespace_path(
+    tmp_path: Path,
+) -> None:
+    module_file = tmp_path / "opentelemetry" / "trace.py"
+    module = SimpleNamespace(
+        __file__=str(module_file),
+        __path__=_BrokenNamespacePath(),
+    )
+
+    assert _module_source_paths(module) == (module_file.resolve(),)
+
+
+def test_candidate_import_context_preserves_repo_local_environment_modules(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+    import sys
+
+    primary = tmp_path / "primary"
+    candidate = tmp_path / "candidate"
+    for project in (primary, candidate):
+        (project / "src" / "runtime_pkg").mkdir(parents=True)
+        (project / "eval_pkg").mkdir()
+        (project / "shared_pkg").mkdir()
+        subprocess.run(["git", "init", str(project)], check=True, capture_output=True)
+    (candidate / "eval_pkg" / "__init__.py").touch()
+    (candidate / "eval_pkg" / "evaluation.py").write_text(
+        "from shared_pkg import MARKER\ndef evaluate():\n    return MARKER\n",
+        encoding="utf-8",
+    )
+    (candidate / "shared_pkg" / "__init__.py").write_text(
+        "MARKER = 'candidate-flat-sibling'\n",
+        encoding="utf-8",
+    )
+
+    environment = primary / ".venv"
+    site_packages = environment / "lib" / "python3.13" / "site-packages"
+    site_packages.mkdir(parents=True)
+    project_module = SimpleNamespace(
+        __file__=str(primary / "src" / "runtime_pkg" / "tool.py")
+    )
+    namespace_module = SimpleNamespace(
+        __file__=None,
+        __path__=_ParentBackedNamespacePath(
+            "runtime_pkg.layout_test",
+            primary / "src" / "runtime_pkg" / "namespace",
+        ),
+    )
+    configured_module = SimpleNamespace(
+        __file__=str(primary / "eval_pkg" / "evaluation.py")
+    )
+    flat_sibling_module = SimpleNamespace(
+        __file__=str(primary / "shared_pkg" / "__init__.py"),
+        MARKER="primary-flat-sibling",
+    )
+    import_hook = SimpleNamespace(
+        __file__=str(site_packages / "beartype" / "claw" / "__init__.py")
+    )
+    monkeypatch.setitem(sys.modules, "runtime_pkg.layout_test", project_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "runtime_pkg.layout_test.namespace",
+        namespace_module,
+    )
+    monkeypatch.setitem(sys.modules, "eval_pkg.evaluation", configured_module)
+    monkeypatch.setitem(sys.modules, "shared_pkg", flat_sibling_module)
+    monkeypatch.setitem(sys.modules, "beartype.claw.layout_test", import_hook)
+    monkeypatch.setattr(sys, "prefix", str(environment))
+    monkeypatch.setattr(sys, "exec_prefix", str(environment))
+    monkeypatch.setattr(
+        sys,
+        "path",
+        [str(primary / "src"), str(site_packages), *sys.path],
+    )
+
+    with candidate_import_context(
+        primary_project_root=primary,
+        candidate_project_root=candidate,
+        refs=("eval_pkg.evaluation:evaluate",),
+    ):
+        assert "runtime_pkg.layout_test" not in sys.modules
+        assert "runtime_pkg.layout_test.namespace" not in sys.modules
+        assert "eval_pkg.evaluation" not in sys.modules
+        assert "shared_pkg" not in sys.modules
+        assert sys.modules["beartype.claw.layout_test"] is import_hook
+        assert str(candidate / "src") in sys.path
+        assert str(site_packages) in sys.path
+        evaluate = resolve_module_attr(
+            "eval_pkg.evaluation:evaluate", expected_root=candidate
+        )
+        assert evaluate() == "candidate-flat-sibling"
+        candidate_shared_file = sys.modules["shared_pkg"].__file__
+        assert candidate_shared_file is not None
+        assert Path(candidate_shared_file).is_relative_to(candidate)
+
+    assert sys.modules["runtime_pkg.layout_test"] is project_module
+    assert sys.modules["runtime_pkg.layout_test.namespace"] is namespace_module
+    assert sys.modules["eval_pkg.evaluation"] is configured_module
+    assert sys.modules["shared_pkg"] is flat_sibling_module
+    assert sys.modules["beartype.claw.layout_test"] is import_hook
 
 
 # ---------- --gepa-dir override ----------
