@@ -25,9 +25,16 @@ from pydantic_ai_gepa.cli.run import RunState
 from pydantic_ai_gepa.cli.runs import ParetoLog, utc_now_iso
 
 EVALUATE_MODULE_SOURCE = textwrap.dedent("""
+    import os
     from pathlib import Path
 
     async def evaluate(case):
+        if os.environ.get("GEPA_TEST_REBASELINE_FAILURE"):
+            raise RuntimeError("simulated rebaseline outage")
+        fail_iteration = os.environ.get("GEPA_TEST_FAIL_TRACE_ITERATION")
+        trace_path = os.environ.get("GEPA_TRACE_FILE", "")
+        if fail_iteration and f"/{int(fail_iteration):04d}-" in trace_path:
+            raise RuntimeError("simulated later rebaseline outage")
         path = Path(f"out_{case.name}.txt")
         return path.read_text(encoding="utf-8").strip() if path.exists() else ""
 """).lstrip()
@@ -699,6 +706,81 @@ def test_select_dirty_primary_promotes_in_run_state_only(git_repo: Path) -> None
     # re-fanned lane worktree, which carries the same commit).
     assert list(state.reflection_baseline_samples) == [pytest.approx(2.0 / 3.0)]
     assert state.reflection_baseline_commit_sha == lane_1.candidate_sha
+
+
+def test_select_rebaseline_infrastructure_failure_preserves_incumbent(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = _start_lane_run(git_repo, lanes=1)
+    run_id = _run_id(run)
+    lane = _drive_lane(git_repo, run_id, "lane-1", {"out_case-2.txt": "b\n"})
+    initial_ready_count = len(_events(git_repo, run_id, "lane_ready"))
+    monkeypatch.setenv("GEPA_TEST_REBASELINE_FAILURE", "1")
+
+    result = _select(git_repo, run_id)
+
+    assert result.exit_code == 1
+    assert "infrastructure failure" in result.output
+    state = _state(git_repo, run_id)
+    assert state.best_commit_sha == lane.candidate_sha
+    assert state.select_phase == "rebaseline"
+    assert state.select_context is not None
+    failures = state.select_context["rebaseline_infrastructure_failures"]
+    assert len(failures) == 1
+    assert failures[0]["outcome"] == "infrastructure_failure"
+    assert failures[0]["selectable"] is False
+    assert failures[0]["valid_samples_before_failure"] == []
+    assert failures[0]["evaluation_errors"][0]["error_message"] == (
+        "simulated rebaseline outage"
+    )
+    assert len(_events(git_repo, run_id, "lane_ready")) == initial_ready_count
+    lane_state = load_lane_state(git_repo, run_id, "lane-1")
+    assert lane_state.status == "paused_for_reflection"
+    assert lane_state.packet_path is None
+
+    monkeypatch.delenv("GEPA_TEST_REBASELINE_FAILURE")
+    retried = _select(git_repo, run_id)
+    assert retried.exit_code == 0, retried.output
+    recovered = _state(git_repo, run_id)
+    assert recovered.select_phase is None
+    assert recovered.reflection_baseline_commit_sha == lane.candidate_sha
+    recovered_lane = load_lane_state(git_repo, run_id, "lane-1")
+    assert recovered_lane.packet_path is not None
+
+
+def test_select_later_rebaseline_failure_discards_partial_samples(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = _start_lane_run(
+        git_repo,
+        1,
+        "--acceptance-max-repetitions",
+        "2",
+        "--max-iterations",
+        "20",
+    )
+    run_id = _run_id(run)
+    lane = _drive_lane(git_repo, run_id, "lane-1", {"out_case-2.txt": "b\n"})
+    next_iteration = ParetoLog(run_id, git_repo).count_rows() + 2
+    monkeypatch.setenv("GEPA_TEST_FAIL_TRACE_ITERATION", str(next_iteration))
+
+    result = _select(git_repo, run_id)
+
+    assert result.exit_code == 1
+    state = _state(git_repo, run_id)
+    assert state.best_commit_sha == lane.candidate_sha
+    assert state.select_phase == "rebaseline"
+    assert state.select_context is not None
+    failure = state.select_context["rebaseline_infrastructure_failures"][-1]
+    assert failure["outcome"] == "infrastructure_failure"
+    assert failure["selectable"] is False
+    assert len(failure["valid_samples_before_failure"]) == 1
+    assert failure["evaluation_errors"][0]["error_message"] == (
+        "simulated later rebaseline outage"
+    )
+    assert state.reflection_baseline_commit_sha != lane.candidate_sha
+    lane_state = load_lane_state(git_repo, run_id, "lane-1")
+    assert lane_state.packet_path is None
 
 
 def test_no_accepted_lane_means_no_promotion(git_repo: Path) -> None:

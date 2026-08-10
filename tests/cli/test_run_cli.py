@@ -15,6 +15,8 @@ from typer.testing import CliRunner
 from pydantic_ai_gepa.cli import app as gepa_app
 from pydantic_ai_gepa.cli.candidates import candidate_id_from_components
 from pydantic_ai_gepa.cli.layout import final_report_path, run_state_path
+from pydantic_ai_gepa.evaluation import EvaluationRecord
+from pydantic_ai_gepa.types import RolloutOutput
 
 
 AGENT_MODULE_SOURCE = textwrap.dedent("""
@@ -70,6 +72,38 @@ def _run_payload(output: str) -> dict[str, object]:
     )
     payload = json.loads(line)
     return payload["run"]
+
+
+def _fail_rollout_calls(
+    monkeypatch: pytest.MonkeyPatch, call_numbers: set[int]
+) -> None:
+    from pydantic_ai_gepa.cli import run as run_module
+
+    original = run_module.run_eval_once
+    call_count = 0
+
+    def wrapped(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        outcome = original(**kwargs)
+        if call_count not in call_numbers:
+            return outcome
+        record = outcome.records[0]
+        outcome.records[0] = EvaluationRecord(
+            case_id=record.case_id,
+            score=record.score,
+            feedback=record.feedback,
+            payload={
+                **record.payload,
+                "output": RolloutOutput.from_error(
+                    RuntimeError(f"provider unavailable on call {call_count}"),
+                    kind="system",
+                ),
+            },
+        )
+        return outcome
+
+    monkeypatch.setattr(run_module, "run_eval_once", wrapped)
 
 
 def test_managed_run_pauses_for_reflection_and_writes_trace_paths(repo: Path) -> None:
@@ -159,6 +193,209 @@ def test_managed_run_repeats_baseline_and_candidate_on_saved_minibatch(
     assert isinstance(candidate_report_paths, list)
     assert len(set(candidate_report_paths)) == 3
     assert payload["iterations"] == 8
+
+
+def test_baseline_rollout_failure_pauses_without_installing_baseline(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fail_rollout_calls(monkeypatch, {1})
+
+    result = _run("run", "start", "--size", "2", "--max-iterations", "4")
+
+    assert result.exit_code == 0, result.output
+    payload = _run_payload(result.output)
+    failed_minibatch_id = payload["last_minibatch_id"]
+    assert payload["status"] == "paused_after_infrastructure_error"
+    assert payload["best_candidate_id"] is None
+    assert payload["reflection_baseline_samples"] == []
+    comparison = payload["last_comparison"]
+    assert isinstance(comparison, dict)
+    assert comparison["outcome"] == "infrastructure_failure"
+    assert comparison["selectable"] is False
+    assert comparison["verdict"] is None
+    assert comparison["phase"] == "baseline"
+    assert comparison["evaluation_error_count"] == 1
+    retried = _run("run", "continue", "--run-id", str(payload["run_id"]))
+    assert retried.exit_code == 0, retried.output
+    retry_payload = _run_payload(retried.output)
+    assert retry_payload["status"] == "paused_for_reflection"
+    assert retry_payload["best_candidate_id"] is not None
+    retry_samples = retry_payload["reflection_baseline_samples"]
+    assert isinstance(retry_samples, list)
+    assert len(retry_samples) == 1
+    assert retry_payload["reflection_minibatch_id"] == failed_minibatch_id
+    assert retry_payload["last_comparison"] is None
+
+
+def test_budget_edge_baseline_failure_is_terminal_without_a_quality_best(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fail_rollout_calls(monkeypatch, {1})
+
+    result = _run("run", "start", "--size", "2", "--max-iterations", "1")
+
+    assert result.exit_code == 0, result.output
+    payload = _run_payload(result.output)
+    assert payload["status"] == "done"
+    assert payload["best_candidate_id"] is None
+    comparison = payload["last_comparison"]
+    assert isinstance(comparison, dict)
+    assert comparison["outcome"] == "infrastructure_failure"
+    assert comparison["retryable"] is False
+    assert comparison["recommendation"] == "stop_budget_exhausted"
+    report = Path(str(payload["final_report_path"])).read_text(encoding="utf-8")
+    assert "accepted_best_candidate_id" not in report
+
+
+def test_budget_edge_candidate_failure_finishes_without_promoting_candidate(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fail_rollout_calls(monkeypatch, {2})
+    start = _run("run", "start", "--size", "2", "--max-iterations", "2")
+    start_payload = _run_payload(start.output)
+    incumbent = start_payload["best_candidate_id"]
+
+    result = _run("run", "continue", "--run-id", str(start_payload["run_id"]))
+
+    assert result.exit_code == 0, result.output
+    payload = _run_payload(result.output)
+    assert payload["status"] == "done"
+    assert payload["best_candidate_id"] == incumbent
+    comparison = payload["last_comparison"]
+    assert isinstance(comparison, dict)
+    assert comparison["outcome"] == "infrastructure_failure"
+    assert comparison["retryable"] is False
+
+
+def test_mixed_baseline_repetitions_discard_partial_samples(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fail_rollout_calls(monkeypatch, {2})
+
+    result = _run(
+        "run",
+        "start",
+        "--size",
+        "2",
+        "--max-iterations",
+        "10",
+        "--acceptance-repetitions",
+        "3",
+        "--acceptance-max-repetitions",
+        "3",
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = _run_payload(result.output)
+    assert payload["status"] == "paused_after_infrastructure_error"
+    assert payload["iterations"] == 2
+    assert payload["best_candidate_id"] is None
+    assert payload["reflection_baseline_samples"] == []
+    comparison = payload["last_comparison"]
+    assert isinstance(comparison, dict)
+    assert len(comparison["valid_samples_before_failure"]) == 1
+    assert comparison["verdict"] is None
+
+
+def test_healthy_baseline_before_later_failure_remains_the_incumbent(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pydantic_ai_gepa.cli import run as run_module
+
+    original = run_module.run_eval_once
+    call_count = 0
+
+    def wrapped(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        outcome = original(**kwargs)
+        if call_count == 1:
+            outcome.summary["n_failures"] = 0
+        elif call_count == 2:
+            record = outcome.records[0]
+            outcome.records[0] = EvaluationRecord(
+                case_id=record.case_id,
+                score=record.score,
+                feedback=record.feedback,
+                payload={
+                    **record.payload,
+                    "output": RolloutOutput.from_error(
+                        RuntimeError("provider unavailable"), kind="system"
+                    ),
+                },
+            )
+        return outcome
+
+    monkeypatch.setattr(run_module, "run_eval_once", wrapped)
+
+    result = _run("run", "start", "--size", "2", "--max-iterations", "4")
+
+    assert result.exit_code == 0, result.output
+    payload = _run_payload(result.output)
+    assert payload["status"] == "paused_after_infrastructure_error"
+    assert payload["best_candidate_id"] is not None
+    assert payload["best_mean_score"] == pytest.approx(0.5)
+
+
+def test_candidate_rollout_failure_preserves_incumbent_and_can_retry(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fail_rollout_calls(monkeypatch, {4})
+    start = _run("run", "start", "--size", "2", "--max-iterations", "7")
+    start_payload = _run_payload(start.output)
+    incumbent = start_payload["best_candidate_id"]
+
+    failed = _run("run", "continue", "--run-id", str(start_payload["run_id"]))
+
+    assert failed.exit_code == 0, failed.output
+    failed_payload = _run_payload(failed.output)
+    assert failed_payload["status"] == "paused_after_infrastructure_error"
+    assert failed_payload["best_candidate_id"] == incumbent
+    comparison = failed_payload["last_comparison"]
+    assert isinstance(comparison, dict)
+    assert comparison["outcome"] == "infrastructure_failure"
+    assert comparison["phase"] == "candidate"
+    assert comparison["verdict"] is None
+
+    retried = _run("run", "continue", "--run-id", str(start_payload["run_id"]))
+    assert retried.exit_code == 0, retried.output
+    retry_comparison = _run_payload(retried.output)["last_comparison"]
+    assert isinstance(retry_comparison, dict)
+    assert retry_comparison["outcome"] == "valid"
+    assert retry_comparison["verdict"] == "equivalent"
+
+
+def test_mixed_candidate_repetitions_never_compare_partial_samples(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fail_rollout_calls(monkeypatch, {5})
+    start = _run(
+        "run",
+        "start",
+        "--size",
+        "2",
+        "--max-iterations",
+        "10",
+        "--acceptance-repetitions",
+        "3",
+        "--acceptance-max-repetitions",
+        "3",
+    )
+    start_payload = _run_payload(start.output)
+    baseline_samples = start_payload["reflection_baseline_samples"]
+    assert isinstance(baseline_samples, list)
+    assert len(baseline_samples) == 3
+
+    failed = _run("run", "continue", "--run-id", str(start_payload["run_id"]))
+
+    assert failed.exit_code == 0, failed.output
+    payload = _run_payload(failed.output)
+    assert payload["status"] == "paused_after_infrastructure_error"
+    comparison = payload["last_comparison"]
+    assert isinstance(comparison, dict)
+    assert comparison["outcome"] == "infrastructure_failure"
+    assert comparison["valid_samples_before_failure"] == [pytest.approx(0.5)]
+    assert comparison["verdict"] is None
 
 
 def test_continue_after_revert_discards_candidate_and_advances(repo: Path) -> None:

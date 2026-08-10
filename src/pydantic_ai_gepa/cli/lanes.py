@@ -42,12 +42,20 @@ from typing import Any, Literal
 import typer
 
 from ..acceptance import compare_candidate_samples
+from ..evaluation_health import (
+    EvaluationInfrastructureFailure,
+    evaluation_infrastructure_failures,
+)
 from .candidates import GitCandidateError, git_candidate_state
 from .eval import run_eval_once
 from .events import EventDraft, LaneScan, LaneScanResult, emit, run_reaper_pass
 from .layout import (
+    candidate_project_root,
     current_gepa_dirname,
     gepa_dir,
+    git_root,
+    project_prefix,
+    project_root_for_workspace,
     repo_root,
     run_dir,
 )
@@ -62,7 +70,7 @@ LaneStatus = Literal[
     "stalled",
 ]
 
-PACKET_VERSION = 1
+PACKET_VERSION = 2
 WORKTREES_DIRNAME = "worktrees"
 LANE_BRANCH_PREFIX = "gepa/lane"
 LANE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -97,7 +105,7 @@ def _resolve_workspace_root() -> Path:
             "`gepa --gepa-dir /abs/path/to/.gepa ...` or export GEPA_DIR. "
             "No workspace path is derived from the current directory."
         )
-    return path.resolve().parent
+    return project_root_for_workspace(path)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -143,6 +151,7 @@ class LaneState:
     iteration: int
     branch: str | None = None
     worktree_path: str | None = None
+    candidate_project_path: str | None = None
     packet_path: str | None = None
     lease_epoch: int = 0
     lease_expires_at: str | None = None
@@ -166,6 +175,7 @@ class LaneState:
             "iteration": self.iteration,
             "branch": self.branch,
             "worktree_path": self.worktree_path,
+            "candidate_project_path": self.candidate_project_path,
             "packet_path": self.packet_path,
             "lease_epoch": self.lease_epoch,
             "lease_expires_at": self.lease_expires_at,
@@ -188,6 +198,7 @@ class LaneState:
             iteration=int(data["iteration"]),
             branch=data.get("branch"),
             worktree_path=data.get("worktree_path"),
+            candidate_project_path=data.get("candidate_project_path"),
             packet_path=data.get("packet_path"),
             lease_epoch=int(data.get("lease_epoch", 0)),
             lease_expires_at=data.get("lease_expires_at"),
@@ -295,7 +306,7 @@ def load_all_lane_states(workspace_root: Path, run_id: str) -> list[LaneState]:
 
 
 def worktrees_root(workspace_root: Path) -> Path:
-    return workspace_root / WORKTREES_DIRNAME
+    return git_root(workspace_root) / WORKTREES_DIRNAME
 
 
 def lane_worktree_path(workspace_root: Path, run_id: str, lane: str) -> Path:
@@ -304,28 +315,26 @@ def lane_worktree_path(workspace_root: Path, run_id: str, lane: str) -> Path:
 
 
 def ensure_worktrees_ignored(workspace_root: Path) -> None:
-    """Gitignore the worktrees dir via .git/info/exclude (never tracked files).
+    """Gitignore the worktrees dir via the common Git dir's info/exclude.
 
     Adding to .gitignore would dirty the primary tree; info/exclude is local
     and untracked, so `git ls-files --others --exclude-standard` (used by git
     candidate identity) skips lane worktrees automatically.
     """
-    git_path = workspace_root / ".git"
-    if git_path.is_file():
-        # Linked worktree as primary: .git is a gitdir pointer file; resolve
-        # the real git dir before writing info/exclude.
-        content = git_path.read_text(encoding="utf-8").strip()
-        if content.startswith("gitdir:"):
-            git_path = Path(content.split(":", 1)[1].strip())
-            if not git_path.is_absolute():
-                git_path = (workspace_root / git_path).resolve()
-    info_dir = git_path / "info"
+    repository = git_root(workspace_root)
+    common_raw = _git(repository, "rev-parse", "--git-common-dir")
+    common_dir = Path(common_raw)
+    if not common_dir.is_absolute():
+        common_dir = (repository / common_dir).resolve()
+    info_dir = common_dir / "info"
     info_dir.mkdir(parents=True, exist_ok=True)
     exclude = info_dir / "exclude"
     entry = f"/{WORKTREES_DIRNAME}/"
     existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
     if entry not in existing.splitlines():
         with exclude.open("a", encoding="utf-8") as fh:
+            if existing and not existing.endswith("\n"):
+                fh.write("\n")
             fh.write(f"{entry}\n")
 
 
@@ -345,7 +354,7 @@ def create_lane_worktree(
     branch = lane_branch(run_id, lane, iteration)
     path = lane_worktree_path(workspace_root, run_id, lane)
     path.parent.mkdir(parents=True, exist_ok=True)
-    _git(workspace_root, "worktree", "add", str(path), "-b", branch, base_sha)
+    _git(git_root(workspace_root), "worktree", "add", str(path), "-b", branch, base_sha)
     return path, branch
 
 
@@ -399,10 +408,16 @@ def write_packet(
     report/trace paths, metric side info, a bounded journal tail, the worktree
     path, and the exact `gepa lane continue` invocation.
     """
+    repository = git_root(workspace_root)
+    candidate_project = candidate_project_root(workspace_root, worktree_path)
     gepa_abs = str(gepa_dir(workspace_root).resolve())
+    continue_argv = _lane_continue_argv(
+        gepa_abs=gepa_abs,
+        lane=lane,
+        run_id=run_state.run_id,
+    )
     invocation = (
-        f"gepa --gepa-dir {shlex.quote(gepa_abs)} "
-        f"lane continue {shlex.quote(lane)} --run-id {shlex.quote(run_state.run_id)}"
+        f"cd {shlex.quote(str(candidate_project))} && {shlex.join(continue_argv)}"
     )
     packet = {
         "packet_version": PACKET_VERSION,
@@ -410,6 +425,11 @@ def write_packet(
         "lane": lane,
         "iteration": iteration,
         "worktree_path": str(worktree_path),
+        "git_root": str(repository),
+        "project_root": str(workspace_root.resolve()),
+        "project_prefix": project_prefix(workspace_root, repository).as_posix(),
+        "candidate_project_root": str(candidate_project),
+        "gepa_workspace": gepa_abs,
         "branch": branch,
         "baseline": {
             "candidate_id": run_state.reflection_baseline_candidate_id,
@@ -424,12 +444,44 @@ def write_packet(
             list(run_state.reflection_baseline_trace_paths)
         ),
         "journal_tail": _journal_tail(workspace_root, run_state.journal_tail_lines),
+        "continue_cwd": str(candidate_project),
+        "continue_argv": continue_argv,
         "continue_invocation": invocation,
     }
     path = lanes_dir(workspace_root, run_state.run_id) / lane / "packet.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(packet, indent=2, default=str), encoding="utf-8")
     return path
+
+
+def _lane_continue_argv(
+    *,
+    gepa_abs: str,
+    lane: str,
+    run_id: str,
+    foreground: bool = False,
+    handoff_lease_epoch: int | None = None,
+) -> list[str]:
+    """Build a launcher independent of the caller's PATH or active venv."""
+
+    argv = [
+        sys.executable,
+        "-I",
+        "-c",
+        "from pydantic_ai_gepa.cli import app; app()",
+        "--gepa-dir",
+        gepa_abs,
+        "lane",
+        "continue",
+        lane,
+        "--run-id",
+        run_id,
+    ]
+    if foreground:
+        argv.append("--foreground")
+    if handoff_lease_epoch is not None:
+        argv.extend(["--handoff-lease-epoch", str(handoff_lease_epoch)])
+    return argv
 
 
 # ----------------------------- lane eval --------------------------------
@@ -493,6 +545,81 @@ def _touch_heartbeat(
     return fresh
 
 
+def _stall_for_infrastructure_failure(
+    *,
+    workspace_root: Path,
+    run_state: Any,
+    lane_state: LaneState,
+    git_state: Any,
+    outcomes: list[Any],
+    failures: tuple[EvaluationInfrastructureFailure, ...],
+    valid_samples: list[float],
+) -> LaneState:
+    """Persist a non-selectable failed evaluation and preserve the incumbent."""
+
+    run_id = run_state.run_id
+    lane = lane_state.lane
+    reports = [str(outcome.summary["report_path"]) for outcome in outcomes]
+    traces = [
+        str(outcome.summary["trace_path"])
+        for outcome in outcomes
+        if outcome.summary.get("trace_path")
+    ]
+    comparison = {
+        "run_id": run_id,
+        "lane": lane,
+        "iteration": lane_state.iteration,
+        "outcome": "infrastructure_failure",
+        "selectable": False,
+        "verdict": None,
+        "retryable": True,
+        "reason_code": "required_rollout_failed",
+        "minibatch_id": run_state.reflection_minibatch_id,
+        "baseline_candidate_id": run_state.reflection_baseline_candidate_id,
+        "baseline_commit_sha": run_state.reflection_baseline_commit_sha,
+        "candidate_id": git_state.candidate_id,
+        "candidate_commit_sha": lane_state.candidate_sha,
+        "candidate_report_paths": reports,
+        "candidate_trace_paths": traces,
+        "valid_samples_before_failure": list(valid_samples),
+        "evaluation_error_count": len(failures),
+        "evaluation_errors": [failure.to_dict() for failure in failures],
+    }
+    comparison_path = _write_comparison(
+        workspace_root, run_id, lane, lane_state.iteration, comparison
+    )
+    stalled = LaneState(
+        **{
+            **lane_state.to_dict(),
+            "status": "stalled",
+            "eval_samples": (),
+            "verdict": None,
+            "verdict_delta": None,
+            "comparison_path": str(comparison_path),
+            "eval_pid": None,
+            "heartbeat_at": None,
+            "updated_at": utc_now_iso(),
+        }
+    )
+    stalled.save(workspace_root, run_id)
+    reason = (
+        f"required rollout failed ({len(failures)} evaluation error(s)); "
+        f"inspect {comparison_path} and reset the lane after infrastructure recovery"
+    )
+    emit(
+        run_id,
+        lane,
+        EventDraft(
+            type="lane_stalled",
+            lane=lane,
+            payload={"reason": reason, "lease_epoch": stalled.lease_epoch},
+        ),
+        root=workspace_root,
+    )
+    typer.echo(f"Lane {lane} stalled: {reason}.", err=True)
+    return stalled
+
+
 def _run_lane_eval_loop(
     *,
     workspace_root: Path,
@@ -518,11 +645,16 @@ def _run_lane_eval_loop(
         )
 
     worktree = Path(str(lane_state.worktree_path))
+    candidate_project = (
+        Path(lane_state.candidate_project_path)
+        if lane_state.candidate_project_path
+        else candidate_project_root(workspace_root, worktree)
+    )
     branch = str(lane_state.branch)
     commit_sha = _auto_commit_worktree(worktree, branch, lane)
 
     try:
-        git_state = git_candidate_state(worktree)
+        git_state = git_candidate_state(candidate_project)
     except GitCandidateError as exc:
         raise typer.BadParameter(str(exc)) from exc
     if git_state.dirty:
@@ -557,7 +689,7 @@ def _run_lane_eval_loop(
     # children are spawned with cwd=worktree; foreground callers are switched
     # here so both paths evaluate the same tree).
     previous_cwd = Path.cwd()
-    os.chdir(worktree)
+    os.chdir(candidate_project)
     samples: list[float] = []
     outcomes: list[Any] = []
     comparison_result = None
@@ -576,7 +708,7 @@ def _run_lane_eval_loop(
                 capture_traces=True,
                 candidate_source="git",
                 lane=lane,
-                candidate_root=worktree,
+                candidate_root=candidate_project,
                 workspace_root=workspace_root,
             )
             outcomes.append(outcome)
@@ -586,6 +718,17 @@ def _run_lane_eval_loop(
                     "The lane candidate changed mid-evaluation "
                     f"({git_state.candidate_id} -> {current_id}); refusing to "
                     "compare mixed candidates."
+                )
+            failures = evaluation_infrastructure_failures(outcome.records)
+            if failures:
+                return _stall_for_infrastructure_failure(
+                    workspace_root=workspace_root,
+                    run_state=run_state,
+                    lane_state=lane_state,
+                    git_state=git_state,
+                    outcomes=outcomes,
+                    failures=failures,
+                    valid_samples=samples,
                 )
             samples.append(float(outcome.summary["mean_score"]))
             lane_state = LaneState(
@@ -926,22 +1069,19 @@ def lane_continue(
     lane_dir = lanes_dir(workspace_root, run_state.run_id) / lane
     lane_dir.mkdir(parents=True, exist_ok=True)
     log_path = lane_dir / "eval.log"
-    argv = [
-        sys.executable,
-        "-c",
-        "from pydantic_ai_gepa.cli import app; app()",
-        "--gepa-dir",
-        gepa_abs,
-        "lane",
-        "continue",
-        lane,
-        "--run-id",
-        run_state.run_id,
-        "--foreground",
-        "--handoff-lease-epoch",
-        str(state.lease_epoch),
-    ]
-    worktree_path = str(state.worktree_path)
+    argv = _lane_continue_argv(
+        gepa_abs=gepa_abs,
+        lane=lane,
+        run_id=run_state.run_id,
+        foreground=True,
+        handoff_lease_epoch=state.lease_epoch,
+    )
+    worktree_path = Path(str(state.worktree_path))
+    candidate_project_path = (
+        Path(state.candidate_project_path)
+        if state.candidate_project_path
+        else candidate_project_root(workspace_root, worktree_path)
+    )
     try:
         with log_path.open("ab") as log_handle:
             process = subprocess.Popen(  # noqa: S603
@@ -950,7 +1090,7 @@ def lane_continue(
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
-                cwd=worktree_path,
+                cwd=str(candidate_project_path),
             )
     except OSError as exc:
         # Spawn failed: release the handoff lease so the lane stays dispatchable.
@@ -1186,6 +1326,9 @@ def fan_out_lanes(run_state: Any, workspace_root: Path) -> None:
                 iteration=run_state.iterations,
                 branch=branch,
                 worktree_path=str(path),
+                candidate_project_path=str(
+                    candidate_project_root(workspace_root, path)
+                ),
                 packet_path=str(packet_path),
                 updated_at=utc_now_iso(),
             ).save(workspace_root, run_state.run_id)
@@ -1206,11 +1349,17 @@ def fan_out_lanes(run_state: Any, workspace_root: Path) -> None:
     except Exception:
         for path, branch, lane in reversed(created):
             try:
-                _git(workspace_root, "worktree", "remove", "--force", str(path))
+                _git(
+                    git_root(workspace_root),
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(path),
+                )
             except Exception:
                 pass
             try:
-                _git(workspace_root, "branch", "-D", branch)
+                _git(git_root(workspace_root), "branch", "-D", branch)
             except Exception:
                 pass
             lane_dir = lanes_dir(workspace_root, run_state.run_id) / lane

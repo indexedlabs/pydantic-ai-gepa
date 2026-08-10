@@ -328,6 +328,30 @@ def test_pareto_front_drops_dominated(tmp_path: Path) -> None:
     assert {r.candidate_id for r in front} == {"c1", "c2"}
 
 
+def test_pareto_front_excludes_non_selectable_infrastructure_rows(
+    tmp_path: Path,
+) -> None:
+    ensure_layout(tmp_path)
+    run = new_run_id()
+    log = ParetoLog(run, tmp_path)
+    healthy = _row("healthy", {"a": -1.0})
+    infrastructure_failure = ParetoRow(
+        **{
+            **_row("failed", {"a": 0.0}, status="infrastructure_failure").to_dict(),
+            "extra": {
+                "outcome": "infrastructure_failure",
+                "selectable": False,
+            },
+        }
+    )
+    log.append(healthy)
+    log.append(infrastructure_failure)
+
+    assert log.count_rows() == 2
+    assert [row.candidate_id for row in log.selectable_rows()] == ["healthy"]
+    assert [row.candidate_id for row in log.front()] == ["healthy"]
+
+
 def test_pareto_persists_full_schema(tmp_path: Path) -> None:
     ensure_layout(tmp_path)
     run = new_run_id()
