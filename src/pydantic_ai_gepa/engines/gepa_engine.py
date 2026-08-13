@@ -13,7 +13,6 @@ from ..gepa_graph.models import CandidateMap, GepaConfig, GepaResult, GepaState
 from ..runner import _resolve_candidate_selector, _resolve_component_selector
 from ..types import ReflectionConfig
 from .base import (
-    BudgetExhausted,
     BudgetTracker,
     EngineConfig,
     EngineEvent,
@@ -89,6 +88,11 @@ class GepaEngine:
             memory_exporter=None,
         )
         graph = create_gepa_graph(config=gepa_config)
+        # Reserve before the graph can invoke a rollout. The graph's own cap
+        # is identical; unused capacity is refunded after its exact telemetry
+        # is known, so result accounting remains honest.
+        reserved = gepa_config.max_evaluations
+        budget.spend(reserved)
 
         try:
             run_output: GepaResult | None = None
@@ -105,19 +109,11 @@ class GepaEngine:
 
         num_metric_calls = state.total_evaluations
         history: list[EngineEvent] = []
-        try:
-            budget.spend(num_metric_calls)
-        except BudgetExhausted:
-            history.append(
-                EngineEvent(
-                    kind="budget_overshoot",
-                    message="GEPA completed after exceeding its allocated budget slice.",
-                    data={
-                        "total_evaluations": num_metric_calls,
-                        "budget_remaining_before_spend": remaining_budget,
-                    },
-                )
+        if num_metric_calls > reserved:
+            raise RuntimeError(
+                f"GEPA exceeded its pre-reserved slice ({num_metric_calls}>{reserved})."
             )
+        budget.refund(reserved - num_metric_calls)
 
         best_candidate = _candidate_map(gepa_result.best_candidate, seed_candidate)
         history.append(

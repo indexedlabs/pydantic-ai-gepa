@@ -263,7 +263,12 @@ def test_pareto_log_concurrent_appends(tmp_path: Path) -> None:
 
 
 def _row(
-    candidate_id: str, scores: dict[str, float], status: str = "evaluated"
+    candidate_id: str,
+    scores: dict[str, float],
+    status: str = "evaluated",
+    *,
+    objective_scores: dict[str, float] | None = None,
+    per_case_objective_scores: dict[str, dict[str, float]] | None = None,
 ) -> ParetoRow:
     return ParetoRow(
         candidate_id=candidate_id,
@@ -275,6 +280,8 @@ def _row(
         status=status,
         summary=f"Row {candidate_id}",
         timestamp=utc_now_iso(),
+        objective_scores=objective_scores or {},
+        per_case_objective_scores=per_case_objective_scores or {},
     )
 
 
@@ -350,6 +357,79 @@ def test_pareto_front_excludes_non_selectable_infrastructure_rows(
     assert log.count_rows() == 2
     assert [row.candidate_id for row in log.selectable_rows()] == ["healthy"]
     assert [row.candidate_id for row in log.front()] == ["healthy"]
+
+
+def test_pareto_front_supports_objective_hybrid_and_cartesian_coordinates(
+    tmp_path: Path,
+) -> None:
+    ensure_layout(tmp_path)
+    run = new_run_id()
+    log = ParetoLog(run, tmp_path)
+    weaker = _row(
+        "weaker",
+        {"a": 0.5, "b": 0.5},
+        objective_scores={"quality": 0.2},
+        per_case_objective_scores={
+            "a": {"quality": 0.2},
+            "b": {"quality": 0.2},
+        },
+    )
+    stronger = _row(
+        "stronger",
+        {"a": 0.6, "b": 0.6},
+        objective_scores={"quality": 0.8},
+        per_case_objective_scores={
+            "a": {"quality": 0.8},
+            "b": {"quality": 0.8},
+        },
+    )
+    log.append(weaker)
+    log.append(stronger)
+
+    for mode in ("objective", "hybrid", "cartesian"):
+        assert [row.candidate_id for row in log.front(mode=mode)] == ["stronger"]
+
+
+@pytest.mark.parametrize("mode", ["objective", "hybrid", "cartesian"])
+def test_pareto_front_fails_closed_for_missing_or_inconsistent_coordinates(
+    tmp_path: Path, mode: str
+) -> None:
+    ensure_layout(tmp_path)
+    run = new_run_id()
+    log = ParetoLog(run, tmp_path)
+    complete = _row(
+        "complete",
+        {"a": 0.5},
+        objective_scores={"quality": 0.5},
+        per_case_objective_scores={"a": {"quality": 0.5}},
+    )
+    incomplete = _row("incomplete", {"a": 0.5})
+    if mode == "cartesian":
+        incomplete = _row("incomplete", {"a": 0.5}, objective_scores={"quality": 0.5})
+    elif mode == "hybrid":
+        incomplete = _row("incomplete", {"a": 0.5}, objective_scores={"different": 0.5})
+    log.append(complete)
+    log.append(incomplete)
+
+    with pytest.raises(ValueError):
+        log.front(mode=mode)
+
+
+def test_pareto_front_rejects_unknown_mode(tmp_path: Path) -> None:
+    ensure_layout(tmp_path)
+    log = ParetoLog(new_run_id(), tmp_path)
+    log.append(_row("candidate", {"a": 1.0}))
+
+    with pytest.raises(ValueError, match="Unknown Pareto frontier mode"):
+        log.front(mode="not-a-mode")
+
+
+def test_pareto_row_rejects_non_mapping_per_case_objectives() -> None:
+    data = _row("candidate", {"a": 1.0}).to_dict()
+    data["per_case_objective_scores"] = ["not-a-mapping"]
+
+    with pytest.raises(ValueError, match="per_case_objective_scores"):
+        ParetoRow.from_dict(data)
 
 
 def test_pareto_persists_full_schema(tmp_path: Path) -> None:

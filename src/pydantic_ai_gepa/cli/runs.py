@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import random
 import subprocess
@@ -187,6 +188,8 @@ class ParetoRow:
     summary: str
     timestamp: str
     lane: str | None = None
+    objective_scores: dict[str, float] = field(default_factory=dict)
+    per_case_objective_scores: dict[str, dict[str, float]] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -201,6 +204,11 @@ class ParetoRow:
             "summary": self.summary,
             "timestamp": self.timestamp,
             "lane": self.lane,
+            "objective_scores": dict(self.objective_scores),
+            "per_case_objective_scores": {
+                case_id: dict(scores)
+                for case_id, scores in self.per_case_objective_scores.items()
+            },
         }
         if self.extra:
             out["extra"] = dict(self.extra)
@@ -209,6 +217,9 @@ class ParetoRow:
     @staticmethod
     def from_dict(data: dict[str, Any]) -> ParetoRow:
         # Rows written before lanes existed carry no "lane" key; default to None.
+        raw_per_case_objectives = data.get("per_case_objective_scores", {})
+        if not isinstance(raw_per_case_objectives, dict):
+            raise ValueError("per_case_objective_scores must be a mapping.")
         return ParetoRow(
             candidate_id=str(data["candidate_id"]),
             commit_sha=data.get("commit_sha"),
@@ -222,6 +233,11 @@ class ParetoRow:
             summary=str(data.get("summary", "")),
             timestamp=str(data["timestamp"]),
             lane=data.get("lane"),
+            objective_scores=_finite_objective_scores(data.get("objective_scores", {})),
+            per_case_objective_scores={
+                str(case_id): _finite_objective_scores(scores)
+                for case_id, scores in raw_per_case_objectives.items()
+            },
             extra=dict(data.get("extra", {})),
         )
 
@@ -333,23 +349,36 @@ class ParetoLog:
                 count += 1
         return count
 
-    def front(self) -> list[ParetoRow]:
-        """Return rows that are Pareto-dominant across per-case scores.
+    def front(self, *, mode: str = "instance") -> list[ParetoRow]:
+        """Return the selectable Pareto front with complete matching coordinates.
 
-        A row dominates another if its per-case scores are >= the other's on
-        every shared case and strictly > on at least one. Rows without any
-        overlapping cases are kept (they're incomparable). Higher score = better.
+        Rows must expose identical coordinates for the requested frontier mode;
+        partial rows fail closed instead of being treated as incomparable.
         """
+        if mode not in {"instance", "objective", "hybrid", "cartesian"}:
+            raise ValueError(f"Unknown Pareto frontier mode: {mode!r}.")
         rows = self.selectable_rows()
         if not rows:
             return []
+        coordinates = [_row_coordinates(row, mode) for row in rows]
+        if any(coordinate is None for coordinate in coordinates):
+            raise ValueError(
+                f"{mode} frontier requires complete coordinates for every selectable row."
+            )
+        first_coordinates = set(coordinates[0] or {})
+        if any(
+            set(coordinate or {}) != first_coordinates for coordinate in coordinates[1:]
+        ):
+            raise ValueError(
+                "Pareto frontier rows must have identical coordinate keys; refusing incomparable partial rows."
+            )
 
         front: list[ParetoRow] = []
         for candidate in rows:
             dominated = False
             front_after: list[ParetoRow] = []
             for existing in front:
-                cmp = _dominance(existing.per_case_scores, candidate.per_case_scores)
+                cmp = _row_dominance(existing, candidate, mode=mode)
                 if cmp == "existing":
                     dominated = True
                     front_after.append(existing)
@@ -401,3 +430,60 @@ def _dominance(a: dict[str, float], b: dict[str, float]) -> str | None:
     if b_ge_all and b_gt_any:
         return "candidate"
     return None
+
+
+def _finite_objective_scores(raw: Any) -> dict[str, float]:
+    """Validate named higher-is-better objective coordinates at the ledger edge."""
+    if not isinstance(raw, dict):
+        raise ValueError("objective_scores must be a mapping.")
+    values: dict[str, float] = {}
+    for name, value in raw.items():
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            raise ValueError(f"Objective score {name!r} must be finite numeric.")
+        values[str(name)] = float(value)
+    return values
+
+
+def _row_dominance(
+    existing: ParetoRow, candidate: ParetoRow, *, mode: str
+) -> str | None:
+    """Compare instance/objective/hybrid/cartesian frontier coordinates."""
+    if mode not in {"instance", "objective", "hybrid", "cartesian"}:
+        raise ValueError(
+            "front mode must be instance, objective, hybrid, or cartesian."
+        )
+    left = _row_coordinates(existing, mode)
+    right = _row_coordinates(candidate, mode)
+    if left is None or right is None or set(left) != set(right):
+        return None
+    comparison = _dominance(left, right)
+    if comparison == "existing":
+        return "existing"
+    if comparison == "candidate":
+        return "candidate"
+    return None
+
+
+def _row_coordinates(row: ParetoRow, mode: str) -> dict[str, float] | None:
+    coordinates: dict[str, float] = {}
+    if mode in {"instance", "hybrid"}:
+        coordinates.update(
+            {f"case:{case_id}": score for case_id, score in row.per_case_scores.items()}
+        )
+    if mode in {"objective", "hybrid"}:
+        if not row.objective_scores:
+            return None
+        coordinates.update(
+            {f"objective:{name}": score for name, score in row.objective_scores.items()}
+        )
+    if mode == "cartesian":
+        for case_id, objectives in row.per_case_objective_scores.items():
+            for name, score in objectives.items():
+                coordinates[f"case:{case_id}:objective:{name}"] = score
+        if not coordinates:
+            return None
+    return coordinates or None

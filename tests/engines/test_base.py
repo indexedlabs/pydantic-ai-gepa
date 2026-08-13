@@ -16,6 +16,7 @@ from pydantic_ai_gepa.engines.base import (
     EngineConfig,
     OptimizationTask,
 )
+from pydantic_ai_gepa.cli.eval import _objective_scores as cli_objective_scores
 from pydantic_ai_gepa.evaluation import EvaluationRecord
 from pydantic_ai_gepa.types import MetricResult, RolloutOutput
 
@@ -120,3 +121,46 @@ async def test_optimization_task_aggregates_payload_side_info(
         "cases": [{"case_id": "case", "side_info": {"hint": "be concise"}}],
         "feedback": ["try again"],
     }
+
+
+@pytest.mark.asyncio
+async def test_objective_scores_require_identical_keys_for_every_case(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = Agent(TestModel(custom_output_text="ok"), instructions="seed")
+    cases = [
+        Case(name="one", inputs="one", expected_output="ok"),
+        Case(name="two", inputs="two", expected_output="ok"),
+    ]
+    task = OptimizationTask(
+        agent=agent,
+        trainset=cases,
+        valset=cases,
+        metric=lambda case, output: MetricResult(score=1.0),
+    )
+    records = [
+        EvaluationRecord(
+            case_id="one",
+            score=1.0,
+            feedback=None,
+            payload={"side_info": {"scores": {"quality": 1.0}}},
+        ),
+        EvaluationRecord(
+            case_id="two",
+            score=1.0,
+            feedback=None,
+            payload={"side_info": {"scores": {"safety": 1.0}}},
+        ),
+    ]
+
+    async def fake_evaluate_candidate_dataset(**kwargs: Any) -> list[EvaluationRecord]:
+        return records
+
+    monkeypatch.setattr(
+        "pydantic_ai_gepa.engines.base.evaluate_candidate_dataset",
+        fake_evaluate_candidate_dataset,
+    )
+    with pytest.raises(ValueError, match="identical objective keys"):
+        await task.evaluate(await task.seed_candidate())
+    with pytest.raises(Exception, match="identical objective keys"):
+        cli_objective_scores(records)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable
 from typing import Any
 
 import pytest
@@ -217,6 +218,47 @@ async def test_coding_agent_engine_stops_after_a_budget_overshoot() -> None:
     assert result.best_candidate["instructions"].text == "seed"
     assert result.num_metric_calls == budget.spent == 3
     assert any(event.kind == "budget_overshoot" for event in result.history)
+
+
+@pytest.mark.asyncio
+async def test_coding_agent_engine_stops_cleanly_when_first_minibatch_is_unaffordable() -> (
+    None
+):
+    """A preflight failure must not leak a provider call or raise from run()."""
+
+    metric_calls = 0
+    proposer_calls = 0
+    task = _task(case_count=2)
+    original_metric = task.metric
+
+    def counted_metric(
+        case: Case[str, str, Any], output: RolloutOutput[Any]
+    ) -> MetricResult | Awaitable[MetricResult]:
+        nonlocal metric_calls
+        metric_calls += 1
+        return original_metric(case, output)
+
+    task.metric = counted_metric
+
+    async def propose(context: ReflectionContext) -> CandidateMap:
+        del context
+        nonlocal proposer_calls
+        proposer_calls += 1
+        return _candidate("correct")
+
+    config = EngineConfig(
+        engine="coding_agent",
+        max_metric_calls=1,
+        engine_config={"propose": propose, "minibatch_size": 2},
+    )
+    budget = BudgetTracker(1)
+
+    result = await get_engine("coding_agent", config).run(task, config, budget)
+
+    assert result.best_candidate["instructions"].text == "seed"
+    assert result.num_metric_calls == budget.spent == 0
+    assert metric_calls == proposer_calls == 0
+    assert any(event.kind == "budget_exhausted" for event in result.history)
 
 
 @pytest.mark.parametrize("propose", [None, "not callable", object()])

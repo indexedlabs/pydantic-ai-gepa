@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -95,6 +96,61 @@ def _count_evals_in_run(run_id: str, root: Path | None = None) -> int:
 
 
 DEFAULT_FAILURE_THRESHOLD = 0.999
+
+
+def _objective_scores(
+    records: list[EvaluationRecord],
+) -> tuple[dict[str, float], dict[str, dict[str, float]], bool]:
+    """Extract validated higher-is-better objective coordinates from metric ASI."""
+    values: dict[str, list[float]] = {}
+    per_case: dict[str, dict[str, float]] = {}
+    selectable = True
+    objective_key_sets: list[set[str] | None] = []
+    for record in records:
+        info = record.payload.get("side_info")
+        if not isinstance(info, dict):
+            info = record.payload.get("metric_side_info")
+        if not isinstance(info, dict):
+            info = getattr(record.payload.get("trajectory"), "metric_side_info", None)
+        if not isinstance(info, dict):
+            objective_key_sets.append(None)
+            continue
+        if info.get("selectable") is False or info.get("infrastructure_valid") is False:
+            selectable = False
+        raw = info.get("scores")
+        if raw is None:
+            objective_key_sets.append(None)
+            continue
+        if not isinstance(raw, dict):
+            raise typer.BadParameter("Metric side_info['scores'] must be a mapping.")
+        case_values: dict[str, float] = {}
+        objective_key_sets.append({str(name) for name in raw})
+        for name, value in raw.items():
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+            ):
+                raise typer.BadParameter(
+                    f"Objective score {name!r} for {record.case_id!r} must be finite numeric."
+                )
+            key = str(name)
+            number = float(value)
+            values.setdefault(key, []).append(number)
+            case_values[key] = number
+        if case_values:
+            per_case[record.case_id] = case_values
+    if any(keys is not None for keys in objective_key_sets):
+        first = objective_key_sets[0]
+        if first is None or any(keys != first for keys in objective_key_sets[1:]):
+            raise typer.BadParameter(
+                "Metric side_info['scores'] must expose identical objective keys for every evaluated case."
+            )
+    return (
+        {key: sum(items) / len(items) for key, items in values.items()},
+        per_case,
+        selectable,
+    )
 
 
 @dataclass(frozen=True)
@@ -488,10 +544,13 @@ def run_eval_once(
     per_case = {record.case_id: record.score for record in records}
     mean = sum(per_case.values()) / len(per_case) if per_case else 0.0
     infrastructure_failures = evaluation_infrastructure_failures(records)
+    objective_scores, per_case_objective_scores, metric_selectable = _objective_scores(
+        records
+    )
     evaluation_outcome = (
         "infrastructure_failure" if infrastructure_failures else "valid"
     )
-    selectable = not infrastructure_failures
+    selectable = not infrastructure_failures and metric_selectable
     pareto_status = "infrastructure_failure" if infrastructure_failures else status
 
     pareto = ParetoLog(active_run_id, workspace_root)
@@ -511,6 +570,8 @@ def run_eval_once(
             summary=f"{pareto_status} eval of {candidate.id} on minibatch {minibatch.id} (mean={mean:.3f})",
             timestamp=utc_now_iso(),
             lane=lane,
+            objective_scores=objective_scores,
+            per_case_objective_scores=per_case_objective_scores,
             extra={
                 "eval_id": eval_id,
                 "outcome": evaluation_outcome,
@@ -560,6 +621,8 @@ def run_eval_once(
         "selectable": selectable,
         "evaluation_errors": [failure.to_dict() for failure in infrastructure_failures],
         "mean_score": mean,
+        "objective_scores": objective_scores,
+        "per_case_objective_scores": per_case_objective_scores,
         "n_cases": len(records),
         "n_failures": len([record for record in records if record.score < threshold]),
         "iterations": iteration,
