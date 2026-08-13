@@ -1,0 +1,9 @@
+{
+  "checkpoint_id": "019ff909404d",
+  "created_at": "2026-08-13T02:52:40.980574+00:00",
+  "branch_name": "omni/3-core-composition",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "0f0f92ce97a6f9367a4e94e7b765d4eff7493bad"
+  ]
+}
