@@ -9,6 +9,54 @@ You are the reflection model. The `gepa` CLI is a small toolkit that handles min
 
 There is no `propose` or `reflect` verb on the CLI because that's the work you do — while `gepa run` is paused, or between manual `gepa eval` invocations — by editing files.
 
+## Outer Omni protocol for code candidates
+
+`gepa run --lanes` is intentionally a single-parent managed run. Do not try to
+turn its lane count into a multi-parent Omni plan. For independently explored
+git/code candidates, a root orchestrator drives the separate durable outer
+controller and routes packets without reading reflection text:
+
+```bash
+gepa omni start --plan ./omni-plan.json
+gepa omni next <omni-id> --json
+# create only the workspace named in child_ready/phase2_ready, then launch your worker
+gepa omni child-dispatched <omni-id> --receipt ./dispatch.json
+gepa omni child-submit <omni-id> --receipt ./child-result.json
+gepa omni compare-submit <omni-id> --receipt ./comparison.json
+gepa omni reporting-submit <omni-id> --receipt ./report.json  # only if reporting was planned
+gepa omni ack <omni-id> <event-id>
+```
+
+The plan uses SHA-256-pinned seed/minibatch/test artifacts, evaluator identity
+and digest, equal phase-one metric-call slices, an explicit repeated comparison
+budget, and a fresh phase-two workspace. Workspace paths may be intended paths
+at `start`; create or verify the exact isolated directory before submitting the
+dispatch receipt. A `child_ready` packet is all the
+worker needs: its child/engine ID, isolated workspace, immutable seed and
+minibatch paths/hashes, opaque SHA-pinned driver manifest, and reserved metric
+calls. The controller never executes the manifest; the orchestrator reads it
+to choose its engine adapter. Submit only immutable
+receipts with those same identities. The controller, not child self-reported
+scores, chooses a Pareto provisional winner, then accepts it only when the
+shared confidence-interval/practical-delta comparison clears the frozen
+threshold against seed/incumbent. Rejected, equivalent, or inconclusive votes
+retain the baseline; an optional bounded `max_repetitions` can collect more
+matched samples only for an inconclusive vote. Events redeliver unacked work
+after restart.
+
+Keep the emitted packet untouched: its original SHA is recorded in the durable
+outbox, and dispatch/semantic receipts are rejected if the packet, plan, or
+frozen input bytes changed after emission.
+
+Child optimization usage is an explicit `child_receipt` attestation. The outer
+controller enforces its reserved ceiling but does not independently meter an
+arbitrary worker; production adapters should bind manifests to evaluator-owned
+usage-ledger receipts.
+
+Use `error-submit` only for an explicit, evidence-backed frozen evaluator target
+that is inconsistent or unattainable. Do not emit `ERROR.md` for ordinary code,
+test, provider, credential, or worker failures.
+
 ## Setup (run once)
 
 ```bash
