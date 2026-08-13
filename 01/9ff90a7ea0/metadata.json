@@ -1,0 +1,9 @@
+{
+  "checkpoint_id": "019ff90a7ea0",
+  "created_at": "2026-08-13T02:54:02.469109+00:00",
+  "branch_name": "omni/4-outer-controller",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "d6c8f5536e38695008739b2cd48444b651e4002a"
+  ]
+}
