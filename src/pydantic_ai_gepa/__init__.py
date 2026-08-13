@@ -20,8 +20,12 @@ from .inspection import (
 from .exceptions import UsageBudgetExceeded
 from .runner import GepaOptimizationResult, optimize_agent
 from .compose import (
+    FairVote,
+    OmniPlan,
     PipelineResult,
+    optimize_adaptive_sequential,
     optimize_best_of,
+    optimize_omni,
     optimize_parallel,
     optimize_sequential,
     optimize_vote,
@@ -71,10 +75,14 @@ __all__ = [
     "AcceptanceComparison",
     "compare_candidate_samples",
     "optimize_parallel",
+    "optimize_omni",
+    "optimize_adaptive_sequential",
     "optimize_best_of",
     "optimize_sequential",
     "optimize_vote",
     "PipelineResult",
+    "OmniPlan",
+    "FairVote",
     "GepaOptimizationResult",
     "Adapter",
     "AgentAdapter",

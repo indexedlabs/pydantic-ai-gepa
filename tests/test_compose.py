@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Generator
 from typing import Any
 
@@ -11,6 +12,7 @@ from pydantic_ai.models.test import TestModel
 from pydantic_evals import Case
 
 from pydantic_ai_gepa.compose import (
+    optimize_adaptive_sequential,
     optimize_best_of,
     optimize_parallel,
     optimize_sequential,
@@ -59,6 +61,20 @@ class _FakeEngine:
         budget: BudgetTracker,
     ) -> EngineResult:
         options = config.engine_config
+        started = options.get("started")
+        if isinstance(started, asyncio.Event):
+            started.set()
+        if options.get("raise_error"):
+            raise RuntimeError("engine failure")
+        wait_for = options.get("wait_for")
+        if isinstance(wait_for, asyncio.Event):
+            try:
+                await wait_for.wait()
+            except asyncio.CancelledError:
+                cancelled = options.get("cancelled")
+                if isinstance(cancelled, asyncio.Event):
+                    cancelled.set()
+                raise
         seen = options.get("seen_seeds")
         if isinstance(seen, list):
             seen.append((await task.seed_candidate())["instructions"].text)
@@ -86,6 +102,8 @@ def _config(
     reported_score: float = 0.0,
     spend: int = 0,
     seen_seeds: list[str] | None = None,
+    max_metric_calls: int = 200,
+    **extra: Any,
 ) -> EngineConfig:
     options: dict[str, Any] = {
         "candidate": candidate,
@@ -94,7 +112,12 @@ def _config(
     }
     if seen_seeds is not None:
         options["seen_seeds"] = seen_seeds
-    return EngineConfig(engine=_ENGINE_NAME, engine_config=options)
+    options.update(extra)
+    return EngineConfig(
+        engine=_ENGINE_NAME,
+        max_metric_calls=max_metric_calls,
+        engine_config=options,
+    )
 
 
 @pytest.mark.asyncio
@@ -112,6 +135,82 @@ async def test_optimize_parallel_preserves_order_and_shares_its_budget() -> None
 
 
 @pytest.mark.asyncio
+async def test_parallel_cancels_and_awaits_siblings_before_releasing_slices() -> None:
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    never = asyncio.Event()
+    with pytest.raises(RuntimeError, match="engine failure"):
+        await optimize_parallel(
+            _task(),
+            [
+                _config(_candidate("bad"), raise_error=True),
+                _config(
+                    _candidate("slow"),
+                    seen_seeds=[],
+                    wait_for=never,
+                    started=started,
+                    cancelled=cancelled,
+                ),
+            ],
+            max_metric_calls=2,
+        )
+    # The implementation waits for cancellation; it cannot return while a
+    # sibling could still use its released local slice.
+    assert cancelled.is_set() or not started.is_set()
+
+
+@pytest.mark.asyncio
+async def test_adaptive_sequential_uses_affordable_slices_and_switches_on_plateau() -> (
+    None
+):
+    seen_seeds: list[str] = []
+    result = await optimize_adaptive_sequential(
+        _task(),
+        [
+            _config(
+                _candidate("correct"),
+                spend=1,
+                seen_seeds=seen_seeds,
+                max_metric_calls=1,
+            ),
+            _config(
+                _candidate("wrong"),
+                spend=1,
+                seen_seeds=seen_seeds,
+                max_metric_calls=1,
+            ),
+        ],
+        max_metric_calls=4,
+        patience=1,
+        max_switches=1,
+    )
+    # The first slice improves, its second equal-score slice plateaus, then
+    # the scheduler reaches the next fresh engine instead of capping at two
+    # configured families.
+    assert len(result.results) >= 3
+    assert [phase["engine"] for phase in result.phases][-1] == _ENGINE_NAME
+    assert result.total_metric_calls >= 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("keyword", "value"),
+    [("plateau_min_improvement", -0.1), ("max_switches", -1), ("max_slices", 0)],
+)
+async def test_adaptive_rejects_invalid_bounds_before_work(
+    keyword: str, value: float | int
+) -> None:
+    arguments: dict[str, Any] = {keyword: value}
+    with pytest.raises(ValueError):
+        await optimize_adaptive_sequential(
+            _task(),
+            [_config(_candidate("correct"))],
+            max_metric_calls=1,
+            **arguments,
+        )
+
+
+@pytest.mark.asyncio
 async def test_optimize_best_of_uses_fair_valset_scores_not_reported_scores() -> None:
     low_actual = _config(_candidate("wrong"), reported_score=99.0)
     high_actual = _config(_candidate("correct"), reported_score=-1.0)
@@ -125,6 +224,46 @@ async def test_optimize_best_of_uses_fair_valset_scores_not_reported_scores() ->
     assert result.fair_scores == [0.0, 1.0]
     assert [item.best_score for item in result.results] == [99.0, -1.0]
     assert result.total_metric_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_best_of_noisy_vote_is_not_anchored_to_first_engine() -> None:
+    agent = Agent(TestModel(custom_output_text="response"), instructions="seed")
+    case = Case(name="case", inputs="input", expected_output="response")
+    samples = {"low": iter([0.4, 0.6]), "high": iter([0.45, 0.65])}
+
+    def metric(case: Case[str, str, Any], output: RolloutOutput[Any]) -> MetricResult:
+        del case, output
+        active = agent._override_instructions.get()
+        text = str(active.value if active is not None else agent._instructions)
+        key = "high" if "high" in text else "low"
+        return MetricResult(score=next(samples[key]))
+
+    task = OptimizationTask(agent=agent, trainset=[case], valset=[case], metric=metric)
+    result = await optimize_best_of(
+        task,
+        [_config(_candidate("low")), _config(_candidate("high"))],
+        max_metric_calls=2,
+        fair_vote_repetitions=2,
+        fair_vote_max_repetitions=2,
+    )
+
+    assert result.best_index == 1
+    assert result.decision["baseline_index"] is None
+    assert result.decision["acceptance"]["verdict"] == "not_applicable"
+
+
+@pytest.mark.asyncio
+async def test_underfunded_comparison_fails_before_an_engine_can_run() -> None:
+    seen: list[str] = []
+    with pytest.raises(ValueError, match="cannot fund"):
+        await optimize_best_of(
+            _task(),
+            [_config(_candidate("correct"), seen_seeds=seen)],
+            max_metric_calls=1,
+            comparison_metric_calls=0,
+        )
+    assert seen == []
 
 
 @pytest.mark.asyncio
