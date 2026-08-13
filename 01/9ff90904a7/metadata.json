@@ -1,0 +1,37 @@
+{
+  "checkpoint_id": "019ff90904a7",
+  "created_at": "2026-08-13T02:52:25.935428+00:00",
+  "branch_name": "omni/1-lane-contract",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "ec2dccaed16c4da735d614bc11e7e9e1fb486615"
+  ],
+  "entity_touches": [
+    ".mighty/loro/edges/019ff8d5-6b89-71f3-93f0-b545b31f5533.loro",
+    ".mighty/loro/edges/019ff8d5-6bf0-7002-af45-9a132bce91d5.loro",
+    ".mighty/loro/edges/019ff8d5-6cb7-7fb2-8db7-0b0d7a307e91.loro",
+    ".mighty/loro/edges/019ff8d5-88f9-7ed3-9189-8f7a980609bc.loro",
+    ".mighty/loro/edges/019ff8d5-894c-73a1-b778-ccc844a4944e.loro",
+    ".mighty/loro/edges/019ff8d5-89a7-7c82-9735-d334d499f851.loro",
+    ".mighty/loro/edges/019ff8d5-89fd-7582-a8e0-ddd5f48ed305.loro",
+    ".mighty/loro/edges/019ff905-faca-7540-b1e1-6f9035906241.loro",
+    ".mighty/loro/edges/019ff905-fb58-7253-828f-79fa17d09c8d.loro",
+    ".mighty/loro/edges/019ff905-fc25-7d30-b21f-ad6cc1a65868.loro",
+    ".mighty/loro/edges/019ff905-fcb7-7923-b44d-5714f15b09bc.loro",
+    ".mighty/loro/edges/019ff905-fd41-7252-b906-4be344b69d77.loro",
+    ".mighty/loro/edges/019ff905-fdce-7770-b9b3-6deb88b2bedc.loro",
+    ".mighty/loro/edges/019ff905-fe98-70c2-8620-4f348c6dc68d.loro",
+    ".mighty/loro/edges/019ff905-ff61-7dc2-9205-35c919831554.loro",
+    ".mighty/loro/edges/019ff905-ffeb-7ec3-9d5d-0b4a9a99759c.loro",
+    ".mighty/loro/messages/019ff8d0-c531-7fb0-980e-0706b3ba6745.loro",
+    ".mighty/loro/messages/019ff906-14a2-7983-841e-35c387861116.loro",
+    ".mighty/loro/messages/019ff906-1553-7c53-af3e-ef27da13a8d9.loro",
+    ".mighty/loro/records/019ff8b5-6204-77a2-baa8-0a1c53d463e4.loro",
+    ".mighty/loro/records/019ff8b5-70fe-7e51-86d0-c8888f4a863e.loro",
+    ".mighty/loro/records/019ff8d5-6c07-7a01-b38a-1b709ebe654f.loro",
+    ".mighty/loro/records/019ff8d5-6cca-76e2-97fd-c01321919412.loro",
+    ".mighty/loro/records/019ff905-fb6d-7f33-ab00-a5127f178966.loro",
+    ".mighty/loro/records/019ff905-fde3-7a50-8377-935e6f69dd03.loro",
+    ".mighty/loro/records/019ff905-feac-76a3-8f2d-f6714f8ea7a4.loro"
+  ]
+}
