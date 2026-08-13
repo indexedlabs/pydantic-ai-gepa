@@ -340,7 +340,7 @@ class ParetoLog:
         every shared case and strictly > on at least one. Rows without any
         overlapping cases are kept (they're incomparable). Higher score = better.
         """
-        rows = self.iter_rows()
+        rows = self.selectable_rows()
         if not rows:
             return []
 
@@ -362,6 +362,16 @@ class ParetoLog:
                 front_after.append(candidate)
             front = front_after
         return front
+
+    def selectable_rows(self) -> list[ParetoRow]:
+        """Return rows whose evaluations may participate in quality ranking."""
+
+        return [
+            row
+            for row in self.iter_rows()
+            if row.extra.get("selectable", True) is not False
+            and row.extra.get("outcome") != "infrastructure_failure"
+        ]
 
 
 def _dominance(a: dict[str, float], b: dict[str, float]) -> str | None:

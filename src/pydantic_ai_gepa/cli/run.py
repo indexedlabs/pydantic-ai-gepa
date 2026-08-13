@@ -18,6 +18,10 @@ from typing import Any, Literal, cast
 import typer
 
 from ..acceptance import AcceptanceComparison, compare_candidate_samples
+from ..evaluation_health import (
+    EvaluationInfrastructureFailure,
+    evaluation_infrastructure_failures,
+)
 from .candidates import (
     GitCandidateError,
     candidate_id_from_components,
@@ -54,6 +58,7 @@ RunStatus = Literal[
     "running",
     "paused_for_reflection",
     "paused_after_candidate_eval",
+    "paused_after_infrastructure_error",
     "done",
 ]
 
@@ -112,6 +117,7 @@ class RunState:
     # winner, per-lane progress) so an interrupted select resumes idempotently.
     select_phase: str | None = None
     select_context: dict[str, Any] | None = None
+    infrastructure_retry_minibatch_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -163,6 +169,7 @@ class RunState:
             "iteration_started_at": self.iteration_started_at,
             "select_phase": self.select_phase,
             "select_context": self.select_context,
+            "infrastructure_retry_minibatch_id": self.infrastructure_retry_minibatch_id,
         }
 
     @staticmethod
@@ -281,6 +288,9 @@ class RunState:
                 if isinstance(data.get("select_context"), dict)
                 else None
             ),
+            infrastructure_retry_minibatch_id=data.get(
+                "infrastructure_retry_minibatch_id"
+            ),
         )
 
     def save(self, root: Path | None = None) -> Path:
@@ -352,20 +362,104 @@ def _with_last_outcome(state: RunState, outcome: EvalOutcome) -> RunState:
         last_trace_path=(
             str(summary["trace_path"]) if summary.get("trace_path") else None
         ),
-        best_candidate_id=state.best_candidate_id or str(summary["candidate_id"]),
-        best_commit_sha=(
-            state.best_commit_sha
-            or (
-                _summary_commit_sha(summary)
-                if state.candidate_source == "git"
-                else None
-            )
+    )
+
+
+def _outcome_infrastructure_failures(
+    outcome: EvalOutcome,
+) -> tuple[EvaluationInfrastructureFailure, ...]:
+    return evaluation_infrastructure_failures(outcome.records)
+
+
+def _infrastructure_failure_comparison(
+    state: RunState,
+    outcomes: list[EvalOutcome],
+    *,
+    phase: Literal["baseline", "candidate"],
+    failures: tuple[EvaluationInfrastructureFailure, ...],
+    valid_samples: tuple[float, ...] = (),
+) -> dict[str, Any]:
+    """Build the persisted, non-selectable result for a failed comparison."""
+
+    first_summary = outcomes[0].summary
+    reports = [str(outcome.summary["report_path"]) for outcome in outcomes]
+    traces = [
+        str(outcome.summary["trace_path"])
+        for outcome in outcomes
+        if outcome.summary.get("trace_path")
+    ]
+    comparison: dict[str, Any] = {
+        "outcome": "infrastructure_failure",
+        "selectable": False,
+        "verdict": None,
+        "improved": False,
+        "phase": phase,
+        "reason_code": "required_rollout_failed",
+        "retryable": state.iterations < state.max_iterations,
+        "recommendation": (
+            "retry_after_infrastructure_recovery"
+            if state.iterations < state.max_iterations
+            else "stop_budget_exhausted"
         ),
-        best_mean_score=(
-            state.best_mean_score
-            if state.best_mean_score is not None
-            else float(summary["mean_score"])
+        "minibatch_id": str(first_summary["minibatch_id"]),
+        "candidate_id": str(first_summary["candidate_id"]),
+        "candidate_commit_sha": first_summary.get("commit_sha"),
+        "candidate_report_path": reports[-1],
+        "candidate_report_paths": reports,
+        "candidate_trace_path": traces[-1] if traces else None,
+        "candidate_trace_paths": traces,
+        "valid_samples_before_failure": list(valid_samples),
+        "evaluation_error_count": len(failures),
+        "evaluation_errors": [failure.to_dict() for failure in failures],
+    }
+    if phase == "candidate":
+        comparison.update(
+            {
+                "baseline_candidate_id": state.reflection_baseline_candidate_id,
+                "baseline_commit_sha": state.reflection_baseline_commit_sha,
+                "baseline_iteration": state.reflection_baseline_iteration,
+                "baseline_samples": list(state.reflection_baseline_samples),
+                "baseline_report_path": state.reflection_baseline_report_path,
+                "baseline_report_paths": list(state.reflection_baseline_report_paths),
+                "baseline_trace_path": state.reflection_baseline_trace_path,
+                "baseline_trace_paths": list(state.reflection_baseline_trace_paths),
+            }
+        )
+    return comparison
+
+
+def _pause_after_infrastructure_failure(
+    state: RunState,
+    outcomes: list[EvalOutcome],
+    *,
+    phase: Literal["baseline", "candidate"],
+    failures: tuple[EvaluationInfrastructureFailure, ...],
+    valid_samples: tuple[float, ...] = (),
+) -> tuple[RunState, dict[str, Any]]:
+    comparison = _infrastructure_failure_comparison(
+        state,
+        outcomes,
+        phase=phase,
+        failures=failures,
+        valid_samples=valid_samples,
+    )
+    if phase == "baseline":
+        state = _with_timestamp(
+            _clear_reflection_baseline(state),
+            infrastructure_retry_minibatch_id=str(outcomes[-1].summary["minibatch_id"]),
+        )
+    status: RunStatus = (
+        "paused_after_infrastructure_error"
+        if state.iterations < state.max_iterations
+        else "done"
+    )
+    return (
+        _with_timestamp(
+            state,
+            status=status,
+            last_comparison=comparison,
         ),
+        comparison,
     )
 
 
@@ -412,6 +506,8 @@ def _mark_reflection_pause(state: RunState, outcomes: list[EvalOutcome]) -> RunS
         best_candidate_id=best_candidate_id,
         best_commit_sha=best_commit_sha,
         best_mean_score=best_mean_score,
+        infrastructure_retry_minibatch_id=None,
+        last_comparison=None,
     )
 
 
@@ -460,9 +556,10 @@ def _mark_done(state: RunState) -> RunState:
 
 def _fresh_baseline_outcome(state: RunState) -> tuple[RunState, EvalOutcome]:
     epoch = state.next_epoch
+    retry_minibatch_id = state.infrastructure_retry_minibatch_id
     outcome = run_eval_once(
         candidate_file=None,
-        minibatch_id=None,
+        minibatch_id=retry_minibatch_id,
         size=state.size,
         seed=state.seed,
         epoch=epoch,
@@ -473,7 +570,13 @@ def _fresh_baseline_outcome(state: RunState) -> tuple[RunState, EvalOutcome]:
         capture_traces=True,
         candidate_source=state.candidate_source,
     )
-    return _with_timestamp(state, next_epoch=epoch + 1), outcome
+    return (
+        _with_timestamp(
+            state,
+            next_epoch=epoch + (0 if retry_minibatch_id is not None else 1),
+        ),
+        outcome,
+    )
 
 
 def _capture_reflection_baseline(
@@ -485,6 +588,15 @@ def _capture_reflection_baseline(
     affordable_repetitions = max(1, (remaining_iterations + 1) // 2)
     target_repetitions = min(state.acceptance_max_repetitions, affordable_repetitions)
     outcomes = [first_outcome]
+    first_failures = _outcome_infrastructure_failures(first_outcome)
+    if first_failures:
+        paused, _ = _pause_after_infrastructure_failure(
+            state,
+            outcomes,
+            phase="baseline",
+            failures=first_failures,
+        )
+        return paused, outcomes
     expected_candidate_id = str(first_outcome.summary["candidate_id"])
     minibatch_id = str(first_outcome.summary["minibatch_id"])
 
@@ -511,6 +623,18 @@ def _capture_reflection_baseline(
             raise typer.Exit(code=1)
         outcomes.append(outcome)
         state = _with_last_outcome(state, outcome)
+        failures = _outcome_infrastructure_failures(outcome)
+        if failures:
+            paused, _ = _pause_after_infrastructure_failure(
+                state,
+                outcomes,
+                phase="baseline",
+                failures=failures,
+                valid_samples=tuple(
+                    float(item.summary["mean_score"]) for item in outcomes[:-1]
+                ),
+            )
+            return paused, outcomes
 
     return _mark_reflection_pause(state, outcomes), outcomes
 
@@ -525,7 +649,27 @@ def _advance_to_reflection_or_done(
         outcomes.append(outcome)
         state = _with_last_outcome(state, outcome)
 
+        failures = _outcome_infrastructure_failures(outcome)
+        if failures:
+            state, _ = _pause_after_infrastructure_failure(
+                state,
+                outcomes,
+                phase="baseline",
+                failures=failures,
+            )
+            return state, outcomes
+
+        state = _with_timestamp(
+            state,
+            infrastructure_retry_minibatch_id=None,
+            last_comparison=None,
+        )
+        if outcome.n_failures == 0 and state.best_candidate_id is None:
+            state = _mark_best_candidate(state, outcome)
+
         if state.iterations >= state.max_iterations:
+            if state.best_candidate_id is None:
+                state = _mark_best_candidate(state, outcome)
             return _mark_done(state), outcomes
 
         if outcome.n_failures > 0:
@@ -590,6 +734,16 @@ def _evaluate_reflected_candidate(
                 err=True,
             )
             raise typer.Exit(code=1)
+        failures = _outcome_infrastructure_failures(outcome)
+        if failures:
+            state, comparison = _pause_after_infrastructure_failure(
+                state,
+                outcomes,
+                phase="candidate",
+                failures=failures,
+                valid_samples=tuple(candidate_samples),
+            )
+            return state, outcomes, comparison
         candidate_samples.append(float(outcome.summary["mean_score"]))
 
         if len(candidate_samples) < initial_candidate_samples:
@@ -613,6 +767,8 @@ def _evaluate_reflected_candidate(
         "inconclusive": "inconclusive_revise_or_end",
     }[comparison_result.verdict]
     comparison = {
+        "outcome": "valid",
+        "selectable": True,
         "minibatch_id": state.reflection_minibatch_id,
         "baseline_candidate_id": state.reflection_baseline_candidate_id,
         "baseline_commit_sha": state.reflection_baseline_commit_sha,
@@ -677,7 +833,9 @@ def _current_baseline_candidate_id(
 def _write_final_report(
     state: RunState, *, overshoot: int | None = None, root: Path | None = None
 ) -> tuple[Path, str]:
-    rows = ParetoLog(state.run_id, root).iter_rows()
+    pareto = ParetoLog(state.run_id, root)
+    rows = pareto.iter_rows()
+    selectable_rows = pareto.selectable_rows()
     path = final_report_path(state.run_id, root)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -695,8 +853,8 @@ def _write_final_report(
             f"--max-iterations (in-flight lane evals; bounded by "
             f"lanes x --acceptance-max-repetitions, pydanticaigepa-dec-msy)"
         )
-    if rows:
-        best = max(rows, key=lambda row: row.mean_score)
+    if selectable_rows:
+        best = max(selectable_rows, key=lambda row: row.mean_score)
         latest = rows[-1]
         lines.extend(
             [
@@ -722,13 +880,23 @@ def _write_final_report(
                 "## Last Candidate Comparison",
                 "",
                 f"- minibatch_id: {comparison['minibatch_id']}",
-                f"- baseline_mean_score: {comparison['baseline_mean_score']:.6f}",
-                f"- candidate_mean_score: {comparison['candidate_mean_score']:.6f}",
-                f"- delta: {comparison['delta']:.6f}",
+                f"- outcome: {comparison.get('outcome', 'valid')}",
                 f"- verdict: {comparison.get('verdict', 'unknown')}",
                 f"- recommendation: {comparison['recommendation']}",
             ]
         )
+        if comparison.get("outcome", "valid") == "valid":
+            lines.extend(
+                [
+                    f"- baseline_mean_score: {comparison['baseline_mean_score']:.6f}",
+                    f"- candidate_mean_score: {comparison['candidate_mean_score']:.6f}",
+                    f"- delta: {comparison['delta']:.6f}",
+                ]
+            )
+        elif comparison.get("evaluation_error_count"):
+            lines.append(
+                f"- evaluation_error_count: {comparison['evaluation_error_count']}"
+            )
         if "lower_bound" in comparison and "upper_bound" in comparison:
             lines.extend(
                 [
@@ -763,6 +931,8 @@ def _public_state(
     payload["final_report_path"] = str(final_report) if final_report else None
     if state.status == "done":
         payload["next_command"] = None
+    elif state.status == "paused_after_infrastructure_error":
+        payload["next_command"] = f"gepa run continue --run-id {state.run_id}"
     elif state.lanes > 0:
         payload["next_command"] = f"gepa next --wait --run-id {state.run_id}"
     else:
@@ -831,6 +1001,18 @@ def _emit_status(
                     "baseline, run:"
                 )
                 typer.echo(f"  {comparison['discard_command']}")
+    elif state.status == "paused_after_infrastructure_error":
+        comparison = state.last_comparison or {}
+        typer.echo(
+            "A required evaluation rollout failed outside the quality "
+            "comparison. The incumbent was preserved. Recover the service "
+            "or configuration, then retry:"
+        )
+        typer.echo(f"  gepa run continue --run-id {state.run_id}")
+        if comparison.get("candidate_report_path"):
+            typer.echo(f"Failure report: {comparison['candidate_report_path']}")
+        if comparison.get("candidate_trace_path"):
+            typer.echo(f"Failure trace: {comparison['candidate_trace_path']}")
     elif state.status == "done":
         typer.echo("Run complete.")
         if final_report_text:
@@ -873,6 +1055,44 @@ def _validate_acceptance_options(
     if min_delta < 0.0:
         typer.echo("--acceptance-min-delta must be >= 0.", err=True)
         raise typer.Exit(code=2)
+
+
+def _fan_out_lane_run_if_ready(
+    state: RunState,
+    outcomes: list[EvalOutcome],
+) -> tuple[RunState, list[EvalOutcome]]:
+    """Validate a measured lane baseline and fan out its next iteration."""
+
+    if state.lanes < 1 or state.status != "paused_for_reflection":
+        return state, outcomes
+
+    from .lanes import fan_out_lanes, worktrees_root
+
+    workspace_root = repo_root()
+    fresh_state = git_candidate_state(
+        workspace_root,
+        exclude_paths=[
+            runs_dir(workspace_root),
+            worktrees_root(workspace_root),
+            journal_path(workspace_root),
+        ],
+    )
+    if (
+        fresh_state.commit_sha != state.reflection_baseline_commit_sha
+        or fresh_state.dirty
+    ):
+        state = _with_timestamp(state, status="running")
+        state.save()
+        state, extra_outcomes = _advance_to_reflection_or_done(state)
+        outcomes.extend(extra_outcomes)
+        state.save()
+
+    if state.status == "paused_for_reflection":
+        fan_out_lanes(state, workspace_root)
+        state = _with_timestamp(state, status="running")
+        state = replace(state, iteration_started_at=state.updated_at)
+        state.save()
+    return state, outcomes
 
 
 @app.command("start")
@@ -983,6 +1203,9 @@ def start(
     active_candidate_source = cast(
         CandidateSource, candidate_source or cfg.candidate_source
     )
+    workspace_root = repo_root()
+    from .lanes import ensure_worktrees_ignored, worktrees_root
+
     if lanes > 0:
         if active_candidate_source != "git":
             typer.echo(
@@ -995,9 +1218,6 @@ def start(
         # tree is rejected (spec-1do constraint). The journal is tracked
         # bookkeeping the CLI itself appends to — exclude it like select does
         # (one dirtiness definition across verbs).
-        from .lanes import ensure_worktrees_ignored, worktrees_root
-
-        workspace_root = repo_root()
         ensure_worktrees_ignored(workspace_root)
         try:
             primary_state = git_candidate_state(
@@ -1073,37 +1293,7 @@ def start(
     state.save()
     state, outcomes = _advance_to_reflection_or_done(state)
     state.save()
-    if lanes > 0 and state.status == "paused_for_reflection":
-        # Lane branches are cut from the CURRENT best commit — re-check the
-        # primary hasn't moved since the (possibly minutes-old) clean check.
-        fresh_state = git_candidate_state(
-            workspace_root,
-            exclude_paths=[
-                runs_dir(workspace_root),
-                worktrees_root(workspace_root),
-                journal_path(workspace_root),
-            ],
-        )
-        if (
-            fresh_state.commit_sha != state.reflection_baseline_commit_sha
-            or fresh_state.dirty
-        ):
-            # The baseline was measured against a HEAD that has since moved;
-            # advance again so lanes branch off the code actually scored.
-            state = _with_timestamp(state, status="running")
-            state.save()
-            state, extra_outcomes = _advance_to_reflection_or_done(state)
-            outcomes.extend(extra_outcomes)
-            state.save()
-    if lanes > 0 and state.status == "paused_for_reflection":
-        # Fan out: worktrees + packets + lane_ready events. The run-level
-        # status returns to "running" — lanes carry the reflection pause.
-        from .lanes import fan_out_lanes
-
-        fan_out_lanes(state, repo_root())
-        state = _with_timestamp(state, status="running")
-        state = replace(state, iteration_started_at=state.updated_at)
-        state.save()
+    state, outcomes = _fan_out_lane_run_if_ready(state, outcomes)
 
     final_path: Path | None = None
     final_text: str | None = None
@@ -1139,7 +1329,10 @@ def continue_(
 ) -> None:
     """Resume after reflection edits and advance to the next pause or completion."""
     state = _load_state(run_id)
-    if state.lanes > 0:
+    if state.lanes > 0 and not (
+        state.status == "paused_after_infrastructure_error"
+        and state.reflection_minibatch_id is None
+    ):
         typer.echo(
             "`gepa run continue` does not drive lane runs. Evaluate a lane with "
             "`gepa lane continue <lane>` and commit the iteration with "
@@ -1155,6 +1348,22 @@ def continue_(
         return
 
     outcomes: list[EvalOutcome] = []
+    if state.lanes > 0:
+        state, outcomes = _advance_to_reflection_or_done(state)
+        state, outcomes = _fan_out_lane_run_if_ready(state, outcomes)
+        state.save()
+        final_path = None
+        final_text = None
+        if state.status == "done":
+            final_path, final_text = _write_final_report(state)
+        _emit_status(
+            state,
+            outcomes=outcomes,
+            final_report=final_path,
+            final_report_text=final_text,
+        )
+        return
+
     if (
         state.status == "paused_after_candidate_eval"
         and state.reflection_baseline_candidate_id is not None
@@ -1196,7 +1405,7 @@ def continue_(
         elif comparison["improved"]:
             state, advanced_outcomes = _advance_to_reflection_or_done(state)
             outcomes.extend(advanced_outcomes)
-        else:
+        elif comparison.get("outcome") != "infrastructure_failure":
             state = _with_timestamp(state, status="paused_after_candidate_eval")
     else:
         state, outcomes = _advance_to_reflection_or_done(state)
