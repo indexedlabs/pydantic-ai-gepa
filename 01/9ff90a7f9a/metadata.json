@@ -1,0 +1,9 @@
+{
+  "checkpoint_id": "019ff90a7f9a",
+  "created_at": "2026-08-13T02:54:02.719672+00:00",
+  "branch_name": "omni/5-omni-docs",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "967f5da0376f6f73c9521e332d45c4128f5f9a51"
+  ]
+}
