@@ -111,6 +111,29 @@ class CodingAgentEngine:
             )
             epoch += 1
             minibatch = await train_loader.fetch(minibatch_ids)
+            # A baseline is an indivisible provider-facing operation.  Do not
+            # let `_affordable_repetitions` turn an unaffordable first batch
+            # into one attempted evaluation: `_evaluate_minibatch` reserves
+            # before it invokes the provider, so stopping here is both clean
+            # and honest.
+            if (
+                len(minibatch) > budget.remaining
+                or len(minibatch) > engine_budget.remaining
+            ):
+                history.append(
+                    EngineEvent(
+                        kind="budget_exhausted",
+                        message="No complete baseline minibatch is affordable.",
+                        data={
+                            "stage": "baseline_minibatch",
+                            "requested": len(minibatch),
+                            "budget_remaining": budget.remaining,
+                            "engine_budget_remaining": engine_budget.remaining,
+                        },
+                    )
+                )
+                stop_reason = "budget_exhausted"
+                break
             effective_max_repetitions = _affordable_repetitions(
                 requested=acceptance_max_repetitions,
                 case_count=len(minibatch),
@@ -120,12 +143,19 @@ class CodingAgentEngine:
             baseline_batches: list[list[EvaluationRecord]] = []
             baseline_budget_exhausted = False
             for _ in range(effective_max_repetitions):
-                baseline_records = await self._evaluate_minibatch(
-                    task=task,
-                    candidate=best,
-                    minibatch=minibatch,
-                    concurrency=concurrency,
-                )
+                try:
+                    baseline_records = await self._evaluate_minibatch(
+                        task=task,
+                        candidate=best,
+                        minibatch=minibatch,
+                        concurrency=concurrency,
+                        budget=budget,
+                        engine_budget=engine_budget,
+                    )
+                except BudgetExhausted:
+                    baseline_budget_exhausted = True
+                    stop_reason = "budget_exhausted"
+                    break
                 if not self._spend_or_record_overshoot(
                     budget=budget,
                     engine_budget=engine_budget,
@@ -194,7 +224,12 @@ class CodingAgentEngine:
                         candidate=proposal,
                         minibatch=minibatch,
                         concurrency=concurrency,
+                        budget=budget,
+                        engine_budget=engine_budget,
                     )
+                except BudgetExhausted:
+                    stop_reason = "budget_exhausted"
+                    break
                 except Exception as exc:
                     raise RuntimeError(
                         "Coding-agent proposal evaluation failed."
@@ -222,7 +257,7 @@ class CodingAgentEngine:
                     break
 
             if comparison_result is None:
-                if stop_reason == "budget_overshoot":
+                if stop_reason in {"budget_overshoot", "budget_exhausted"}:
                     break
                 raise RuntimeError(
                     "Coding-agent comparison did not collect enough proposal samples."
@@ -288,8 +323,17 @@ class CodingAgentEngine:
         candidate: CandidateMap,
         minibatch: Sequence[Case[Any, Any, Any]],
         concurrency: int,
+        budget: BudgetTracker,
+        engine_budget: BudgetTracker,
     ) -> list[EvaluationRecord]:
         """Evaluate one candidate on the explicitly selected minibatch."""
+        budget.preflight(len(minibatch))
+        engine_budget.preflight(len(minibatch))
+        # Reserve before the provider invocation. A rollout that raises after
+        # contacting a provider remains accounted; only never-started calls
+        # are rejected by preflight.
+        budget.spend(len(minibatch))
+        engine_budget.spend(len(minibatch))
         return await evaluate_candidate_dataset(
             agent=task.agent,
             metric=task.metric,
@@ -314,28 +358,27 @@ class CodingAgentEngine:
     ) -> tuple[float, bool]:
         """Score the winner on the valset and charge that fair comparison.
 
-        The score is evaluated before spending so it remains available for the
-        result when the final comparison itself would exceed the shared budget.
-        In that overshoot case the budget remains unchanged and the event makes
-        the uncharged evaluation explicit to a composing caller.
+        Both budgets are reserved before evaluator invocation. If a provider
+        raises after starting a rollout, the call remains accounted; a
+        preflight failure makes no evaluator call.
         """
-        final_evaluation = await task.evaluate(candidate, budget=None)
-        if final_evaluation.num_cases > engine_budget.remaining:
+        case_count = len(await task._validation_cases())
+        if case_count > engine_budget.remaining:
             history.append(
                 EngineEvent(
                     kind="budget_overshoot",
                     message="Final valset evaluation exceeded the engine metric-call budget.",
                     data={
                         "stage": "final_valset",
-                        "requested": final_evaluation.num_cases,
+                        "requested": case_count,
                         "budget_remaining": budget.remaining,
                         "engine_budget_remaining": engine_budget.remaining,
                     },
                 )
             )
-            return final_evaluation.score, False
+            return 0.0, False
         try:
-            budget.spend(final_evaluation.num_cases)
+            budget.preflight(case_count)
         except BudgetExhausted:
             history.append(
                 EngineEvent(
@@ -343,14 +386,15 @@ class CodingAgentEngine:
                     message="Final valset evaluation exceeded the shared metric-call budget.",
                     data={
                         "stage": "final_valset",
-                        "requested": final_evaluation.num_cases,
+                        "requested": case_count,
                         "budget_remaining": budget.remaining,
                         "engine_budget_remaining": engine_budget.remaining,
                     },
                 )
             )
-            return final_evaluation.score, False
-        engine_budget.spend(final_evaluation.num_cases)
+            return 0.0, False
+        engine_budget.spend(case_count)
+        final_evaluation = await task.evaluate(candidate, budget=budget)
         return final_evaluation.score, True
 
     def _spend_or_record_overshoot(
@@ -363,37 +407,8 @@ class CodingAgentEngine:
         records: Sequence[EvaluationRecord],
     ) -> bool:
         """Charge an evaluation or record the budget overshoot that stops it."""
-        if len(records) > engine_budget.remaining:
-            history.append(
-                EngineEvent(
-                    kind="budget_overshoot",
-                    message="Minibatch evaluation exceeded the engine metric-call budget.",
-                    data={
-                        "stage": stage,
-                        "requested": len(records),
-                        "budget_remaining": budget.remaining,
-                        "engine_budget_remaining": engine_budget.remaining,
-                    },
-                )
-            )
-            return False
-        try:
-            budget.spend(len(records))
-        except BudgetExhausted:
-            history.append(
-                EngineEvent(
-                    kind="budget_overshoot",
-                    message="Minibatch evaluation exceeded the shared metric-call budget.",
-                    data={
-                        "stage": stage,
-                        "requested": len(records),
-                        "budget_remaining": budget.remaining,
-                        "engine_budget_remaining": engine_budget.remaining,
-                    },
-                )
-            )
-            return False
-        engine_budget.spend(len(records))
+        # `_evaluate_minibatch` reserved both budgets before invoking the
+        # evaluator. Keep this helper for the existing history call sites.
         return True
 
     def _option(self, name: str, default: Any) -> Any:

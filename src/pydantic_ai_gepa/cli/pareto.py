@@ -61,6 +61,11 @@ def pareto(
         "--front/--all",
         help="--all (default) shows full chronological history; --front shows only Pareto-dominant rows (useful with multi-objective scoring; mostly degenerate with a single-objective mean).",
     ),
+    frontier: str = typer.Option(
+        "instance",
+        "--frontier",
+        help="Frontier coordinates: instance | objective | hybrid | cartesian.",
+    ),
 ) -> None:
     """Show the eval history for a run (default) or just the Pareto front (`--front`)."""
     try:
@@ -73,7 +78,11 @@ def pareto(
         raise
 
     log = ParetoLog(active_run)
-    rows = log.front() if front else log.iter_rows()
+    try:
+        rows = log.front(mode=frontier) if front else log.iter_rows()
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
 
     if format_ == "json":
         typer.echo(json.dumps(_rows_for_output(rows), indent=2))

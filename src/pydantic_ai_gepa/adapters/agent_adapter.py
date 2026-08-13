@@ -866,6 +866,11 @@ class _BaseAgentAdapter(
                 "score": metric_result.score,
                 "feedback": metric_result.feedback,
             }
+            if metric_result.side_info is not None:
+                # Keep objective/selectability material available even when a
+                # caller intentionally disables trace capture, without
+                # changing the historic reflection side-info aggregate.
+                result["metric_side_info"] = metric_result.side_info
             if trajectory is not None:
                 result["trajectory"] = trajectory
             return result
