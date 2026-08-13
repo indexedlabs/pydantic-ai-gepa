@@ -20,11 +20,14 @@ from .registry import (
 from .gepa_engine import GepaEngine
 from .coding_agent_engine import CodingAgentEngine, Proposer, ReflectionContext
 from .best_of_n import BestOfNEngine
+from .autoresearch_engine import AutonomousResearchDriver, AutonomousResearchEngine
 
 __all__ = [
     "BudgetExhausted",
     "BudgetTracker",
     "BestOfNEngine",
+    "AutonomousResearchDriver",
+    "AutonomousResearchEngine",
     "CandidateEvaluation",
     "CodingAgentEngine",
     "EngineConfig",
