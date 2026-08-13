@@ -1,0 +1,9 @@
+{
+  "checkpoint_id": "019ff9065d5b",
+  "created_at": "2026-08-13T02:49:31.814119+00:00",
+  "branch_name": "codex/omni-orchestration",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "04cad89ba530be182b49862695c2be336c19e255"
+  ]
+}
