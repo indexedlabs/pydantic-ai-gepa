@@ -18,6 +18,7 @@ from . import journal as journal_cmd
 from . import lanes as lanes_cmd
 from . import pareto as pareto_cmd
 from . import run as run_cmd
+from . import omni as omni_cmd
 from .layout import load_dotenv, set_gepa_dirname
 
 app = typer.Typer(
@@ -83,6 +84,7 @@ app.add_typer(
     name="lane",
     help="Drive reflection lanes: lease, continue (background eval), reset.",
 )
+app.add_typer(omni_cmd.app, name="omni", help="Durable outer Omni meta-run controller.")
 app.add_typer(
     run_cmd.app,
     name="run",
