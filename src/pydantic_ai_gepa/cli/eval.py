@@ -209,6 +209,7 @@ def _format_failures(
     threshold: float = DEFAULT_FAILURE_THRESHOLD,
     *,
     candidate_source: CandidateSource = "components",
+    redact_scores: bool = False,
 ) -> str:
     lines = ["# Eval report", ""]
     failures = [r for r in records if r.score < threshold]
@@ -222,12 +223,17 @@ def _format_failures(
         else "Review per-case feedback and edit slots in `.gepa/components/` "
         "or change the agent's source."
     )
-    lines.append(
-        f"{len(failures)} of {len(records)} case(s) underperformed "
-        f"(score < {threshold}). {next_step}\n"
-    )
+    if redact_scores:
+        lines.append(f"{len(failures)} of {len(records)} case(s) need attention. {next_step}\n")
+    else:
+        lines.append(
+            f"{len(failures)} of {len(records)} case(s) underperformed "
+            f"(score < {threshold}). {next_step}\n"
+        )
     for record in failures:
-        lines.append(f"## {record.case_id} — score {record.score:.3f}")
+        lines.append(
+            f"## {record.case_id}" if redact_scores else f"## {record.case_id} — score {record.score:.3f}"
+        )
         if record.feedback:
             lines.append("")
             lines.append(record.feedback.rstrip())
@@ -293,6 +299,7 @@ def _write_trace_file(
     *,
     path: Path,
     records: list[EvaluationRecord],
+    redact_scores: bool = False,
 ) -> Path | None:
     trace_rows: list[dict[str, Any]] = []
     for record in records:
@@ -301,7 +308,8 @@ def _write_trace_file(
             continue
         trace_record = trajectory.to_reflective_record()
         trace_record["case_id"] = record.case_id
-        trace_record["score"] = record.score
+        if not redact_scores:
+            trace_record["score"] = record.score
         if record.feedback:
             trace_record["feedback"] = record.feedback
         metric_side_info = getattr(trajectory, "metric_side_info", None)
@@ -667,7 +675,12 @@ def run_eval_once(
     reports_dir.mkdir(parents=True, exist_ok=True)
     report_path = reports_dir / f"{iteration:04d}-{eval_id}-{candidate.id}.md"
     report_path.write_text(
-        _format_failures(records, threshold=threshold, candidate_source=source),
+        _format_failures(
+            records,
+            threshold=threshold,
+            candidate_source=source,
+            redact_scores=cfg.acceptance.mode == "vector",
+        ),
         encoding="utf-8",
     )
     if infrastructure_failures:
@@ -676,6 +689,7 @@ def run_eval_once(
         _write_trace_file(
             path=planned_trace_path,
             records=records,
+            redact_scores=cfg.acceptance.mode == "vector",
         )
         if planned_trace_path is not None
         else None

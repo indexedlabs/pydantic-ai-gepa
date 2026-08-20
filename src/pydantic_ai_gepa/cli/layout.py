@@ -61,6 +61,7 @@ class AcceptanceConfig:
     vector_schema_version: str = "1"
     telemetry_schema_version: str = "1"
     rebaseline_interval: int | None = None
+    probe_allowance_per_lease: int = 10
     require_probe_receipt: bool = False
     pinned_scorer: bool = False
     component_files: tuple[str, ...] = ()
@@ -93,6 +94,15 @@ class AcceptanceConfig:
         ):
             raise GepaConfigError(
                 "acceptance.rebaseline_interval must be a positive integer or omitted."
+            )
+        raw_probe_allowance = data.get("probe_allowance_per_lease", 10)
+        if (
+            isinstance(raw_probe_allowance, bool)
+            or not isinstance(raw_probe_allowance, int)
+            or raw_probe_allowance < 0
+        ):
+            raise GepaConfigError(
+                "acceptance.probe_allowance_per_lease must be a non-negative integer."
             )
         files = data.get("component_files", [])
         if not isinstance(files, list) or not all(
@@ -150,6 +160,7 @@ class AcceptanceConfig:
             vector_schema_version=str(data.get("vector_schema_version", "1")),
             telemetry_schema_version=str(data.get("telemetry_schema_version", "1")),
             rebaseline_interval=raw_rebaseline_interval,
+            probe_allowance_per_lease=raw_probe_allowance,
             require_probe_receipt=bool(data.get("require_probe_receipt", False)),
             pinned_scorer=bool(data.get("pinned_scorer", False)),
             component_files=tuple(files),

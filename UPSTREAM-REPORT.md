@@ -90,6 +90,29 @@ downstream comparators:
   `run_start_baseline` in `journal_context`; scheduled checks additionally set
   `comparison_kind = "run_start_rebaseline"`.
 
+## Reflector-isolation security fixes
+
+- Probes now run the vector component allowlist and configured reviewer before
+  any rollout. Rejections are durable `probe_review_rejection` journal rows,
+  so rejected candidate text cannot use the probe as an assertion oracle.
+- `acceptance.probe_allowance_per_lease` is a non-negative per-lane allowance
+  (default `10`). Each attempted probe first writes and fsyncs a
+  `probe_budget_debit` journal row; exhaustion stops before evaluation.
+- A successful probe writes its receipt to the append-only run journal before
+  returning control to the reflector. Receipt files are now merely citations:
+  `lane continue` requires their exact case, component hash, flip, and
+  `probe_row_id` to match a CLI-authored `probe_receipt` journal row.
+- The detached-evaluation handoff includes a component-byte digest captured by
+  the parent after its gate. The child recomputes it before its first rollout;
+  a mismatch becomes a `handoff_component_hash_mismatch` journal entry and
+  returns the lane to reflection without spending an evaluation.
+- Vector-mode reflector packets and artifacts omit scalar baseline mean/samples,
+  trace-row scores, and report score headers. Scalar-mode packets and reports
+  remain unchanged; the full score data remains in operator journal/ledger
+  artifacts.
+- Allowlist rejections now journal the actual offending diff hunks as well as
+  file paths, making the reviewed mutation auditable.
+
 ## Verification
 
 - `uv run ruff check .` — passed.
@@ -97,3 +120,6 @@ downstream comparators:
 - Focused vector/lane/probe/run/select suites — 74 passed.
 - Full `uv run pytest` — 618 passed, 7 pre-existing deprecation/serializer
   warnings, completed in 56.22 seconds.
+- Security follow-up: focused vector/lane/eval suites — 47 passed; `uv run
+  ruff check` and touched-file `uv run pyright` — clean; full `uv run pytest`
+  — 622 passed, 7 warnings, completed in 92.83 seconds.

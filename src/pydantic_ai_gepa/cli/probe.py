@@ -1,4 +1,4 @@
-"""One-case, non-budgeted assertion-vector probes for reflection lanes."""
+"""Budgeted, journal-authenticated one-case assertion-vector probes."""
 
 from __future__ import annotations
 
@@ -11,8 +11,17 @@ import typer
 
 from ..vector_acceptance import VectorRecord, VectorRecordStore
 from .eval import run_eval_once
-from .lanes import _resolve_lane_run, load_all_lane_states, load_lane_state
+from .lanes import (
+    _append_journal,
+    _candidate_gate,
+    _journal_rows,
+    _lane_lock,
+    _resolve_lane_run,
+    load_all_lane_states,
+    load_lane_state,
+)
 from .layout import GepaConfig, config_path, probe_receipts_dir, vector_records_path
+from .runs import utc_now_iso
 
 
 def component_hash(worktree: Path, component_files: tuple[str, ...]) -> str:
@@ -88,7 +97,7 @@ def probe(
         None, "--run-id", help="Defaults to the latest lane run."
     ),
 ) -> None:
-    """Evaluate one case without spending acceptance budget or Pareto eligibility."""
+    """Evaluate one gated case without acceptance/Pareto eligibility."""
     workspace_root, run_state = _resolve_lane_run(run_id)
     if lane is None:
         states = load_all_lane_states(workspace_root, run_state.run_id)
@@ -97,75 +106,122 @@ def probe(
                 "--lane is required when the run has multiple lanes."
             )
         lane = states[0].lane
-    state = load_lane_state(workspace_root, run_state.run_id, lane)
-    if not state.worktree_path or not state.candidate_project_path:
-        raise typer.BadParameter(f"Lane {lane} has no candidate worktree.")
     cfg = GepaConfig.load(config_path(workspace_root))
     if cfg.acceptance.mode != "vector":
         raise typer.BadParameter("gepa probe requires acceptance.mode = 'vector'.")
-    worktree = Path(state.worktree_path)
-    candidate_root = Path(state.candidate_project_path)
-    outcome = run_eval_once(
-        candidate_file=None,
-        minibatch_id=None,
-        size=1,
-        seed=run_state.seed,
-        epoch=run_state.next_epoch,
-        run_id=run_state.run_id,
-        concurrency=run_state.concurrency,
-        max_iterations=run_state.max_iterations,
-        threshold=run_state.threshold,
-        capture_traces=True,
-        candidate_source="git",
-        lane=lane,
-        candidate_root=candidate_root,
-        workspace_root=workspace_root,
-        case_id=case,
-        row_scope="probe",
-        vector_incumbent_hash=run_state.reflection_baseline_candidate_id,
-    )
-    raw = outcome.summary.get("vector_record")
-    if not isinstance(raw, dict):
-        raise typer.BadParameter("Probe metric did not produce a vector record.")
-    candidate = VectorRecord.from_dict(raw)
-    store = VectorRecordStore(vector_records_path(run_state.run_id, workspace_root))
-    baseline = store.matching_incumbent_for_case(candidate.key, case_id=case)
-    if not baseline:
-        raise typer.BadParameter(
-            "No compatible incumbent vector record is available for this probe."
+    with _lane_lock(workspace_root, run_state.run_id, lane):
+        state = load_lane_state(workspace_root, run_state.run_id, lane)
+        if not state.worktree_path or not state.candidate_project_path:
+            raise typer.BadParameter(f"Lane {lane} has no candidate worktree.")
+        rejected = _candidate_gate(
+            workspace_root=workspace_root,
+            run_state=run_state,
+            state=state,
+            verify_probe_receipt=False,
+            rejection_kind="probe_review_rejection",
         )
-    before = _statuses(baseline[-1].assertions.get(case))
-    after = _statuses(candidate.assertions.get(case))
-    changes = {
-        key: {"before": before.get(key), "after": after.get(key)}
-        for key in sorted(set(before) | set(after))
-        if before.get(key) != after.get(key)
-    }
-    receipt = {
-        "receipt_version": 1,
-        "run_id": run_state.run_id,
-        "lane": lane,
-        "iteration": state.iteration,
-        "case": case,
-        "candidate_component_hash": component_hash(
-            worktree, cfg.acceptance.component_files
-        ),
-        "candidate_hash": candidate.key.candidate_hash,
-        "incumbent_hash": candidate.key.incumbent_hash,
-        "inventory_hash": baseline[-1].key.inventory_hash,
-        "scorer_identity": candidate.key.scorer_identity,
-        "vector_schema_version": candidate.key.vector_schema_version,
-        "telemetry_schema_version": candidate.key.telemetry_schema_version,
-        "changes": changes,
-        "proof": _receipt_proof(worktree, case, changes),
-        "row_scope": "probe",
-    }
-    directory = probe_receipts_dir(run_state.run_id, workspace_root)
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{lane}-{state.iteration:04d}-{case}.json"
-    path.write_text(
-        json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+        if rejected is not None:
+            typer.echo(
+                f"Lane {lane} candidate review failed; probe rollout was not run.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        used = len(
+            [
+                row
+                for row in _journal_rows(
+                    workspace_root, run_state.run_id, "probe_budget_debit"
+                )
+                if row.get("lane") == lane and row.get("lease_epoch") == state.lease_epoch
+            ]
+        )
+        if used >= cfg.acceptance.probe_allowance_per_lease:
+            raise typer.BadParameter(
+                "Probe allowance exhausted for this lane lease "
+                f"({used}/{cfg.acceptance.probe_allowance_per_lease})."
+            )
+        _append_journal(
+            workspace_root,
+            {
+                "timestamp": utc_now_iso(),
+                "kind": "probe_budget_debit",
+                "run_id": run_state.run_id,
+                "lane": lane,
+                "iteration": state.iteration,
+                "lease_epoch": state.lease_epoch,
+                "allowance": cfg.acceptance.probe_allowance_per_lease,
+                "used": used + 1,
+                "case": case,
+            },
+        )
+        worktree = Path(state.worktree_path)
+        candidate_root = Path(state.candidate_project_path)
+        outcome = run_eval_once(
+            candidate_file=None,
+            minibatch_id=None,
+            size=1,
+            seed=run_state.seed,
+            epoch=run_state.next_epoch,
+            run_id=run_state.run_id,
+            concurrency=run_state.concurrency,
+            max_iterations=run_state.max_iterations,
+            threshold=run_state.threshold,
+            capture_traces=True,
+            candidate_source="git",
+            lane=lane,
+            candidate_root=candidate_root,
+            workspace_root=workspace_root,
+            case_id=case,
+            row_scope="probe",
+            vector_incumbent_hash=run_state.reflection_baseline_candidate_id,
+        )
+        raw = outcome.summary.get("vector_record")
+        if not isinstance(raw, dict):
+            raise typer.BadParameter("Probe metric did not produce a vector record.")
+        candidate = VectorRecord.from_dict(raw)
+        store = VectorRecordStore(vector_records_path(run_state.run_id, workspace_root))
+        baseline = store.matching_incumbent_for_case(candidate.key, case_id=case)
+        if not baseline:
+            raise typer.BadParameter(
+                "No compatible incumbent vector record is available for this probe."
+            )
+        before = _statuses(baseline[-1].assertions.get(case))
+        after = _statuses(candidate.assertions.get(case))
+        changes = {
+            key: {"before": before.get(key), "after": after.get(key)}
+            for key in sorted(set(before) | set(after))
+            if before.get(key) != after.get(key)
+        }
+        receipt = {
+            "receipt_version": 1,
+            "run_id": run_state.run_id,
+            "lane": lane,
+            "iteration": state.iteration,
+            "case": case,
+            "probe_row_id": str(outcome.summary["eval_id"]),
+            "candidate_component_hash": component_hash(
+                worktree, cfg.acceptance.component_files
+            ),
+            "candidate_hash": candidate.key.candidate_hash,
+            "incumbent_hash": candidate.key.incumbent_hash,
+            "inventory_hash": baseline[-1].key.inventory_hash,
+            "scorer_identity": candidate.key.scorer_identity,
+            "vector_schema_version": candidate.key.vector_schema_version,
+            "telemetry_schema_version": candidate.key.telemetry_schema_version,
+            "changes": changes,
+            "proof": _receipt_proof(worktree, case, changes),
+            "row_scope": "probe",
+        }
+        _append_journal(
+            workspace_root,
+            {"timestamp": utc_now_iso(), "kind": "probe_receipt", **receipt},
+        )
+        directory = probe_receipts_dir(run_state.run_id, workspace_root)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{lane}-{state.iteration:04d}-{case}.json"
+        path.write_text(
+            json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
     typer.echo(
         json.dumps({"receipt_path": str(path), "changes": changes}, sort_keys=True)
     )

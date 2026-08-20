@@ -16,13 +16,19 @@ from typer.testing import CliRunner
 
 from pydantic_ai_gepa.cli import app as gepa_app
 from pydantic_ai_gepa.cli.candidates import git_candidate_state
-from pydantic_ai_gepa.cli.eval import EvalOutcome
+from pydantic_ai_gepa.cli.eval import EvalOutcome, _format_failures, _write_trace_file
 from pydantic_ai_gepa.cli.lanes import (
     _candidate_gate,
     _run_lane_eval_loop,
+    LaneState,
     load_lane_state,
+    write_packet,
 )
-from pydantic_ai_gepa.cli.layout import probe_receipts_dir, vector_records_path
+from pydantic_ai_gepa.cli.layout import (
+    journal_path,
+    probe_receipts_dir,
+    vector_records_path,
+)
 from pydantic_ai_gepa.cli.probe import component_hash
 from pydantic_ai_gepa.cli.run import RunState
 from pydantic_ai_gepa.cli.runs import ParetoLog
@@ -57,12 +63,20 @@ def _config(
     receipt: bool = False,
     rebaseline_interval: int | None = None,
     pinned_scorer: bool = False,
+    reviewer: bool = False,
+    probe_allowance_per_lease: int | None = None,
 ) -> str:
     files = ", ".join(json.dumps(item) for item in components)
     rebaseline = (
         "" if rebaseline_interval is None else f"rebaseline_interval = {rebaseline_interval}\n"
     )
     pinned = "pinned_scorer = true\n" if pinned_scorer else ""
+    reviewer_line = 'reviewer = "vector_pkg.reviewer:make_reviewer"\n' if reviewer else ""
+    probe_allowance = (
+        ""
+        if probe_allowance_per_lease is None
+        else f"probe_allowance_per_lease = {probe_allowance_per_lease}\n"
+    )
     return textwrap.dedent(f"""
         evaluate = "vector_pkg.evaluation:evaluate"
         candidate_source = "git"
@@ -77,6 +91,8 @@ def _config(
         meta_files = ["prediction.json"]
         require_probe_receipt = {str(receipt).lower()}
         {rebaseline}
+        {reviewer_line}
+        {probe_allowance}
     """).lstrip()
 
 
@@ -118,6 +134,17 @@ def vector_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pat
         "        })\n"
         "def make_comparator():\n"
         "    return Comparator()\n",
+        encoding="utf-8",
+    )
+    (package / "reviewer.py").write_text(
+        "from pydantic_ai_gepa.candidate_review import CandidateReviewVerdict, ReviewFinding\n"
+        "class Reviewer:\n"
+        "    def review(self, request):\n"
+        "        if any('blocked' in value for value in request.components.values()):\n"
+        "            return CandidateReviewVerdict('fail', (ReviewFinding(None, None, 'blocked candidate', 'error'),))\n"
+        "        return CandidateReviewVerdict('pass')\n"
+        "def make_reviewer():\n"
+        "    return Reviewer()\n",
         encoding="utf-8",
     )
     (tmp_path / "score.txt").write_text("bad\n", encoding="utf-8")
@@ -212,6 +239,14 @@ def test_foreground_continue_enforces_candidate_gate(vector_repo: Path) -> None:
     assert result.exit_code == 1
     assert "candidate review failed" in result.output
     assert ParetoLog(run_id, vector_repo).count_rows() == rows_before
+    journal = [
+        json.loads(line)
+        for line in journal_path(vector_repo).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    rejection = next(row for row in journal if row.get("kind") == "candidate_review_rejection")
+    assert "unauthorized.py" in rejection["diff"]
+    assert "BAD = True" in rejection["diff"]
 
 
 def test_probe_diffs_against_full_inventory_incumbent(vector_repo: Path) -> None:
@@ -238,6 +273,74 @@ def test_probe_diffs_against_full_inventory_incumbent(vector_repo: Path) -> None
     assert payload["changes"]["quality"] == {"before": "fail", "after": "pass"}
     assert Path(payload["receipt_path"]).is_file()
     assert ParetoLog(run_id, vector_repo).count_rows() == rows_before
+    journal = [
+        json.loads(line)
+        for line in journal_path(vector_repo).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    receipt = next(row for row in journal if row.get("kind") == "probe_receipt")
+    assert receipt["probe_row_id"]
+    assert receipt["changes"] == payload["changes"]
+
+
+def test_probe_runs_candidate_review_before_rollout(vector_repo: Path) -> None:
+    config = vector_repo / ".gepa" / "gepa.toml"
+    config.write_text(_config(reviewer=True, pinned_scorer=True), encoding="utf-8")
+    _git(vector_repo, "add", str(config.relative_to(vector_repo)))
+    _git(vector_repo, "commit", "-m", "Enable vector reviewer")
+    payload, _ = _start(vector_repo)
+    run_id = str(payload["run_id"])
+    state = load_lane_state(vector_repo, run_id, "lane-1")
+    worktree = Path(str(state.worktree_path))
+    (worktree / "score.txt").write_text("blocked\n", encoding="utf-8")
+    rows_before = len(VectorRecordStore(vector_records_path(run_id, vector_repo)).records())
+
+    result = _run(
+        "--gepa-dir", str(vector_repo / ".gepa"), "probe", "--case", "case-1",
+        "--lane", "lane-1", "--run-id", run_id,
+    )
+
+    assert result.exit_code == 1
+    assert "candidate review failed" in result.output
+    assert len(VectorRecordStore(vector_records_path(run_id, vector_repo)).records()) == rows_before
+    journal = [
+        json.loads(line)
+        for line in journal_path(vector_repo).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(row.get("kind") == "probe_review_rejection" for row in journal)
+
+
+def test_probe_allowance_is_durable_per_lease(vector_repo: Path) -> None:
+    config = vector_repo / ".gepa" / "gepa.toml"
+    config.write_text(_config(probe_allowance_per_lease=1), encoding="utf-8")
+    _git(vector_repo, "add", str(config.relative_to(vector_repo)))
+    _git(vector_repo, "commit", "-m", "Limit probe allowance")
+    payload, _ = _start(vector_repo)
+    run_id = str(payload["run_id"])
+    state = load_lane_state(vector_repo, run_id, "lane-1")
+    (Path(str(state.worktree_path)) / "score.txt").write_text("good\n", encoding="utf-8")
+
+    first = _run(
+        "--gepa-dir", str(vector_repo / ".gepa"), "probe", "--case", "case-1",
+        "--lane", "lane-1", "--run-id", run_id,
+    )
+    second = _run(
+        "--gepa-dir", str(vector_repo / ".gepa"), "probe", "--case", "case-2",
+        "--lane", "lane-1", "--run-id", run_id,
+    )
+
+    assert first.exit_code == 0, first.output
+    assert second.exit_code != 0
+    assert "Probe allowance exhausted" in second.output
+    journal = [
+        json.loads(line)
+        for line in journal_path(vector_repo).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    debits = [row for row in journal if row.get("kind") == "probe_budget_debit"]
+    assert len(debits) == 1
+    assert debits[0]["lease_epoch"] == state.lease_epoch
 
 
 def test_receipt_gate_requires_exact_case_key_and_fixed_direction(
@@ -266,6 +369,8 @@ def test_receipt_gate_requires_exact_case_key_and_fixed_direction(
     receipts.mkdir(parents=True)
     receipt_path = receipts / "wrong.json"
     base = {
+        "run_id": run_id,
+        "probe_row_id": "probe-row-1",
         "candidate_component_hash": component_hash(worktree, ("score.txt",)),
         "lane": "lane-1",
         "iteration": state.iteration,
@@ -282,10 +387,93 @@ def test_receipt_gate_requires_exact_case_key_and_fixed_direction(
     base["proof"] = {"key": "quality", "case": "case-1", "direction": "fail_to_pass"}
     base["changes"] = {"quality": {"before": "fail", "after": "pass"}}
     receipt_path.write_text(json.dumps(base), encoding="utf-8")
-    assert (
-        _candidate_gate(workspace_root=vector_repo, run_state=run_state, state=state)
-        is None
+    rejected = _candidate_gate(
+        workspace_root=vector_repo, run_state=run_state, state=state
     )
+    assert rejected is not None
+    assert "No matching probe receipt" in rejected.review_findings[0]["explanation"]
+    with journal_path(vector_repo).open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"kind": "probe_receipt", **base}) + "\n")
+    assert _candidate_gate(workspace_root=vector_repo, run_state=run_state, state=state) is None
+
+
+def test_handoff_refuses_component_mutation_after_parent_gate(vector_repo: Path) -> None:
+    payload, _ = _start(vector_repo)
+    run_id = str(payload["run_id"])
+    state = load_lane_state(vector_repo, run_id, "lane-1")
+    worktree = Path(str(state.worktree_path))
+    LaneState(
+        **{
+            **state.to_dict(),
+            "status": "leased",
+            "lease_epoch": 7,
+            "lease_purpose": "handoff",
+            "lease_expires_at": "2999-01-01T00:00:00+00:00",
+            "handoff_component_hash": component_hash(worktree, ("score.txt",)),
+        }
+    ).save(vector_repo, run_id)
+    (worktree / "score.txt").write_text("good\n", encoding="utf-8")
+    rows_before = ParetoLog(run_id, vector_repo).count_rows()
+
+    result = _run(
+        "--gepa-dir", str(vector_repo / ".gepa"), "lane", "continue", "lane-1",
+        "--run-id", run_id, "--foreground", "--handoff-lease-epoch", "7",
+    )
+
+    assert result.exit_code == 1
+    assert "component hash changed" in result.output
+    assert ParetoLog(run_id, vector_repo).count_rows() == rows_before
+    assert load_lane_state(vector_repo, run_id, "lane-1").status == "paused_for_reflection"
+    journal = [
+        json.loads(line)
+        for line in journal_path(vector_repo).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(row.get("kind") == "handoff_component_hash_mismatch" for row in journal)
+
+
+def test_vector_pinned_packets_and_reflector_artifacts_hide_scores(
+    vector_repo: Path,
+) -> None:
+    config = vector_repo / ".gepa" / "gepa.toml"
+    config.write_text(_config(pinned_scorer=True), encoding="utf-8")
+    _git(vector_repo, "add", str(config.relative_to(vector_repo)))
+    _git(vector_repo, "commit", "-m", "Pin vector scorer")
+    payload, run_state = _start(vector_repo)
+    run_id = str(payload["run_id"])
+    state = load_lane_state(vector_repo, run_id, "lane-1")
+    packet = json.loads(
+        write_packet(
+            vector_repo,
+            run_state,
+            "lane-1",
+            state.iteration,
+            Path(str(state.worktree_path)),
+            str(state.branch),
+        ).read_text(encoding="utf-8")
+    )
+    assert "mean_score" not in packet["baseline"]
+    assert "samples" not in packet["baseline"]
+
+    record = EvaluationRecord("case-1", 0.25, "detail", {})
+    assert "score" not in _format_failures([record], redact_scores=True)
+    assert "score 0.250" in _format_failures([record])
+
+    class Trace:
+        def to_reflective_record(self) -> dict[str, str]:
+            return {"safe": "context"}
+
+    trace_path = _write_trace_file(
+        path=vector_repo / ".gepa" / "runs" / run_id / "redacted.jsonl",
+        records=[
+            EvaluationRecord(
+                "case-1", 0.25, "detail", {"trajectory": Trace()}
+            )
+        ],
+        redact_scores=True,
+    )
+    assert trace_path is not None
+    assert "score" not in json.loads(trace_path.read_text(encoding="utf-8"))
 
 
 def test_infra_retry_does_not_consume_scored_escalation_slot(
