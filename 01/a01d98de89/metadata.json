@@ -1,0 +1,9 @@
+{
+  "checkpoint_id": "01a01d98de89",
+  "created_at": "2026-08-20T05:15:52.932155+00:00",
+  "branch_name": "assertion-acceptance-loop",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "6f54e73514cd1c2c7a537ac31e958e3053c3c3af"
+  ]
+}
