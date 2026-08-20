@@ -1,0 +1,19 @@
+{
+  "checkpoint_id": "01a0204c6270",
+  "created_at": "2026-08-20T17:51:12.085822+00:00",
+  "branch_name": "assertion-acceptance-loop",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "86c37fbba47e3ce8a9a379ada8af8d693dc3f519"
+  ],
+  "entity_touches": [
+    ".mighty/loro/edges/01a02048-1e69-7443-85fb-f81da18ed25f.loro",
+    ".mighty/loro/edges/01a0204c-6089-77c1-ab8e-1699c72cd587.loro",
+    ".mighty/loro/edges/01a0204c-60fb-7901-bd0b-a826eeedbe67.loro",
+    ".mighty/loro/messages/01a02048-3293-74c0-9f69-849a6cf78e5c.loro",
+    ".mighty/loro/messages/01a02048-32e7-7961-8af4-7727896b33e9.loro",
+    ".mighty/loro/messages/01a0204c-6018-7173-9d83-b78e198fcdb4.loro",
+    ".mighty/loro/records/01a02048-1e3b-7e71-91dc-526793d77cf3.loro",
+    ".mighty/loro/records/01a0204c-609a-7912-a2eb-fd08ef957126.loro"
+  ]
+}
