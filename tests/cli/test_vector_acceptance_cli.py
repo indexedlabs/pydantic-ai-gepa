@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import textwrap
@@ -51,9 +52,17 @@ def _run_payload(output: str) -> dict[str, object]:
 
 
 def _config(
-    *, components: tuple[str, ...] = ("score.txt",), receipt: bool = False
+    *,
+    components: tuple[str, ...] = ("score.txt",),
+    receipt: bool = False,
+    rebaseline_interval: int | None = None,
+    pinned_scorer: bool = False,
 ) -> str:
     files = ", ".join(json.dumps(item) for item in components)
+    rebaseline = (
+        "" if rebaseline_interval is None else f"rebaseline_interval = {rebaseline_interval}\n"
+    )
+    pinned = "pinned_scorer = true\n" if pinned_scorer else ""
     return textwrap.dedent(f"""
         evaluate = "vector_pkg.evaluation:evaluate"
         candidate_source = "git"
@@ -63,9 +72,11 @@ def _config(
         [acceptance]
         mode = "vector"
         comparator = "vector_pkg.comparator:make_comparator"
+        {pinned}
         component_files = [{files}]
         meta_files = ["prediction.json"]
         require_probe_receipt = {str(receipt).lower()}
+        {rebaseline}
     """).lstrip()
 
 
@@ -98,8 +109,13 @@ def vector_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pat
         "from pydantic_ai_gepa.vector_acceptance import VectorComparison\n"
         "class Comparator:\n"
         "    def compare(self, request):\n"
-        "        verdict = 'accepted' if len(request.candidate) >= 3 else 'needs_escalation'\n"
-        "        return VectorComparison(verdict, display_score=1.0)\n"
+        "        context = dict(request.journal_context)\n"
+        "        verdict = 'rejected' if context.get('comparison_kind') == 'run_start_rebaseline' else 'accepted'\n"
+        "        return VectorComparison(verdict, display_score=1.0, detail={\n"
+        "            'context': context,\n"
+        "            'incumbent_records': len(request.incumbent),\n"
+        "            'candidate_records': len(request.candidate),\n"
+        "        })\n"
         "def make_comparator():\n"
         "    return Comparator()\n",
         encoding="utf-8",
@@ -353,3 +369,177 @@ def test_infra_retry_does_not_consume_scored_escalation_slot(
     assert tuple(final.eval_samples) == (1.0, 1.0, 1.0)
     assert comparator_attempts == [3, 4]
     assert final.verdict == "accepted"
+
+
+def test_periodic_rebaseline_is_paired_journaled_and_never_reverts_incumbent(
+    vector_repo: Path,
+) -> None:
+    config = vector_repo / ".gepa" / "gepa.toml"
+    config.write_text(
+        _config(rebaseline_interval=1, pinned_scorer=True), encoding="utf-8"
+    )
+    _git(vector_repo, "add", str(config.relative_to(vector_repo)))
+    _git(vector_repo, "commit", "-m", "Enable periodic rebaseline")
+
+    payload, initial = _start(vector_repo)
+    run_id = str(payload["run_id"])
+    run_start = initial.run_start_baseline
+    assert run_start is not None
+    assert run_start["candidate_id"] == initial.reflection_baseline_candidate_id
+    assert set(run_start["component_hashes"]) == {"score.txt"}
+    assert isinstance(run_start["component_hashes"]["score.txt"], str)
+    assert len(run_start["vector_record_keys"]) == initial.acceptance_max_repetitions
+
+    lane = load_lane_state(vector_repo, run_id, "lane-1")
+    worktree = Path(str(lane.worktree_path))
+    (worktree / "score.txt").write_text("good\n", encoding="utf-8")
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(worktree)
+        continued = _run(
+            "--gepa-dir",
+            str(vector_repo / ".gepa"),
+            "lane",
+            "continue",
+            "lane-1",
+            "--run-id",
+            run_id,
+            "--foreground",
+        )
+    finally:
+        os.chdir(previous_cwd)
+    assert continued.exit_code == 0, continued.output
+    lane = load_lane_state(vector_repo, run_id, "lane-1")
+    candidate_context = json.loads(Path(str(lane.comparison_path)).read_text())["detail"][
+        "context"
+    ]
+    assert candidate_context["accepted_promotion_count"] == 0
+    assert candidate_context["run_start_baseline"]["candidate_id"] == run_start["candidate_id"]
+
+    selected = _run(
+        "--gepa-dir", str(vector_repo / ".gepa"), "run", "select", "--run-id", run_id
+    )
+    assert selected.exit_code == 0, selected.output
+    final = RunState.from_dict(
+        json.loads(
+            (vector_repo / ".gepa" / "runs" / run_id / "state.json").read_text()
+        )
+    )
+    assert final.accepted_promotion_count == 1
+    assert final.best_commit_sha == lane.candidate_sha
+    assert final.run_start_baseline == run_start
+
+    journal = [
+        json.loads(line)
+        for line in (vector_repo / ".gepa" / "journal.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    promotions = [
+        row
+        for row in journal
+        if row.get("kind") == "accepted_promotion" and row.get("run_id") == run_id
+    ]
+    assert [row["promotion_count"] for row in promotions] == [1]
+    rebaselines = [
+        row
+        for row in journal
+        if row.get("kind") == "run_start_rebaseline" and row.get("run_id") == run_id
+    ]
+    assert len(rebaselines) == 1
+    assert rebaselines[0]["outcome"] == "failed"
+    assert rebaselines[0]["incumbent_candidate_id"] == final.best_candidate_id
+    assert rebaselines[0]["run_start_baseline"] == run_start
+    rebaseline_context = rebaselines[0]["comparison"]["detail"]["context"]
+    assert rebaseline_context["accepted_promotion_count"] == 1
+    assert rebaseline_context["run_start_baseline"] == run_start
+    assert rebaselines[0]["comparison"]["detail"]["incumbent_records"] == 2
+    assert rebaselines[0]["comparison"]["detail"]["candidate_records"] == 2
+
+
+def test_promotion_counter_is_not_doubled_when_select_resumes_after_a_crash(
+    vector_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pydantic_ai_gepa.cli.select as select_module
+
+    config = vector_repo / ".gepa" / "gepa.toml"
+    config.write_text(_config(pinned_scorer=True), encoding="utf-8")
+    _git(vector_repo, "add", str(config.relative_to(vector_repo)))
+    _git(vector_repo, "commit", "-m", "Use pinned vector scorer")
+    payload, _ = _start(vector_repo)
+    run_id = str(payload["run_id"])
+    lane = load_lane_state(vector_repo, run_id, "lane-1")
+    worktree = Path(str(lane.worktree_path))
+    (worktree / "score.txt").write_text("good\n", encoding="utf-8")
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(worktree)
+        continued = _run(
+            "--gepa-dir",
+            str(vector_repo / ".gepa"),
+            "lane",
+            "continue",
+            "lane-1",
+            "--run-id",
+            run_id,
+            "--foreground",
+        )
+    finally:
+        os.chdir(previous_cwd)
+    assert continued.exit_code == 0, continued.output
+
+    original_reset = select_module._reset_primary_to
+
+    def crash_after_reset(root: Path, commit_sha: str) -> None:
+        original_reset(root, commit_sha)
+        raise RuntimeError("simulated crash after durable promotion journal")
+
+    monkeypatch.setattr(select_module, "_reset_primary_to", crash_after_reset)
+    crashed = CliRunner().invoke(
+        gepa_app,
+        [
+            "--gepa-dir",
+            str(vector_repo / ".gepa"),
+            "run",
+            "select",
+            "--run-id",
+            run_id,
+        ],
+    )
+    assert crashed.exit_code == 1
+    journal = [
+        json.loads(line)
+        for line in (vector_repo / ".gepa" / "journal.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    assert [
+        row["promotion_count"]
+        for row in journal
+        if row.get("kind") == "accepted_promotion" and row.get("run_id") == run_id
+    ] == [1]
+    assert not [
+        row
+        for row in journal
+        if row.get("kind") == "run_start_rebaseline" and row.get("run_id") == run_id
+    ]
+
+    monkeypatch.setattr(select_module, "_reset_primary_to", original_reset)
+    resumed = _run(
+        "--gepa-dir", str(vector_repo / ".gepa"), "run", "select", "--run-id", run_id
+    )
+    assert resumed.exit_code == 0, resumed.output
+    final = RunState.from_dict(
+        json.loads(
+            (vector_repo / ".gepa" / "runs" / run_id / "state.json").read_text()
+        )
+    )
+    assert final.accepted_promotion_count == 1
+    journal = [
+        json.loads(line)
+        for line in (vector_repo / ".gepa" / "journal.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    assert [
+        row["promotion_count"]
+        for row in journal
+        if row.get("kind") == "accepted_promotion" and row.get("run_id") == run_id
+    ] == [1]

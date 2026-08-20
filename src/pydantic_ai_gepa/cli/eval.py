@@ -28,6 +28,7 @@ and never imports scorer code from the candidate worktree.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -63,6 +64,7 @@ from .layout import (
     candidate_import_context,
     config_path,
     insert_repo_root_on_path,
+    journal_path,
     latest_run_id,
     new_run_id,
     repo_root,
@@ -96,6 +98,27 @@ from ..vector_acceptance import (
 
 GEPA_TRACE_FILE_ENV = "GEPA_TRACE_FILE"
 GEPA_CANDIDATE_COMPONENTS_ENV = "GEPA_CANDIDATE_COMPONENTS_JSON"
+
+
+def _candidate_component_hashes(
+    candidate: Candidate,
+    *,
+    source: CandidateSource,
+    candidate_root: Path,
+    component_files: tuple[str, ...],
+) -> dict[str, str]:
+    """Return stable hashes for the candidate component boundary in this eval."""
+    if source != "git":
+        return {
+            name: hashlib.sha256(text.encode("utf-8")).hexdigest()
+            for name, text in candidate.components.items()
+        }
+    hashes: dict[str, str] = {}
+    for relative in component_files:
+        path = candidate_root / relative
+        if path.is_file():
+            hashes[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return hashes
 
 
 def _resolve_run_id(run_id: str | None, root: Path | None = None) -> str:
@@ -473,7 +496,11 @@ def run_eval_once(
         try:
             git_state = git_candidate_state(
                 active_candidate_project,
-                exclude_paths=[run_dir(active_run_id, workspace_root)],
+                exclude_paths=[
+                    run_dir(active_run_id, workspace_root),
+                    journal_path(primary_project_root),
+                    primary_project_root / "worktrees",
+                ],
             )
         except GitCandidateError as exc:
             typer.echo(str(exc), err=True)
@@ -656,6 +683,12 @@ def run_eval_once(
 
     summary: dict[str, Any] = {
         "candidate_id": candidate.id,
+        "component_hashes": _candidate_component_hashes(
+            candidate,
+            source=source,
+            candidate_root=active_candidate_project,
+            component_files=cfg.acceptance.component_files,
+        ),
         "candidate_role": status,
         "candidate_source": source,
         "commit_sha": (

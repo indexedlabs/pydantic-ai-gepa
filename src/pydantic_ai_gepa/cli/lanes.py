@@ -1055,6 +1055,9 @@ def _run_lane_eval_loop(
                             "run_id": run_id,
                             "lane": lane,
                             "iteration": lane_state.iteration,
+                            "comparison_kind": "candidate_acceptance",
+                            "accepted_promotion_count": run_state.accepted_promotion_count,
+                            "run_start_baseline": run_state.run_start_baseline,
                         },
                     ),
                 )

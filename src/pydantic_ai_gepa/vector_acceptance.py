@@ -90,7 +90,13 @@ class VectorRecord:
 
 @dataclass(frozen=True, slots=True)
 class VectorComparisonRequest:
-    """Opaque samples supplied to a harness-defined acceptance comparator."""
+    """Opaque samples supplied to a harness-defined acceptance comparator.
+
+    ``journal_context`` carries durable orchestration facts without assigning
+    meaning to assertion keys. Vector lane comparisons provide
+    ``accepted_promotion_count`` and ``run_start_baseline``; scheduled
+    comparisons additionally set ``comparison_kind = 'run_start_rebaseline'``.
+    """
 
     incumbent: tuple[VectorRecord, ...]
     candidate: tuple[VectorRecord, ...]
@@ -265,6 +271,27 @@ class VectorRecordStore:
             and case_id in record.assertions
         ]
         return sorted(matches, key=lambda item: item.key.repetition)
+
+    def records_for_keys(
+        self, keys: Sequence[Mapping[str, Any]]
+    ) -> list[VectorRecord]:
+        """Load the most recent persisted record for each exact vector key.
+
+        Re-baseline scheduling stores run-start keys, rather than deriving a
+        baseline from whatever compatible records happen to exist later.
+        Selecting the last matching append makes a crash/retry replacement
+        deterministic while preserving the requested key order.
+        """
+        requested = [json.dumps(dict(key), sort_keys=True) for key in keys]
+        latest = {
+            json.dumps(asdict(record.key), sort_keys=True): record
+            for record in self.records()
+            if record.outcome == "scored"
+        }
+        missing = [key for key in requested if key not in latest]
+        if missing:
+            raise ValueError("A stored run-start vector record is unavailable.")
+        return [latest[key] for key in requested]
 
 
 def inventory_hash(case_ids: Sequence[str]) -> str:

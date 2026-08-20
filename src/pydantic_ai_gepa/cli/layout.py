@@ -60,6 +60,7 @@ class AcceptanceConfig:
     comparator: str | None = None
     vector_schema_version: str = "1"
     telemetry_schema_version: str = "1"
+    rebaseline_interval: int | None = None
     require_probe_receipt: bool = False
     pinned_scorer: bool = False
     component_files: tuple[str, ...] = ()
@@ -83,6 +84,15 @@ class AcceptanceConfig:
         ):
             raise GepaConfigError(
                 "acceptance.comparator is required in vector mode (module:factory)."
+            )
+        raw_rebaseline_interval = data.get("rebaseline_interval")
+        if raw_rebaseline_interval is not None and (
+            isinstance(raw_rebaseline_interval, bool)
+            or not isinstance(raw_rebaseline_interval, int)
+            or raw_rebaseline_interval <= 0
+        ):
+            raise GepaConfigError(
+                "acceptance.rebaseline_interval must be a positive integer or omitted."
             )
         files = data.get("component_files", [])
         if not isinstance(files, list) or not all(
@@ -139,6 +149,7 @@ class AcceptanceConfig:
             comparator=comparator,
             vector_schema_version=str(data.get("vector_schema_version", "1")),
             telemetry_schema_version=str(data.get("telemetry_schema_version", "1")),
+            rebaseline_interval=raw_rebaseline_interval,
             require_probe_receipt=bool(data.get("require_probe_receipt", False)),
             pinned_scorer=bool(data.get("pinned_scorer", False)),
             component_files=tuple(files),

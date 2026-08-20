@@ -68,10 +68,32 @@ the implementation changes, then green with all 15 tests passing.
   documentation and the README: map keys are the exact relative paths from
   `acceptance.component_files`.
 
+## Re-baseline interface
+
+Vector lane runs now expose the generic periodic re-baseline surface needed by
+downstream comparators:
+
+- `acceptance.rebaseline_interval = N` enables a run-start paired comparison
+  after every Nth accepted promotion; omitting it leaves the feature off.
+- The run state persists `accepted_promotion_count` and an immutable
+  `run_start_baseline` containing candidate id, commit SHA, per-component
+  hashes, frozen minibatch id, and exact stored vector-record keys.
+- Selection writes one durable `accepted_promotion` journal record per actual
+  promotion. Resume deduplicates by lane, iteration, and candidate SHA, so a
+  crash cannot double-count the promotion.
+- Before re-fanning lanes, a scheduled re-baseline re-evaluates the promoted
+  incumbent for the run-start record repetitions on the same frozen minibatch
+  and supplies the paired vectors to the configured comparator. Its journaled
+  result is evidence only: rejection or infrastructure failure preserves the
+  current incumbent and never promotes or restores the run-start baseline.
+- Every vector comparator request now receives `accepted_promotion_count` and
+  `run_start_baseline` in `journal_context`; scheduled checks additionally set
+  `comparison_kind = "run_start_rebaseline"`.
+
 ## Verification
 
 - `uv run ruff check .` — passed.
 - `uv run pyright` on every touched Python source and test file — 0 errors.
-- Focused vector/lane/probe/eval/select suites — 69 passed.
-- Full `uv run pytest` — 616 passed, 7 pre-existing deprecation/serializer
-  warnings, completed in 56.62 seconds.
+- Focused vector/lane/probe/run/select suites — 74 passed.
+- Full `uv run pytest` — 618 passed, 7 pre-existing deprecation/serializer
+  warnings, completed in 56.22 seconds.
