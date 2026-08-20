@@ -1,0 +1,25 @@
+{
+  "checkpoint_id": "01a01db47fc8",
+  "created_at": "2026-08-20T05:46:03.674189+00:00",
+  "branch_name": "assertion-acceptance-loop",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "6de9bc8352da3d4c760ef98201359a0f15518c5c"
+  ],
+  "entity_touches": [
+    ".mighty/loro/edges/01a01d9f-ebcc-7dc1-b797-2cb948bd994b.loro",
+    ".mighty/loro/edges/01a01db3-d8ec-7d70-ab03-f31f2c9fa75f.loro",
+    ".mighty/loro/edges/01a01db3-d93c-7c81-a82f-f962dec1327e.loro",
+    ".mighty/loro/edges/01a01db3-d989-7ad2-92b5-2adcc5b285f4.loro",
+    ".mighty/loro/edges/01a01db3-d9d5-7650-9856-50b2b24fe695.loro",
+    ".mighty/loro/edges/01a01db3-da48-7d11-9ec7-049f9ab63170.loro",
+    ".mighty/loro/edges/01a01db3-da94-7910-aca6-d74723725835.loro",
+    ".mighty/loro/edges/01a01db4-5f9c-7b03-99ca-9562ae02acb7.loro",
+    ".mighty/loro/messages/01a01da0-048f-7cb1-89d7-a89d35d2ea76.loro",
+    ".mighty/loro/messages/01a01da0-050b-73c0-b92f-da318a0b797f.loro",
+    ".mighty/loro/messages/01a01db3-b468-7343-a995-1cfdaf9c0a0c.loro",
+    ".mighty/loro/records/01a01d9f-eb82-7422-bf25-78821498679b.loro",
+    ".mighty/loro/records/01a01db3-d9e0-7703-8505-9be3625d7749.loro",
+    ".mighty/loro/records/01a01db4-5fa8-70e0-8d88-7e9aae6faa3c.loro"
+  ]
+}
