@@ -62,6 +62,7 @@ class AcceptanceConfig:
     telemetry_schema_version: str = "1"
     rebaseline_interval: int | None = None
     probe_allowance_per_lease: int = 10
+    packet_projector: str | None = None
     require_probe_receipt: bool = False
     pinned_scorer: bool = False
     component_files: tuple[str, ...] = ()
@@ -103,6 +104,13 @@ class AcceptanceConfig:
         ):
             raise GepaConfigError(
                 "acceptance.probe_allowance_per_lease must be a non-negative integer."
+            )
+        packet_projector = data.get("packet_projector")
+        if packet_projector is not None and (
+            not isinstance(packet_projector, str) or ":" not in packet_projector
+        ):
+            raise GepaConfigError(
+                "acceptance.packet_projector must be a 'module:function' reference."
             )
         files = data.get("component_files", [])
         if not isinstance(files, list) or not all(
@@ -161,6 +169,7 @@ class AcceptanceConfig:
             telemetry_schema_version=str(data.get("telemetry_schema_version", "1")),
             rebaseline_interval=raw_rebaseline_interval,
             probe_allowance_per_lease=raw_probe_allowance,
+            packet_projector=packet_projector,
             require_probe_receipt=bool(data.get("require_probe_receipt", False)),
             pinned_scorer=bool(data.get("pinned_scorer", False)),
             component_files=tuple(files),

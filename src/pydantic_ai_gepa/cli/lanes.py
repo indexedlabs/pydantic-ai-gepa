@@ -59,6 +59,7 @@ from .eval import run_eval_once
 from .events import EventDraft, LaneScan, LaneScanResult, emit, run_reaper_pass
 from .layout import (
     GepaConfig,
+    GepaConfigError,
     candidate_project_root,
     config_path,
     current_gepa_dirname,
@@ -68,6 +69,7 @@ from .layout import (
     project_prefix,
     project_root_for_workspace,
     repo_root,
+    resolve_module_attr,
     run_dir,
     vector_records_path,
 )
@@ -453,6 +455,32 @@ def _collect_metric_side_info_by_rep(trace_paths: list[str]) -> list[dict[str, A
     return result
 
 
+def _project_packet(
+    packet: dict[str, Any],
+    *,
+    config: GepaConfig,
+    workspace_root: Path,
+    candidate_project: Path,
+) -> dict[str, Any]:
+    """Apply the optional packet projection at the final serialization boundary."""
+    reference = config.acceptance.packet_projector
+    if reference is None:
+        return packet
+    projector = resolve_module_attr(
+        reference,
+        kind="packet projector",
+        expected_root=(
+            workspace_root if config.acceptance.pinned_scorer else candidate_project
+        ),
+    )
+    if not callable(projector):
+        raise GepaConfigError("acceptance.packet_projector must resolve to a callable.")
+    projected = projector(packet)
+    if not isinstance(projected, dict):
+        raise GepaConfigError("acceptance.packet_projector must return a packet dict.")
+    return projected
+
+
 def write_packet(
     workspace_root: Path,
     run_state: Any,  # RunState — imported lazily to avoid a module cycle
@@ -514,6 +542,12 @@ def write_packet(
     if cfg.acceptance.mode != "vector":
         packet["baseline"]["mean_score"] = run_state.reflection_baseline_mean_score
         packet["baseline"]["samples"] = list(run_state.reflection_baseline_samples)
+    packet = _project_packet(
+        packet,
+        config=cfg,
+        workspace_root=workspace_root,
+        candidate_project=candidate_project,
+    )
     path = lanes_dir(workspace_root, run_state.run_id) / lane / "packet.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(packet, indent=2, default=str), encoding="utf-8")

@@ -113,6 +113,15 @@ downstream comparators:
 - Allowlist rejections now journal the actual offending diff hunks as well as
   file paths, making the reviewed mutation auditable.
 
+## Reflection packet projector
+
+`acceptance.packet_projector = "module:function"` now supplies a first-class
+packet projection hook. `write_packet` resolves it at the final serialization
+boundary, requires a dict result, and applies it for every caller — including
+a fresh `gepa run select` resume at `select_phase = "emit"`. Resolution is
+root-fenced like the other acceptance hooks; a configured pinned-scorer
+projector that cannot load is a hard error, never a silent unprojected packet.
+
 ## Verification
 
 - `uv run ruff check .` — passed.
@@ -123,3 +132,6 @@ downstream comparators:
 - Security follow-up: focused vector/lane/eval suites — 47 passed; `uv run
   ruff check` and touched-file `uv run pyright` — clean; full `uv run pytest`
   — 622 passed, 7 warnings, completed in 92.83 seconds.
+- Packet-projector follow-up: focused select/lane/vector suites — 55 passed;
+  `uv run ruff check .` and touched-source `uv run pyright` — clean; full
+  `uv run pytest` — 623 passed, 7 warnings, completed in 60.80 seconds.
