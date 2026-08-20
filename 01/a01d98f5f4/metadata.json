@@ -1,0 +1,13 @@
+{
+  "checkpoint_id": "01a01d98f5f4",
+  "created_at": "2026-08-20T05:15:58.949587+00:00",
+  "branch_name": "assertion-acceptance-loop",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "d8c867c58a84cce55c9134d85a3c9741b4d5f5e6"
+  ],
+  "entity_touches": [
+    ".mighty/loro/messages/01a01d98-f594-7bd0-8100-d507e523f26a.loro",
+    ".mighty/loro/records/01a01d8a-ead4-7880-8a10-84d607aeadd9.loro"
+  ]
+}
