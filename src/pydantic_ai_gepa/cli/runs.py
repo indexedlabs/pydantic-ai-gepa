@@ -336,7 +336,7 @@ class ParetoLog:
             rows.append(row)
         return rows
 
-    def count_rows(self) -> int:
+    def count_rows(self, *, scope: str = "acceptance") -> int:
         """Count completed evals: the number of parseable rows in the log.
 
         A torn partial row from a killed writer does not count — the eval did
@@ -345,7 +345,8 @@ class ParetoLog:
         """
         count = 0
         for line in self._read_lines():
-            if self._is_valid_row_line(line):
+            row = self._parse_line(line)
+            if row is not None and row.extra.get("row_scope", "acceptance") == scope:
                 count += 1
         return count
 
@@ -400,6 +401,7 @@ class ParetoLog:
             for row in self.iter_rows()
             if row.extra.get("selectable", True) is not False
             and row.extra.get("outcome") != "infrastructure_failure"
+            and row.extra.get("row_scope", "acceptance") == "acceptance"
         ]
 
 

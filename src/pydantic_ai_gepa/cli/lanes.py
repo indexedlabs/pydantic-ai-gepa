@@ -42,6 +42,14 @@ from typing import Any, Literal
 import typer
 
 from ..acceptance import compare_candidate_samples
+from ..vector_acceptance import (
+    VectorComparison,
+    VectorComparisonRequest,
+    VectorRecord,
+    VectorRecordStore,
+    compare_vectors,
+    resolve_vector_comparator,
+)
 from ..evaluation_health import (
     EvaluationInfrastructureFailure,
     evaluation_infrastructure_failures,
@@ -50,7 +58,9 @@ from .candidates import GitCandidateError, git_candidate_state
 from .eval import run_eval_once
 from .events import EventDraft, LaneScan, LaneScanResult, emit, run_reaper_pass
 from .layout import (
+    GepaConfig,
     candidate_project_root,
+    config_path,
     current_gepa_dirname,
     gepa_dir,
     git_root,
@@ -58,6 +68,7 @@ from .layout import (
     project_root_for_workspace,
     repo_root,
     run_dir,
+    vector_records_path,
 )
 from .runs import utc_now_iso
 
@@ -166,6 +177,8 @@ class LaneState:
     comparison_path: str | None = None
     eval_pid: int | None = None
     heartbeat_at: str | None = None
+    review_failures: int = 0
+    review_findings: tuple[dict[str, Any], ...] = ()
     updated_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -187,6 +200,8 @@ class LaneState:
             "comparison_path": self.comparison_path,
             "eval_pid": self.eval_pid,
             "heartbeat_at": self.heartbeat_at,
+            "review_failures": self.review_failures,
+            "review_findings": list(self.review_findings),
             "updated_at": self.updated_at,
         }
 
@@ -216,6 +231,10 @@ class LaneState:
                 int(data["eval_pid"]) if data.get("eval_pid") is not None else None
             ),
             heartbeat_at=data.get("heartbeat_at"),
+            review_failures=int(data.get("review_failures", 0)),
+            review_findings=tuple(
+                item for item in data.get("review_findings", []) if isinstance(item, dict)
+            ),
             updated_at=str(data.get("updated_at", "")),
         )
 
@@ -394,6 +413,14 @@ def _collect_metric_side_info(trace_paths: list[str]) -> dict[str, Any]:
     return side_info
 
 
+def _collect_metric_side_info_by_rep(trace_paths: list[str]) -> list[dict[str, Any]]:
+    """Keep repetition boundaries intact; scalar packets retain the legacy view."""
+    result: list[dict[str, Any]] = []
+    for raw in trace_paths:
+        result.append({"trace_path": raw, "cases": _collect_metric_side_info([raw])})
+    return result
+
+
 def write_packet(
     workspace_root: Path,
     run_state: Any,  # RunState — imported lazily to avoid a module cycle
@@ -419,6 +446,12 @@ def write_packet(
     invocation = (
         f"cd {shlex.quote(str(candidate_project))} && {shlex.join(continue_argv)}"
     )
+    cfg = GepaConfig.load(config_path(workspace_root))
+    metric_info: Any = (
+        _collect_metric_side_info_by_rep(list(run_state.reflection_baseline_trace_paths))
+        if cfg.acceptance.mode == "vector"
+        else _collect_metric_side_info(list(run_state.reflection_baseline_trace_paths))
+    )
     packet = {
         "packet_version": PACKET_VERSION,
         "run_id": run_state.run_id,
@@ -440,9 +473,7 @@ def write_packet(
             "report_paths": list(run_state.reflection_baseline_report_paths),
             "trace_paths": list(run_state.reflection_baseline_trace_paths),
         },
-        "metric_side_info": _collect_metric_side_info(
-            list(run_state.reflection_baseline_trace_paths)
-        ),
+        "metric_side_info": metric_info,
         "journal_tail": _journal_tail(workspace_root, run_state.journal_tail_lines),
         "continue_cwd": str(candidate_project),
         "continue_argv": continue_argv,
@@ -515,6 +546,160 @@ def _auto_commit_worktree(worktree: Path, branch: str, lane: str) -> str:
             f"gepa lane continue: {lane} candidate",
         )
     return _git(worktree, "rev-parse", "HEAD")
+
+
+def _candidate_gate(
+    *,
+    workspace_root: Path,
+    run_state: Any,
+    state: LaneState,
+) -> LaneState | None:
+    """Reject out-of-scope diffs and run the optional pre-evaluation reviewer."""
+    cfg = GepaConfig.load(config_path(workspace_root))
+    if cfg.acceptance.mode != "vector":
+        return None
+    worktree = Path(str(state.worktree_path))
+    baseline = str(run_state.reflection_baseline_commit_sha)
+    changed = set(_git(worktree, "diff", "--name-only", baseline).splitlines())
+    # ``git diff`` deliberately omits untracked files, which must not bypass
+    # the component-file allowlist before the auto-commit stages them.
+    changed.update(
+        line[3:]
+        for line in _git(worktree, "status", "--porcelain").splitlines()
+        if len(line) >= 4
+    )
+    allowed = set(cfg.acceptance.component_files)
+    unexpected = sorted(item for item in changed if item and item not in allowed)
+    if unexpected:
+        findings = ({
+            "component": None,
+            "excerpt": ", ".join(unexpected),
+            "explanation": "Candidate changed files outside acceptance.component_files.",
+            "severity": "error",
+        },)
+        rejected = LaneState(
+            **{
+                **state.to_dict(),
+                "status": "stalled",
+                "review_failures": state.review_failures + 1,
+                "review_findings": findings,
+                "lease_expires_at": None,
+                "lease_purpose": None,
+                "updated_at": utc_now_iso(),
+            }
+        )
+        rejected.save(workspace_root, run_state.run_id)
+        return rejected
+    if cfg.acceptance.reviewer:
+        from ..candidate_review import (
+            AgentCandidateReviewer,
+            CandidateReviewRequest,
+            CommandCandidateReviewer,
+            resolve_candidate_reviewer,
+        )
+        from .layout import resolve_module_attr
+
+        components = {
+            relative: (worktree / relative).read_text(encoding="utf-8")
+            for relative in cfg.acceptance.component_files
+            if (worktree / relative).is_file()
+        }
+        request = CandidateReviewRequest(
+            components=components,
+            diff=_git(worktree, "diff", baseline, "--", *cfg.acceptance.component_files),
+            workspace_path=str(worktree),
+            opaque_context=cfg.acceptance.review_context,
+            attempt=state.review_failures + 1,
+            prior_findings=(),
+        )
+        reviewer_root = workspace_root if cfg.acceptance.pinned_scorer else worktree
+        if cfg.acceptance.reviewer_kind == "module":
+            reviewer = resolve_candidate_reviewer(
+                cfg.acceptance.reviewer, expected_root=reviewer_root
+            )
+        elif cfg.acceptance.reviewer_kind == "agent":
+            agent = resolve_module_attr(
+                str(cfg.acceptance.reviewer), kind="reviewer agent", expected_root=reviewer_root
+            )
+            reviewer = AgentCandidateReviewer(
+                agent, samples=int(cfg.acceptance.reviewer_options.get("samples", 3))
+            )
+        else:
+            reviewer = CommandCandidateReviewer(
+                str(cfg.acceptance.reviewer),
+                output_path=str(cfg.acceptance.reviewer_options.get("output_path", "verdict.json")),
+                timeout_secs=float(cfg.acceptance.reviewer_options.get("timeout_secs", 120)),
+                retries=int(cfg.acceptance.reviewer_options.get("retries", 1)),
+            )
+        verdict = reviewer.review(request)
+        if verdict.disposition == "fail":
+            findings = tuple({
+                "component": item.component,
+                "excerpt": item.excerpt,
+                "explanation": item.explanation,
+                "severity": item.severity,
+            } for item in verdict.findings)
+            return _review_rejection(workspace_root, run_state, state, findings)
+    if not cfg.acceptance.require_probe_receipt:
+        return None
+    from .probe import component_hash
+    from .layout import probe_receipts_dir
+
+    prediction_path = worktree / "prediction.json"
+    try:
+        prediction = json.loads(prediction_path.read_text(encoding="utf-8"))
+        keys = prediction.get("assertion_keys", prediction.get("predictions", []))
+        if not isinstance(keys, list):
+            raise ValueError("assertion_keys must be a list")
+        names = {
+            str(item.get("key")) if isinstance(item, dict) else str(item)
+            for item in keys
+        }
+        names.discard("None")
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return _review_rejection(workspace_root, run_state, state, ({
+            "component": "prediction.json", "excerpt": None,
+            "explanation": f"A valid prediction.json is required: {exc}", "severity": "error",
+        },))
+    component_digest = component_hash(worktree, cfg.acceptance.component_files)
+    matched = False
+    for receipt_path in probe_receipts_dir(run_state.run_id, workspace_root).glob("*.json"):
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if receipt.get("candidate_component_hash") != component_digest:
+            continue
+        changes = receipt.get("changes")
+        if isinstance(changes, dict) and names.intersection(str(item) for item in changes):
+            matched = True
+            break
+    if matched:
+        return None
+    return _review_rejection(workspace_root, run_state, state, ({
+        "component": "prediction.json", "excerpt": ", ".join(sorted(names)),
+        "explanation": "No matching probe receipt proves a predicted assertion flip for this candidate.",
+        "severity": "error",
+    },))
+
+
+def _review_rejection(
+    workspace_root: Path, run_state: Any, state: LaneState, findings: tuple[dict[str, Any], ...]
+) -> LaneState:
+    failures = state.review_failures + 1
+    rejected = LaneState(
+        **{
+            **state.to_dict(),
+            "status": "stalled" if failures >= 3 else "paused_for_reflection",
+            "review_failures": failures,
+            "review_findings": findings,
+            "lease_expires_at": None,
+            "lease_purpose": None,
+            "updated_at": utc_now_iso(),
+        }
+    )
+    rejected.save(workspace_root, run_state.run_id)
+    return rejected
 
 
 def _write_comparison(
@@ -679,8 +864,12 @@ def _run_lane_eval_loop(
     )
     lane_state = _touch_heartbeat(workspace_root, run_id, lane_state, pid)
 
+    cfg = GepaConfig.load(config_path(workspace_root))
+    vector_mode = cfg.acceptance.mode == "vector"
     baseline_samples = tuple(float(v) for v in run_state.reflection_baseline_samples)
-    max_candidate_samples = len(baseline_samples)
+    max_candidate_samples = (
+        run_state.acceptance_repetitions + 1 if vector_mode else len(baseline_samples)
+    )
     initial_samples = min(run_state.acceptance_repetitions, max_candidate_samples)
 
     # The candidate tree is the cwd for evaluation: `evaluate` callables and
@@ -693,6 +882,8 @@ def _run_lane_eval_loop(
     samples: list[float] = []
     outcomes: list[Any] = []
     comparison_result = None
+    vector_comparison: VectorComparison | None = None
+    infra_retries = 0
     try:
         for _ in range(max_candidate_samples):
             outcome = run_eval_once(
@@ -710,6 +901,8 @@ def _run_lane_eval_loop(
                 lane=lane,
                 candidate_root=candidate_project,
                 workspace_root=workspace_root,
+                vector_incumbent_hash=run_state.reflection_baseline_candidate_id,
+                vector_repetition=len(samples) + 1,
             )
             outcomes.append(outcome)
             current_id = str(outcome.summary["candidate_id"])
@@ -721,6 +914,9 @@ def _run_lane_eval_loop(
                 )
             failures = evaluation_infrastructure_failures(outcome.records)
             if failures:
+                if vector_mode and infra_retries == 0:
+                    infra_retries += 1
+                    continue
                 return _stall_for_infrastructure_failure(
                     workspace_root=workspace_root,
                     run_state=run_state,
@@ -738,18 +934,65 @@ def _run_lane_eval_loop(
 
             if len(samples) < initial_samples:
                 continue
-            comparison_result = compare_candidate_samples(
-                baseline_samples[: len(samples)],
-                tuple(samples),
-                confidence=run_state.acceptance_confidence,
-                min_delta=run_state.acceptance_min_delta,
-            )
-            if comparison_result.verdict != "inconclusive":
-                break
+            if vector_mode:
+                raw_record = outcome.summary.get("vector_record")
+                if not isinstance(raw_record, dict):
+                    raise typer.BadParameter("Vector acceptance requires a vector metric record.")
+                current = VectorRecord.from_dict(raw_record)
+                store = VectorRecordStore(vector_records_path(run_id, workspace_root))
+                candidate_records = tuple(store.matching(current.key))
+                from dataclasses import replace
+
+                incumbent_records = tuple(
+                    store.matching(
+                        replace(current.key, candidate_hash=current.key.incumbent_hash)
+                    )
+                )
+                comparator = resolve_vector_comparator(
+                    str(cfg.acceptance.comparator),
+                    expected_root=(workspace_root if cfg.acceptance.pinned_scorer else candidate_project),
+                )
+                vector_comparison = compare_vectors(
+                    comparator,
+                    VectorComparisonRequest(
+                        incumbent=incumbent_records,
+                        candidate=candidate_records,
+                        attempt=1,
+                        escalation=max(0, len(samples) - initial_samples),
+                        journal_context={"run_id": run_id, "lane": lane, "iteration": lane_state.iteration},
+                    ),
+                )
+                if vector_comparison.verdict != "needs_escalation":
+                    break
+                if len(samples) >= max_candidate_samples:
+                    vector_comparison = VectorComparison(
+                        verdict="equivalent",
+                        ranking_key=vector_comparison.ranking_key,
+                        display_score=vector_comparison.display_score,
+                        detail={**vector_comparison.detail, "escalation_exhausted": True},
+                    )
+                    break
+            else:
+                comparison_result = compare_candidate_samples(
+                    baseline_samples[: len(samples)],
+                    tuple(samples),
+                    confidence=run_state.acceptance_confidence,
+                    min_delta=run_state.acceptance_min_delta,
+                )
+                if comparison_result.verdict != "inconclusive":
+                    break
     finally:
         os.chdir(previous_cwd)
 
-    assert comparison_result is not None
+    if vector_comparison is not None:
+        result_data = vector_comparison.to_dict()
+        verdict = vector_comparison.verdict
+        display = vector_comparison.display_score
+    else:
+        assert comparison_result is not None
+        result_data = comparison_result.to_dict()
+        verdict = comparison_result.verdict
+        display = comparison_result.delta
     comparison = {
         "run_id": run_id,
         "lane": lane,
@@ -767,7 +1010,7 @@ def _run_lane_eval_loop(
             for outcome in outcomes
             if outcome.summary.get("trace_path")
         ],
-        **comparison_result.to_dict(),
+        **result_data,
     }
     comparison_path = _write_comparison(
         workspace_root, run_id, lane, lane_state.iteration, comparison
@@ -780,8 +1023,8 @@ def _run_lane_eval_loop(
         **{
             **lane_state.to_dict(),
             "status": "awaiting_selection",
-            "verdict": comparison_result.verdict,
-            "verdict_delta": comparison_result.delta,
+            "verdict": verdict,
+            "verdict_delta": display,
             "comparison_path": str(comparison_path),
             "eval_pid": None,
             "updated_at": utc_now_iso(),
@@ -795,16 +1038,16 @@ def _run_lane_eval_loop(
             type="verdict",
             lane=lane,
             payload={
-                "verdict": comparison_result.verdict,
-                "delta": comparison_result.delta,
+                "verdict": verdict,
+                "delta": display,
                 "comparison_path": str(comparison_path),
             },
         ),
         root=workspace_root,
     )
     typer.echo(
-        f"Lane {lane} verdict: {comparison_result.verdict} "
-        f"(delta={comparison_result.delta:+.4f}); event {verdict_id}."
+        f"Lane {lane} verdict: {verdict} "
+        f"(display={display:+.4f}); event {verdict_id}."
     )
     return lane_state
 
@@ -1037,6 +1280,18 @@ def lane_continue(
                 err=True,
             )
             raise typer.Exit(code=1)
+
+        if not foreground:
+            rejected = _candidate_gate(
+                workspace_root=workspace_root, run_state=run_state, state=state
+            )
+            if rejected is not None:
+                typer.echo(
+                    f"Lane {lane} candidate review failed; no paired evaluation was spent. "
+                    f"Round {rejected.review_failures}/3.",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
 
         if not foreground:
             # Handoff lease with a REAL expiry: if the detached child dies

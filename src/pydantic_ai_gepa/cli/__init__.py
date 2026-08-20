@@ -17,6 +17,7 @@ from . import init as init_cmd
 from . import journal as journal_cmd
 from . import lanes as lanes_cmd
 from . import pareto as pareto_cmd
+from . import probe as probe_cmd
 from . import run as run_cmd
 from . import omni as omni_cmd
 from .layout import load_dotenv, set_gepa_dirname
@@ -79,6 +80,7 @@ app.command(name="pareto", help="Show Pareto front or full history (json or tsv)
 )
 app.command(name="next")(events_cmd.next_command)
 app.command(name="ack")(events_cmd.ack_command)
+app.command(name="probe", help="Run one non-budgeted assertion-vector probe.")(probe_cmd.probe)
 app.add_typer(
     lanes_cmd.app,
     name="lane",

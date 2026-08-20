@@ -80,7 +80,9 @@ from .lanes import (
     write_packet,
 )
 from .layout import (
+    GepaConfig,
     candidate_project_root,
+    config_path,
     final_report_path,
     journal_path,
     run_dir,
@@ -559,18 +561,25 @@ def _phase_promote(
             _invalidate_cross_baseline(workspace_root, state, lane_state)
             invalidated.append(lane_state.lane)
 
-    # 3. Winner selection, strategy `best`: highest memoized delta among
-    #    accepted lanes; ties break by lane id order. Verdicts are consumed
+    # 3. Winner selection: vector runs use the comparator's opaque ranking
+    #    tuple; scalar runs retain the historical delta ordering. Verdicts are consumed
     #    from lane state (memoized by the lane eval) — never re-derived here.
     accepted = [lane_state for lane_state in valid if lane_state.verdict == "accepted"]
     winner: LaneState | None = None
     if accepted:
+        vector_mode = GepaConfig.load(config_path(workspace_root)).acceptance.mode == "vector"
+
+        def rank(lane_state: LaneState) -> tuple[float | str, ...]:
+            if not vector_mode:
+                return (-(lane_state.verdict_delta or 0.0), lane_state.lane)
+            raw = _load_comparison(lane_state).get("ranking_key", [])
+            if not isinstance(raw, list) or not all(isinstance(item, (int, float)) for item in raw):
+                raise typer.BadParameter("Vector comparison ranking_key must be a numeric tuple.")
+            return tuple(-float(item) for item in raw) + (lane_state.lane,)
+
         winner = sorted(
             accepted,
-            key=lambda lane_state: (
-                -(lane_state.verdict_delta or 0.0),
-                lane_state.lane,
-            ),
+            key=rank,
         )[0]
     losers = [lane_state.lane for lane_state in valid if lane_state is not winner]
 
@@ -603,7 +612,7 @@ def _phase_promote(
     #    otherwise promotion happens in run state only (user work is never
     #    destroyed).
     comparison = _load_comparison(winner)
-    winner_mean = comparison.get("candidate_mean")
+    winner_mean = comparison.get("candidate_mean", comparison.get("display_score"))
     if winner_mean is None and winner.eval_samples:
         winner_mean = sum(winner.eval_samples) / len(winner.eval_samples)
     winner_candidate_id = (

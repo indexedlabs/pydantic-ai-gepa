@@ -66,6 +66,7 @@ from .layout import (
     resolve_metric,
     resolve_skills,
     run_dir,
+    vector_records_path,
 )
 from .metrics import default_substring_metric
 from .runs import (
@@ -77,9 +78,18 @@ from .runs import (
     utc_now_iso,
 )
 from .store import ComponentStore
+from ..vector_acceptance import (
+    VectorRecord,
+    VectorRecordKey,
+    VectorRecordStore,
+    inventory_hash,
+    scorer_identity,
+    side_info_vector,
+)
 
 
 GEPA_TRACE_FILE_ENV = "GEPA_TRACE_FILE"
+GEPA_CANDIDATE_COMPONENTS_ENV = "GEPA_CANDIDATE_COMPONENTS_JSON"
 
 
 def _resolve_run_id(run_id: str | None, root: Path | None = None) -> str:
@@ -294,6 +304,10 @@ def run_eval_once(
     lane: str | None = None,
     candidate_root: Path | None = None,
     workspace_root: Path | None = None,
+    case_id: str | None = None,
+    row_scope: str = "acceptance",
+    vector_repetition: int | None = None,
+    vector_incumbent_hash: str | None = None,
 ) -> EvalOutcome:
     """Evaluate one baseline/candidate and append the standard run artifacts.
 
@@ -426,7 +440,11 @@ def run_eval_once(
 
     run_dir(active_run_id, workspace_root).mkdir(parents=True, exist_ok=True)
     minibatch_store = MinibatchStore(active_run_id, workspace_root)
-    if minibatch_id:
+    if case_id is not None:
+        if minibatch_id is not None:
+            raise typer.BadParameter("--case selection cannot be combined with a minibatch id.")
+        minibatch = minibatch_store.sample([case_id], size=1, seed=seed, epoch=epoch)
+    elif minibatch_id:
         minibatch = minibatch_store.load(minibatch_id)
     else:
         minibatch = minibatch_store.sample(
@@ -479,26 +497,44 @@ def run_eval_once(
     )
     if source == "git":
         configured_refs = (cfg.agent, cfg.evaluate, cfg.metric, cfg.case_factory)
+        scorer_root = primary_project_root if cfg.acceptance.pinned_scorer else active_candidate_project
+        candidate_components: dict[str, str] = {}
+        if cfg.acceptance.pinned_scorer:
+            for relative in cfg.acceptance.component_files:
+                path = active_candidate_project / relative
+                if not path.is_file():
+                    raise typer.BadParameter(
+                        f"Declared candidate component file is missing: {relative}"
+                    )
+                try:
+                    candidate_components[relative] = path.read_bytes().decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise typer.BadParameter(
+                        f"Declared component file {relative} must be UTF-8 text."
+                    ) from exc
+        previous_payload = os.environ.get(GEPA_CANDIDATE_COMPONENTS_ENV)
+        if cfg.acceptance.pinned_scorer:
+            os.environ[GEPA_CANDIDATE_COMPONENTS_ENV] = json.dumps(candidate_components, sort_keys=True)
         with candidate_import_context(
             primary_project_root=primary_project_root,
-            candidate_project_root=active_candidate_project,
+            candidate_project_root=scorer_root,
             refs=configured_refs,
         ):
             agent = (
-                resolve_agent(cfg, expected_root=active_candidate_project)
+                resolve_agent(cfg, expected_root=scorer_root)
                 if cfg.agent
                 else None
             )
-            evaluate = resolve_evaluate(cfg, expected_root=active_candidate_project)
+            evaluate = resolve_evaluate(cfg, expected_root=scorer_root)
             metric = (
-                resolve_metric(cfg, expected_root=active_candidate_project)
+                resolve_metric(cfg, expected_root=scorer_root)
                 if cfg.metric
                 else default_substring_metric
             )
             case_factory = resolve_case_factory(
-                cfg, expected_root=active_candidate_project
+                cfg, expected_root=scorer_root
             )
-            skills_fs = resolve_skills(cfg, root=active_candidate_project)
+            skills_fs = resolve_skills(cfg, root=scorer_root)
             with _expose_trace_path(planned_trace_path):
                 if evaluate is not None:
                     records = asyncio.run(
@@ -517,13 +553,20 @@ def run_eval_once(
                             agent=agent,
                             metric=metric,
                             dataset=subset,
-                            candidate={},
+                            candidate=Candidate(
+                                id=candidate.id,
+                                components=candidate_components,
+                            ).to_candidate_map(),
                             concurrency=concurrency,
                             case_factory=case_factory,
                             capture_traces=capture_traces,
                             skills_fs=skills_fs,
                         )
                     )
+        if previous_payload is None:
+            os.environ.pop(GEPA_CANDIDATE_COMPONENTS_ENV, None)
+        else:
+            os.environ[GEPA_CANDIDATE_COMPONENTS_ENV] = previous_payload
     else:
         assert metric is not None
         with _expose_trace_path(planned_trace_path):
@@ -579,6 +622,7 @@ def run_eval_once(
                 "evaluation_errors": [
                     failure.to_dict() for failure in infrastructure_failures
                 ],
+                "row_scope": row_scope,
             },
         )
     )
@@ -629,7 +673,37 @@ def run_eval_once(
         "max_iterations": max_iterations,
         "report_path": str(report_path),
         "trace_path": str(trace_path) if trace_path else None,
+        "row_scope": row_scope,
     }
+
+    if cfg.acceptance.mode == "vector":
+        assertions, latency = side_info_vector(records)
+        repetition = vector_repetition if vector_repetition is not None else iteration
+        incumbent_hash = vector_incumbent_hash or candidate.id
+        vector = VectorRecord(
+            key=VectorRecordKey(
+                run_id=active_run_id,
+                inventory_hash=inventory_hash(list(minibatch.case_ids)),
+                scorer_identity=scorer_identity(
+                    (cfg.metric, cfg.case_factory, cfg.acceptance.comparator),
+                    root=(primary_project_root if cfg.acceptance.pinned_scorer else None),
+                ),
+                incumbent_hash=incumbent_hash,
+                candidate_hash=candidate.id,
+                repetition=repetition,
+                vector_schema_version=cfg.acceptance.vector_schema_version,
+                telemetry_schema_version=cfg.acceptance.telemetry_schema_version,
+            ),
+            assertions=assertions,
+            latency=latency,
+            display_score=mean,
+            outcome="infra_error" if infrastructure_failures else "scored",
+            error={"evaluation_errors": [item.to_dict() for item in infrastructure_failures]}
+            if infrastructure_failures
+            else None,
+        )
+        VectorRecordStore(vector_records_path(active_run_id, workspace_root)).append(vector)
+        summary["vector_record"] = vector.to_dict()
 
     return EvalOutcome(
         records=records,
