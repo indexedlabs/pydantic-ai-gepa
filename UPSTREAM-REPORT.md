@@ -36,14 +36,42 @@
 - The local Mighty store does not contain `indexed-task-0n5`; this work is
   tracked locally as `pydanticaigepa-task-5jw`.
 
+## Review fixes
+
+The follow-up review was addressed in full. Regression tests were added first;
+the combined review-focused run was red with 11 failures and 4 passes before
+the implementation changes, then green with all 15 tests passing.
+
+- Scorer identities now include the resolved source bytes of the metric, case
+  factory, and comparator (including the built-in default metric), so scorer
+  edits invalidate pooled vector records.
+- The candidate allowlist now excludes declared `acceptance.meta_files`, with
+  `prediction.json` always included, and porcelain-v1 `-z` parsing records both
+  sides of renames/copies correctly.
+- Direct foreground lane continues now run the same vector candidate gate as
+  background continues, covering allowlist, reviewer, and receipt checks.
+- Probe lookup now binds run/scorer/schema/incumbent identity and reads the
+  requested case from the compatible full-inventory incumbent record. The
+  regression exercises the complete `run_eval_once` artifact path.
+- Probe receipts prove exactly one prediction tuple (key, case, fail-to-pass
+  direction), and the gate verifies a fail-like before status and pass-like
+  after status for that exact key.
+- The single infrastructure retry no longer consumes a scored repetition:
+  scored samples remain capped at `acceptance_repetitions + 1`, while total
+  attempts remain capped by that budget plus the one retry. Comparator requests
+  receive the true attempt number.
+- Comparator/reviewer classes are instantiated or rejected clearly; mixed
+  candidate hashes and invalid vector outcomes are refused; passing reviews
+  may retain non-error advisories; and invalid command-review severities safely
+  default to `error`.
+- The pinned-scorer component-ID contract is documented in both module
+  documentation and the README: map keys are the exact relative paths from
+  `acceptance.component_files`.
+
 ## Verification
 
-- `uv run ruff check src/pydantic_ai_gepa tests/test_vector_acceptance.py`
-- `uv run pyright src/pydantic_ai_gepa/cli/{layout,lanes}.py src/pydantic_ai_gepa/candidate_review.py`
-- `uv run pytest tests/test_vector_acceptance.py tests/cli/test_lanes_cli.py -q`
-
-I also started `uv run pytest -q` under a 55-second local timeout. It reached
-35% without a failure before the timeout terminated it, so the focused suite
-above is the completed test result.
-
-All completed successfully (29 tests in the final focused pytest invocation).
+- `uv run ruff check .` — passed.
+- `uv run pyright` on every touched Python source and test file — 0 errors.
+- Focused vector/lane/probe/eval/select suites — 69 passed.
+- Full `uv run pytest` — 616 passed, 7 pre-existing deprecation/serializer
+  warnings, completed in 56.62 seconds.

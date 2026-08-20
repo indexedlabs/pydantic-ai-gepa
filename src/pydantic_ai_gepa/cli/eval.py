@@ -17,6 +17,12 @@ as the reflector. The library's job is to:
 The coding agent reads the report, edits component slots or source code, and
 re-runs ``gepa eval`` — there is no separate ``propose`` verb because the
 agent IS the reflector.
+
+Pinned-scorer component contract: when ``acceptance.pinned_scorer = true``,
+the candidate component map is keyed by the exact relative file paths listed
+in ``acceptance.component_files``. Downstream agents/evaluators must therefore
+accept file-path component ids; GEPA decodes those candidate files as UTF-8
+and never imports scorer code from the candidate worktree.
 """
 
 from __future__ import annotations
@@ -442,7 +448,9 @@ def run_eval_once(
     minibatch_store = MinibatchStore(active_run_id, workspace_root)
     if case_id is not None:
         if minibatch_id is not None:
-            raise typer.BadParameter("--case selection cannot be combined with a minibatch id.")
+            raise typer.BadParameter(
+                "--case selection cannot be combined with a minibatch id."
+            )
         minibatch = minibatch_store.sample([case_id], size=1, seed=seed, epoch=epoch)
     elif minibatch_id:
         minibatch = minibatch_store.load(minibatch_id)
@@ -497,7 +505,11 @@ def run_eval_once(
     )
     if source == "git":
         configured_refs = (cfg.agent, cfg.evaluate, cfg.metric, cfg.case_factory)
-        scorer_root = primary_project_root if cfg.acceptance.pinned_scorer else active_candidate_project
+        scorer_root = (
+            primary_project_root
+            if cfg.acceptance.pinned_scorer
+            else active_candidate_project
+        )
         candidate_components: dict[str, str] = {}
         if cfg.acceptance.pinned_scorer:
             for relative in cfg.acceptance.component_files:
@@ -514,26 +526,22 @@ def run_eval_once(
                     ) from exc
         previous_payload = os.environ.get(GEPA_CANDIDATE_COMPONENTS_ENV)
         if cfg.acceptance.pinned_scorer:
-            os.environ[GEPA_CANDIDATE_COMPONENTS_ENV] = json.dumps(candidate_components, sort_keys=True)
+            os.environ[GEPA_CANDIDATE_COMPONENTS_ENV] = json.dumps(
+                candidate_components, sort_keys=True
+            )
         with candidate_import_context(
             primary_project_root=primary_project_root,
             candidate_project_root=scorer_root,
             refs=configured_refs,
         ):
-            agent = (
-                resolve_agent(cfg, expected_root=scorer_root)
-                if cfg.agent
-                else None
-            )
+            agent = resolve_agent(cfg, expected_root=scorer_root) if cfg.agent else None
             evaluate = resolve_evaluate(cfg, expected_root=scorer_root)
             metric = (
                 resolve_metric(cfg, expected_root=scorer_root)
                 if cfg.metric
                 else default_substring_metric
             )
-            case_factory = resolve_case_factory(
-                cfg, expected_root=scorer_root
-            )
+            case_factory = resolve_case_factory(cfg, expected_root=scorer_root)
             skills_fs = resolve_skills(cfg, root=scorer_root)
             with _expose_trace_path(planned_trace_path):
                 if evaluate is not None:
@@ -685,8 +693,15 @@ def run_eval_once(
                 run_id=active_run_id,
                 inventory_hash=inventory_hash(list(minibatch.case_ids)),
                 scorer_identity=scorer_identity(
-                    (cfg.metric, cfg.case_factory, cfg.acceptance.comparator),
-                    root=(primary_project_root if cfg.acceptance.pinned_scorer else None),
+                    (
+                        cfg.metric
+                        or "pydantic_ai_gepa.cli.metrics:default_substring_metric",
+                        cfg.case_factory,
+                        cfg.acceptance.comparator,
+                    ),
+                    root=(
+                        primary_project_root if cfg.acceptance.pinned_scorer else None
+                    ),
                 ),
                 incumbent_hash=incumbent_hash,
                 candidate_hash=candidate.id,
@@ -698,11 +713,17 @@ def run_eval_once(
             latency=latency,
             display_score=mean,
             outcome="infra_error" if infrastructure_failures else "scored",
-            error={"evaluation_errors": [item.to_dict() for item in infrastructure_failures]}
+            error={
+                "evaluation_errors": [
+                    item.to_dict() for item in infrastructure_failures
+                ]
+            }
             if infrastructure_failures
             else None,
         )
-        VectorRecordStore(vector_records_path(active_run_id, workspace_root)).append(vector)
+        VectorRecordStore(vector_records_path(active_run_id, workspace_root)).append(
+            vector
+        )
         summary["vector_record"] = vector.to_dict()
 
     return EvalOutcome(

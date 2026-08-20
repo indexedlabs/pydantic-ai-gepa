@@ -233,7 +233,9 @@ class LaneState:
             heartbeat_at=data.get("heartbeat_at"),
             review_failures=int(data.get("review_failures", 0)),
             review_findings=tuple(
-                item for item in data.get("review_findings", []) if isinstance(item, dict)
+                item
+                for item in data.get("review_findings", [])
+                if isinstance(item, dict)
             ),
             updated_at=str(data.get("updated_at", "")),
         )
@@ -448,7 +450,9 @@ def write_packet(
     )
     cfg = GepaConfig.load(config_path(workspace_root))
     metric_info: Any = (
-        _collect_metric_side_info_by_rep(list(run_state.reflection_baseline_trace_paths))
+        _collect_metric_side_info_by_rep(
+            list(run_state.reflection_baseline_trace_paths)
+        )
         if cfg.acceptance.mode == "vector"
         else _collect_metric_side_info(list(run_state.reflection_baseline_trace_paths))
     )
@@ -560,23 +564,18 @@ def _candidate_gate(
         return None
     worktree = Path(str(state.worktree_path))
     baseline = str(run_state.reflection_baseline_commit_sha)
-    changed = set(_git(worktree, "diff", "--name-only", baseline).splitlines())
-    # ``git diff`` deliberately omits untracked files, which must not bypass
-    # the component-file allowlist before the auto-commit stages them.
-    changed.update(
-        line[3:]
-        for line in _git(worktree, "status", "--porcelain").splitlines()
-        if len(line) >= 4
-    )
-    allowed = set(cfg.acceptance.component_files)
+    changed = _candidate_changed_paths(worktree, baseline)
+    allowed = set(cfg.acceptance.component_files) | set(cfg.acceptance.meta_files)
     unexpected = sorted(item for item in changed if item and item not in allowed)
     if unexpected:
-        findings = ({
-            "component": None,
-            "excerpt": ", ".join(unexpected),
-            "explanation": "Candidate changed files outside acceptance.component_files.",
-            "severity": "error",
-        },)
+        findings = (
+            {
+                "component": None,
+                "excerpt": ", ".join(unexpected),
+                "explanation": "Candidate changed files outside acceptance.component_files.",
+                "severity": "error",
+            },
+        )
         rejected = LaneState(
             **{
                 **state.to_dict(),
@@ -606,7 +605,9 @@ def _candidate_gate(
         }
         request = CandidateReviewRequest(
             components=components,
-            diff=_git(worktree, "diff", baseline, "--", *cfg.acceptance.component_files),
+            diff=_git(
+                worktree, "diff", baseline, "--", *cfg.acceptance.component_files
+            ),
             workspace_path=str(worktree),
             opaque_context=cfg.acceptance.review_context,
             attempt=state.review_failures + 1,
@@ -619,7 +620,9 @@ def _candidate_gate(
             )
         elif cfg.acceptance.reviewer_kind == "agent":
             agent = resolve_module_attr(
-                str(cfg.acceptance.reviewer), kind="reviewer agent", expected_root=reviewer_root
+                str(cfg.acceptance.reviewer),
+                kind="reviewer agent",
+                expected_root=reviewer_root,
             )
             reviewer = AgentCandidateReviewer(
                 agent, samples=int(cfg.acceptance.reviewer_options.get("samples", 3))
@@ -627,64 +630,111 @@ def _candidate_gate(
         else:
             reviewer = CommandCandidateReviewer(
                 str(cfg.acceptance.reviewer),
-                output_path=str(cfg.acceptance.reviewer_options.get("output_path", "verdict.json")),
-                timeout_secs=float(cfg.acceptance.reviewer_options.get("timeout_secs", 120)),
+                output_path=str(
+                    cfg.acceptance.reviewer_options.get("output_path", "verdict.json")
+                ),
+                timeout_secs=float(
+                    cfg.acceptance.reviewer_options.get("timeout_secs", 120)
+                ),
                 retries=int(cfg.acceptance.reviewer_options.get("retries", 1)),
             )
         verdict = reviewer.review(request)
         if verdict.disposition == "fail":
-            findings = tuple({
-                "component": item.component,
-                "excerpt": item.excerpt,
-                "explanation": item.explanation,
-                "severity": item.severity,
-            } for item in verdict.findings)
+            findings = tuple(
+                {
+                    "component": item.component,
+                    "excerpt": item.excerpt,
+                    "explanation": item.explanation,
+                    "severity": item.severity,
+                }
+                for item in verdict.findings
+            )
             return _review_rejection(workspace_root, run_state, state, findings)
     if not cfg.acceptance.require_probe_receipt:
         return None
-    from .probe import component_hash
+    from .probe import component_hash, is_fixed_status_change
     from .layout import probe_receipts_dir
 
     prediction_path = worktree / "prediction.json"
     try:
         prediction = json.loads(prediction_path.read_text(encoding="utf-8"))
-        keys = prediction.get("assertion_keys", prediction.get("predictions", []))
-        if not isinstance(keys, list):
-            raise ValueError("assertion_keys must be a list")
-        names = {
-            str(item.get("key")) if isinstance(item, dict) else str(item)
-            for item in keys
-        }
-        names.discard("None")
+        raw_predictions = prediction.get("predictions")
+        if not isinstance(raw_predictions, list) or not raw_predictions:
+            raise ValueError("predictions must be a non-empty list")
+        predictions: list[tuple[str, str, str]] = []
+        for item in raw_predictions:
+            if not isinstance(item, dict):
+                raise ValueError("each prediction must name key, case, and direction")
+            key = item.get("key")
+            case_id = item.get("case")
+            direction = item.get("direction")
+            if not isinstance(key, str) or not isinstance(case_id, str):
+                raise ValueError("each prediction must name string key and case values")
+            if direction != "fail_to_pass":
+                raise ValueError("prediction direction must be 'fail_to_pass'")
+            predictions.append((key, case_id, direction))
     except (OSError, ValueError, json.JSONDecodeError) as exc:
-        return _review_rejection(workspace_root, run_state, state, ({
-            "component": "prediction.json", "excerpt": None,
-            "explanation": f"A valid prediction.json is required: {exc}", "severity": "error",
-        },))
+        return _review_rejection(
+            workspace_root,
+            run_state,
+            state,
+            (
+                {
+                    "component": "prediction.json",
+                    "excerpt": None,
+                    "explanation": f"A valid prediction.json is required: {exc}",
+                    "severity": "error",
+                },
+            ),
+        )
     component_digest = component_hash(worktree, cfg.acceptance.component_files)
-    matched = False
-    for receipt_path in probe_receipts_dir(run_state.run_id, workspace_root).glob("*.json"):
+    for receipt_path in probe_receipts_dir(run_state.run_id, workspace_root).glob(
+        "*.json"
+    ):
         try:
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
         if receipt.get("candidate_component_hash") != component_digest:
             continue
+        if (
+            receipt.get("lane") != state.lane
+            or receipt.get("iteration") != state.iteration
+        ):
+            continue
+        proof = receipt.get("proof")
         changes = receipt.get("changes")
-        if isinstance(changes, dict) and names.intersection(str(item) for item in changes):
-            matched = True
-            break
-    if matched:
-        return None
-    return _review_rejection(workspace_root, run_state, state, ({
-        "component": "prediction.json", "excerpt": ", ".join(sorted(names)),
-        "explanation": "No matching probe receipt proves a predicted assertion flip for this candidate.",
-        "severity": "error",
-    },))
+        if not isinstance(proof, dict) or not isinstance(changes, dict):
+            continue
+        proof_tuple = (proof.get("key"), proof.get("case"), proof.get("direction"))
+        if proof_tuple not in predictions:
+            continue
+        change = changes.get(proof.get("key"))
+        if not isinstance(change, dict):
+            continue
+        if is_fixed_status_change(change.get("before"), change.get("after")):
+            return None
+    names = [f"{case_id}:{key}:{direction}" for key, case_id, direction in predictions]
+    return _review_rejection(
+        workspace_root,
+        run_state,
+        state,
+        (
+            {
+                "component": "prediction.json",
+                "excerpt": ", ".join(sorted(names)),
+                "explanation": "No matching probe receipt proves a predicted assertion flip for this candidate.",
+                "severity": "error",
+            },
+        ),
+    )
 
 
 def _review_rejection(
-    workspace_root: Path, run_state: Any, state: LaneState, findings: tuple[dict[str, Any], ...]
+    workspace_root: Path,
+    run_state: Any,
+    state: LaneState,
+    findings: tuple[dict[str, Any], ...],
 ) -> LaneState:
     failures = state.review_failures + 1
     rejected = LaneState(
@@ -700,6 +750,40 @@ def _review_rejection(
     )
     rejected.save(workspace_root, run_state.run_id)
     return rejected
+
+
+def _candidate_changed_paths(worktree: Path, baseline: str) -> set[str]:
+    """Return changed paths, including both sides of renames and untracked files."""
+
+    def raw_git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(worktree), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+
+    changed = {
+        item
+        for item in raw_git("diff", "--name-only", "-z", baseline).split("\0")
+        if item
+    }
+    entries = raw_git("status", "--porcelain=v1", "-z").split("\0")
+    index = 0
+    while index < len(entries):
+        entry = entries[index]
+        index += 1
+        if not entry:
+            continue
+        if len(entry) < 4:
+            continue
+        status = entry[:2]
+        changed.add(entry[3:])
+        if "R" in status or "C" in status:
+            if index < len(entries) and entries[index]:
+                changed.add(entries[index])
+            index += 1
+    return changed
 
 
 def _write_comparison(
@@ -884,8 +968,10 @@ def _run_lane_eval_loop(
     comparison_result = None
     vector_comparison: VectorComparison | None = None
     infra_retries = 0
+    attempts = 0
     try:
-        for _ in range(max_candidate_samples):
+        while len(samples) < max_candidate_samples:
+            attempts += 1
             outcome = run_eval_once(
                 candidate_file=None,
                 minibatch_id=run_state.reflection_minibatch_id,
@@ -937,7 +1023,9 @@ def _run_lane_eval_loop(
             if vector_mode:
                 raw_record = outcome.summary.get("vector_record")
                 if not isinstance(raw_record, dict):
-                    raise typer.BadParameter("Vector acceptance requires a vector metric record.")
+                    raise typer.BadParameter(
+                        "Vector acceptance requires a vector metric record."
+                    )
                 current = VectorRecord.from_dict(raw_record)
                 store = VectorRecordStore(vector_records_path(run_id, workspace_root))
                 candidate_records = tuple(store.matching(current.key))
@@ -950,16 +1038,24 @@ def _run_lane_eval_loop(
                 )
                 comparator = resolve_vector_comparator(
                     str(cfg.acceptance.comparator),
-                    expected_root=(workspace_root if cfg.acceptance.pinned_scorer else candidate_project),
+                    expected_root=(
+                        workspace_root
+                        if cfg.acceptance.pinned_scorer
+                        else candidate_project
+                    ),
                 )
                 vector_comparison = compare_vectors(
                     comparator,
                     VectorComparisonRequest(
                         incumbent=incumbent_records,
                         candidate=candidate_records,
-                        attempt=1,
+                        attempt=attempts,
                         escalation=max(0, len(samples) - initial_samples),
-                        journal_context={"run_id": run_id, "lane": lane, "iteration": lane_state.iteration},
+                        journal_context={
+                            "run_id": run_id,
+                            "lane": lane,
+                            "iteration": lane_state.iteration,
+                        },
                     ),
                 )
                 if vector_comparison.verdict != "needs_escalation":
@@ -969,7 +1065,10 @@ def _run_lane_eval_loop(
                         verdict="equivalent",
                         ranking_key=vector_comparison.ranking_key,
                         display_score=vector_comparison.display_score,
-                        detail={**vector_comparison.detail, "escalation_exhausted": True},
+                        detail={
+                            **vector_comparison.detail,
+                            "escalation_exhausted": True,
+                        },
                     )
                     break
             else:
@@ -1046,8 +1145,7 @@ def _run_lane_eval_loop(
         root=workspace_root,
     )
     typer.echo(
-        f"Lane {lane} verdict: {verdict} "
-        f"(display={display:+.4f}); event {verdict_id}."
+        f"Lane {lane} verdict: {verdict} (display={display:+.4f}); event {verdict_id}."
     )
     return lane_state
 
@@ -1281,7 +1379,10 @@ def lane_continue(
             )
             raise typer.Exit(code=1)
 
-        if not foreground:
+        # Direct foreground continues and detached-parent continues both run
+        # the gate. Only the fenced child skips it because its parent already
+        # gated the exact unchanged worktree before spawning the child.
+        if not (foreground and handoff_lease_epoch is not None):
             rejected = _candidate_gate(
                 workspace_root=workspace_root, run_state=run_state, state=state
             )

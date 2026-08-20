@@ -63,6 +63,7 @@ class AcceptanceConfig:
     require_probe_receipt: bool = False
     pinned_scorer: bool = False
     component_files: tuple[str, ...] = ()
+    meta_files: tuple[str, ...] = ("prediction.json",)
     reviewer: str | None = None
     reviewer_kind: Literal["module", "agent", "command"] = "module"
     reviewer_options: dict[str, Any] = field(default_factory=dict)
@@ -77,13 +78,27 @@ class AcceptanceConfig:
         if mode not in {"scalar", "vector"}:
             raise GepaConfigError("acceptance.mode must be 'scalar' or 'vector'.")
         comparator = data.get("comparator")
-        if mode == "vector" and (not isinstance(comparator, str) or ":" not in comparator):
+        if mode == "vector" and (
+            not isinstance(comparator, str) or ":" not in comparator
+        ):
             raise GepaConfigError(
                 "acceptance.comparator is required in vector mode (module:factory)."
             )
         files = data.get("component_files", [])
-        if not isinstance(files, list) or not all(isinstance(item, str) for item in files):
-            raise GepaConfigError("acceptance.component_files must be an array of paths.")
+        if not isinstance(files, list) or not all(
+            isinstance(item, str) for item in files
+        ):
+            raise GepaConfigError(
+                "acceptance.component_files must be an array of paths."
+            )
+        raw_meta_files = data.get("meta_files", ["prediction.json"])
+        if not isinstance(raw_meta_files, list) or not all(
+            isinstance(item, str) for item in raw_meta_files
+        ):
+            raise GepaConfigError("acceptance.meta_files must be an array of paths.")
+        meta_files = list(raw_meta_files)
+        if "prediction.json" not in meta_files:
+            meta_files.append("prediction.json")
         raw_reviewer = data.get("reviewer")
         reviewer_kind: Literal["module", "agent", "command"] = "module"
         reviewer_options: dict[str, Any] = {}
@@ -92,7 +107,9 @@ class AcceptanceConfig:
         elif isinstance(raw_reviewer, dict):
             kind = raw_reviewer.get("provider", "module")
             if kind not in {"module", "agent", "command"}:
-                raise GepaConfigError("acceptance.reviewer.provider must be module, agent, or command.")
+                raise GepaConfigError(
+                    "acceptance.reviewer.provider must be module, agent, or command."
+                )
             reviewer_kind = kind
             reviewer = raw_reviewer.get("factory" if kind == "module" else "ref")
             if kind == "command":
@@ -101,11 +118,19 @@ class AcceptanceConfig:
         elif raw_reviewer is None:
             reviewer = None
         else:
-            raise GepaConfigError("acceptance.reviewer must be a reference or TOML table.")
+            raise GepaConfigError(
+                "acceptance.reviewer must be a reference or TOML table."
+            )
         if reviewer is not None and not isinstance(reviewer, str):
             raise GepaConfigError("acceptance.reviewer reference must be a string.")
-        if reviewer_kind in {"module", "agent"} and reviewer is not None and ":" not in reviewer:
-            raise GepaConfigError("acceptance reviewer module references must be module:attr.")
+        if (
+            reviewer_kind in {"module", "agent"}
+            and reviewer is not None
+            and ":" not in reviewer
+        ):
+            raise GepaConfigError(
+                "acceptance reviewer module references must be module:attr."
+            )
         context = data.get("review_context", {}) or {}
         if not isinstance(context, dict):
             raise GepaConfigError("acceptance.review_context must be a TOML table.")
@@ -117,6 +142,7 @@ class AcceptanceConfig:
             require_probe_receipt=bool(data.get("require_probe_receipt", False)),
             pinned_scorer=bool(data.get("pinned_scorer", False)),
             component_files=tuple(files),
+            meta_files=tuple(meta_files),
             reviewer=reviewer,
             reviewer_kind=reviewer_kind,
             reviewer_options=reviewer_options,

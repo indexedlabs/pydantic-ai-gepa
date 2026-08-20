@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import shlex
 import subprocess
 import tempfile
@@ -46,11 +47,16 @@ class CandidateReviewVerdict:
     findings: tuple[ReviewFinding, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.disposition == "pass" and self.findings:
-            raise ValueError("Passing review verdicts cannot carry findings.")
+        if self.disposition == "pass" and any(
+            finding.severity == "error" for finding in self.findings
+        ):
+            raise ValueError("Passing review verdicts cannot carry error findings.")
 
     def to_dict(self) -> dict[str, Any]:
-        return {"disposition": self.disposition, "findings": [asdict(item) for item in self.findings]}
+        return {
+            "disposition": self.disposition,
+            "findings": [asdict(item) for item in self.findings],
+        }
 
 
 @runtime_checkable
@@ -58,11 +64,29 @@ class CandidateReviewer(Protocol):
     def review(self, request: CandidateReviewRequest) -> CandidateReviewVerdict: ...
 
 
-def resolve_candidate_reviewer(ref: str, *, expected_root: Path | None = None) -> CandidateReviewer:
+def resolve_candidate_reviewer(
+    ref: str, *, expected_root: Path | None = None
+) -> CandidateReviewer:
     from .cli.layout import resolve_module_attr
 
-    factory = resolve_module_attr(ref, kind="candidate reviewer", expected_root=expected_root)
-    reviewer = factory() if callable(factory) and not hasattr(factory, "review") else factory
+    factory = resolve_module_attr(
+        ref, kind="candidate reviewer", expected_root=expected_root
+    )
+    if inspect.isclass(factory):
+        try:
+            reviewer = factory()
+        except TypeError as exc:
+            raise TypeError(
+                "Reviewer classes must be constructible without arguments."
+            ) from exc
+    else:
+        reviewer = (
+            factory()
+            if callable(factory) and not hasattr(factory, "review")
+            else factory
+        )
+    if inspect.isclass(reviewer):
+        raise TypeError("Reviewer factory returned a class instead of an instance.")
     if not isinstance(reviewer, CandidateReviewer):
         raise TypeError("Reviewer factory must return an object with review(request).")
     return reviewer
@@ -98,7 +122,18 @@ class AgentCandidateReviewer:
             responses.append(_AgentVerdict.model_validate(value))
         failing = [item for item in responses if item.disposition == "fail"]
         if len(failing) * 2 <= self.samples:
-            return CandidateReviewVerdict("pass")
+            advisories = tuple(
+                ReviewFinding(
+                    component=item.component,
+                    excerpt=item.excerpt,
+                    explanation=item.explanation,
+                    severity=item.severity,
+                )
+                for response in responses
+                for item in response.findings
+                if item.severity != "error"
+            )
+            return CandidateReviewVerdict("pass", advisories)
         findings = tuple(
             ReviewFinding(
                 component=item.component,
@@ -134,7 +169,9 @@ class CommandCandidateReviewer:
             with tempfile.TemporaryDirectory(prefix="gepa-review-") as temporary:
                 root = Path(temporary)
                 request_path = root / "request.json"
-                request_path.write_text(json.dumps(request.to_dict(), indent=2), encoding="utf-8")
+                request_path.write_text(
+                    json.dumps(request.to_dict(), indent=2), encoding="utf-8"
+                )
                 output = root / self.output_path
                 argv = shlex.split(
                     self.command_template.format(
@@ -144,14 +181,27 @@ class CommandCandidateReviewer:
                     )
                 )
                 try:
-                    subprocess.run(argv, cwd=root, check=True, timeout=self.timeout_secs)
+                    subprocess.run(
+                        argv, cwd=root, check=True, timeout=self.timeout_secs
+                    )
                     raw = json.loads(output.read_text(encoding="utf-8"))
                     return _verdict_from_mapping(raw)
-                except (OSError, subprocess.SubprocessError, TimeoutError, json.JSONDecodeError, FileNotFoundError, ValueError) as exc:
+                except (
+                    OSError,
+                    subprocess.SubprocessError,
+                    TimeoutError,
+                    json.JSONDecodeError,
+                    FileNotFoundError,
+                    ValueError,
+                ) as exc:
                     last_error = exc
         return CandidateReviewVerdict(
             "fail",
-            (ReviewFinding(None, None, f"Candidate reviewer command failed: {last_error}"),),
+            (
+                ReviewFinding(
+                    None, None, f"Candidate reviewer command failed: {last_error}"
+                ),
+            ),
         )
 
 
@@ -162,14 +212,21 @@ def _verdict_from_mapping(raw: Mapping[str, Any]) -> CandidateReviewVerdict:
     findings_raw = raw.get("findings", [])
     if not isinstance(findings_raw, list):
         raise ValueError("Reviewer findings must be a list.")
-    findings = tuple(
-        ReviewFinding(
-            component=item.get("component"),
-            excerpt=item.get("excerpt"),
-            explanation=str(item["explanation"]),
-            severity=str(item.get("severity", "error")),  # type: ignore[arg-type]
+    findings_list: list[ReviewFinding] = []
+    for item in findings_raw:
+        if not isinstance(item, Mapping):
+            continue
+        raw_severity = item.get("severity", "error")
+        severity: Literal["info", "warning", "error"] = (
+            raw_severity if raw_severity in {"info", "warning", "error"} else "error"
         )
-        for item in findings_raw
-        if isinstance(item, Mapping)
-    )
+        findings_list.append(
+            ReviewFinding(
+                component=item.get("component"),
+                excerpt=item.get("excerpt"),
+                explanation=str(item["explanation"]),
+                severity=severity,
+            )
+        )
+    findings = tuple(findings_list)
     return CandidateReviewVerdict(disposition, findings)

@@ -35,17 +35,67 @@ def _statuses(payload: Any) -> dict[str, Any]:
     }
 
 
+def is_fixed_status_change(before: Any, after: Any) -> bool:
+    """Return whether a probe status moved from fail-like to pass-like."""
+    fail_like = before is False or (
+        isinstance(before, str)
+        and before.casefold() in {"fail", "failed", "failing", "false"}
+    )
+    pass_like = after is True or (
+        isinstance(after, str)
+        and after.casefold() in {"pass", "passed", "passing", "true"}
+    )
+    return fail_like and pass_like
+
+
+def _receipt_proof(
+    worktree: Path, case: str, changes: Mapping[str, Any]
+) -> dict[str, str] | None:
+    """Bind a receipt to one predicted key/case/fixed direction."""
+    requested: list[str] = []
+    prediction_path = worktree / "prediction.json"
+    if prediction_path.is_file():
+        try:
+            raw = json.loads(prediction_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            raw = {}
+        predictions = raw.get("predictions", []) if isinstance(raw, Mapping) else []
+        if isinstance(predictions, list):
+            requested = [
+                str(item["key"])
+                for item in predictions
+                if isinstance(item, Mapping)
+                and item.get("case") == case
+                and item.get("direction") == "fail_to_pass"
+                and isinstance(item.get("key"), str)
+            ]
+    candidates = [*requested, *(key for key in sorted(changes) if key not in requested)]
+    for key in candidates:
+        change = changes.get(key)
+        if isinstance(change, Mapping) and is_fixed_status_change(
+            change.get("before"), change.get("after")
+        ):
+            return {"key": key, "case": case, "direction": "fail_to_pass"}
+    return None
+
+
 def probe(
     case: str = typer.Option(..., "--case", help="Frozen dataset case id to probe."),
-    lane: str | None = typer.Option(None, "--lane", help="Lane to probe; required when a run has multiple lanes."),
-    run_id: str | None = typer.Option(None, "--run-id", help="Defaults to the latest lane run."),
+    lane: str | None = typer.Option(
+        None, "--lane", help="Lane to probe; required when a run has multiple lanes."
+    ),
+    run_id: str | None = typer.Option(
+        None, "--run-id", help="Defaults to the latest lane run."
+    ),
 ) -> None:
     """Evaluate one case without spending acceptance budget or Pareto eligibility."""
     workspace_root, run_state = _resolve_lane_run(run_id)
     if lane is None:
         states = load_all_lane_states(workspace_root, run_state.run_id)
         if len(states) != 1:
-            raise typer.BadParameter("--lane is required when the run has multiple lanes.")
+            raise typer.BadParameter(
+                "--lane is required when the run has multiple lanes."
+            )
         lane = states[0].lane
     state = load_lane_state(workspace_root, run_state.run_id, lane)
     if not state.worktree_path or not state.candidate_project_path:
@@ -56,12 +106,22 @@ def probe(
     worktree = Path(state.worktree_path)
     candidate_root = Path(state.candidate_project_path)
     outcome = run_eval_once(
-        candidate_file=None, minibatch_id=None, size=1, seed=run_state.seed,
-        epoch=run_state.next_epoch, run_id=run_state.run_id,
-        concurrency=run_state.concurrency, max_iterations=run_state.max_iterations,
-        threshold=run_state.threshold, capture_traces=True, candidate_source="git",
-        lane=lane, candidate_root=candidate_root, workspace_root=workspace_root,
-        case_id=case, row_scope="probe",
+        candidate_file=None,
+        minibatch_id=None,
+        size=1,
+        seed=run_state.seed,
+        epoch=run_state.next_epoch,
+        run_id=run_state.run_id,
+        concurrency=run_state.concurrency,
+        max_iterations=run_state.max_iterations,
+        threshold=run_state.threshold,
+        capture_traces=True,
+        candidate_source="git",
+        lane=lane,
+        candidate_root=candidate_root,
+        workspace_root=workspace_root,
+        case_id=case,
+        row_scope="probe",
         vector_incumbent_hash=run_state.reflection_baseline_candidate_id,
     )
     raw = outcome.summary.get("vector_record")
@@ -69,9 +129,11 @@ def probe(
         raise typer.BadParameter("Probe metric did not produce a vector record.")
     candidate = VectorRecord.from_dict(raw)
     store = VectorRecordStore(vector_records_path(run_state.run_id, workspace_root))
-    baseline = store.matching(candidate.key, candidate_hash=candidate.key.incumbent_hash)
+    baseline = store.matching_incumbent_for_case(candidate.key, case_id=case)
     if not baseline:
-        raise typer.BadParameter("No compatible incumbent vector record is available for this probe.")
+        raise typer.BadParameter(
+            "No compatible incumbent vector record is available for this probe."
+        )
     before = _statuses(baseline[-1].assertions.get(case))
     after = _statuses(candidate.assertions.get(case))
     changes = {
@@ -80,19 +142,30 @@ def probe(
         if before.get(key) != after.get(key)
     }
     receipt = {
-        "receipt_version": 1, "run_id": run_state.run_id, "lane": lane,
-        "iteration": state.iteration, "case": case,
-        "candidate_component_hash": component_hash(worktree, cfg.acceptance.component_files),
+        "receipt_version": 1,
+        "run_id": run_state.run_id,
+        "lane": lane,
+        "iteration": state.iteration,
+        "case": case,
+        "candidate_component_hash": component_hash(
+            worktree, cfg.acceptance.component_files
+        ),
         "candidate_hash": candidate.key.candidate_hash,
         "incumbent_hash": candidate.key.incumbent_hash,
-        "inventory_hash": candidate.key.inventory_hash,
+        "inventory_hash": baseline[-1].key.inventory_hash,
         "scorer_identity": candidate.key.scorer_identity,
         "vector_schema_version": candidate.key.vector_schema_version,
         "telemetry_schema_version": candidate.key.telemetry_schema_version,
-        "changes": changes, "row_scope": "probe",
+        "changes": changes,
+        "proof": _receipt_proof(worktree, case, changes),
+        "row_scope": "probe",
     }
     directory = probe_receipts_dir(run_state.run_id, workspace_root)
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{lane}-{state.iteration:04d}-{case}.json"
-    path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    typer.echo(json.dumps({"receipt_path": str(path), "changes": changes}, sort_keys=True))
+    path.write_text(
+        json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    typer.echo(
+        json.dumps({"receipt_path": str(path), "changes": changes}, sort_keys=True)
+    )

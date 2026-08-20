@@ -322,6 +322,18 @@ tests/                # Test suite
 
 In addition to the Python `optimize_agent()` entry point, `pydantic-ai-gepa` ships a `gepa` CLI that lets coding agents (Claude Code, Codex, etc.) drive the optimization loop directly. The CLI exposes `init`, `run`, `eval`, `apply`, `components`, `pareto`, `journal`, `next`, `ack`, and `lane`. For agent-driven optimization, prefer `gepa run start --max-iterations N`: it evaluates minibatches until reflection is useful, writes report and trace paths, pauses for the coding agent to edit components or source, then `gepa run continue` evaluates those edits against the same mini-valset. Stochastic pipelines can use `--acceptance-repetitions`, `--acceptance-max-repetitions`, `--acceptance-confidence`, and `--acceptance-min-delta` so candidate decisions carry repeated samples, variance, confidence bounds, and an accepted/rejected/equivalent/inconclusive verdict instead of comparing two single rollout means. In git candidate mode, `gepa run start --lanes N` additionally fans the run out into N worktree-backed reflection lanes evaluated in the background and coordinated by an event stream (`gepa next` / `gepa ack` / `gepa run select`), so a coding agent can orchestrate several isolated reflector subagents in parallel — see the "Parallel reflection lanes" section of the bundled skill at [`src/pydantic_ai_gepa/skills/gepa_optimize/SKILL.md`](src/pydantic_ai_gepa/skills/gepa_optimize/SKILL.md) for the orchestrator loop, the subagent dispatch contract, and the content-file convention.
 
+### Pinned-scorer component IDs
+
+Assertion-vector runs can set `acceptance.pinned_scorer = true` to load the
+metric, comparator, and reviewer from the incumbent workspace instead of the
+candidate worktree. In this mode, every entry in
+`acceptance.component_files` serves two roles: it is an allowed relative file
+path and the exact component ID supplied in the candidate component map. For
+example, `component_files = ["prompts/planner.md"]` supplies the component as
+`{"prompts/planner.md": <text>}`. Downstream harnesses must accept these
+file-path component IDs. Non-component run metadata belongs in
+`acceptance.meta_files`; `prediction.json` is always treated as metadata.
+
 ## More Info
 
 - **[docs/gepa.md](docs/gepa.md)** - GEPA algorithm details

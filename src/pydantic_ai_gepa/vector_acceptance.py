@@ -2,12 +2,17 @@
 
 The optimizer deliberately treats assertion keys and latency payloads as opaque.
 Harnesses own their meaning through a comparator configured from ``gepa.toml``.
+In pinned-scorer mode, component-map keys are the exact relative file paths
+declared by ``acceptance.component_files``; harnesses must accept those paths
+as component ids.
 """
 
 from __future__ import annotations
 
 import hashlib
 import importlib
+import importlib.util
+import inspect
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -60,6 +65,9 @@ class VectorRecord:
         key = raw.get("key")
         if not isinstance(key, Mapping):
             raise ValueError("Vector record is missing its key.")
+        outcome = raw.get("outcome", "scored")
+        if outcome not in {"scored", "infra_error"}:
+            raise ValueError("Vector record outcome must be 'scored' or 'infra_error'.")
         return cls(
             key=VectorRecordKey(
                 run_id=str(key["run_id"]),
@@ -74,7 +82,7 @@ class VectorRecord:
             assertions=dict(raw.get("assertions") or {}),
             latency=dict(raw.get("latency") or {}),
             display_score=float(raw["display_score"]),
-            outcome=str(raw.get("outcome", "scored")),  # type: ignore[arg-type]
+            outcome=outcome,
             error=dict(raw["error"]) if isinstance(raw.get("error"), Mapping) else None,
             record_version=int(raw.get("record_version", VECTOR_RECORD_VERSION)),
         )
@@ -95,6 +103,11 @@ class VectorComparisonRequest:
         if not self.incumbent or not self.candidate:
             raise ValueError("Comparator requires incumbent and candidate records.")
         reference = self.incumbent[0].key
+        candidate_hashes = {record.key.candidate_hash for record in self.candidate}
+        if len(candidate_hashes) != 1:
+            raise ValueError(
+                "Refusing vector comparison across more than one candidate hash."
+            )
         for record in records:
             key = record.key
             if (
@@ -141,7 +154,9 @@ class VectorComparator(Protocol):
     def compare(self, request: VectorComparisonRequest) -> VectorComparison: ...
 
 
-def resolve_vector_comparator(ref: str, *, expected_root: Path | None = None) -> VectorComparator:
+def resolve_vector_comparator(
+    ref: str, *, expected_root: Path | None = None
+) -> VectorComparator:
     """Resolve a ``module:factory`` comparator and validate its narrow API."""
     if ":" not in ref:
         raise ValueError("Comparator must be a 'module:factory' reference.")
@@ -152,15 +167,35 @@ def resolve_vector_comparator(ref: str, *, expected_root: Path | None = None) ->
         try:
             module_file.relative_to(expected_root.resolve())
         except ValueError as exc:
-            raise ValueError(f"Comparator {ref!r} is outside pinned scorer root.") from exc
+            raise ValueError(
+                f"Comparator {ref!r} is outside pinned scorer root."
+            ) from exc
     factory = getattr(module, attr)
-    comparator = factory() if callable(factory) and not hasattr(factory, "compare") else factory
+    if inspect.isclass(factory):
+        try:
+            comparator = factory()
+        except TypeError as exc:
+            raise TypeError(
+                "Comparator classes must be constructible without arguments."
+            ) from exc
+    else:
+        comparator = (
+            factory()
+            if callable(factory) and not hasattr(factory, "compare")
+            else factory
+        )
+    if inspect.isclass(comparator):
+        raise TypeError("Comparator factory returned a class instead of an instance.")
     if not isinstance(comparator, VectorComparator):
-        raise TypeError("Comparator factory must return an object with compare(request).")
+        raise TypeError(
+            "Comparator factory must return an object with compare(request)."
+        )
     return comparator
 
 
-def compare_vectors(comparator: VectorComparator, request: VectorComparisonRequest) -> VectorComparison:
+def compare_vectors(
+    comparator: VectorComparator, request: VectorComparisonRequest
+) -> VectorComparison:
     """Invoke a comparator after enforcing record compatibility and result shape."""
     request.validate_compatible()
     result = comparator.compare(request)
@@ -190,7 +225,9 @@ class VectorRecordStore:
             output.append(VectorRecord.from_dict(json.loads(line)))
         return output
 
-    def matching(self, key: VectorRecordKey, *, candidate_hash: str | None = None) -> list[VectorRecord]:
+    def matching(
+        self, key: VectorRecordKey, *, candidate_hash: str | None = None
+    ) -> list[VectorRecord]:
         target = candidate_hash or key.candidate_hash
         matches = [
             record
@@ -206,20 +243,74 @@ class VectorRecordStore:
         ]
         return sorted(matches, key=lambda item: item.key.repetition)
 
+    def matching_incumbent_for_case(
+        self, key: VectorRecordKey, *, case_id: str
+    ) -> list[VectorRecord]:
+        """Find pooled incumbent reps containing ``case_id`` across inventories.
+
+        A probe intentionally has a one-case inventory hash, while its
+        incumbent was scored on the frozen full inventory. All other identity
+        and schema dimensions remain binding.
+        """
+        matches = [
+            record
+            for record in self.records()
+            if record.key.run_id == key.run_id
+            and record.key.scorer_identity == key.scorer_identity
+            and record.key.incumbent_hash == key.incumbent_hash
+            and record.key.candidate_hash == key.incumbent_hash
+            and record.key.vector_schema_version == key.vector_schema_version
+            and record.key.telemetry_schema_version == key.telemetry_schema_version
+            and record.outcome == "scored"
+            and case_id in record.assertions
+        ]
+        return sorted(matches, key=lambda item: item.key.repetition)
+
 
 def inventory_hash(case_ids: Sequence[str]) -> str:
     return hashlib.sha256(json.dumps(sorted(case_ids)).encode()).hexdigest()
 
 
 def scorer_identity(refs: Sequence[str | None], *, root: Path | None = None) -> str:
-    """Hash configured scorer references plus their pinned source bytes when present."""
+    """Hash configured scorer references and their resolved module source bytes."""
     digest = hashlib.sha256()
     for ref in refs:
         digest.update((ref or "").encode())
         digest.update(b"\0")
-    if root is not None:
-        digest.update(str(root.resolve()).encode())
+        if ref is None:
+            continue
+        module_name = ref.split(":", 1)[0]
+        source_path = _resolve_module_source(module_name, root=root)
+        digest.update(source_path.read_bytes())
+        digest.update(b"\0")
     return digest.hexdigest()
+
+
+def _resolve_module_source(module_name: str, *, root: Path | None) -> Path:
+    """Resolve one module without making an import cache part of its identity."""
+    relative = Path(*module_name.split("."))
+    candidates: list[Path] = []
+    if root is not None:
+        resolved_root = root.resolve()
+        for prefix in (resolved_root, resolved_root / "src"):
+            candidates.extend(
+                (
+                    prefix / relative.with_suffix(".py"),
+                    prefix / relative / "__init__.py",
+                )
+            )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    spec = importlib.util.find_spec(module_name)
+    if spec is None or not spec.origin or spec.origin in {"built-in", "frozen"}:
+        raise ValueError(
+            f"Could not resolve source bytes for scorer module {module_name!r}."
+        )
+    source = Path(spec.origin).resolve()
+    if not source.is_file():
+        raise ValueError(f"Scorer module {module_name!r} has no readable source file.")
+    return source
 
 
 def side_info_vector(records: Sequence[Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -230,7 +321,9 @@ def side_info_vector(records: Sequence[Any]) -> tuple[dict[str, Any], dict[str, 
         payload = getattr(record, "payload", {})
         info = payload.get("side_info") if isinstance(payload, Mapping) else None
         if not isinstance(info, Mapping):
-            trajectory = payload.get("trajectory") if isinstance(payload, Mapping) else None
+            trajectory = (
+                payload.get("trajectory") if isinstance(payload, Mapping) else None
+            )
             info = getattr(trajectory, "metric_side_info", None)
         if not isinstance(info, Mapping):
             continue
