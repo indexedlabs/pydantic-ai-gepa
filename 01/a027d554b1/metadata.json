@@ -1,0 +1,9 @@
+{
+  "checkpoint_id": "01a027d554b1",
+  "created_at": "2026-08-22T04:58:07.475077+00:00",
+  "branch_name": "v1/supervision-gate-notes",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "325834977901445b88c73d8885906466ef017a0d"
+  ]
+}
