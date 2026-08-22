@@ -55,13 +55,14 @@ from .layout import (
     current_gepa_dirname,
     gepa_dir,
     git_root,
+    notes_dir,
     project_prefix,
     project_root_for_workspace,
     repo_root,
     run_dir,
 )
 from .notes import notes_index
-from .runs import utc_now_iso
+from .runs import MinibatchStore, utc_now_iso
 
 LaneStatus = Literal[
     "created",
@@ -447,7 +448,7 @@ def write_packet(
         ),
         "journal_tail": _journal_tail(workspace_root, run_state.journal_tail_lines),
         "notes_index": [
-            note.to_dict() for note in notes_index(gepa_dir(workspace_root) / "notes")
+            note.to_dict() for note in notes_index(notes_dir(workspace_root))
         ],
         "continue_cwd": str(candidate_project),
         "continue_argv": continue_argv,
@@ -524,8 +525,14 @@ def _auto_commit_worktree(
         for excluded in (exclude_paths or candidate_identity_exempt_paths(worktree))
     ]
     _git(worktree, "add", "-A", "--", ".", *excluded_pathspecs)
-    status = _git(worktree, "status", "--porcelain")
-    if status:
+    has_staged_changes = (
+        subprocess.run(
+            ["git", "-C", str(worktree), "diff", "--cached", "--quiet"],
+            check=False,
+        ).returncode
+        != 0
+    )
+    if has_staged_changes:
         _git(
             worktree,
             "-c",
@@ -674,9 +681,14 @@ def _run_lane_eval_loop(
         else candidate_project_root(workspace_root, worktree)
     )
     branch = str(lane_state.branch)
+    try:
+        workspace_relative = (
+            gepa_dir(workspace_root).resolve().relative_to(workspace_root.resolve())
+        )
+    except ValueError:
+        workspace_relative = None
     candidate_exclusions = candidate_identity_exempt_paths(
-        candidate_project,
-        workspace_relative_path=gepa_dir(workspace_root).relative_to(workspace_root),
+        candidate_project, workspace_relative_path=workspace_relative
     )
     commit_sha = _auto_commit_worktree(
         worktree, branch, lane, exclude_paths=candidate_exclusions
@@ -724,6 +736,8 @@ def _run_lane_eval_loop(
     os.chdir(candidate_project)
     samples: list[float] = []
     outcomes: list[Any] = []
+    gate_outcomes: list[Any] = []
+    gate_comparison: dict[str, Any] | None = None
     comparison_result = None
     try:
         if gate_cases:
@@ -736,7 +750,6 @@ def _run_lane_eval_loop(
                 candidate_root=candidate_project,
                 lane=lane,
             )
-            outcomes.extend(gate_outcomes)
             if str(gate_outcomes[0].summary["candidate_id"]) != git_state.candidate_id:
                 raise typer.BadParameter(
                     "The lane candidate changed during gate evaluation; "
@@ -748,7 +761,7 @@ def _run_lane_eval_loop(
                     run_state=run_state,
                     lane_state=lane_state,
                     git_state=git_state,
-                    outcomes=outcomes,
+                    outcomes=gate_outcomes,
                     failures=evaluation_infrastructure_failures(
                         gate_outcomes[-1].records
                     ),
@@ -795,7 +808,24 @@ def _run_lane_eval_loop(
                     root=workspace_root,
                 )
                 return completed
-        for _ in range(max_candidate_samples):
+        for sample_index in range(max_candidate_samples):
+            selected_case_ids = None
+            supplemental_records = ()
+            if sample_index == 0 and gate_outcomes:
+                minibatch = MinibatchStore(run_id, workspace_root).load(
+                    run_state.reflection_minibatch_id
+                )
+                remaining_case_ids = tuple(
+                    case_id
+                    for case_id in minibatch.case_ids
+                    if case_id not in gate_cases
+                )
+                # An all-minibatch gate has no complement. Retain the normal
+                # evaluation in that degenerate case rather than asking the
+                # evaluator to score an empty selection.
+                if remaining_case_ids:
+                    selected_case_ids = remaining_case_ids
+                    supplemental_records = gate_outcomes[0].records
             outcome = run_eval_once(
                 candidate_file=None,
                 minibatch_id=run_state.reflection_minibatch_id,
@@ -811,6 +841,8 @@ def _run_lane_eval_loop(
                 lane=lane,
                 candidate_root=candidate_project,
                 workspace_root=workspace_root,
+                selected_case_ids=selected_case_ids,
+                supplemental_records=supplemental_records,
             )
             outcomes.append(outcome)
             current_id = str(outcome.summary["candidate_id"])
@@ -868,6 +900,7 @@ def _run_lane_eval_loop(
             for outcome in outcomes
             if outcome.summary.get("trace_path")
         ],
+        "gate": gate_comparison,
         **comparison_result.to_dict(),
     }
     comparison_path = _write_comparison(
@@ -1062,6 +1095,10 @@ def lane_continue(
     """
     _validate_lane_id(lane)
     workspace_root, run_state = _resolve_lane_run(run_id)
+    if gate_case:
+        from .run import _validate_gate_cases
+
+        _validate_gate_cases(run_state, gate_case, root=workspace_root)
     now = datetime.now(timezone.utc)
 
     with _lane_lock(workspace_root, run_state.run_id, lane):

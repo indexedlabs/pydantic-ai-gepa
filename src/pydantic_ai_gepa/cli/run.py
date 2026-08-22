@@ -86,6 +86,7 @@ class RunState:
     reflection_baseline_commit_sha: str | None = None
     reflection_baseline_mean_score: float | None = None
     reflection_baseline_samples: tuple[float, ...] = ()
+    reflection_baseline_eval_ids: tuple[str, ...] = ()
     reflection_baseline_iteration: int | None = None
     reflection_baseline_report_path: str | None = None
     reflection_baseline_report_paths: tuple[str, ...] = ()
@@ -110,6 +111,10 @@ class RunState:
     journal_tail_lines: int = 20
     stall_threshold: int = 5
     iterations_since_acceptance: int = 0
+    # Gate comparisons do not write Pareto rows, but a rejected gate is still
+    # a consumed managed-run iteration. Keep this independently so budget
+    # accounting never depends on emitting forbidden gate rows.
+    gate_consumed_iterations: int = 0
     # Set at fan-out/re-fan: the straggler-timeout clock starts here, immune
     # to unrelated run-state saves refreshing updated_at (spec-er3).
     iteration_started_at: str | None = None
@@ -144,6 +149,7 @@ class RunState:
             "reflection_baseline_commit_sha": self.reflection_baseline_commit_sha,
             "reflection_baseline_mean_score": self.reflection_baseline_mean_score,
             "reflection_baseline_samples": list(self.reflection_baseline_samples),
+            "reflection_baseline_eval_ids": list(self.reflection_baseline_eval_ids),
             "reflection_baseline_iteration": self.reflection_baseline_iteration,
             "reflection_baseline_report_path": self.reflection_baseline_report_path,
             "reflection_baseline_report_paths": list(
@@ -170,6 +176,7 @@ class RunState:
             "journal_tail_lines": self.journal_tail_lines,
             "stall_threshold": self.stall_threshold,
             "iterations_since_acceptance": self.iterations_since_acceptance,
+            "gate_consumed_iterations": self.gate_consumed_iterations,
             "iteration_started_at": self.iteration_started_at,
             "select_phase": self.select_phase,
             "select_context": self.select_context,
@@ -222,6 +229,9 @@ class RunState:
                         else []
                     ),
                 )
+            ),
+            reflection_baseline_eval_ids=tuple(
+                str(value) for value in data.get("reflection_baseline_eval_ids", ())
             ),
             reflection_baseline_iteration=(
                 int(data["reflection_baseline_iteration"])
@@ -283,6 +293,7 @@ class RunState:
             journal_tail_lines=int(data.get("journal_tail_lines", 20)),
             stall_threshold=int(data.get("stall_threshold", 5)),
             iterations_since_acceptance=int(data.get("iterations_since_acceptance", 0)),
+            gate_consumed_iterations=int(data.get("gate_consumed_iterations", 0)),
             iteration_started_at=data.get("iteration_started_at"),
             select_phase=(
                 str(data["select_phase"])
@@ -494,6 +505,9 @@ def _mark_reflection_pause(state: RunState, outcomes: list[EvalOutcome]) -> RunS
         reflection_baseline_commit_sha=_summary_commit_sha(first_summary),
         reflection_baseline_mean_score=baseline_mean_score,
         reflection_baseline_samples=baseline_samples,
+        reflection_baseline_eval_ids=tuple(
+            str(outcome.summary["eval_id"]) for outcome in outcomes
+        ),
         reflection_baseline_iteration=int(first_summary["iterations"]),
         reflection_baseline_report_path=str(first_summary["report_path"]),
         reflection_baseline_report_paths=tuple(
@@ -551,6 +565,21 @@ def _consume_candidate_verdict(state: RunState, *, accepted: bool) -> RunState:
     )
 
 
+def _consume_gate_rejection(state: RunState) -> RunState:
+    """Record a rejected gate as one budgeted candidate iteration.
+
+    Gate evaluations intentionally have no Pareto rows, so their budget cost
+    must be represented explicitly in managed-run state.
+    """
+
+    state = _consume_candidate_verdict(state, accepted=False)
+    return _with_timestamp(
+        state,
+        iterations=state.iterations + 1,
+        gate_consumed_iterations=state.gate_consumed_iterations + 1,
+    )
+
+
 def _clear_reflection_baseline(state: RunState) -> RunState:
     return _with_timestamp(
         state,
@@ -559,6 +588,7 @@ def _clear_reflection_baseline(state: RunState) -> RunState:
         reflection_baseline_commit_sha=None,
         reflection_baseline_mean_score=None,
         reflection_baseline_samples=(),
+        reflection_baseline_eval_ids=(),
         reflection_baseline_iteration=None,
         reflection_baseline_report_path=None,
         reflection_baseline_report_paths=(),
@@ -699,6 +729,9 @@ def _advance_to_reflection_or_done(
 
 def _evaluate_reflected_candidate(
     state: RunState,
+    *,
+    gate_outcomes: Sequence[EvalOutcome] = (),
+    gate_case_ids: Sequence[str] = (),
 ) -> tuple[RunState, list[EvalOutcome], dict[str, Any]]:
     if state.reflection_minibatch_id is None:
         typer.echo(
@@ -726,6 +759,17 @@ def _evaluate_reflected_candidate(
     candidate_id: str | None = None
     comparison_result: AcceptanceComparison | None = None
     while len(candidate_samples) < max_candidate_samples:
+        selected_case_ids: Sequence[str] | None = None
+        supplemental_records = ()
+        if not outcomes and gate_outcomes:
+            assert state.reflection_minibatch_id is not None
+            minibatch = MinibatchStore(state.run_id).load(state.reflection_minibatch_id)
+            selected_case_ids = [
+                case_id
+                for case_id in minibatch.case_ids
+                if case_id not in gate_case_ids
+            ]
+            supplemental_records = gate_outcomes[0].records
         outcome = run_eval_once(
             candidate_file=None,
             minibatch_id=state.reflection_minibatch_id,
@@ -738,6 +782,8 @@ def _evaluate_reflected_candidate(
             threshold=state.threshold,
             capture_traces=True,
             candidate_source=state.candidate_source,
+            selected_case_ids=selected_case_ids,
+            supplemental_records=supplemental_records,
         )
         state = _with_last_outcome(state, outcome)
         outcomes.append(outcome)
@@ -812,6 +858,19 @@ def _evaluate_reflected_candidate(
             if outcome.summary.get("trace_path")
         ],
         **comparison_result.to_dict(),
+        "gate": {
+            "cases": list(gate_case_ids),
+            "report_paths": [
+                outcome.summary["report_path"] for outcome in gate_outcomes
+            ],
+            "trace_paths": [
+                outcome.summary["trace_path"]
+                for outcome in gate_outcomes
+                if outcome.summary.get("trace_path")
+            ],
+        }
+        if gate_outcomes
+        else None,
         "recommendation": recommendation,
     }
     if state.candidate_source == "git" and state.reflection_baseline_commit_sha:
@@ -828,15 +887,22 @@ def _gate_baseline_samples(
     """Recover the saved baseline's scores for a declared gate subset."""
 
     assert state.reflection_minibatch_id is not None
-    assert state.reflection_baseline_candidate_id is not None
-    rows = [
-        row
+    if not state.reflection_baseline_eval_ids:
+        raise typer.BadParameter(
+            "The saved reflection baseline lacks evaluation identifiers. "
+            "Start a new reflection iteration."
+        )
+    rows_by_eval_id = {
+        str(row.extra.get("eval_id")): row
         for row in ParetoLog(state.run_id, root).iter_rows()
-        if row.minibatch_id == state.reflection_minibatch_id
-        and row.candidate_id == state.reflection_baseline_candidate_id
+        if row.status not in {"infrastructure_failure"}
+    }
+    rows = [
+        rows_by_eval_id[eval_id]
+        for eval_id in state.reflection_baseline_eval_ids
+        if eval_id in rows_by_eval_id
     ]
     expected = len(state.reflection_baseline_samples)
-    rows = rows[-expected:]
     if len(rows) != expected:
         raise typer.BadParameter(
             "The saved reflection baseline is missing per-case scores required "
@@ -889,9 +955,10 @@ def _evaluate_gate_cases(
 
     gate_case_ids = _validate_gate_cases(state, gate_case_ids, root=workspace_root)
     baseline_samples = _gate_baseline_samples(state, gate_case_ids, root=workspace_root)
-    max_candidate_samples = min(
-        len(baseline_samples), state.max_iterations - state.iterations
-    )
+    remaining = state.max_iterations - state.iterations
+    if lane is not None:
+        remaining = len(baseline_samples)
+    max_candidate_samples = min(len(baseline_samples), remaining)
     if max_candidate_samples < 1:
         raise typer.BadParameter("No evaluation budget remains for gate comparison.")
     initial_samples = min(state.acceptance_repetitions, max_candidate_samples)
@@ -919,6 +986,7 @@ def _evaluate_gate_cases(
             workspace_root=workspace_root,
         )
         outcomes.append(outcome)
+        state = replace(_with_last_outcome(state, outcome), iterations=state.iterations)
         current_candidate_id = str(outcome.summary["candidate_id"])
         if candidate_id is None:
             candidate_id = current_candidate_id
@@ -1593,7 +1661,7 @@ def continue_(
             assert gate_comparison is not None
             comparison = gate_comparison
             comparison_outcomes = gate_outcomes
-            state = _consume_candidate_verdict(state, accepted=False)
+            state = _consume_gate_rejection(state)
             state = _with_timestamp(
                 state,
                 status="paused_after_candidate_eval",
@@ -1604,7 +1672,9 @@ def continue_(
             comparison_outcomes = gate_outcomes
         else:
             state, comparison_outcomes, comparison = _evaluate_reflected_candidate(
-                state
+                state,
+                gate_outcomes=gate_outcomes,
+                gate_case_ids=gate_case,
             )
             outcomes.extend(comparison_outcomes)
 

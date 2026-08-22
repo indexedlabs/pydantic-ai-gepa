@@ -570,6 +570,27 @@ def test_lane_lease_and_double_lease_rejected(git_repo: Path) -> None:
     assert "already leased" in again.output
 
 
+def test_lane_continue_rejects_unknown_gate_before_leasing(git_repo: Path) -> None:
+    run = _start_lane_run(git_repo, lanes=1)
+    run_id = str(run["run_id"])
+
+    result = _run(
+        "--gepa-dir",
+        str(git_repo / ".gepa"),
+        "lane",
+        "continue",
+        "lane-1",
+        "--run-id",
+        run_id,
+        "--gate-case",
+        "not-in-minibatch",
+    )
+
+    assert result.exit_code == 2
+    assert "Available:" in result.output
+    assert _lane_state(git_repo, run_id, "lane-1").status == "paused_for_reflection"
+
+
 def test_lane_continue_evaluates_and_emits_verdict(git_repo: Path) -> None:
     """Reflector flow end-to-end: edit worktree, continue, verdict lands."""
     run = _start_lane_run(git_repo, lanes=1)

@@ -94,7 +94,21 @@ def _resolve_run_id(run_id: str | None, root: Path | None = None) -> str:
 
 
 def _count_evals_in_run(run_id: str, root: Path | None = None) -> int:
-    return ParetoLog(run_id, root).count_rows()
+    rows = ParetoLog(run_id, root).count_rows()
+    # A gate rejection intentionally has no Pareto row. Read its explicit
+    # managed-run counter so the normal pre-evaluation hard budget gate still
+    # stops repeated reflect -> gate-reject cycles.
+    from .layout import run_state_path
+    from .run import RunState
+
+    path = run_state_path(run_id, root)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return rows + RunState.from_dict(data).gate_consumed_iterations
+    except (OSError, ValueError, TypeError):
+        pass
+    return rows
 
 
 DEFAULT_FAILURE_THRESHOLD = 0.999
@@ -297,6 +311,7 @@ def run_eval_once(
     candidate_root: Path | None = None,
     workspace_root: Path | None = None,
     selected_case_ids: Sequence[str] | None = None,
+    supplemental_records: Sequence[EvaluationRecord] = (),
     write_pareto: bool = True,
 ) -> EvalOutcome:
     """Evaluate one baseline/candidate and append the standard run artifacts.
@@ -461,13 +476,19 @@ def run_eval_once(
 
     if source == "git":
         try:
+            try:
+                workspace_relative = (
+                    gepa_dir(primary_project_root)
+                    .resolve()
+                    .relative_to(primary_project_root.resolve())
+                )
+            except ValueError:
+                workspace_relative = None
             git_state = git_candidate_state(
                 active_candidate_project,
                 exclude_paths=candidate_identity_exempt_paths(
                     active_candidate_project,
-                    workspace_relative_path=gepa_dir(primary_project_root).relative_to(
-                        primary_project_root
-                    ),
+                    workspace_relative_path=workspace_relative,
                 ),
             )
         except GitCandidateError as exc:
@@ -562,6 +583,8 @@ def run_eval_once(
                 )
             )
 
+    if supplemental_records:
+        records = [*supplemental_records, *records]
     per_case = {record.case_id: record.score for record in records}
     mean = sum(per_case.values()) / len(per_case) if per_case else 0.0
     infrastructure_failures = evaluation_infrastructure_failures(records)

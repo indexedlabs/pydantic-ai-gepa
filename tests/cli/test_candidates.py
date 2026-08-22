@@ -165,3 +165,18 @@ def test_notes_are_excluded_from_primary_and_lane_candidate_identity(
     assert ".gepa/notes/strategy.md" not in _git(
         worktree, "show", "--format=", "--name-only", "HEAD"
     )
+
+
+def test_lane_auto_commit_skips_excluded_only_changes(tmp_path: Path) -> None:
+    repo = _git_repo(tmp_path)
+    worktree = repo / "worktrees" / "lane-1"
+    worktree.parent.mkdir()
+    branch = "gepa/lane/test"
+    _git(repo, "worktree", "add", "-b", branch, str(worktree))
+    journal = worktree / ".gepa" / "journal.jsonl"
+    journal.parent.mkdir(parents=True)
+    journal.write_text('{"event": "redirect"}\n', encoding="utf-8")
+    before = _git(worktree, "rev-parse", "HEAD")
+
+    assert _auto_commit_worktree(worktree, branch, "lane-1") == before
+    assert _git(worktree, "rev-parse", "HEAD") == before

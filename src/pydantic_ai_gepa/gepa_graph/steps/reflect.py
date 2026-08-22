@@ -129,13 +129,19 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
 
     if state.config.reflection_config and state.config.reflection_config.journal_file:
         from ..proposal.journal_tools import create_journal_toolset
-        from ..proposal.note_tools import create_note_toolset
 
         journal_file = state.config.reflection_config.journal_file
         component_toolsets.append(create_journal_toolset(journal_file))
-        component_toolsets.append(
-            create_note_toolset(Path(journal_file).parent / "notes")
+    if state.config.reflection_config:
+        from ...cli.layout import notes_dir
+        from ..proposal.note_tools import create_note_toolset
+
+        configured_notes_dir = state.config.reflection_config.notes_dir
+        active_notes_dir = (
+            Path(configured_notes_dir) if configured_notes_dir else notes_dir()
         )
+        if active_notes_dir.is_dir():
+            component_toolsets.append(create_note_toolset(active_notes_dir))
 
     import json
 

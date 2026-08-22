@@ -29,7 +29,7 @@ def notes_index(notes_dir: Path) -> list[NoteSummary]:
             frontmatter, _ = _parse_note(path)
             name = frontmatter["name"]
             description = frontmatter["description"]
-        except (OSError, TypeError, ValueError, yaml.YAMLError):
+        except (KeyError, OSError, TypeError, ValueError, yaml.YAMLError):
             continue
         if isinstance(name, str) and isinstance(description, str):
             notes.append(NoteSummary(name=name, description=description, path=path))

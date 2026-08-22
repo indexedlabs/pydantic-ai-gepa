@@ -347,11 +347,17 @@ def candidate_identity_exempt_paths(
     """Paths that are managed metadata, never part of a git candidate identity."""
 
     workspace_root = (root or repo_root()).resolve()
-    workspace = (
-        workspace_root / workspace_relative_path
-        if workspace_relative_path is not None
-        else gepa_dir(workspace_root)
-    )
+    if workspace_relative_path is not None:
+        workspace = workspace_root / workspace_relative_path
+    else:
+        workspace = gepa_dir(workspace_root)
+    try:
+        workspace = workspace.resolve()
+        workspace.relative_to(workspace_root.resolve())
+    except ValueError:
+        # An out-of-tree GEPA_DIR cannot be a pathspec below this candidate;
+        # retain the historical behavior of simply not excluding it.
+        return (workspace_root / "worktrees",)
     return (
         workspace / "runs",
         workspace_root / "worktrees",

@@ -28,3 +28,19 @@ def test_load_note_unknown_name_lists_available_notes(tmp_path: Path) -> None:
     assert toolset.tools["load_note"].function(name="focus") == "reference body\n"  # type: ignore
     with pytest.raises(Exception, match="Available notes: focus"):
         toolset.tools["load_note"].function(name="missing")  # type: ignore
+
+
+def test_notes_index_skips_missing_frontmatter_keys(tmp_path: Path) -> None:
+    notes_dir = tmp_path / ".gepa" / "notes"
+    notes_dir.mkdir(parents=True)
+    (notes_dir / "incomplete.md").write_text(
+        "---\nname: incomplete\n---\nignored\n", encoding="utf-8"
+    )
+    (notes_dir / "valid.md").write_text(
+        "---\nname: valid\ndescription: Usable note\n---\nbody\n",
+        encoding="utf-8",
+    )
+
+    assert [note.to_dict() for note in notes_index(notes_dir)] == [
+        {"name": "valid", "description": "Usable note"}
+    ]

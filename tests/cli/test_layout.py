@@ -15,6 +15,7 @@ from pydantic_ai_gepa.cli.layout import (
     GepaConfigError,
     _module_source_paths,
     candidate_import_context,
+    candidate_identity_exempt_paths,
     candidate_project_root,
     candidate_dir,
     components_dir,
@@ -428,6 +429,22 @@ def test_env_var_falls_back_when_no_explicit_override(
 
     monkeypatch.setenv("GEPA_DIR", ".gepa.from-env")
     assert current_gepa_dirname() == ".gepa.from-env"
+
+
+def test_candidate_exclusions_allow_symlinked_out_of_tree_gepa_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _reset_gepa_dirname: None
+) -> None:
+    workspace_root = tmp_path / "project"
+    workspace_root.mkdir()
+    actual_gepa = tmp_path / "external-gepa"
+    actual_gepa.mkdir()
+    linked_gepa = workspace_root / "linked-gepa"
+    linked_gepa.symlink_to(actual_gepa, target_is_directory=True)
+    monkeypatch.setenv("GEPA_DIR", str(linked_gepa))
+
+    assert candidate_identity_exempt_paths(workspace_root) == (
+        workspace_root.resolve() / "worktrees",
+    )
 
 
 def test_explicit_override_beats_env_var(

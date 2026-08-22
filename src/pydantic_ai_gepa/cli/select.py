@@ -587,7 +587,10 @@ def _phase_promote(
     if winner is None:
         from .run import _consume_candidate_verdict
 
-        state = _consume_candidate_verdict(state, accepted=False)
+        if any(
+            lane_state.verdict in {"rejected", "equivalent"} for lane_state in valid
+        ):
+            state = _consume_candidate_verdict(state, accepted=False)
         typer.echo(
             "No lane was accepted; no promotion. All resolved lanes are "
             "journaled as losers and lanes re-fan onto the current best."

@@ -210,6 +210,40 @@ def test_gate_rejection_skips_full_minibatch_and_pareto(
     assert ParetoLog(run_id).count_rows() == before
 
 
+def test_gate_rejection_consumes_managed_run_budget(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pydantic_ai_gepa.cli import run as run_module
+
+    start = _run(
+        "run",
+        "start",
+        "--size",
+        "2",
+        "--max-iterations",
+        "2",
+        "--acceptance-repetitions",
+        "1",
+    )
+    run_id = str(_run_payload(start.output)["run_id"])
+    original = run_module.run_eval_once
+
+    def gate_loses(**kwargs):
+        outcome = original(**kwargs)
+        if kwargs.get("selected_case_ids"):
+            outcome.summary["mean_score"] = 0.0
+        return outcome
+
+    monkeypatch.setattr(run_module, "run_eval_once", gate_loses)
+    result = _run("run", "continue", "--run-id", run_id, "--gate-case", "case-paris")
+
+    assert result.exit_code == 0, result.output
+    payload = _run_payload(result.output)
+    assert payload["status"] == "done"
+    assert payload["iterations"] == 2
+    assert _load_state(run_id).gate_consumed_iterations == 1
+
+
 def test_gate_passes_then_full_minibatch_verdict_governs(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -232,7 +266,7 @@ def test_gate_passes_then_full_minibatch_verdict_governs(
     def gate_passes(**kwargs):
         calls.append(kwargs)
         outcome = original(**kwargs)
-        if kwargs.get("selected_case_ids"):
+        if kwargs.get("selected_case_ids") == ("case-paris",):
             outcome.summary["mean_score"] = 2.0
         return outcome
 
@@ -242,7 +276,7 @@ def test_gate_passes_then_full_minibatch_verdict_governs(
     assert result.exit_code == 0, result.output
     assert [call.get("selected_case_ids") for call in calls] == [
         ("case-paris",),
-        None,
+        ["case-berlin"],
     ]
     comparison = _run_payload(result.output)["last_comparison"]
     assert isinstance(comparison, dict)
