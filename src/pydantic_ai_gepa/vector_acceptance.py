@@ -272,9 +272,7 @@ class VectorRecordStore:
         ]
         return sorted(matches, key=lambda item: item.key.repetition)
 
-    def records_for_keys(
-        self, keys: Sequence[Mapping[str, Any]]
-    ) -> list[VectorRecord]:
+    def records_for_keys(self, keys: Sequence[Mapping[str, Any]]) -> list[VectorRecord]:
         """Load the most recent persisted record for each exact vector key.
 
         Re-baseline scheduling stores run-start keys, rather than deriving a

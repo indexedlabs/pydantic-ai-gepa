@@ -60,12 +60,14 @@ from .events import EventDraft, LaneScan, LaneScanResult, emit, run_reaper_pass
 from .layout import (
     GepaConfig,
     GepaConfigError,
+    candidate_identity_exempt_paths,
     candidate_project_root,
     config_path,
     current_gepa_dirname,
     gepa_dir,
     git_root,
     journal_path,
+    notes_dir,
     project_prefix,
     project_root_for_workspace,
     repo_root,
@@ -73,7 +75,8 @@ from .layout import (
     run_dir,
     vector_records_path,
 )
-from .runs import utc_now_iso
+from .notes import notes_index
+from .runs import MinibatchStore, utc_now_iso
 
 LaneStatus = Literal[
     "created",
@@ -424,7 +427,11 @@ def _journal_rows(workspace_root: Path, run_id: str, kind: str) -> list[dict[str
             row = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(row, dict) and row.get("run_id") == run_id and row.get("kind") == kind:
+        if (
+            isinstance(row, dict)
+            and row.get("run_id") == run_id
+            and row.get("kind") == kind
+        ):
             rows.append(row)
     return rows
 
@@ -535,6 +542,9 @@ def write_packet(
         },
         "metric_side_info": metric_info,
         "journal_tail": _journal_tail(workspace_root, run_state.journal_tail_lines),
+        "notes_index": [
+            note.to_dict() for note in notes_index(notes_dir(workspace_root))
+        ],
         "continue_cwd": str(candidate_project),
         "continue_argv": continue_argv,
         "continue_invocation": invocation,
@@ -561,6 +571,7 @@ def _lane_continue_argv(
     run_id: str,
     foreground: bool = False,
     handoff_lease_epoch: int | None = None,
+    gate_cases: tuple[str, ...] = (),
 ) -> list[str]:
     """Build a launcher independent of the caller's PATH or active venv."""
 
@@ -581,13 +592,21 @@ def _lane_continue_argv(
         argv.append("--foreground")
     if handoff_lease_epoch is not None:
         argv.extend(["--handoff-lease-epoch", str(handoff_lease_epoch)])
+    for case_name in gate_cases:
+        argv.extend(["--gate-case", case_name])
     return argv
 
 
 # ----------------------------- lane eval --------------------------------
 
 
-def _auto_commit_worktree(worktree: Path, branch: str, lane: str) -> str:
+def _auto_commit_worktree(
+    worktree: Path,
+    branch: str,
+    lane: str,
+    *,
+    exclude_paths: tuple[Path, ...] | None = None,
+) -> str:
     """Commit all worktree changes onto the lane branch; return the HEAD sha.
 
     Lane candidates are always clean commits because continue auto-commits
@@ -601,9 +620,23 @@ def _auto_commit_worktree(worktree: Path, branch: str, lane: str) -> str:
             f"Lane worktree {worktree} is on branch {current_branch!r}, "
             f"expected {branch!r}; run `gepa lane reset {lane}` to recover."
         )
-    _git(worktree, "add", "-A")
-    status = _git(worktree, "status", "--porcelain")
-    if status:
+    # Run metadata and reflector notes are never candidate changes. Resetting
+    # the index is safe (it leaves the worktree untouched), then add only
+    # candidate paths so even a pre-staged note cannot enter this commit.
+    _git(worktree, "reset", "--quiet", "HEAD")
+    excluded_pathspecs = [
+        f":(exclude){excluded.relative_to(worktree).as_posix()}"
+        for excluded in (exclude_paths or candidate_identity_exempt_paths(worktree))
+    ]
+    _git(worktree, "add", "-A", "--", ".", *excluded_pathspecs)
+    has_staged_changes = (
+        subprocess.run(
+            ["git", "-C", str(worktree), "diff", "--cached", "--quiet"],
+            check=False,
+        ).returncode
+        != 0
+    )
+    if has_staged_changes:
         _git(
             worktree,
             "-c",
@@ -726,6 +759,7 @@ def _candidate_gate(
         return None
     from .probe import component_hash, is_fixed_status_change
     from .layout import probe_receipts_dir
+
     prediction_path = worktree / "prediction.json"
     try:
         prediction = json.loads(prediction_path.read_text(encoding="utf-8"))
@@ -763,7 +797,9 @@ def _candidate_gate(
     journal_receipts = _journal_rows(workspace_root, run_state.run_id, "probe_receipt")
     # A reflector may cite a receipt file, but it is only evidence when its
     # complete content is anchored by a prior CLI-authored journal row.
-    for receipt_path in probe_receipts_dir(run_state.run_id, workspace_root).glob("*.json"):
+    for receipt_path in probe_receipts_dir(run_state.run_id, workspace_root).glob(
+        "*.json"
+    ):
         try:
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -843,7 +879,9 @@ def _review_rejection(
     rejected = LaneState(
         **{
             **state.to_dict(),
-            "status": "stalled" if always_stall or failures >= 3 else "paused_for_reflection",
+            "status": "stalled"
+            if always_stall or failures >= 3
+            else "paused_for_reflection",
             "review_failures": failures,
             "review_findings": findings,
             "lease_expires_at": None,
@@ -1042,6 +1080,7 @@ def _run_lane_eval_loop(
     workspace_root: Path,
     run_state: Any,  # RunState
     lane_state: LaneState,
+    gate_cases: tuple[str, ...] = (),
 ) -> LaneState:
     """Run the escalating acceptance eval for the lane's committed candidate.
 
@@ -1068,10 +1107,24 @@ def _run_lane_eval_loop(
         else candidate_project_root(workspace_root, worktree)
     )
     branch = str(lane_state.branch)
-    commit_sha = _auto_commit_worktree(worktree, branch, lane)
+    try:
+        workspace_relative = (
+            gepa_dir(workspace_root).resolve().relative_to(workspace_root.resolve())
+        )
+    except ValueError:
+        workspace_relative = None
+    candidate_exclusions = candidate_identity_exempt_paths(
+        candidate_project, workspace_relative_path=workspace_relative
+    )
+    commit_sha = _auto_commit_worktree(
+        worktree, branch, lane, exclude_paths=candidate_exclusions
+    )
 
     try:
-        git_state = git_candidate_state(candidate_project)
+        git_state = git_candidate_state(
+            candidate_project,
+            exclude_paths=candidate_exclusions,
+        )
     except GitCandidateError as exc:
         raise typer.BadParameter(str(exc)) from exc
     if git_state.dirty:
@@ -1113,13 +1166,100 @@ def _run_lane_eval_loop(
     os.chdir(candidate_project)
     samples: list[float] = []
     outcomes: list[Any] = []
+    gate_outcomes: list[Any] = []
+    gate_comparison: dict[str, Any] | None = None
     comparison_result = None
     vector_comparison: VectorComparison | None = None
     infra_retries = 0
     attempts = 0
     try:
+        if gate_cases:
+            from .run import _evaluate_gate_cases
+
+            _, gate_outcomes, gate_comparison = _evaluate_gate_cases(
+                run_state,
+                gate_cases,
+                workspace_root=workspace_root,
+                candidate_root=candidate_project,
+                lane=lane,
+            )
+            if str(gate_outcomes[0].summary["candidate_id"]) != git_state.candidate_id:
+                raise typer.BadParameter(
+                    "The lane candidate changed during gate evaluation; "
+                    "refusing to compare mixed candidates."
+                )
+            if gate_comparison.get("outcome") != "valid":
+                return _stall_for_infrastructure_failure(
+                    workspace_root=workspace_root,
+                    run_state=run_state,
+                    lane_state=lane_state,
+                    git_state=git_state,
+                    outcomes=gate_outcomes,
+                    failures=evaluation_infrastructure_failures(
+                        gate_outcomes[-1].records
+                    ),
+                    valid_samples=[],
+                )
+            if gate_comparison.get("rejection_reason") == "gate":
+                comparison = {
+                    "run_id": run_id,
+                    "lane": lane,
+                    "iteration": lane_state.iteration,
+                    "baseline_candidate_id": run_state.reflection_baseline_candidate_id,
+                    "baseline_commit_sha": run_state.reflection_baseline_commit_sha,
+                    "candidate_id": git_state.candidate_id,
+                    "candidate_commit_sha": commit_sha,
+                    **gate_comparison,
+                }
+                comparison_path = _write_comparison(
+                    workspace_root, run_id, lane, lane_state.iteration, comparison
+                )
+                completed = LaneState(
+                    **{
+                        **lane_state.to_dict(),
+                        "status": "awaiting_selection",
+                        "verdict": "rejected",
+                        "verdict_delta": gate_comparison["delta"],
+                        "comparison_path": str(comparison_path),
+                        "eval_pid": None,
+                        "updated_at": utc_now_iso(),
+                    }
+                )
+                completed.save(workspace_root, run_id)
+                emit(
+                    run_id,
+                    lane,
+                    EventDraft(
+                        type="verdict",
+                        lane=lane,
+                        payload={
+                            "verdict": "rejected",
+                            "delta": gate_comparison["delta"],
+                            "comparison_path": str(comparison_path),
+                        },
+                    ),
+                    root=workspace_root,
+                )
+                return completed
         while len(samples) < max_candidate_samples:
             attempts += 1
+            selected_case_ids = None
+            supplemental_records = ()
+            if not outcomes and gate_outcomes:
+                minibatch = MinibatchStore(run_id, workspace_root).load(
+                    run_state.reflection_minibatch_id
+                )
+                remaining_case_ids = tuple(
+                    case_id
+                    for case_id in minibatch.case_ids
+                    if case_id not in gate_cases
+                )
+                # An all-minibatch gate has no complement. Retain the normal
+                # evaluation in that degenerate case rather than asking the
+                # evaluator to score an empty selection.
+                if remaining_case_ids:
+                    selected_case_ids = remaining_case_ids
+                    supplemental_records = gate_outcomes[0].records
             outcome = run_eval_once(
                 candidate_file=None,
                 minibatch_id=run_state.reflection_minibatch_id,
@@ -1137,6 +1277,8 @@ def _run_lane_eval_loop(
                 workspace_root=workspace_root,
                 vector_incumbent_hash=run_state.reflection_baseline_candidate_id,
                 vector_repetition=len(samples) + 1,
+                selected_case_ids=selected_case_ids,
+                supplemental_records=supplemental_records,
             )
             outcomes.append(outcome)
             current_id = str(outcome.summary["candidate_id"])
@@ -1260,6 +1402,7 @@ def _run_lane_eval_loop(
             for outcome in outcomes
             if outcome.summary.get("trace_path")
         ],
+        "gate": gate_comparison,
         **result_data,
     }
     comparison_path = _write_comparison(
@@ -1427,6 +1570,11 @@ def lane_continue(
         "--handoff-lease-epoch",
         hidden=True,
     ),
+    gate_case: list[str] = typer.Option(
+        [],
+        "--gate-case",
+        help="Case name from the current reflection minibatch to evaluate first. Repeatable.",
+    ),
 ) -> None:
     """Auto-commit the lane worktree and evaluate the candidate in the background.
 
@@ -1448,6 +1596,10 @@ def lane_continue(
     """
     _validate_lane_id(lane)
     workspace_root, run_state = _resolve_lane_run(run_id)
+    if gate_case:
+        from .run import _validate_gate_cases
+
+        _validate_gate_cases(run_state, gate_case, root=workspace_root)
     now = datetime.now(timezone.utc)
 
     with _lane_lock(workspace_root, run_state.run_id, lane):
@@ -1478,7 +1630,9 @@ def lane_continue(
             try:
                 actual_hash = component_hash(
                     Path(str(state.worktree_path)),
-                    GepaConfig.load(config_path(workspace_root)).acceptance.component_files,
+                    GepaConfig.load(
+                        config_path(workspace_root)
+                    ).acceptance.component_files,
                 )
             except OSError:
                 actual_hash = None
@@ -1578,7 +1732,9 @@ def lane_continue(
             try:
                 before_gate_hash = component_hash(
                     Path(str(state.worktree_path)),
-                    GepaConfig.load(config_path(workspace_root)).acceptance.component_files,
+                    GepaConfig.load(
+                        config_path(workspace_root)
+                    ).acceptance.component_files,
                 )
             except OSError as exc:
                 rejected = _review_rejection(
@@ -1621,7 +1777,9 @@ def lane_continue(
             try:
                 after_gate_hash = component_hash(
                     Path(str(state.worktree_path)),
-                    GepaConfig.load(config_path(workspace_root)).acceptance.component_files,
+                    GepaConfig.load(
+                        config_path(workspace_root)
+                    ).acceptance.component_files,
                 )
             except OSError:
                 after_gate_hash = None
@@ -1676,7 +1834,10 @@ def lane_continue(
 
     if foreground:
         _run_lane_eval_loop(
-            workspace_root=workspace_root, run_state=run_state, lane_state=state
+            workspace_root=workspace_root,
+            run_state=run_state,
+            lane_state=state,
+            gate_cases=tuple(gate_case),
         )
         return
 
@@ -1693,6 +1854,7 @@ def lane_continue(
         run_id=run_state.run_id,
         foreground=True,
         handoff_lease_epoch=state.lease_epoch,
+        gate_cases=tuple(gate_case),
     )
     worktree_path = Path(str(state.worktree_path))
     candidate_project_path = (

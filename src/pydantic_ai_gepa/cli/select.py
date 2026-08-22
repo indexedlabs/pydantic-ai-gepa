@@ -92,6 +92,7 @@ from .lanes import (
 )
 from .layout import (
     GepaConfig,
+    candidate_identity_exempt_paths,
     candidate_project_root,
     config_path,
     final_report_path,
@@ -225,7 +226,11 @@ def _journal_rows(workspace_root: Path, run_id: str, kind: str) -> list[dict[str
         if not line.strip():
             continue
         raw = json.loads(line)
-        if isinstance(raw, dict) and raw.get("run_id") == run_id and raw.get("kind") == kind:
+        if (
+            isinstance(raw, dict)
+            and raw.get("run_id") == run_id
+            and raw.get("kind") == kind
+        ):
             rows.append(raw)
     return rows
 
@@ -484,18 +489,11 @@ def _primary_checkout_state(workspace_root: Path) -> tuple[str, bool]:
     (journal.jsonl, which select itself appends to every iteration) — never
     counts as user changes.
     """
-    from .lanes import worktrees_root
-    from .layout import runs_dir
-
     head = _git(workspace_root, "rev-parse", "HEAD")
     try:
         candidate = git_candidate_state(
             workspace_root,
-            exclude_paths=[
-                runs_dir(workspace_root),
-                worktrees_root(workspace_root),
-                journal_path(workspace_root),
-            ],
+            exclude_paths=candidate_identity_exempt_paths(workspace_root),
         )
         dirty = candidate.dirty
     except GitCandidateError:
@@ -655,14 +653,20 @@ def _phase_promote(
     accepted = [lane_state for lane_state in valid if lane_state.verdict == "accepted"]
     winner: LaneState | None = None
     if accepted:
-        vector_mode = GepaConfig.load(config_path(workspace_root)).acceptance.mode == "vector"
+        vector_mode = (
+            GepaConfig.load(config_path(workspace_root)).acceptance.mode == "vector"
+        )
 
         def rank(lane_state: LaneState) -> tuple[float | str, ...]:
             if not vector_mode:
                 return (-(lane_state.verdict_delta or 0.0), lane_state.lane)
             raw = _load_comparison(lane_state).get("ranking_key", [])
-            if not isinstance(raw, list) or not all(isinstance(item, (int, float)) for item in raw):
-                raise typer.BadParameter("Vector comparison ranking_key must be a numeric tuple.")
+            if not isinstance(raw, list) or not all(
+                isinstance(item, (int, float)) for item in raw
+            ):
+                raise typer.BadParameter(
+                    "Vector comparison ranking_key must be a numeric tuple."
+                )
             return tuple(-float(item) for item in raw) + (lane_state.lane,)
 
         winner = sorted(
@@ -688,6 +692,12 @@ def _phase_promote(
     )
 
     if winner is None:
+        from .run import _consume_candidate_verdict
+
+        if any(
+            lane_state.verdict in {"rejected", "equivalent"} for lane_state in valid
+        ):
+            state = _consume_candidate_verdict(state, accepted=False)
         typer.echo(
             "No lane was accepted; no promotion. All resolved lanes are "
             "journaled as losers and lanes re-fan onto the current best."
@@ -764,6 +774,9 @@ def _phase_promote(
         ),
         accepted_promotion_count=promotion_count,
     )
+    from .run import _consume_candidate_verdict
+
+    state = _consume_candidate_verdict(state, accepted=True)
     ctx["primary_promoted"] = primary_promoted
     ctx["winner_mean"] = winner_mean
     ctx["accepted_promotion_count"] = promotion_count
@@ -950,7 +963,11 @@ def _phase_run_start_rebaseline(
         return state, ctx, "refan"
     raw_keys = baseline.get("vector_record_keys")
     minibatch_id = baseline.get("minibatch_id")
-    if not isinstance(raw_keys, list) or not raw_keys or not isinstance(minibatch_id, str):
+    if (
+        not isinstance(raw_keys, list)
+        or not raw_keys
+        or not isinstance(minibatch_id, str)
+    ):
         _journal_run_start_rebaseline(
             workspace_root,
             state,
@@ -1507,9 +1524,7 @@ def run_select(run_id: str | None) -> Any:
         from .run import RunState
 
         raw = json.loads(
-            run_state_path(run_state.run_id, workspace_root).read_text(
-                encoding="utf-8"
-            )
+            run_state_path(run_state.run_id, workspace_root).read_text(encoding="utf-8")
         )
         if not isinstance(raw, dict):
             raise typer.BadParameter("Managed run state must be a JSON object.")

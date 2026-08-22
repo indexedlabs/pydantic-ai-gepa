@@ -132,7 +132,8 @@ def probe(
                 for row in _journal_rows(
                     workspace_root, run_state.run_id, "probe_budget_debit"
                 )
-                if row.get("lane") == lane and row.get("lease_epoch") == state.lease_epoch
+                if row.get("lane") == lane
+                and row.get("lease_epoch") == state.lease_epoch
             ]
         )
         if used >= cfg.acceptance.probe_allowance_per_lease:

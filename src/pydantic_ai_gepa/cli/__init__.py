@@ -80,7 +80,9 @@ app.command(name="pareto", help="Show Pareto front or full history (json or tsv)
 )
 app.command(name="next")(events_cmd.next_command)
 app.command(name="ack")(events_cmd.ack_command)
-app.command(name="probe", help="Run one non-budgeted assertion-vector probe.")(probe_cmd.probe)
+app.command(name="probe", help="Run one non-budgeted assertion-vector probe.")(
+    probe_cmd.probe
+)
 app.add_typer(
     lanes_cmd.app,
     name="lane",

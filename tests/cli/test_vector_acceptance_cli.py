@@ -68,10 +68,14 @@ def _config(
 ) -> str:
     files = ", ".join(json.dumps(item) for item in components)
     rebaseline = (
-        "" if rebaseline_interval is None else f"rebaseline_interval = {rebaseline_interval}\n"
+        ""
+        if rebaseline_interval is None
+        else f"rebaseline_interval = {rebaseline_interval}\n"
     )
     pinned = "pinned_scorer = true\n" if pinned_scorer else ""
-    reviewer_line = 'reviewer = "vector_pkg.reviewer:make_reviewer"\n' if reviewer else ""
+    reviewer_line = (
+        'reviewer = "vector_pkg.reviewer:make_reviewer"\n' if reviewer else ""
+    )
     probe_allowance = (
         ""
         if probe_allowance_per_lease is None
@@ -244,7 +248,9 @@ def test_foreground_continue_enforces_candidate_gate(vector_repo: Path) -> None:
         for line in journal_path(vector_repo).read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    rejection = next(row for row in journal if row.get("kind") == "candidate_review_rejection")
+    rejection = next(
+        row for row in journal if row.get("kind") == "candidate_review_rejection"
+    )
     assert "unauthorized.py" in rejection["diff"]
     assert "BAD = True" in rejection["diff"]
 
@@ -293,16 +299,28 @@ def test_probe_runs_candidate_review_before_rollout(vector_repo: Path) -> None:
     state = load_lane_state(vector_repo, run_id, "lane-1")
     worktree = Path(str(state.worktree_path))
     (worktree / "score.txt").write_text("blocked\n", encoding="utf-8")
-    rows_before = len(VectorRecordStore(vector_records_path(run_id, vector_repo)).records())
+    rows_before = len(
+        VectorRecordStore(vector_records_path(run_id, vector_repo)).records()
+    )
 
     result = _run(
-        "--gepa-dir", str(vector_repo / ".gepa"), "probe", "--case", "case-1",
-        "--lane", "lane-1", "--run-id", run_id,
+        "--gepa-dir",
+        str(vector_repo / ".gepa"),
+        "probe",
+        "--case",
+        "case-1",
+        "--lane",
+        "lane-1",
+        "--run-id",
+        run_id,
     )
 
     assert result.exit_code == 1
     assert "candidate review failed" in result.output
-    assert len(VectorRecordStore(vector_records_path(run_id, vector_repo)).records()) == rows_before
+    assert (
+        len(VectorRecordStore(vector_records_path(run_id, vector_repo)).records())
+        == rows_before
+    )
     journal = [
         json.loads(line)
         for line in journal_path(vector_repo).read_text(encoding="utf-8").splitlines()
@@ -319,15 +337,31 @@ def test_probe_allowance_is_durable_per_lease(vector_repo: Path) -> None:
     payload, _ = _start(vector_repo)
     run_id = str(payload["run_id"])
     state = load_lane_state(vector_repo, run_id, "lane-1")
-    (Path(str(state.worktree_path)) / "score.txt").write_text("good\n", encoding="utf-8")
+    (Path(str(state.worktree_path)) / "score.txt").write_text(
+        "good\n", encoding="utf-8"
+    )
 
     first = _run(
-        "--gepa-dir", str(vector_repo / ".gepa"), "probe", "--case", "case-1",
-        "--lane", "lane-1", "--run-id", run_id,
+        "--gepa-dir",
+        str(vector_repo / ".gepa"),
+        "probe",
+        "--case",
+        "case-1",
+        "--lane",
+        "lane-1",
+        "--run-id",
+        run_id,
     )
     second = _run(
-        "--gepa-dir", str(vector_repo / ".gepa"), "probe", "--case", "case-2",
-        "--lane", "lane-1", "--run-id", run_id,
+        "--gepa-dir",
+        str(vector_repo / ".gepa"),
+        "probe",
+        "--case",
+        "case-2",
+        "--lane",
+        "lane-1",
+        "--run-id",
+        run_id,
     )
 
     assert first.exit_code == 0, first.output
@@ -394,10 +428,15 @@ def test_receipt_gate_requires_exact_case_key_and_fixed_direction(
     assert "No matching probe receipt" in rejected.review_findings[0]["explanation"]
     with journal_path(vector_repo).open("a", encoding="utf-8") as fh:
         fh.write(json.dumps({"kind": "probe_receipt", **base}) + "\n")
-    assert _candidate_gate(workspace_root=vector_repo, run_state=run_state, state=state) is None
+    assert (
+        _candidate_gate(workspace_root=vector_repo, run_state=run_state, state=state)
+        is None
+    )
 
 
-def test_handoff_refuses_component_mutation_after_parent_gate(vector_repo: Path) -> None:
+def test_handoff_refuses_component_mutation_after_parent_gate(
+    vector_repo: Path,
+) -> None:
     payload, _ = _start(vector_repo)
     run_id = str(payload["run_id"])
     state = load_lane_state(vector_repo, run_id, "lane-1")
@@ -416,14 +455,24 @@ def test_handoff_refuses_component_mutation_after_parent_gate(vector_repo: Path)
     rows_before = ParetoLog(run_id, vector_repo).count_rows()
 
     result = _run(
-        "--gepa-dir", str(vector_repo / ".gepa"), "lane", "continue", "lane-1",
-        "--run-id", run_id, "--foreground", "--handoff-lease-epoch", "7",
+        "--gepa-dir",
+        str(vector_repo / ".gepa"),
+        "lane",
+        "continue",
+        "lane-1",
+        "--run-id",
+        run_id,
+        "--foreground",
+        "--handoff-lease-epoch",
+        "7",
     )
 
     assert result.exit_code == 1
     assert "component hash changed" in result.output
     assert ParetoLog(run_id, vector_repo).count_rows() == rows_before
-    assert load_lane_state(vector_repo, run_id, "lane-1").status == "paused_for_reflection"
+    assert (
+        load_lane_state(vector_repo, run_id, "lane-1").status == "paused_for_reflection"
+    )
     journal = [
         json.loads(line)
         for line in journal_path(vector_repo).read_text(encoding="utf-8").splitlines()
@@ -465,11 +514,7 @@ def test_vector_pinned_packets_and_reflector_artifacts_hide_scores(
 
     trace_path = _write_trace_file(
         path=vector_repo / ".gepa" / "runs" / run_id / "redacted.jsonl",
-        records=[
-            EvaluationRecord(
-                "case-1", 0.25, "detail", {"trajectory": Trace()}
-            )
-        ],
+        records=[EvaluationRecord("case-1", 0.25, "detail", {"trajectory": Trace()})],
         redact_scores=True,
     )
     assert trace_path is not None
@@ -598,20 +643,21 @@ def test_periodic_rebaseline_is_paired_journaled_and_never_reverts_incumbent(
         os.chdir(previous_cwd)
     assert continued.exit_code == 0, continued.output
     lane = load_lane_state(vector_repo, run_id, "lane-1")
-    candidate_context = json.loads(Path(str(lane.comparison_path)).read_text())["detail"][
-        "context"
-    ]
+    candidate_context = json.loads(Path(str(lane.comparison_path)).read_text())[
+        "detail"
+    ]["context"]
     assert candidate_context["accepted_promotion_count"] == 0
-    assert candidate_context["run_start_baseline"]["candidate_id"] == run_start["candidate_id"]
+    assert (
+        candidate_context["run_start_baseline"]["candidate_id"]
+        == run_start["candidate_id"]
+    )
 
     selected = _run(
         "--gepa-dir", str(vector_repo / ".gepa"), "run", "select", "--run-id", run_id
     )
     assert selected.exit_code == 0, selected.output
     final = RunState.from_dict(
-        json.loads(
-            (vector_repo / ".gepa" / "runs" / run_id / "state.json").read_text()
-        )
+        json.loads((vector_repo / ".gepa" / "runs" / run_id / "state.json").read_text())
     )
     assert final.accepted_promotion_count == 1
     assert final.best_commit_sha == lane.candidate_sha
@@ -716,9 +762,7 @@ def test_promotion_counter_is_not_doubled_when_select_resumes_after_a_crash(
     )
     assert resumed.exit_code == 0, resumed.output
     final = RunState.from_dict(
-        json.loads(
-            (vector_repo / ".gepa" / "runs" / run_id / "state.json").read_text()
-        )
+        json.loads((vector_repo / ".gepa" / "runs" / run_id / "state.json").read_text())
     )
     assert final.accepted_promotion_count == 1
     journal = [

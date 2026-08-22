@@ -71,6 +71,9 @@ class ReflectionConfig:
     across completely separate GEPA executions.
     """
 
+    notes_dir: str | None = None
+    """Optional reflector-notes directory; defaults to ``.gepa/notes``."""
+
     additional_instructions: str | None = None
     """Additional domain-specific instructions appended to the reflection agent's prompt.
 
