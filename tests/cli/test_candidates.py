@@ -9,6 +9,8 @@ from pathlib import Path
 import pytest
 
 from pydantic_ai_gepa.cli.candidates import Candidate, git_candidate_state
+from pydantic_ai_gepa.cli.lanes import _auto_commit_worktree
+from pydantic_ai_gepa.cli.layout import candidate_identity_exempt_paths
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -120,3 +122,61 @@ def test_git_candidate_can_exclude_cli_run_artifacts(tmp_path: Path) -> None:
 
     assert included.dirty is True
     assert excluded.dirty is False
+
+
+def test_notes_are_excluded_from_primary_and_lane_candidate_identity(
+    tmp_path: Path,
+) -> None:
+    repo = _git_repo(tmp_path)
+    primary_note = repo / ".gepa" / "notes" / "strategy.md"
+    primary_note.parent.mkdir(parents=True)
+    first = git_candidate_state(
+        repo, exclude_paths=candidate_identity_exempt_paths(repo)
+    )
+    primary_note.write_text(
+        "---\nname: strategy\ndescription: First note\n---\nbody one\n",
+        encoding="utf-8",
+    )
+    second = git_candidate_state(
+        repo, exclude_paths=candidate_identity_exempt_paths(repo)
+    )
+    assert second.candidate_id == first.candidate_id
+
+    worktree = repo / "worktrees" / "lane-1"
+    worktree.parent.mkdir()
+    branch = "gepa/lane/test"
+    _git(repo, "worktree", "add", "-b", branch, str(worktree))
+    lane_note = worktree / ".gepa" / "notes" / "strategy.md"
+    lane_note.parent.mkdir(parents=True)
+    lane_before = git_candidate_state(
+        worktree, exclude_paths=candidate_identity_exempt_paths(worktree)
+    )
+    lane_note.write_text(
+        "---\nname: strategy\ndescription: Changed note\n---\nbody two\n",
+        encoding="utf-8",
+    )
+    lane_after = git_candidate_state(
+        worktree, exclude_paths=candidate_identity_exempt_paths(worktree)
+    )
+    assert lane_after.candidate_id == lane_before.candidate_id
+
+    (worktree / "pipeline.py").write_text("VALUE = 2\n", encoding="utf-8")
+    _auto_commit_worktree(worktree, branch, "lane-1")
+    assert ".gepa/notes/strategy.md" not in _git(
+        worktree, "show", "--format=", "--name-only", "HEAD"
+    )
+
+
+def test_lane_auto_commit_skips_excluded_only_changes(tmp_path: Path) -> None:
+    repo = _git_repo(tmp_path)
+    worktree = repo / "worktrees" / "lane-1"
+    worktree.parent.mkdir()
+    branch = "gepa/lane/test"
+    _git(repo, "worktree", "add", "-b", branch, str(worktree))
+    journal = worktree / ".gepa" / "journal.jsonl"
+    journal.parent.mkdir(parents=True)
+    journal.write_text('{"event": "redirect"}\n', encoding="utf-8")
+    before = _git(worktree, "rev-parse", "HEAD")
+
+    assert _auto_commit_worktree(worktree, branch, "lane-1") == before
+    assert _git(worktree, "rev-parse", "HEAD") == before

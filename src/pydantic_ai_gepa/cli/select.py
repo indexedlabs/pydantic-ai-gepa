@@ -80,6 +80,7 @@ from .lanes import (
     write_packet,
 )
 from .layout import (
+    candidate_identity_exempt_paths,
     candidate_project_root,
     final_report_path,
     journal_path,
@@ -394,18 +395,11 @@ def _primary_checkout_state(workspace_root: Path) -> tuple[str, bool]:
     (journal.jsonl, which select itself appends to every iteration) — never
     counts as user changes.
     """
-    from .lanes import worktrees_root
-    from .layout import runs_dir
-
     head = _git(workspace_root, "rev-parse", "HEAD")
     try:
         candidate = git_candidate_state(
             workspace_root,
-            exclude_paths=[
-                runs_dir(workspace_root),
-                worktrees_root(workspace_root),
-                journal_path(workspace_root),
-            ],
+            exclude_paths=candidate_identity_exempt_paths(workspace_root),
         )
         dirty = candidate.dirty
     except GitCandidateError:
@@ -591,6 +585,12 @@ def _phase_promote(
     )
 
     if winner is None:
+        from .run import _consume_candidate_verdict
+
+        if any(
+            lane_state.verdict in {"rejected", "equivalent"} for lane_state in valid
+        ):
+            state = _consume_candidate_verdict(state, accepted=False)
         typer.echo(
             "No lane was accepted; no promotion. All resolved lanes are "
             "journaled as losers and lanes re-fan onto the current best."
@@ -653,6 +653,9 @@ def _phase_promote(
             float(winner_mean) if winner_mean is not None else state.best_mean_score
         ),
     )
+    from .run import _consume_candidate_verdict
+
+    state = _consume_candidate_verdict(state, accepted=True)
     ctx["primary_promoted"] = primary_promoted
     ctx["winner_mean"] = winner_mean
     # Checkpoint immediately after the promotion decision: the recorded phase

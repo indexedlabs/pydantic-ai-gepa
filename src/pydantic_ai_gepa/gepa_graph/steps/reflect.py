@@ -6,6 +6,7 @@ import difflib
 import hashlib
 import inspect
 import re
+from pathlib import Path
 from typing import Any, Mapping, Sequence, cast
 
 import logfire
@@ -129,11 +130,19 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
     if state.config.reflection_config and state.config.reflection_config.journal_file:
         from ..proposal.journal_tools import create_journal_toolset
 
-        component_toolsets.append(
-            create_journal_toolset(state.config.reflection_config.journal_file)
-        )
+        journal_file = state.config.reflection_config.journal_file
+        component_toolsets.append(create_journal_toolset(journal_file))
+    if state.config.reflection_config:
+        from ...cli.layout import notes_dir
+        from ..proposal.note_tools import create_note_toolset
 
-    from pathlib import Path
+        configured_notes_dir = state.config.reflection_config.notes_dir
+        active_notes_dir = (
+            Path(configured_notes_dir) if configured_notes_dir else notes_dir()
+        )
+        if active_notes_dir.is_dir():
+            component_toolsets.append(create_note_toolset(active_notes_dir))
+
     import json
 
     components_file = Path(
@@ -227,8 +236,6 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
 
         # Capture and save the Reflector's own trace data (tool calls, reasoning)
         if deps.memory_exporter is not None:
-            from pathlib import Path
-
             spans = deps.memory_exporter.get_finished_spans()
             if spans:
                 from ..proposal.trace_store import span_to_jsonl_line

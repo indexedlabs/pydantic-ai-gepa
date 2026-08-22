@@ -20,6 +20,7 @@ from pydantic_ai_gepa.cli.lanes import (
     LaneState,
     lane_state_path,
     load_lane_state,
+    write_packet,
 )
 from pydantic_ai_gepa.cli.run import RunState
 
@@ -253,6 +254,70 @@ def test_packet_is_self_contained(git_repo: Path) -> None:
     assert packet["continue_argv"][0] == sys.executable
     assert packet["continue_argv"][1] == "-I"
     assert invocation.startswith(f"cd {git_repo}/worktrees/")
+
+
+def test_redirect_journal_entry_reaches_next_reflection_packet(git_repo: Path) -> None:
+    run = _start_lane_run(git_repo, lanes=1)
+    run_id = str(run["run_id"])
+    (git_repo / ".gepa" / "journal.jsonl").open("a", encoding="utf-8").write(
+        json.dumps(
+            {
+                "timestamp": "t1",
+                "content": "Try a narrower hypothesis.",
+                "strategy": "redirect",
+            }
+        )
+        + "\n"
+    )
+    lane = _lane_state(git_repo, run_id, "lane-1")
+    packet_path = write_packet(
+        git_repo,
+        RunState.from_dict(
+            json.loads(
+                (git_repo / ".gepa" / "runs" / run_id / "state.json").read_text()
+            )
+        ),
+        lane.lane,
+        lane.iteration,
+        Path(str(lane.worktree_path)),
+        str(lane.branch),
+    )
+    journal_tail = json.loads(packet_path.read_text(encoding="utf-8"))["journal_tail"]
+    assert journal_tail[-1]["strategy"] == "redirect"
+    assert journal_tail[-1]["content"] == "Try a narrower hypothesis."
+
+
+def test_packet_indexes_notes_without_including_their_bodies(git_repo: Path) -> None:
+    run = _start_lane_run(git_repo, lanes=1)
+    run_id = str(run["run_id"])
+    notes = git_repo / ".gepa" / "notes"
+    notes.mkdir()
+    body = "Prefer tool traces over generic prompt rewrites."
+    (notes / "trace-first.md").write_text(
+        "---\nname: trace-first\ndescription: Prioritize trace evidence\n---\n"
+        + body
+        + "\n",
+        encoding="utf-8",
+    )
+    lane = _lane_state(git_repo, run_id, "lane-1")
+    packet_path = write_packet(
+        git_repo,
+        RunState.from_dict(
+            json.loads(
+                (git_repo / ".gepa" / "runs" / run_id / "state.json").read_text()
+            )
+        ),
+        lane.lane,
+        lane.iteration,
+        Path(str(lane.worktree_path)),
+        str(lane.branch),
+    )
+    packet_text = packet_path.read_text(encoding="utf-8")
+    packet = json.loads(packet_text)
+    assert packet["notes_index"] == [
+        {"name": "trace-first", "description": "Prioritize trace evidence"}
+    ]
+    assert body not in packet_text
 
 
 def test_nested_monorepo_lane_uses_candidate_project_and_src_imports(
@@ -503,6 +568,27 @@ def test_lane_lease_and_double_lease_rejected(git_repo: Path) -> None:
     again = _run("--gepa-dir", gepa_dir, "lane", "lease", "lane-1", "--run-id", run_id)
     assert again.exit_code == 1
     assert "already leased" in again.output
+
+
+def test_lane_continue_rejects_unknown_gate_before_leasing(git_repo: Path) -> None:
+    run = _start_lane_run(git_repo, lanes=1)
+    run_id = str(run["run_id"])
+
+    result = _run(
+        "--gepa-dir",
+        str(git_repo / ".gepa"),
+        "lane",
+        "continue",
+        "lane-1",
+        "--run-id",
+        run_id,
+        "--gate-case",
+        "not-in-minibatch",
+    )
+
+    assert result.exit_code == 2
+    assert "Available:" in result.output
+    assert _lane_state(git_repo, run_id, "lane-1").status == "paused_for_reflection"
 
 
 def test_lane_continue_evaluates_and_emits_verdict(git_repo: Path) -> None:

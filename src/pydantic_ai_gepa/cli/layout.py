@@ -131,6 +131,9 @@ class GepaConfig:
     skills: str | None = None
     """Optional path (relative to repo root) to an Agent Skills directory."""
 
+    stall_threshold: int = 5
+    """Candidate verdicts without an acceptance before a run is reported stalled."""
+
     @staticmethod
     def from_dict(data: dict[str, Any]) -> GepaConfig:
         candidate_source = data.get("candidate_source", "components")
@@ -188,6 +191,11 @@ class GepaConfig:
             raise GepaConfigError(
                 f"Invalid 'skills' value: {skills!r}. Expected a path string or omit."
             )
+        stall_threshold = data.get("stall_threshold", 5)
+        if not isinstance(stall_threshold, int) or stall_threshold < 1:
+            raise GepaConfigError(
+                "Invalid 'stall_threshold' value: expected an integer >= 1."
+            )
         return GepaConfig(
             agent=agent,
             evaluate=evaluate,
@@ -197,6 +205,7 @@ class GepaConfig:
             case_factory=case_factory,
             defaults=defaults,
             skills=skills,
+            stall_threshold=stall_threshold,
         )
 
     @staticmethod
@@ -322,8 +331,39 @@ def journal_path(root: Path | None = None) -> Path:
     return gepa_dir(root) / JOURNAL_FILENAME
 
 
+def notes_dir(root: Path | None = None) -> Path:
+    return gepa_dir(root) / "notes"
+
+
 def runs_dir(root: Path | None = None) -> Path:
     return gepa_dir(root) / "runs"
+
+
+def candidate_identity_exempt_paths(
+    root: Path | None = None,
+    *,
+    workspace_relative_path: Path | None = None,
+) -> tuple[Path, ...]:
+    """Paths that are managed metadata, never part of a git candidate identity."""
+
+    workspace_root = (root or repo_root()).resolve()
+    if workspace_relative_path is not None:
+        workspace = workspace_root / workspace_relative_path
+    else:
+        workspace = gepa_dir(workspace_root)
+    try:
+        workspace = workspace.resolve()
+        workspace.relative_to(workspace_root.resolve())
+    except ValueError:
+        # An out-of-tree GEPA_DIR cannot be a pathspec below this candidate;
+        # retain the historical behavior of simply not excluding it.
+        return (workspace_root / "worktrees",)
+    return (
+        workspace / "runs",
+        workspace_root / "worktrees",
+        workspace / JOURNAL_FILENAME,
+        workspace / "notes",
+    )
 
 
 def run_dir(run_id: str, root: Path | None = None) -> Path:
