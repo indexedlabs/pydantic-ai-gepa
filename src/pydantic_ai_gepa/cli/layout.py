@@ -47,6 +47,140 @@ JOURNAL_FILENAME = "journal.jsonl"
 CandidateSource = Literal["components", "git"]
 
 
+@dataclass(frozen=True)
+class AcceptanceConfig:
+    """Optional generic assertion-vector acceptance configuration.
+
+    ``mode = "scalar"`` preserves the historical acceptance loop. Vector
+    mode is deliberately explicit because old scalar traces are not a safe
+    baseline for a keyed-vector comparator.
+    """
+
+    mode: Literal["scalar", "vector"] = "scalar"
+    comparator: str | None = None
+    vector_schema_version: str = "1"
+    telemetry_schema_version: str = "1"
+    rebaseline_interval: int | None = None
+    probe_allowance_per_lease: int = 10
+    packet_projector: str | None = None
+    require_probe_receipt: bool = False
+    pinned_scorer: bool = False
+    component_files: tuple[str, ...] = ()
+    meta_files: tuple[str, ...] = ("prediction.json",)
+    reviewer: str | None = None
+    reviewer_kind: Literal["module", "agent", "command"] = "module"
+    reviewer_options: dict[str, Any] = field(default_factory=dict)
+    review_context: dict[str, Any] = field(default_factory=dict)
+
+    @staticmethod
+    def from_dict(raw: Any) -> "AcceptanceConfig":
+        data = raw or {}
+        if not isinstance(data, dict):
+            raise GepaConfigError("'acceptance' must be a TOML table.")
+        mode = data.get("mode", "scalar")
+        if mode not in {"scalar", "vector"}:
+            raise GepaConfigError("acceptance.mode must be 'scalar' or 'vector'.")
+        comparator = data.get("comparator")
+        if mode == "vector" and (
+            not isinstance(comparator, str) or ":" not in comparator
+        ):
+            raise GepaConfigError(
+                "acceptance.comparator is required in vector mode (module:factory)."
+            )
+        raw_rebaseline_interval = data.get("rebaseline_interval")
+        if raw_rebaseline_interval is not None and (
+            isinstance(raw_rebaseline_interval, bool)
+            or not isinstance(raw_rebaseline_interval, int)
+            or raw_rebaseline_interval <= 0
+        ):
+            raise GepaConfigError(
+                "acceptance.rebaseline_interval must be a positive integer or omitted."
+            )
+        raw_probe_allowance = data.get("probe_allowance_per_lease", 10)
+        if (
+            isinstance(raw_probe_allowance, bool)
+            or not isinstance(raw_probe_allowance, int)
+            or raw_probe_allowance < 0
+        ):
+            raise GepaConfigError(
+                "acceptance.probe_allowance_per_lease must be a non-negative integer."
+            )
+        packet_projector = data.get("packet_projector")
+        if packet_projector is not None and (
+            not isinstance(packet_projector, str) or ":" not in packet_projector
+        ):
+            raise GepaConfigError(
+                "acceptance.packet_projector must be a 'module:function' reference."
+            )
+        files = data.get("component_files", [])
+        if not isinstance(files, list) or not all(
+            isinstance(item, str) for item in files
+        ):
+            raise GepaConfigError(
+                "acceptance.component_files must be an array of paths."
+            )
+        raw_meta_files = data.get("meta_files", ["prediction.json"])
+        if not isinstance(raw_meta_files, list) or not all(
+            isinstance(item, str) for item in raw_meta_files
+        ):
+            raise GepaConfigError("acceptance.meta_files must be an array of paths.")
+        meta_files = list(raw_meta_files)
+        if "prediction.json" not in meta_files:
+            meta_files.append("prediction.json")
+        raw_reviewer = data.get("reviewer")
+        reviewer_kind: Literal["module", "agent", "command"] = "module"
+        reviewer_options: dict[str, Any] = {}
+        if isinstance(raw_reviewer, str):
+            reviewer = raw_reviewer
+        elif isinstance(raw_reviewer, dict):
+            kind = raw_reviewer.get("provider", "module")
+            if kind not in {"module", "agent", "command"}:
+                raise GepaConfigError(
+                    "acceptance.reviewer.provider must be module, agent, or command."
+                )
+            reviewer_kind = kind
+            reviewer = raw_reviewer.get("factory" if kind == "module" else "ref")
+            if kind == "command":
+                reviewer = raw_reviewer.get("command")
+            reviewer_options = dict(raw_reviewer)
+        elif raw_reviewer is None:
+            reviewer = None
+        else:
+            raise GepaConfigError(
+                "acceptance.reviewer must be a reference or TOML table."
+            )
+        if reviewer is not None and not isinstance(reviewer, str):
+            raise GepaConfigError("acceptance.reviewer reference must be a string.")
+        if (
+            reviewer_kind in {"module", "agent"}
+            and reviewer is not None
+            and ":" not in reviewer
+        ):
+            raise GepaConfigError(
+                "acceptance reviewer module references must be module:attr."
+            )
+        context = data.get("review_context", {}) or {}
+        if not isinstance(context, dict):
+            raise GepaConfigError("acceptance.review_context must be a TOML table.")
+        return AcceptanceConfig(
+            mode=mode,
+            comparator=comparator,
+            vector_schema_version=str(data.get("vector_schema_version", "1")),
+            telemetry_schema_version=str(data.get("telemetry_schema_version", "1")),
+            rebaseline_interval=raw_rebaseline_interval,
+            probe_allowance_per_lease=raw_probe_allowance,
+            packet_projector=packet_projector,
+            require_probe_receipt=bool(data.get("require_probe_receipt", False)),
+            pinned_scorer=bool(data.get("pinned_scorer", False)),
+            component_files=tuple(files),
+            meta_files=tuple(meta_files),
+            reviewer=reviewer,
+            reviewer_kind=reviewer_kind,
+            reviewer_options=reviewer_options,
+            review_context=dict(context),
+        )
+
+
 _explicit_gepa_dirname: str | None = None
 
 
@@ -131,6 +265,9 @@ class GepaConfig:
     skills: str | None = None
     """Optional path (relative to repo root) to an Agent Skills directory."""
 
+    acceptance: AcceptanceConfig = field(default_factory=AcceptanceConfig)
+    """Opt-in generic vector acceptance and scorer-integrity settings."""
+
     stall_threshold: int = 5
     """Candidate verdicts without an acceptance before a run is reported stalled."""
 
@@ -205,6 +342,7 @@ class GepaConfig:
             case_factory=case_factory,
             defaults=defaults,
             skills=skills,
+            acceptance=AcceptanceConfig.from_dict(data.get("acceptance")),
             stall_threshold=stall_threshold,
         )
 
@@ -388,6 +526,15 @@ def traces_dir(run_id: str, case_id: str, root: Path | None = None) -> Path:
 
 def pareto_log_path(run_id: str, root: Path | None = None) -> Path:
     return run_dir(run_id, root) / "pareto.jsonl"
+
+
+def vector_records_path(run_id: str, root: Path | None = None) -> Path:
+    """Append-only assertion-vector rollout records for a managed run."""
+    return run_dir(run_id, root) / "vectors.jsonl"
+
+
+def probe_receipts_dir(run_id: str, root: Path | None = None) -> Path:
+    return run_dir(run_id, root) / "probes"
 
 
 def run_state_path(run_id: str, root: Path | None = None) -> Path:

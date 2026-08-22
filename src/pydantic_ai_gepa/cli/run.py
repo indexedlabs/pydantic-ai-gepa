@@ -101,6 +101,11 @@ class RunState:
     best_candidate_id: str | None = None
     best_commit_sha: str | None = None
     best_mean_score: float | None = None
+    # Vector runs preserve their initial scored identity for generic periodic
+    # incumbent-vs-run-start re-baselines. The mapping is intentionally
+    # opaque to the optimizer apart from the documented identity fields.
+    run_start_baseline: dict[str, Any] | None = None
+    accepted_promotion_count: int = 0
     # Lane-run fields (spec-1do). All defaulted so run state files written
     # before lanes existed load unchanged.
     lanes: int = 0
@@ -168,6 +173,8 @@ class RunState:
             "best_candidate_id": self.best_candidate_id,
             "best_commit_sha": self.best_commit_sha,
             "best_mean_score": self.best_mean_score,
+            "run_start_baseline": self.run_start_baseline,
+            "accepted_promotion_count": self.accepted_promotion_count,
             "lanes": self.lanes,
             "heartbeat_interval_secs": self.heartbeat_interval_secs,
             "reflection_lease_secs": self.reflection_lease_secs,
@@ -283,6 +290,12 @@ class RunState:
                 if data.get("best_mean_score") is not None
                 else None
             ),
+            run_start_baseline=(
+                dict(data["run_start_baseline"])
+                if isinstance(data.get("run_start_baseline"), dict)
+                else None
+            ),
+            accepted_promotion_count=int(data.get("accepted_promotion_count", 0)),
             lanes=int(data.get("lanes", 0)),
             heartbeat_interval_secs=float(data.get("heartbeat_interval_secs", 10.0)),
             reflection_lease_secs=float(data.get("reflection_lease_secs", 1800.0)),
@@ -497,6 +510,21 @@ def _mark_reflection_pause(state: RunState, outcomes: list[EvalOutcome]) -> RunS
         if state.best_mean_score is not None
         else baseline_mean_score
     )
+    run_start_baseline = state.run_start_baseline
+    if run_start_baseline is None:
+        vector_keys = []
+        for outcome in outcomes:
+            raw_vector = outcome.summary.get("vector_record")
+            if isinstance(raw_vector, dict) and isinstance(raw_vector.get("key"), dict):
+                vector_keys.append(dict(raw_vector["key"]))
+        if vector_keys:
+            run_start_baseline = {
+                "candidate_id": str(first_summary["candidate_id"]),
+                "commit_sha": _summary_commit_sha(first_summary),
+                "component_hashes": dict(first_summary.get("component_hashes") or {}),
+                "minibatch_id": str(first_summary["minibatch_id"]),
+                "vector_record_keys": vector_keys,
+            }
     return _with_timestamp(
         _with_last_outcome(state, outcomes[-1]),
         status="paused_for_reflection",
@@ -526,6 +554,7 @@ def _mark_reflection_pause(state: RunState, outcomes: list[EvalOutcome]) -> RunS
         best_candidate_id=best_candidate_id,
         best_commit_sha=best_commit_sha,
         best_mean_score=best_mean_score,
+        run_start_baseline=run_start_baseline,
         infrastructure_retry_minibatch_id=None,
         last_comparison=None,
     )

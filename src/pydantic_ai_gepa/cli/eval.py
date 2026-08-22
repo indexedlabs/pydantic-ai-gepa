@@ -17,11 +17,18 @@ as the reflector. The library's job is to:
 The coding agent reads the report, edits component slots or source code, and
 re-runs ``gepa eval`` — there is no separate ``propose`` verb because the
 agent IS the reflector.
+
+Pinned-scorer component contract: when ``acceptance.pinned_scorer = true``,
+the candidate component map is keyed by the exact relative file paths listed
+in ``acceptance.component_files``. Downstream agents/evaluators must therefore
+accept file-path component ids; GEPA decodes those candidate files as UTF-8
+and never imports scorer code from the candidate worktree.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -68,6 +75,7 @@ from .layout import (
     resolve_metric,
     resolve_skills,
     run_dir,
+    vector_records_path,
 )
 from .metrics import default_substring_metric
 from .runs import (
@@ -79,9 +87,39 @@ from .runs import (
     utc_now_iso,
 )
 from .store import ComponentStore
+from ..vector_acceptance import (
+    VectorRecord,
+    VectorRecordKey,
+    VectorRecordStore,
+    inventory_hash,
+    scorer_identity,
+    side_info_vector,
+)
 
 
 GEPA_TRACE_FILE_ENV = "GEPA_TRACE_FILE"
+GEPA_CANDIDATE_COMPONENTS_ENV = "GEPA_CANDIDATE_COMPONENTS_JSON"
+
+
+def _candidate_component_hashes(
+    candidate: Candidate,
+    *,
+    source: CandidateSource,
+    candidate_root: Path,
+    component_files: tuple[str, ...],
+) -> dict[str, str]:
+    """Return stable hashes for the candidate component boundary in this eval."""
+    if source != "git":
+        return {
+            name: hashlib.sha256(text.encode("utf-8")).hexdigest()
+            for name, text in candidate.components.items()
+        }
+    hashes: dict[str, str] = {}
+    for relative in component_files:
+        path = candidate_root / relative
+        if path.is_file():
+            hashes[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return hashes
 
 
 def _resolve_run_id(run_id: str | None, root: Path | None = None) -> str:
@@ -186,6 +224,7 @@ def _format_failures(
     threshold: float = DEFAULT_FAILURE_THRESHOLD,
     *,
     candidate_source: CandidateSource = "components",
+    redact_scores: bool = False,
 ) -> str:
     lines = ["# Eval report", ""]
     failures = [r for r in records if r.score < threshold]
@@ -199,12 +238,21 @@ def _format_failures(
         else "Review per-case feedback and edit slots in `.gepa/components/` "
         "or change the agent's source."
     )
-    lines.append(
-        f"{len(failures)} of {len(records)} case(s) underperformed "
-        f"(score < {threshold}). {next_step}\n"
-    )
+    if redact_scores:
+        lines.append(
+            f"{len(failures)} of {len(records)} case(s) need attention. {next_step}\n"
+        )
+    else:
+        lines.append(
+            f"{len(failures)} of {len(records)} case(s) underperformed "
+            f"(score < {threshold}). {next_step}\n"
+        )
     for record in failures:
-        lines.append(f"## {record.case_id} — score {record.score:.3f}")
+        lines.append(
+            f"## {record.case_id}"
+            if redact_scores
+            else f"## {record.case_id} — score {record.score:.3f}"
+        )
         if record.feedback:
             lines.append("")
             lines.append(record.feedback.rstrip())
@@ -270,6 +318,7 @@ def _write_trace_file(
     *,
     path: Path,
     records: list[EvaluationRecord],
+    redact_scores: bool = False,
 ) -> Path | None:
     trace_rows: list[dict[str, Any]] = []
     for record in records:
@@ -278,7 +327,8 @@ def _write_trace_file(
             continue
         trace_record = trajectory.to_reflective_record()
         trace_record["case_id"] = record.case_id
-        trace_record["score"] = record.score
+        if not redact_scores:
+            trace_record["score"] = record.score
         if record.feedback:
             trace_record["feedback"] = record.feedback
         metric_side_info = getattr(trajectory, "metric_side_info", None)
@@ -310,6 +360,10 @@ def run_eval_once(
     lane: str | None = None,
     candidate_root: Path | None = None,
     workspace_root: Path | None = None,
+    case_id: str | None = None,
+    row_scope: str = "acceptance",
+    vector_repetition: int | None = None,
+    vector_incumbent_hash: str | None = None,
     selected_case_ids: Sequence[str] | None = None,
     supplemental_records: Sequence[EvaluationRecord] = (),
     write_pareto: bool = True,
@@ -445,7 +499,13 @@ def run_eval_once(
 
     run_dir(active_run_id, workspace_root).mkdir(parents=True, exist_ok=True)
     minibatch_store = MinibatchStore(active_run_id, workspace_root)
-    if minibatch_id:
+    if case_id is not None:
+        if minibatch_id is not None:
+            raise typer.BadParameter(
+                "--case selection cannot be combined with a minibatch id."
+            )
+        minibatch = minibatch_store.sample([case_id], size=1, seed=seed, epoch=epoch)
+    elif minibatch_id:
         minibatch = minibatch_store.load(minibatch_id)
     else:
         minibatch = minibatch_store.sample(
@@ -521,26 +581,44 @@ def run_eval_once(
     )
     if source == "git":
         configured_refs = (cfg.agent, cfg.evaluate, cfg.metric, cfg.case_factory)
+        scorer_root = (
+            primary_project_root
+            if cfg.acceptance.pinned_scorer
+            else active_candidate_project
+        )
+        candidate_components: dict[str, str] = {}
+        if cfg.acceptance.pinned_scorer:
+            for relative in cfg.acceptance.component_files:
+                path = active_candidate_project / relative
+                if not path.is_file():
+                    raise typer.BadParameter(
+                        f"Declared candidate component file is missing: {relative}"
+                    )
+                try:
+                    candidate_components[relative] = path.read_bytes().decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise typer.BadParameter(
+                        f"Declared component file {relative} must be UTF-8 text."
+                    ) from exc
+        previous_payload = os.environ.get(GEPA_CANDIDATE_COMPONENTS_ENV)
+        if cfg.acceptance.pinned_scorer:
+            os.environ[GEPA_CANDIDATE_COMPONENTS_ENV] = json.dumps(
+                candidate_components, sort_keys=True
+            )
         with candidate_import_context(
             primary_project_root=primary_project_root,
-            candidate_project_root=active_candidate_project,
+            candidate_project_root=scorer_root,
             refs=configured_refs,
         ):
-            agent = (
-                resolve_agent(cfg, expected_root=active_candidate_project)
-                if cfg.agent
-                else None
-            )
-            evaluate = resolve_evaluate(cfg, expected_root=active_candidate_project)
+            agent = resolve_agent(cfg, expected_root=scorer_root) if cfg.agent else None
+            evaluate = resolve_evaluate(cfg, expected_root=scorer_root)
             metric = (
-                resolve_metric(cfg, expected_root=active_candidate_project)
+                resolve_metric(cfg, expected_root=scorer_root)
                 if cfg.metric
                 else default_substring_metric
             )
-            case_factory = resolve_case_factory(
-                cfg, expected_root=active_candidate_project
-            )
-            skills_fs = resolve_skills(cfg, root=active_candidate_project)
+            case_factory = resolve_case_factory(cfg, expected_root=scorer_root)
+            skills_fs = resolve_skills(cfg, root=scorer_root)
             with _expose_trace_path(planned_trace_path):
                 if evaluate is not None:
                     records = asyncio.run(
@@ -559,13 +637,20 @@ def run_eval_once(
                             agent=agent,
                             metric=metric,
                             dataset=subset,
-                            candidate={},
+                            candidate=Candidate(
+                                id=candidate.id,
+                                components=candidate_components,
+                            ).to_candidate_map(),
                             concurrency=concurrency,
                             case_factory=case_factory,
                             capture_traces=capture_traces,
                             skills_fs=skills_fs,
                         )
                     )
+        if previous_payload is None:
+            os.environ.pop(GEPA_CANDIDATE_COMPONENTS_ENV, None)
+        else:
+            os.environ[GEPA_CANDIDATE_COMPONENTS_ENV] = previous_payload
     else:
         assert metric is not None
         with _expose_trace_path(planned_trace_path):
@@ -624,6 +709,7 @@ def run_eval_once(
                     "evaluation_errors": [
                         failure.to_dict() for failure in infrastructure_failures
                     ],
+                    "row_scope": row_scope,
                 },
             )
         )
@@ -633,7 +719,12 @@ def run_eval_once(
     reports_dir.mkdir(parents=True, exist_ok=True)
     report_path = reports_dir / f"{iteration:04d}-{eval_id}-{candidate.id}.md"
     report_path.write_text(
-        _format_failures(records, threshold=threshold, candidate_source=source),
+        _format_failures(
+            records,
+            threshold=threshold,
+            candidate_source=source,
+            redact_scores=cfg.acceptance.mode == "vector",
+        ),
         encoding="utf-8",
     )
     if infrastructure_failures:
@@ -642,6 +733,7 @@ def run_eval_once(
         _write_trace_file(
             path=planned_trace_path,
             records=records,
+            redact_scores=cfg.acceptance.mode == "vector",
         )
         if planned_trace_path is not None
         else None
@@ -649,6 +741,12 @@ def run_eval_once(
 
     summary: dict[str, Any] = {
         "candidate_id": candidate.id,
+        "component_hashes": _candidate_component_hashes(
+            candidate,
+            source=source,
+            candidate_root=active_candidate_project,
+            component_files=cfg.acceptance.component_files,
+        ),
         "candidate_role": status,
         "candidate_source": source,
         "commit_sha": (
@@ -674,7 +772,50 @@ def run_eval_once(
         "max_iterations": max_iterations,
         "report_path": str(report_path),
         "trace_path": str(trace_path) if trace_path else None,
+        "row_scope": row_scope,
     }
+
+    if cfg.acceptance.mode == "vector":
+        assertions, latency = side_info_vector(records)
+        repetition = vector_repetition if vector_repetition is not None else iteration
+        incumbent_hash = vector_incumbent_hash or candidate.id
+        vector = VectorRecord(
+            key=VectorRecordKey(
+                run_id=active_run_id,
+                inventory_hash=inventory_hash(list(minibatch.case_ids)),
+                scorer_identity=scorer_identity(
+                    (
+                        cfg.metric
+                        or "pydantic_ai_gepa.cli.metrics:default_substring_metric",
+                        cfg.case_factory,
+                        cfg.acceptance.comparator,
+                    ),
+                    root=(
+                        primary_project_root if cfg.acceptance.pinned_scorer else None
+                    ),
+                ),
+                incumbent_hash=incumbent_hash,
+                candidate_hash=candidate.id,
+                repetition=repetition,
+                vector_schema_version=cfg.acceptance.vector_schema_version,
+                telemetry_schema_version=cfg.acceptance.telemetry_schema_version,
+            ),
+            assertions=assertions,
+            latency=latency,
+            display_score=mean,
+            outcome="infra_error" if infrastructure_failures else "scored",
+            error={
+                "evaluation_errors": [
+                    item.to_dict() for item in infrastructure_failures
+                ]
+            }
+            if infrastructure_failures
+            else None,
+        )
+        VectorRecordStore(vector_records_path(active_run_id, workspace_root)).append(
+            vector
+        )
+        summary["vector_record"] = vector.to_dict()
 
     return EvalOutcome(
         records=records,

@@ -21,17 +21,21 @@ phase on the next invocation:
    itself is always delegated to the coding agent — never auto-merged).
 2. ``journal`` — every non-promoted resolved lane is journaled (diff summary,
    verdict, delta, confidence) *before* its branch is deleted.
-3. ``refan`` — reset every lane worktree onto the new best on a fresh
+3. ``run_start_rebaseline`` — when vector ``acceptance.rebaseline_interval``
+   reaches an accepted-promotion multiple, compare the promoted incumbent
+   with the immutable run-start vector set. Its result is journal evidence;
+   it never rolls back or promotes either side.
+4. ``refan`` — reset every lane worktree onto the new best on a fresh
    ``gepa/lane/<lane>/<iteration>`` branch, delete the previous-iteration
    branches (already journaled), and return lanes to ``paused_for_reflection``
    with a bumped iteration and fresh lease epoch. The winner's branch is
    deleted too once the primary checkout carries its commit; when the primary
    could not be promoted (dirty or moved), the winner branch is kept so the
    commit stays reachable.
-4. ``rebaseline`` — sample the next reflection minibatch and re-measure the
+5. ``rebaseline`` — sample the next reflection minibatch and re-measure the
    shared baseline once per iteration against the new best tree (baseline
    evals are paid once per iteration, not once per lane).
-5. ``emit`` — write fresh reflection packets and emit ``lane_ready`` per lane.
+6. ``emit`` — write fresh reflection packets and emit ``lane_ready`` per lane.
 
 ``finalize`` replaces re-fan when the pareto ledger reaches
 ``--max-iterations``: lane-run budget enforcement lives at select, not
@@ -65,6 +69,13 @@ from .candidates import GitCandidateError, git_candidate_state
 from .eval import run_eval_once
 from .events import EventDraft, emit, list_events
 from ..evaluation_health import evaluation_infrastructure_failures
+from ..vector_acceptance import (
+    VectorComparisonRequest,
+    VectorRecord,
+    VectorRecordStore,
+    compare_vectors,
+    resolve_vector_comparator,
+)
 from .lanes import (
     LaneState,
     _git,
@@ -80,12 +91,15 @@ from .lanes import (
     write_packet,
 )
 from .layout import (
+    GepaConfig,
     candidate_identity_exempt_paths,
     candidate_project_root,
+    config_path,
     final_report_path,
     journal_path,
     run_dir,
     run_state_path,
+    vector_records_path,
 )
 from .runs import ParetoLog, utc_now_iso
 
@@ -93,7 +107,15 @@ SELECT_PRODUCER_ID = "select"
 
 # Phase ordering (spec-er3). ``finalize`` is the budget-exhausted terminal
 # phase reached from ``journal`` instead of ``refan``.
-SELECT_PHASES = ("promote", "journal", "refan", "rebaseline", "emit", "finalize")
+SELECT_PHASES = (
+    "promote",
+    "journal",
+    "run_start_rebaseline",
+    "refan",
+    "rebaseline",
+    "emit",
+    "finalize",
+)
 
 _PID_TERM_GRACE_SECS = 5.0
 _PID_KILL_GRACE_SECS = 2.0
@@ -192,6 +214,78 @@ def _journal_lane_outcome(workspace_root: Path, entry: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(entry, sort_keys=True) + "\n")
+
+
+def _journal_rows(workspace_root: Path, run_id: str, kind: str) -> list[dict[str, Any]]:
+    """Read this run's journal rows of one kind in append order."""
+    path = journal_path(workspace_root)
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        raw = json.loads(line)
+        if (
+            isinstance(raw, dict)
+            and raw.get("run_id") == run_id
+            and raw.get("kind") == kind
+        ):
+            rows.append(raw)
+    return rows
+
+
+def _append_journal_once(
+    workspace_root: Path,
+    entry: dict[str, Any],
+    *,
+    identity: dict[str, Any],
+) -> dict[str, Any]:
+    """Append one durable run-journal record, deduplicated for select resume."""
+    kind = str(entry["kind"])
+    run_id = str(entry["run_id"])
+    for existing in _journal_rows(workspace_root, run_id, kind):
+        if all(existing.get(key) == value for key, value in identity.items()):
+            return existing
+    path = journal_path(workspace_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, sort_keys=True) + "\n")
+    return entry
+
+
+def _record_accepted_promotion(
+    workspace_root: Path,
+    state: Any,
+    winner: LaneState,
+    *,
+    candidate_id: str,
+) -> int:
+    """Append the authoritative promotion counter record exactly once."""
+    existing = _journal_rows(workspace_root, state.run_id, "accepted_promotion")
+    identity = {
+        "lane": winner.lane,
+        "iteration": winner.iteration,
+        "candidate_sha": winner.candidate_sha,
+    }
+    for row in existing:
+        if all(row.get(key) == value for key, value in identity.items()):
+            return int(row["promotion_count"])
+    count = max((int(row.get("promotion_count", 0)) for row in existing), default=0) + 1
+    _append_journal_once(
+        workspace_root,
+        {
+            "timestamp": utc_now_iso(),
+            "kind": "accepted_promotion",
+            "run_id": state.run_id,
+            **identity,
+            "candidate_id": candidate_id,
+            "promotion_count": count,
+            "content": f"accepted promotion {count}: {winner.lane} iteration {winner.iteration}",
+        },
+        identity=identity,
+    )
+    return count
 
 
 def _lane_outcome_entry(
@@ -553,18 +647,31 @@ def _phase_promote(
             _invalidate_cross_baseline(workspace_root, state, lane_state)
             invalidated.append(lane_state.lane)
 
-    # 3. Winner selection, strategy `best`: highest memoized delta among
-    #    accepted lanes; ties break by lane id order. Verdicts are consumed
+    # 3. Winner selection: vector runs use the comparator's opaque ranking
+    #    tuple; scalar runs retain the historical delta ordering. Verdicts are consumed
     #    from lane state (memoized by the lane eval) — never re-derived here.
     accepted = [lane_state for lane_state in valid if lane_state.verdict == "accepted"]
     winner: LaneState | None = None
     if accepted:
+        vector_mode = (
+            GepaConfig.load(config_path(workspace_root)).acceptance.mode == "vector"
+        )
+
+        def rank(lane_state: LaneState) -> tuple[float | str, ...]:
+            if not vector_mode:
+                return (-(lane_state.verdict_delta or 0.0), lane_state.lane)
+            raw = _load_comparison(lane_state).get("ranking_key", [])
+            if not isinstance(raw, list) or not all(
+                isinstance(item, (int, float)) for item in raw
+            ):
+                raise typer.BadParameter(
+                    "Vector comparison ranking_key must be a numeric tuple."
+                )
+            return tuple(-float(item) for item in raw) + (lane_state.lane,)
+
         winner = sorted(
             accepted,
-            key=lambda lane_state: (
-                -(lane_state.verdict_delta or 0.0),
-                lane_state.lane,
-            ),
+            key=rank,
         )[0]
     losers = [lane_state.lane for lane_state in valid if lane_state is not winner]
 
@@ -603,7 +710,7 @@ def _phase_promote(
     #    otherwise promotion happens in run state only (user work is never
     #    destroyed).
     comparison = _load_comparison(winner)
-    winner_mean = comparison.get("candidate_mean")
+    winner_mean = comparison.get("candidate_mean", comparison.get("display_score"))
     if winner_mean is None and winner.eval_samples:
         winner_mean = sum(winner.eval_samples) / len(winner.eval_samples)
     winner_candidate_id = (
@@ -620,6 +727,19 @@ def _phase_promote(
             diff_summary=_diff_stat(workspace_root, str(baseline_sha), winner_sha),
             confidence=comparison.get("confidence"),
         ),
+    )
+    promotion_count = _record_accepted_promotion(
+        workspace_root,
+        state,
+        winner,
+        candidate_id=str(winner_candidate_id),
+    )
+    acceptance = GepaConfig.load(config_path(workspace_root)).acceptance
+    scheduled_run_start_rebaseline = bool(
+        acceptance.mode == "vector"
+        and acceptance.rebaseline_interval is not None
+        and promotion_count % acceptance.rebaseline_interval == 0
+        and state.run_start_baseline is not None
     )
 
     old_best = state.best_commit_sha
@@ -652,12 +772,15 @@ def _phase_promote(
         best_mean_score=(
             float(winner_mean) if winner_mean is not None else state.best_mean_score
         ),
+        accepted_promotion_count=promotion_count,
     )
     from .run import _consume_candidate_verdict
 
     state = _consume_candidate_verdict(state, accepted=True)
     ctx["primary_promoted"] = primary_promoted
     ctx["winner_mean"] = winner_mean
+    ctx["accepted_promotion_count"] = promotion_count
+    ctx["scheduled_run_start_rebaseline"] = scheduled_run_start_rebaseline
     # Checkpoint immediately after the promotion decision: the recorded phase
     # state must always be a prefix of externally visible side effects
     # (primary reset, journal entry), so a crash here never leaves the
@@ -750,6 +873,207 @@ def _phase_journal(
             )
     if rows >= state.max_iterations:
         return state, ctx, "finalize"
+    if ctx.get("scheduled_run_start_rebaseline"):
+        return state, ctx, "run_start_rebaseline"
+    return state, ctx, "refan"
+
+
+def _run_start_rebaseline_root(
+    workspace_root: Path, state: Any, ctx: dict[str, Any]
+) -> Path:
+    """Locate the promoted incumbent without mutating the primary checkout."""
+    best_sha = str(state.best_commit_sha)
+    primary_head, primary_dirty = _primary_checkout_state(workspace_root)
+    if primary_head == best_sha and not primary_dirty:
+        return workspace_root
+    winner = load_lane_state(workspace_root, state.run_id, str(ctx["winner"]))
+    worktree = Path(str(winner.worktree_path))
+    return (
+        Path(winner.candidate_project_path)
+        if winner.candidate_project_path
+        else candidate_project_root(workspace_root, worktree)
+    )
+
+
+def _journal_run_start_rebaseline(
+    workspace_root: Path,
+    state: Any,
+    ctx: dict[str, Any],
+    *,
+    outcome: str,
+    incumbent_candidate_id: str,
+    candidate_component_hashes: dict[str, Any],
+    comparison: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    """Persist one re-baseline result per scheduled promotion."""
+    promotion_count = int(ctx["accepted_promotion_count"])
+    return _append_journal_once(
+        workspace_root,
+        {
+            "timestamp": utc_now_iso(),
+            "kind": "run_start_rebaseline",
+            "run_id": state.run_id,
+            "promotion_count": promotion_count,
+            "incumbent_candidate_id": incumbent_candidate_id,
+            "incumbent_commit_sha": state.best_commit_sha,
+            "candidate_component_hashes": candidate_component_hashes,
+            "run_start_baseline": state.run_start_baseline,
+            "outcome": outcome,
+            "comparison": comparison,
+            "error": error,
+            "content": (
+                f"run-start re-baseline after accepted promotion {promotion_count}: "
+                f"{outcome}"
+            ),
+        },
+        identity={"promotion_count": promotion_count},
+    )
+
+
+def _phase_run_start_rebaseline(
+    workspace_root: Path, state: Any, ctx: dict[str, Any]
+) -> tuple[Any, dict[str, Any], str]:
+    """Pair the promoted incumbent with the immutable run-start vector set.
+
+    A comparator rejection is evidence, not rollback authority: the incumbent
+    remains the selected candidate and lanes are re-fanned from it either way.
+    The journal row is the idempotence marker for resume after a crash.
+    """
+    if ctx.get("run_start_rebaseline_finished"):
+        return state, ctx, "refan"
+    existing = _journal_rows(workspace_root, state.run_id, "run_start_rebaseline")
+    promotion_count = int(ctx["accepted_promotion_count"])
+    if any(int(row.get("promotion_count", -1)) == promotion_count for row in existing):
+        ctx["run_start_rebaseline_finished"] = True
+        return state, ctx, "refan"
+
+    baseline = state.run_start_baseline
+    if not isinstance(baseline, dict):
+        _journal_run_start_rebaseline(
+            workspace_root,
+            state,
+            ctx,
+            outcome="unavailable",
+            incumbent_candidate_id=str(state.best_candidate_id),
+            candidate_component_hashes={},
+            error="run-start baseline identity is unavailable",
+        )
+        ctx["run_start_rebaseline_finished"] = True
+        return state, ctx, "refan"
+    raw_keys = baseline.get("vector_record_keys")
+    minibatch_id = baseline.get("minibatch_id")
+    if (
+        not isinstance(raw_keys, list)
+        or not raw_keys
+        or not isinstance(minibatch_id, str)
+    ):
+        _journal_run_start_rebaseline(
+            workspace_root,
+            state,
+            ctx,
+            outcome="unavailable",
+            incumbent_candidate_id=str(state.best_candidate_id),
+            candidate_component_hashes={},
+            error="run-start baseline has no stored vector keys or minibatch",
+        )
+        ctx["run_start_rebaseline_finished"] = True
+        return state, ctx, "refan"
+
+    root = _run_start_rebaseline_root(workspace_root, state, ctx)
+    cfg = GepaConfig.load(config_path(workspace_root))
+    store = VectorRecordStore(vector_records_path(state.run_id, workspace_root))
+    try:
+        incumbent_records = tuple(store.records_for_keys(raw_keys))
+    except ValueError as exc:
+        _journal_run_start_rebaseline(
+            workspace_root,
+            state,
+            ctx,
+            outcome="unavailable",
+            incumbent_candidate_id=str(state.best_candidate_id),
+            candidate_component_hashes={},
+            error=str(exc),
+        )
+        ctx["run_start_rebaseline_finished"] = True
+        return state, ctx, "refan"
+
+    current_records: list[VectorRecord] = []
+    latest_summary: dict[str, Any] | None = None
+    with _chdir(root):
+        for raw_key in raw_keys:
+            if not isinstance(raw_key, dict):
+                raise typer.BadParameter("Stored run-start vector key is malformed.")
+            outcome = run_eval_once(
+                candidate_file=None,
+                minibatch_id=minibatch_id,
+                size=state.size,
+                seed=state.seed,
+                epoch=state.next_epoch,
+                run_id=state.run_id,
+                concurrency=state.concurrency,
+                max_iterations=state.max_iterations,
+                threshold=state.threshold,
+                capture_traces=True,
+                candidate_source=state.candidate_source,
+                lane="run-start-rebaseline",
+                candidate_root=root,
+                workspace_root=workspace_root,
+                vector_incumbent_hash=str(baseline["candidate_id"]),
+                vector_repetition=int(raw_key["repetition"]),
+                row_scope="run_start_rebaseline",
+            )
+            latest_summary = outcome.summary
+            failures = evaluation_infrastructure_failures(outcome.records)
+            raw_vector = outcome.summary.get("vector_record")
+            if failures or not isinstance(raw_vector, dict):
+                _journal_run_start_rebaseline(
+                    workspace_root,
+                    state,
+                    ctx,
+                    outcome="infrastructure_failure",
+                    incumbent_candidate_id=str(outcome.summary["candidate_id"]),
+                    candidate_component_hashes=dict(
+                        outcome.summary.get("component_hashes") or {}
+                    ),
+                    error="required re-baseline rollout did not yield a scored vector",
+                )
+                ctx["run_start_rebaseline_finished"] = True
+                return state, ctx, "refan"
+            current_records.append(VectorRecord.from_dict(raw_vector))
+
+    assert latest_summary is not None
+    comparator = resolve_vector_comparator(
+        str(cfg.acceptance.comparator),
+        expected_root=workspace_root if cfg.acceptance.pinned_scorer else root,
+    )
+    comparison = compare_vectors(
+        comparator,
+        VectorComparisonRequest(
+            incumbent=incumbent_records,
+            candidate=tuple(current_records),
+            attempt=len(current_records),
+            escalation=0,
+            journal_context={
+                "run_id": state.run_id,
+                "lane": ctx.get("winner"),
+                "iteration": ctx.get("new_lane_iteration"),
+                "comparison_kind": "run_start_rebaseline",
+                "accepted_promotion_count": state.accepted_promotion_count,
+                "run_start_baseline": baseline,
+            },
+        ),
+    )
+    _journal_run_start_rebaseline(
+        workspace_root,
+        state,
+        ctx,
+        outcome="passed" if comparison.verdict == "accepted" else "failed",
+        incumbent_candidate_id=str(state.best_candidate_id),
+        candidate_component_hashes=dict(latest_summary.get("component_hashes") or {}),
+        comparison=comparison.to_dict(),
+    )
+    ctx["run_start_rebaseline_finished"] = True
     return state, ctx, "refan"
 
 
@@ -1194,7 +1518,17 @@ def run_select(run_id: str | None) -> Any:
     """Execute `gepa run select` (see module docstring for the phase model)."""
     workspace_root, run_state = _resolve_lane_run(run_id)
     with _select_lock(workspace_root, run_state.run_id):
-        return _run_select_locked(workspace_root, run_state)
+        # Resolve before taking the lock only to locate the run. A second
+        # selector may have waited while the first completed every phase, so
+        # its pre-lock snapshot must never drive a second selection.
+        from .run import RunState
+
+        raw = json.loads(
+            run_state_path(run_state.run_id, workspace_root).read_text(encoding="utf-8")
+        )
+        if not isinstance(raw, dict):
+            raise typer.BadParameter("Managed run state must be a JSON object.")
+        return _run_select_locked(workspace_root, RunState.from_dict(raw))
 
 
 def _run_select_locked(workspace_root: Path, run_state: Any) -> Any:
@@ -1234,6 +1568,7 @@ def _run_select_locked(workspace_root: Path, run_state: Any) -> Any:
     handlers = {
         "promote": _phase_promote,
         "journal": _phase_journal,
+        "run_start_rebaseline": _phase_run_start_rebaseline,
         "refan": _phase_refan,
         "rebaseline": _phase_rebaseline,
         "emit": _phase_emit,

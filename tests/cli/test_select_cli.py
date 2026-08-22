@@ -820,6 +820,49 @@ def test_select_rejects_non_lane_run(git_repo: Path) -> None:
     assert "not a lane run" in select.output
 
 
+def test_resume_at_emit_applies_configured_packet_projector(git_repo: Path) -> None:
+    """A fresh select-resume imports the projector from write_packet itself."""
+    projector = git_repo / "task_pkg" / "packet_projector.py"
+    projector.write_text(
+        "def project(packet):\n"
+        "    return {**packet, 'projected_at_emit': packet['lane']}\n",
+        encoding="utf-8",
+    )
+    config = git_repo / ".gepa" / "gepa.toml"
+    config.write_text(
+        config.read_text(encoding="utf-8")
+        + "\n[acceptance]\n"
+        + "pinned_scorer = true\n"
+        + 'packet_projector = "task_pkg.packet_projector:project"\n',
+        encoding="utf-8",
+    )
+    _git(git_repo, "add", "task_pkg/packet_projector.py", ".gepa/gepa.toml")
+    _git(git_repo, "commit", "-m", "Configure packet projector")
+    run = _start_lane_run(git_repo, lanes=1)
+    run_id = _run_id(run)
+    state = _state(git_repo, run_id)
+    _write_state(
+        git_repo,
+        RunState(
+            **{
+                **state.to_dict(),
+                "select_phase": "emit",
+                "select_context": {"started_ms": 0},
+            }
+        ),
+    )
+    for name in list(sys.modules):
+        if name == "task_pkg" or name.startswith("task_pkg."):
+            sys.modules.pop(name, None)
+
+    resumed = _select(git_repo, run_id)
+
+    assert resumed.exit_code == 0, resumed.output
+    lane = load_lane_state(git_repo, run_id, "lane-1")
+    packet = json.loads(Path(str(lane.packet_path)).read_text(encoding="utf-8"))
+    assert packet["projected_at_emit"] == "lane-1"
+
+
 def test_pre_select_state_loads_with_select_defaults(git_repo: Path) -> None:
     """Run state files written before select existed load with defaults."""
     run = _start_lane_run(git_repo, lanes=1)
