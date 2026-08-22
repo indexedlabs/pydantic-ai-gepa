@@ -461,6 +461,7 @@ def _lane_continue_argv(
     run_id: str,
     foreground: bool = False,
     handoff_lease_epoch: int | None = None,
+    gate_cases: tuple[str, ...] = (),
 ) -> list[str]:
     """Build a launcher independent of the caller's PATH or active venv."""
 
@@ -481,6 +482,8 @@ def _lane_continue_argv(
         argv.append("--foreground")
     if handoff_lease_epoch is not None:
         argv.extend(["--handoff-lease-epoch", str(handoff_lease_epoch)])
+    for case_name in gate_cases:
+        argv.extend(["--gate-case", case_name])
     return argv
 
 
@@ -625,6 +628,7 @@ def _run_lane_eval_loop(
     workspace_root: Path,
     run_state: Any,  # RunState
     lane_state: LaneState,
+    gate_cases: tuple[str, ...] = (),
 ) -> LaneState:
     """Run the escalating acceptance eval for the lane's committed candidate.
 
@@ -694,6 +698,75 @@ def _run_lane_eval_loop(
     outcomes: list[Any] = []
     comparison_result = None
     try:
+        if gate_cases:
+            from .run import _evaluate_gate_cases
+
+            _, gate_outcomes, gate_comparison = _evaluate_gate_cases(
+                run_state,
+                gate_cases,
+                workspace_root=workspace_root,
+                candidate_root=candidate_project,
+                lane=lane,
+            )
+            outcomes.extend(gate_outcomes)
+            if str(gate_outcomes[0].summary["candidate_id"]) != git_state.candidate_id:
+                raise typer.BadParameter(
+                    "The lane candidate changed during gate evaluation; "
+                    "refusing to compare mixed candidates."
+                )
+            if gate_comparison.get("outcome") != "valid":
+                return _stall_for_infrastructure_failure(
+                    workspace_root=workspace_root,
+                    run_state=run_state,
+                    lane_state=lane_state,
+                    git_state=git_state,
+                    outcomes=outcomes,
+                    failures=evaluation_infrastructure_failures(
+                        gate_outcomes[-1].records
+                    ),
+                    valid_samples=[],
+                )
+            if gate_comparison.get("rejection_reason") == "gate":
+                comparison = {
+                    "run_id": run_id,
+                    "lane": lane,
+                    "iteration": lane_state.iteration,
+                    "baseline_candidate_id": run_state.reflection_baseline_candidate_id,
+                    "baseline_commit_sha": run_state.reflection_baseline_commit_sha,
+                    "candidate_id": git_state.candidate_id,
+                    "candidate_commit_sha": commit_sha,
+                    **gate_comparison,
+                }
+                comparison_path = _write_comparison(
+                    workspace_root, run_id, lane, lane_state.iteration, comparison
+                )
+                completed = LaneState(
+                    **{
+                        **lane_state.to_dict(),
+                        "status": "awaiting_selection",
+                        "verdict": "rejected",
+                        "verdict_delta": gate_comparison["delta"],
+                        "comparison_path": str(comparison_path),
+                        "eval_pid": None,
+                        "updated_at": utc_now_iso(),
+                    }
+                )
+                completed.save(workspace_root, run_id)
+                emit(
+                    run_id,
+                    lane,
+                    EventDraft(
+                        type="verdict",
+                        lane=lane,
+                        payload={
+                            "verdict": "rejected",
+                            "delta": gate_comparison["delta"],
+                            "comparison_path": str(comparison_path),
+                        },
+                    ),
+                    root=workspace_root,
+                )
+                return completed
         for _ in range(max_candidate_samples):
             outcome = run_eval_once(
                 candidate_file=None,
@@ -935,6 +1008,11 @@ def lane_continue(
         "--handoff-lease-epoch",
         hidden=True,
     ),
+    gate_case: list[str] = typer.Option(
+        [],
+        "--gate-case",
+        help="Case name from the current reflection minibatch to evaluate first. Repeatable.",
+    ),
 ) -> None:
     """Auto-commit the lane worktree and evaluate the candidate in the background.
 
@@ -1058,7 +1136,10 @@ def lane_continue(
 
     if foreground:
         _run_lane_eval_loop(
-            workspace_root=workspace_root, run_state=run_state, lane_state=state
+            workspace_root=workspace_root,
+            run_state=run_state,
+            lane_state=state,
+            gate_cases=tuple(gate_case),
         )
         return
 
@@ -1075,6 +1156,7 @@ def lane_continue(
         run_id=run_state.run_id,
         foreground=True,
         handoff_lease_epoch=state.lease_epoch,
+        gate_cases=tuple(gate_case),
     )
     worktree_path = Path(str(state.worktree_path))
     candidate_project_path = (

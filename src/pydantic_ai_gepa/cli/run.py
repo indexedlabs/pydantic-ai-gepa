@@ -13,7 +13,7 @@ from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, Sequence, cast
 
 import typer
 
@@ -43,7 +43,7 @@ from .layout import (
     run_state_path,
     runs_dir,
 )
-from .runs import ParetoLog, utc_now_iso
+from .runs import MinibatchStore, ParetoLog, utc_now_iso
 from .store import ComponentStore
 
 
@@ -822,6 +822,162 @@ def _evaluate_reflected_candidate(
     return state, outcomes, comparison
 
 
+def _gate_baseline_samples(
+    state: RunState, gate_case_ids: Sequence[str], *, root: Path | None = None
+) -> tuple[float, ...]:
+    """Recover the saved baseline's scores for a declared gate subset."""
+
+    assert state.reflection_minibatch_id is not None
+    assert state.reflection_baseline_candidate_id is not None
+    rows = [
+        row
+        for row in ParetoLog(state.run_id, root).iter_rows()
+        if row.minibatch_id == state.reflection_minibatch_id
+        and row.candidate_id == state.reflection_baseline_candidate_id
+    ]
+    expected = len(state.reflection_baseline_samples)
+    rows = rows[-expected:]
+    if len(rows) != expected:
+        raise typer.BadParameter(
+            "The saved reflection baseline is missing per-case scores required "
+            "for gate comparison. Start a new reflection iteration."
+        )
+    samples: list[float] = []
+    for row in rows:
+        missing = [
+            case_id for case_id in gate_case_ids if case_id not in row.per_case_scores
+        ]
+        if missing:
+            raise typer.BadParameter(
+                "The saved reflection baseline is missing gate case score(s): "
+                f"{missing}."
+            )
+        samples.append(
+            sum(float(row.per_case_scores[case_id]) for case_id in gate_case_ids)
+            / len(gate_case_ids)
+        )
+    return tuple(samples)
+
+
+def _validate_gate_cases(
+    state: RunState, gate_case_ids: Sequence[str], *, root: Path | None = None
+) -> tuple[str, ...]:
+    """Validate gate names before candidate evaluation begins."""
+
+    assert state.reflection_minibatch_id is not None
+    minibatch = MinibatchStore(state.run_id, root).load(state.reflection_minibatch_id)
+    unknown = [
+        case_id for case_id in gate_case_ids if case_id not in minibatch.case_ids
+    ]
+    if unknown:
+        raise typer.BadParameter(
+            "Gate case(s) must be in the current reflection minibatch; "
+            f"unknown: {unknown}. Available: {list(minibatch.case_ids)}."
+        )
+    return tuple(dict.fromkeys(gate_case_ids))
+
+
+def _evaluate_gate_cases(
+    state: RunState,
+    gate_case_ids: Sequence[str],
+    *,
+    workspace_root: Path | None = None,
+    candidate_root: Path | None = None,
+    lane: str | None = None,
+) -> tuple[RunState, list[EvalOutcome], dict[str, Any]]:
+    """Evaluate a candidate gate without adding gate rows to the Pareto log."""
+
+    gate_case_ids = _validate_gate_cases(state, gate_case_ids, root=workspace_root)
+    baseline_samples = _gate_baseline_samples(state, gate_case_ids, root=workspace_root)
+    max_candidate_samples = min(
+        len(baseline_samples), state.max_iterations - state.iterations
+    )
+    if max_candidate_samples < 1:
+        raise typer.BadParameter("No evaluation budget remains for gate comparison.")
+    initial_samples = min(state.acceptance_repetitions, max_candidate_samples)
+    outcomes: list[EvalOutcome] = []
+    candidate_samples: list[float] = []
+    comparison_result: AcceptanceComparison | None = None
+    candidate_id: str | None = None
+    while len(candidate_samples) < max_candidate_samples:
+        outcome = run_eval_once(
+            candidate_file=None,
+            minibatch_id=state.reflection_minibatch_id,
+            size=state.size,
+            seed=state.seed,
+            epoch=state.next_epoch,
+            run_id=state.run_id,
+            concurrency=state.concurrency,
+            max_iterations=state.max_iterations,
+            threshold=state.threshold,
+            capture_traces=True,
+            candidate_source=state.candidate_source,
+            selected_case_ids=gate_case_ids,
+            write_pareto=False,
+            lane=lane,
+            candidate_root=candidate_root,
+            workspace_root=workspace_root,
+        )
+        outcomes.append(outcome)
+        current_candidate_id = str(outcome.summary["candidate_id"])
+        if candidate_id is None:
+            candidate_id = current_candidate_id
+        elif current_candidate_id != candidate_id:
+            raise typer.BadParameter(
+                "The reflected candidate changed while collecting gate evaluations; "
+                "refusing to compare mixed candidates."
+            )
+        failures = _outcome_infrastructure_failures(outcome)
+        if failures:
+            state, comparison = _pause_after_infrastructure_failure(
+                state,
+                outcomes,
+                phase="candidate",
+                failures=failures,
+                valid_samples=tuple(candidate_samples),
+            )
+            return state, outcomes, comparison
+        candidate_samples.append(float(outcome.summary["mean_score"]))
+        if len(candidate_samples) < initial_samples:
+            continue
+        comparison_result = compare_candidate_samples(
+            baseline_samples[: len(candidate_samples)],
+            candidate_samples,
+            confidence=state.acceptance_confidence,
+            min_delta=state.acceptance_min_delta,
+        )
+        if comparison_result.verdict != "inconclusive":
+            break
+
+    assert comparison_result is not None
+    last_outcome = outcomes[-1]
+    comparison = {
+        "outcome": "valid",
+        "selectable": False,
+        "minibatch_id": state.reflection_minibatch_id,
+        "gate_cases": list(gate_case_ids),
+        "candidate_id": candidate_id,
+        "baseline_mean_score": comparison_result.baseline_mean,
+        "candidate_mean_score": comparison_result.candidate_mean,
+        "candidate_report_path": last_outcome.summary["report_path"],
+        "candidate_report_paths": [
+            outcome.summary["report_path"] for outcome in outcomes
+        ],
+        "candidate_trace_path": last_outcome.summary["trace_path"],
+        "candidate_trace_paths": [
+            outcome.summary["trace_path"]
+            for outcome in outcomes
+            if outcome.summary.get("trace_path")
+        ],
+        **comparison_result.to_dict(),
+        "rejection_reason": (
+            "gate" if comparison_result.verdict == "rejected" else None
+        ),
+        "recommendation": "discard_or_revise",
+    }
+    return state, outcomes, comparison
+
+
 def _current_baseline_candidate_id(
     candidate_source: CandidateSource = "components",
     *,
@@ -1360,6 +1516,11 @@ def continue_(
         "--run-id",
         help="Managed run id. Omit to use the latest run with a state file.",
     ),
+    gate_case: list[str] = typer.Option(
+        [],
+        "--gate-case",
+        help="Case name from the current reflection minibatch to evaluate first. Repeatable.",
+    ),
 ) -> None:
     """Resume after reflection edits and advance to the next pause or completion."""
     state = _load_state(run_id)
@@ -1425,8 +1586,34 @@ def continue_(
         return
 
     if state.reflection_minibatch_id is not None:
-        state, comparison_outcomes, comparison = _evaluate_reflected_candidate(state)
-        outcomes.extend(comparison_outcomes)
+        gate_outcomes: list[EvalOutcome] = []
+        gate_comparison: dict[str, Any] | None = None
+        if gate_case:
+            state, gate_outcomes, gate_comparison = _evaluate_gate_cases(
+                state, gate_case
+            )
+            outcomes.extend(gate_outcomes)
+        gate_rejected = (
+            gate_comparison is not None
+            and gate_comparison.get("rejection_reason") == "gate"
+        )
+        if gate_rejected:
+            comparison = gate_comparison
+            comparison_outcomes = gate_outcomes
+            state = _consume_candidate_verdict(state, accepted=False)
+            state = _with_timestamp(
+                state,
+                status="paused_after_candidate_eval",
+                last_comparison=comparison,
+            )
+        elif gate_comparison and gate_comparison.get("outcome") != "valid":
+            comparison = gate_comparison
+            comparison_outcomes = gate_outcomes
+        else:
+            state, comparison_outcomes, comparison = _evaluate_reflected_candidate(
+                state
+            )
+            outcomes.extend(comparison_outcomes)
 
         if comparison["improved"]:
             state = _consume_candidate_verdict(state, accepted=True)
@@ -1440,7 +1627,9 @@ def continue_(
         elif comparison["improved"]:
             state, advanced_outcomes = _advance_to_reflection_or_done(state)
             outcomes.extend(advanced_outcomes)
-        elif comparison.get("outcome") != "infrastructure_failure":
+        elif (
+            not gate_rejected and comparison.get("outcome") != "infrastructure_failure"
+        ):
             state = _consume_candidate_verdict(state, accepted=False)
             state = _with_timestamp(state, status="paused_after_candidate_eval")
     else:

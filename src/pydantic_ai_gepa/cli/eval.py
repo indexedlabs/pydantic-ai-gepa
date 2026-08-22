@@ -28,7 +28,7 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, cast
+from typing import Any, Iterator, Sequence, cast
 
 import typer
 
@@ -294,6 +294,8 @@ def run_eval_once(
     lane: str | None = None,
     candidate_root: Path | None = None,
     workspace_root: Path | None = None,
+    selected_case_ids: Sequence[str] | None = None,
+    write_pareto: bool = True,
 ) -> EvalOutcome:
     """Evaluate one baseline/candidate and append the standard run artifacts.
 
@@ -441,7 +443,19 @@ def run_eval_once(
             err=True,
         )
         raise typer.Exit(code=1)
-    subset = [by_id[cid] for cid in minibatch.case_ids]
+    selected_ids = tuple(selected_case_ids or minibatch.case_ids)
+    gate_missing = [cid for cid in selected_ids if cid not in minibatch.case_ids]
+    if gate_missing:
+        typer.echo(
+            "Gate cases must belong to the current reflection minibatch; "
+            f"unknown case name(s): {gate_missing}.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if not selected_ids:
+        typer.echo("At least one gate case is required.", err=True)
+        raise typer.Exit(code=2)
+    subset = [by_id[cid] for cid in selected_ids]
 
     if source == "git":
         try:
@@ -553,35 +567,36 @@ def run_eval_once(
     selectable = not infrastructure_failures and metric_selectable
     pareto_status = "infrastructure_failure" if infrastructure_failures else status
 
-    pareto = ParetoLog(active_run_id, workspace_root)
-    pareto.append(
-        ParetoRow(
-            candidate_id=candidate.id,
-            commit_sha=(
-                git_state.commit_sha
-                if git_state is not None
-                else current_commit_sha(active_candidate_project)
-            ),
-            component_overrides_id=candidate_overrides_id,
-            minibatch_id=minibatch.id,
-            per_case_scores=per_case,
-            mean_score=mean,
-            status=pareto_status,
-            summary=f"{pareto_status} eval of {candidate.id} on minibatch {minibatch.id} (mean={mean:.3f})",
-            timestamp=utc_now_iso(),
-            lane=lane,
-            objective_scores=objective_scores,
-            per_case_objective_scores=per_case_objective_scores,
-            extra={
-                "eval_id": eval_id,
-                "outcome": evaluation_outcome,
-                "selectable": selectable,
-                "evaluation_errors": [
-                    failure.to_dict() for failure in infrastructure_failures
-                ],
-            },
+    if write_pareto:
+        pareto = ParetoLog(active_run_id, workspace_root)
+        pareto.append(
+            ParetoRow(
+                candidate_id=candidate.id,
+                commit_sha=(
+                    git_state.commit_sha
+                    if git_state is not None
+                    else current_commit_sha(active_candidate_project)
+                ),
+                component_overrides_id=candidate_overrides_id,
+                minibatch_id=minibatch.id,
+                per_case_scores=per_case,
+                mean_score=mean,
+                status=pareto_status,
+                summary=f"{pareto_status} eval of {candidate.id} on minibatch {minibatch.id} (mean={mean:.3f})",
+                timestamp=utc_now_iso(),
+                lane=lane,
+                objective_scores=objective_scores,
+                per_case_objective_scores=per_case_objective_scores,
+                extra={
+                    "eval_id": eval_id,
+                    "outcome": evaluation_outcome,
+                    "selectable": selectable,
+                    "evaluation_errors": [
+                        failure.to_dict() for failure in infrastructure_failures
+                    ],
+                },
+            )
         )
-    )
 
     # Write the per-case report next to the pareto log.
     reports_dir = run_dir(active_run_id, workspace_root) / "reports"

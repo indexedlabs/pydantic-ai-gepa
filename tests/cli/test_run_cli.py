@@ -20,6 +20,7 @@ from pydantic_ai_gepa.cli.run import (
     _load_state,
     _public_state,
 )
+from pydantic_ai_gepa.cli.runs import ParetoLog
 from pydantic_ai_gepa.evaluation import EvaluationRecord
 from pydantic_ai_gepa.types import RolloutOutput
 
@@ -166,6 +167,150 @@ def test_stall_block_appears_after_five_non_promoting_verdicts_and_clears(
         _consume_candidate_verdict(state, accepted=True), outcomes=[]
     )
     assert "stall" not in accepted
+
+
+def test_gate_rejection_skips_full_minibatch_and_pareto(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pydantic_ai_gepa.cli import run as run_module
+
+    start = _run(
+        "run",
+        "start",
+        "--size",
+        "2",
+        "--max-iterations",
+        "8",
+        "--acceptance-repetitions",
+        "1",
+    )
+    run_id = str(_run_payload(start.output)["run_id"])
+    before = ParetoLog(run_id).count_rows()
+    original = run_module.run_eval_once
+    calls: list[dict[str, object]] = []
+
+    def gate_loses(**kwargs):
+        calls.append(kwargs)
+        outcome = original(**kwargs)
+        if kwargs.get("selected_case_ids"):
+            outcome.summary["mean_score"] = 0.0
+        return outcome
+
+    monkeypatch.setattr(run_module, "run_eval_once", gate_loses)
+    result = _run("run", "continue", "--run-id", run_id, "--gate-case", "case-paris")
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+    assert calls[0]["selected_case_ids"] == ("case-paris",)
+    payload = _run_payload(result.output)
+    comparison = payload["last_comparison"]
+    assert isinstance(comparison, dict)
+    assert comparison["verdict"] == "rejected"
+    assert comparison["rejection_reason"] == "gate"
+    assert ParetoLog(run_id).count_rows() == before
+
+
+def test_gate_passes_then_full_minibatch_verdict_governs(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pydantic_ai_gepa.cli import run as run_module
+
+    start = _run(
+        "run",
+        "start",
+        "--size",
+        "2",
+        "--max-iterations",
+        "8",
+        "--acceptance-repetitions",
+        "1",
+    )
+    run_id = str(_run_payload(start.output)["run_id"])
+    original = run_module.run_eval_once
+    calls: list[dict[str, object]] = []
+
+    def gate_passes(**kwargs):
+        calls.append(kwargs)
+        outcome = original(**kwargs)
+        if kwargs.get("selected_case_ids"):
+            outcome.summary["mean_score"] = 2.0
+        return outcome
+
+    monkeypatch.setattr(run_module, "run_eval_once", gate_passes)
+    result = _run("run", "continue", "--run-id", run_id, "--gate-case", "case-paris")
+
+    assert result.exit_code == 0, result.output
+    assert [call.get("selected_case_ids") for call in calls] == [
+        ("case-paris",),
+        None,
+    ]
+    comparison = _run_payload(result.output)["last_comparison"]
+    assert isinstance(comparison, dict)
+    assert comparison["verdict"] == "equivalent"
+    assert "rejection_reason" not in comparison
+
+
+def test_unknown_gate_case_errors_before_evaluation(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pydantic_ai_gepa.cli import run as run_module
+
+    start = _run(
+        "run",
+        "start",
+        "--size",
+        "2",
+        "--max-iterations",
+        "8",
+        "--acceptance-repetitions",
+        "1",
+    )
+    run_id = str(_run_payload(start.output)["run_id"])
+    monkeypatch.setattr(
+        run_module,
+        "run_eval_once",
+        lambda **_: pytest.fail("gate validation must happen before evaluation"),
+    )
+
+    result = _run("run", "continue", "--run-id", run_id, "--gate-case", "missing")
+
+    assert result.exit_code == 2
+    assert "Available:" in result.output
+    assert "case-paris" in result.output
+    assert "case-berlin" in result.output
+
+
+def test_no_gate_keeps_the_existing_single_full_evaluation(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pydantic_ai_gepa.cli import run as run_module
+
+    start = _run(
+        "run",
+        "start",
+        "--size",
+        "2",
+        "--max-iterations",
+        "8",
+        "--acceptance-repetitions",
+        "1",
+    )
+    run_id = str(_run_payload(start.output)["run_id"])
+    before = ParetoLog(run_id).count_rows()
+    original = run_module.run_eval_once
+    calls: list[dict[str, object]] = []
+
+    def count_calls(**kwargs):
+        calls.append(kwargs)
+        return original(**kwargs)
+
+    monkeypatch.setattr(run_module, "run_eval_once", count_calls)
+    result = _run("run", "continue", "--run-id", run_id)
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+    assert calls[0].get("selected_case_ids") is None
+    assert ParetoLog(run_id).count_rows() == before + 1
 
 
 def test_continue_reports_equivalent_when_candidate_does_not_change(
