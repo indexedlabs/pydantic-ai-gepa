@@ -80,6 +80,7 @@ from .lanes import (
     write_packet,
 )
 from .layout import (
+    candidate_identity_exempt_paths,
     candidate_project_root,
     final_report_path,
     journal_path,
@@ -394,18 +395,11 @@ def _primary_checkout_state(workspace_root: Path) -> tuple[str, bool]:
     (journal.jsonl, which select itself appends to every iteration) — never
     counts as user changes.
     """
-    from .lanes import worktrees_root
-    from .layout import runs_dir
-
     head = _git(workspace_root, "rev-parse", "HEAD")
     try:
         candidate = git_candidate_state(
             workspace_root,
-            exclude_paths=[
-                runs_dir(workspace_root),
-                worktrees_root(workspace_root),
-                journal_path(workspace_root),
-            ],
+            exclude_paths=candidate_identity_exempt_paths(workspace_root),
         )
         dirty = candidate.dirty
     except GitCandidateError:

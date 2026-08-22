@@ -331,8 +331,33 @@ def journal_path(root: Path | None = None) -> Path:
     return gepa_dir(root) / JOURNAL_FILENAME
 
 
+def notes_dir(root: Path | None = None) -> Path:
+    return gepa_dir(root) / "notes"
+
+
 def runs_dir(root: Path | None = None) -> Path:
     return gepa_dir(root) / "runs"
+
+
+def candidate_identity_exempt_paths(
+    root: Path | None = None,
+    *,
+    workspace_relative_path: Path | None = None,
+) -> tuple[Path, ...]:
+    """Paths that are managed metadata, never part of a git candidate identity."""
+
+    workspace_root = (root or repo_root()).resolve()
+    workspace = (
+        workspace_root / workspace_relative_path
+        if workspace_relative_path is not None
+        else gepa_dir(workspace_root)
+    )
+    return (
+        workspace / "runs",
+        workspace_root / "worktrees",
+        workspace / JOURNAL_FILENAME,
+        workspace / "notes",
+    )
 
 
 def run_dir(run_id: str, root: Path | None = None) -> Path:

@@ -287,6 +287,39 @@ def test_redirect_journal_entry_reaches_next_reflection_packet(git_repo: Path) -
     assert journal_tail[-1]["content"] == "Try a narrower hypothesis."
 
 
+def test_packet_indexes_notes_without_including_their_bodies(git_repo: Path) -> None:
+    run = _start_lane_run(git_repo, lanes=1)
+    run_id = str(run["run_id"])
+    notes = git_repo / ".gepa" / "notes"
+    notes.mkdir()
+    body = "Prefer tool traces over generic prompt rewrites."
+    (notes / "trace-first.md").write_text(
+        "---\nname: trace-first\ndescription: Prioritize trace evidence\n---\n"
+        + body
+        + "\n",
+        encoding="utf-8",
+    )
+    lane = _lane_state(git_repo, run_id, "lane-1")
+    packet_path = write_packet(
+        git_repo,
+        RunState.from_dict(
+            json.loads(
+                (git_repo / ".gepa" / "runs" / run_id / "state.json").read_text()
+            )
+        ),
+        lane.lane,
+        lane.iteration,
+        Path(str(lane.worktree_path)),
+        str(lane.branch),
+    )
+    packet_text = packet_path.read_text(encoding="utf-8")
+    packet = json.loads(packet_text)
+    assert packet["notes_index"] == [
+        {"name": "trace-first", "description": "Prioritize trace evidence"}
+    ]
+    assert body not in packet_text
+
+
 def test_nested_monorepo_lane_uses_candidate_project_and_src_imports(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

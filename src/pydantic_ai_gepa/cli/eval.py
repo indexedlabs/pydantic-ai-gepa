@@ -54,8 +54,10 @@ from .dataset import cases_by_id, load_dataset
 from .layout import (
     GepaConfig,
     CandidateSource,
+    candidate_identity_exempt_paths,
     candidate_import_context,
     config_path,
+    gepa_dir,
     insert_repo_root_on_path,
     latest_run_id,
     new_run_id,
@@ -461,7 +463,12 @@ def run_eval_once(
         try:
             git_state = git_candidate_state(
                 active_candidate_project,
-                exclude_paths=[run_dir(active_run_id, workspace_root)],
+                exclude_paths=candidate_identity_exempt_paths(
+                    active_candidate_project,
+                    workspace_relative_path=gepa_dir(primary_project_root).relative_to(
+                        primary_project_root
+                    ),
+                ),
             )
         except GitCandidateError as exc:
             typer.echo(str(exc), err=True)

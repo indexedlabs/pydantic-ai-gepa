@@ -31,10 +31,10 @@ from .eval import DEFAULT_FAILURE_THRESHOLD, EvalOutcome, run_eval_once
 from .layout import (
     GepaConfig,
     CandidateSource,
+    candidate_identity_exempt_paths,
     config_path,
     final_report_path,
     insert_repo_root_on_path,
-    journal_path,
     new_run_id,
     repo_root,
     resolve_agent,
@@ -989,9 +989,7 @@ def _current_baseline_candidate_id(
     insert_repo_root_on_path()
     if candidate_source == "git":
         try:
-            state = git_candidate_state(
-                exclude_paths=[run_dir(active_run_id)] if active_run_id else []
-            )
+            state = git_candidate_state(exclude_paths=candidate_identity_exempt_paths())
         except GitCandidateError as exc:
             typer.echo(str(exc), err=True)
             raise typer.Exit(code=1) from exc
@@ -1244,16 +1242,12 @@ def _fan_out_lane_run_if_ready(
     if state.lanes < 1 or state.status != "paused_for_reflection":
         return state, outcomes
 
-    from .lanes import fan_out_lanes, worktrees_root
+    from .lanes import fan_out_lanes
 
     workspace_root = repo_root()
     fresh_state = git_candidate_state(
         workspace_root,
-        exclude_paths=[
-            runs_dir(workspace_root),
-            worktrees_root(workspace_root),
-            journal_path(workspace_root),
-        ],
+        exclude_paths=candidate_identity_exempt_paths(workspace_root),
     )
     if (
         fresh_state.commit_sha != state.reflection_baseline_commit_sha
@@ -1393,7 +1387,7 @@ def start(
         CandidateSource, candidate_source or cfg.candidate_source
     )
     workspace_root = repo_root()
-    from .lanes import ensure_worktrees_ignored, worktrees_root
+    from .lanes import ensure_worktrees_ignored
 
     if lanes > 0:
         if active_candidate_source != "git":
@@ -1411,11 +1405,7 @@ def start(
         try:
             primary_state = git_candidate_state(
                 workspace_root,
-                exclude_paths=[
-                    runs_dir(workspace_root),
-                    worktrees_root(workspace_root),
-                    journal_path(workspace_root),
-                ],
+                exclude_paths=candidate_identity_exempt_paths(workspace_root),
             )
         except GitCandidateError as exc:
             typer.echo(str(exc), err=True)
@@ -1588,6 +1578,8 @@ def continue_(
     if state.reflection_minibatch_id is not None:
         gate_outcomes: list[EvalOutcome] = []
         gate_comparison: dict[str, Any] | None = None
+        comparison: dict[str, Any]
+        comparison_outcomes: list[EvalOutcome]
         if gate_case:
             state, gate_outcomes, gate_comparison = _evaluate_gate_cases(
                 state, gate_case
@@ -1598,6 +1590,7 @@ def continue_(
             and gate_comparison.get("rejection_reason") == "gate"
         )
         if gate_rejected:
+            assert gate_comparison is not None
             comparison = gate_comparison
             comparison_outcomes = gate_outcomes
             state = _consume_candidate_verdict(state, accepted=False)

@@ -432,6 +432,14 @@ its journal tail. The supervisor fork's only write surface is the journal:
 never edit components, commit candidates, mutate run state, or run `gepa
 next` / `gepa ack`.
 
+### Reflector notes
+
+At session start, read the frontmatter index in `.gepa/notes/`; each
+`<slug>.md` note provides a `name` and `description`. Load bodies only when
+they are relevant. Promote proven journal insights into notes only BETWEEN
+runs: reflectors do not create, edit, or delete notes during an active managed
+run. Notes are reference material, never candidate components.
+
 ### Reflector subagent dispatch template
 
 The reflector gets exactly three inputs — the packet path, the worktree path,

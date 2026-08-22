@@ -50,6 +50,7 @@ from .candidates import GitCandidateError, git_candidate_state
 from .eval import run_eval_once
 from .events import EventDraft, LaneScan, LaneScanResult, emit, run_reaper_pass
 from .layout import (
+    candidate_identity_exempt_paths,
     candidate_project_root,
     current_gepa_dirname,
     gepa_dir,
@@ -59,6 +60,7 @@ from .layout import (
     repo_root,
     run_dir,
 )
+from .notes import notes_index
 from .runs import utc_now_iso
 
 LaneStatus = Literal[
@@ -444,6 +446,9 @@ def write_packet(
             list(run_state.reflection_baseline_trace_paths)
         ),
         "journal_tail": _journal_tail(workspace_root, run_state.journal_tail_lines),
+        "notes_index": [
+            note.to_dict() for note in notes_index(gepa_dir(workspace_root) / "notes")
+        ],
         "continue_cwd": str(candidate_project),
         "continue_argv": continue_argv,
         "continue_invocation": invocation,
@@ -490,7 +495,13 @@ def _lane_continue_argv(
 # ----------------------------- lane eval --------------------------------
 
 
-def _auto_commit_worktree(worktree: Path, branch: str, lane: str) -> str:
+def _auto_commit_worktree(
+    worktree: Path,
+    branch: str,
+    lane: str,
+    *,
+    exclude_paths: tuple[Path, ...] | None = None,
+) -> str:
     """Commit all worktree changes onto the lane branch; return the HEAD sha.
 
     Lane candidates are always clean commits because continue auto-commits
@@ -504,7 +515,15 @@ def _auto_commit_worktree(worktree: Path, branch: str, lane: str) -> str:
             f"Lane worktree {worktree} is on branch {current_branch!r}, "
             f"expected {branch!r}; run `gepa lane reset {lane}` to recover."
         )
-    _git(worktree, "add", "-A")
+    # Run metadata and reflector notes are never candidate changes. Resetting
+    # the index is safe (it leaves the worktree untouched), then add only
+    # candidate paths so even a pre-staged note cannot enter this commit.
+    _git(worktree, "reset", "--quiet", "HEAD")
+    excluded_pathspecs = [
+        f":(exclude){excluded.relative_to(worktree).as_posix()}"
+        for excluded in (exclude_paths or candidate_identity_exempt_paths(worktree))
+    ]
+    _git(worktree, "add", "-A", "--", ".", *excluded_pathspecs)
     status = _git(worktree, "status", "--porcelain")
     if status:
         _git(
@@ -655,10 +674,19 @@ def _run_lane_eval_loop(
         else candidate_project_root(workspace_root, worktree)
     )
     branch = str(lane_state.branch)
-    commit_sha = _auto_commit_worktree(worktree, branch, lane)
+    candidate_exclusions = candidate_identity_exempt_paths(
+        candidate_project,
+        workspace_relative_path=gepa_dir(workspace_root).relative_to(workspace_root),
+    )
+    commit_sha = _auto_commit_worktree(
+        worktree, branch, lane, exclude_paths=candidate_exclusions
+    )
 
     try:
-        git_state = git_candidate_state(candidate_project)
+        git_state = git_candidate_state(
+            candidate_project,
+            exclude_paths=candidate_exclusions,
+        )
     except GitCandidateError as exc:
         raise typer.BadParameter(str(exc)) from exc
     if git_state.dirty:
