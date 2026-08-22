@@ -1,0 +1,18 @@
+{
+  "checkpoint_id": "01a026c7cad8",
+  "created_at": "2026-08-22T00:03:43.080572+00:00",
+  "branch_name": "mh/nested-gepa-lane-isolation",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "1653e812b367038728754daf1bb5227b4a673434"
+  ],
+  "entity_touches": [
+    ".mighty/loro/edges/01a026c7-bc07-7d42-abd1-7e5a51fed07d.loro",
+    ".mighty/loro/edges/01a026c7-bc3c-7190-afe0-66321d61ee87.loro",
+    ".mighty/loro/records/01a026c7-4fcf-7723-a4d5-f2ac5ceaecd9.loro",
+    ".mighty/loro/records/01a026c7-5016-7312-986a-a76dbe0908be.loro",
+    ".mighty/loro/records/01a026c7-5056-79d3-b5c1-2c04d0ea11ad.loro",
+    ".mighty/loro/records/01a026c7-83bd-7463-a499-f9196b568651.loro",
+    ".mighty/loro/records/01a026c7-8408-7db3-9898-0871dee9b225.loro"
+  ]
+}
