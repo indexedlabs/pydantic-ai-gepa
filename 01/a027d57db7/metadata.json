@@ -1,0 +1,39 @@
+{
+  "checkpoint_id": "01a027d57db7",
+  "created_at": "2026-08-22T04:58:17.998621+00:00",
+  "branch_name": "v1/supervision-gate-notes",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "d982fe721ae7f299079bd32b205983d9f7616aab"
+  ],
+  "entity_touches": [
+    ".mighty/loro/actors/019c0691-c3bf-7713-8b2b-f9d1c1bbf68b.loro",
+    ".mighty/loro/actors/019c7789-5afb-7312-87f1-4d428a9c62ce.loro",
+    ".mighty/loro/actors/01a027c8-d7b1-79a3-92e4-10b96dd2f9ea.loro",
+    ".mighty/loro/agent_scopes/01a027c8-d7b1-79a3-92e4-10b96dd2f9ea.loro",
+    ".mighty/loro/agents/01a027c8-d7b0-71a3-80ab-5abdaba256e7.loro",
+    ".mighty/loro/edges/01a027ca-e979-79b3-8875-20bb125f75d5.loro",
+    ".mighty/loro/edges/01a027ca-e9bf-7d01-8a9d-e104b3142712.loro",
+    ".mighty/loro/edges/01a027ca-ea09-7171-8b5e-67d83f1dae36.loro",
+    ".mighty/loro/edges/01a027cf-b7ba-7a53-be8c-59a4bf72f00d.loro",
+    ".mighty/loro/edges/01a027cf-b7fa-7ee2-89ff-cf4939cb1f54.loro",
+    ".mighty/loro/edges/01a027cf-b83d-7203-9828-921d88485daa.loro",
+    ".mighty/loro/edges/01a027d5-5375-7500-89f3-e9f8090edec9.loro",
+    ".mighty/loro/edges/01a027d5-53d4-7913-8b8c-2c50c2a33700.loro",
+    ".mighty/loro/edges/01a027d5-5413-7753-be10-6f675930ce08.loro",
+    ".mighty/loro/external_actors/019c7789-5afb-7312-87f1-4d428a9c62ce.loro",
+    ".mighty/loro/messages/01a027c8-d823-7562-b1e4-e70502b7468b.loro",
+    ".mighty/loro/messages/01a027c8-d857-71f3-8ec1-a465f4a5177a.loro",
+    ".mighty/loro/messages/01a027ca-ea66-7c72-b615-157517a4d154.loro",
+    ".mighty/loro/messages/01a027cb-175d-74d1-b404-8d10f962ecf2.loro",
+    ".mighty/loro/messages/01a027cb-178b-7311-abc1-20e2c67d193a.loro",
+    ".mighty/loro/messages/01a027cf-b892-7e93-b982-d121af62580f.loro",
+    ".mighty/loro/messages/01a027cf-eb9f-7713-9b8e-fe08d01efa16.loro",
+    ".mighty/loro/messages/01a027cf-ebd7-7683-95bc-9dd22c357c70.loro",
+    ".mighty/loro/messages/01a027d5-5467-7921-b697-2448ee4b7820.loro",
+    ".mighty/loro/records/01a027c8-ca1d-7810-8ed4-f4a14b6c0ef1.loro",
+    ".mighty/loro/records/01a027c8-ca66-7e20-95cb-129263fa8ca3.loro",
+    ".mighty/loro/records/01a027c8-caa3-70b0-b03d-e35ebdae1d85.loro",
+    ".mighty/loro/records/01a027d5-5377-79f2-b675-c72c93de4ff9.loro"
+  ]
+}
