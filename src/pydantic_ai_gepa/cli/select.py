@@ -591,6 +591,9 @@ def _phase_promote(
     )
 
     if winner is None:
+        from .run import _consume_candidate_verdict
+
+        state = _consume_candidate_verdict(state, accepted=False)
         typer.echo(
             "No lane was accepted; no promotion. All resolved lanes are "
             "journaled as losers and lanes re-fan onto the current best."
@@ -653,6 +656,9 @@ def _phase_promote(
             float(winner_mean) if winner_mean is not None else state.best_mean_score
         ),
     )
+    from .run import _consume_candidate_verdict
+
+    state = _consume_candidate_verdict(state, accepted=True)
     ctx["primary_promoted"] = primary_promoted
     ctx["winner_mean"] = winner_mean
     # Checkpoint immediately after the promotion decision: the recorded phase

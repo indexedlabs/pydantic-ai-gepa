@@ -75,6 +75,7 @@ def test_config_parse_minimal(tmp_path: Path) -> None:
     assert cfg.agent == "pkg.agents:my_agent"
     assert cfg.dataset == ".gepa/dataset.jsonl"
     assert cfg.defaults == {}
+    assert cfg.stall_threshold == 5
 
 
 def test_config_parse_with_defaults(tmp_path: Path) -> None:

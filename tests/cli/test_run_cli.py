@@ -15,6 +15,11 @@ from typer.testing import CliRunner
 from pydantic_ai_gepa.cli import app as gepa_app
 from pydantic_ai_gepa.cli.candidates import candidate_id_from_components
 from pydantic_ai_gepa.cli.layout import final_report_path, run_state_path
+from pydantic_ai_gepa.cli.run import (
+    _consume_candidate_verdict,
+    _load_state,
+    _public_state,
+)
 from pydantic_ai_gepa.evaluation import EvaluationRecord
 from pydantic_ai_gepa.types import RolloutOutput
 
@@ -130,6 +135,37 @@ def test_run_start_defaults_match_minibatch_evaluation(repo: Path) -> None:
     baseline_samples = payload["reflection_baseline_samples"]
     assert isinstance(baseline_samples, list)
     assert len(baseline_samples) == 3
+
+
+def test_stall_block_appears_after_five_non_promoting_verdicts_and_clears(
+    repo: Path,
+) -> None:
+    start = _run(
+        "run",
+        "start",
+        "--size",
+        "2",
+        "--max-iterations",
+        "8",
+        "--acceptance-repetitions",
+        "1",
+    )
+    run_id = str(_run_payload(start.output)["run_id"])
+    state = _load_state(run_id)
+
+    for _ in range(5):
+        state = _consume_candidate_verdict(state, accepted=False)
+
+    stalled = _public_state(state, outcomes=[])
+    assert stalled["stall"] == {
+        "stalled": True,
+        "iterations_since_acceptance": 5,
+    }
+
+    accepted = _public_state(
+        _consume_candidate_verdict(state, accepted=True), outcomes=[]
+    )
+    assert "stall" not in accepted
 
 
 def test_continue_reports_equivalent_when_candidate_does_not_change(

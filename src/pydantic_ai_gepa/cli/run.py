@@ -108,6 +108,8 @@ class RunState:
     eval_stall_timeout_secs: float = 600.0
     straggler_timeout_secs: float = DEFAULT_STRAGGLER_TIMEOUT_SECS
     journal_tail_lines: int = 20
+    stall_threshold: int = 5
+    iterations_since_acceptance: int = 0
     # Set at fan-out/re-fan: the straggler-timeout clock starts here, immune
     # to unrelated run-state saves refreshing updated_at (spec-er3).
     iteration_started_at: str | None = None
@@ -166,6 +168,8 @@ class RunState:
             "eval_stall_timeout_secs": self.eval_stall_timeout_secs,
             "straggler_timeout_secs": self.straggler_timeout_secs,
             "journal_tail_lines": self.journal_tail_lines,
+            "stall_threshold": self.stall_threshold,
+            "iterations_since_acceptance": self.iterations_since_acceptance,
             "iteration_started_at": self.iteration_started_at,
             "select_phase": self.select_phase,
             "select_context": self.select_context,
@@ -277,6 +281,8 @@ class RunState:
                 data.get("straggler_timeout_secs", DEFAULT_STRAGGLER_TIMEOUT_SECS)
             ),
             journal_tail_lines=int(data.get("journal_tail_lines", 20)),
+            stall_threshold=int(data.get("stall_threshold", 5)),
+            iterations_since_acceptance=int(data.get("iterations_since_acceptance", 0)),
             iteration_started_at=data.get("iteration_started_at"),
             select_phase=(
                 str(data["select_phase"])
@@ -531,6 +537,17 @@ def _mark_best_candidate(
         best_mean_score=(
             float(summary["mean_score"]) if mean_score is None else mean_score
         ),
+    )
+
+
+def _consume_candidate_verdict(state: RunState, *, accepted: bool) -> RunState:
+    """Record one completed reflection verdict without changing lifecycle state."""
+
+    return _with_timestamp(
+        state,
+        iterations_since_acceptance=0
+        if accepted
+        else state.iterations_since_acceptance + 1,
     )
 
 
@@ -938,6 +955,11 @@ def _public_state(
     else:
         payload["next_command"] = f"gepa run continue --run-id {state.run_id}"
     payload["evaluations_this_call"] = [outcome.summary for outcome in outcomes]
+    if state.iterations_since_acceptance >= state.stall_threshold:
+        payload["stall"] = {
+            "stalled": True,
+            "iterations_since_acceptance": state.iterations_since_acceptance,
+        }
     return payload
 
 
@@ -1178,6 +1200,11 @@ def start(
         "--journal-tail-lines",
         help="Lane runs: how many journal entries each reflection packet carries.",
     ),
+    stall_threshold: int | None = typer.Option(
+        None,
+        "--stall-threshold",
+        help="Candidate verdicts without acceptance before stall reporting begins. Defaults to gepa.toml stall_threshold (5).",
+    ),
 ) -> None:
     """Start a managed GEPA run and pause at the first reflection point."""
     _validate_max_iterations(max_iterations)
@@ -1200,6 +1227,12 @@ def start(
         typer.echo("--candidate-source must be 'components' or 'git'.", err=True)
         raise typer.Exit(code=2)
     cfg = GepaConfig.load(config_path())
+    resolved_stall_threshold = (
+        cfg.stall_threshold if stall_threshold is None else stall_threshold
+    )
+    if resolved_stall_threshold < 1:
+        typer.echo("--stall-threshold must be >= 1.", err=True)
+        raise typer.Exit(code=2)
     active_candidate_source = cast(
         CandidateSource, candidate_source or cfg.candidate_source
     )
@@ -1289,6 +1322,7 @@ def start(
         eval_stall_timeout_secs=eval_stall_timeout_secs,
         straggler_timeout_secs=straggler_timeout_secs,
         journal_tail_lines=journal_tail_lines,
+        stall_threshold=resolved_stall_threshold,
     )
     state.save()
     state, outcomes = _advance_to_reflection_or_done(state)
@@ -1395,6 +1429,7 @@ def continue_(
         outcomes.extend(comparison_outcomes)
 
         if comparison["improved"]:
+            state = _consume_candidate_verdict(state, accepted=True)
             state = _mark_best_candidate(
                 state,
                 comparison_outcomes[-1],
@@ -1406,6 +1441,7 @@ def continue_(
             state, advanced_outcomes = _advance_to_reflection_or_done(state)
             outcomes.extend(advanced_outcomes)
         elif comparison.get("outcome") != "infrastructure_failure":
+            state = _consume_candidate_verdict(state, accepted=False)
             state = _with_timestamp(state, status="paused_after_candidate_eval")
     else:
         state, outcomes = _advance_to_reflection_or_done(state)

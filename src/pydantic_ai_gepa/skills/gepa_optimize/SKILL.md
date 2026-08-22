@@ -422,6 +422,16 @@ Rules that keep the loop correct:
   candidate, verdict, progress per lane — always printed as JSON) whenever
   you need a ground-truth snapshot.
 
+### Supervision protocol
+
+When a run-verb JSON summary contains a `stall` block, fork a separate
+supervisor session. The fork reviews the inherited trajectory, appends concise
+redirect advice with `gepa journal append --strategy redirect`, and exits. The
+primary loop continues normally; the next reflection receives that entry via
+its journal tail. The supervisor fork's only write surface is the journal:
+never edit components, commit candidates, mutate run state, or run `gepa
+next` / `gepa ack`.
+
 ### Reflector subagent dispatch template
 
 The reflector gets exactly three inputs — the packet path, the worktree path,
