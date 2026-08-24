@@ -9,13 +9,14 @@ from pathlib import Path
 from typing import Iterator
 
 import pytest
+import typer
 from click.testing import Result
 from typer.testing import CliRunner
 
 from pydantic_ai_gepa.adapters.agent_adapter import AgentAdapterTrajectory
 from pydantic_ai_gepa.cli import app as gepa_app
 from pydantic_ai_gepa.cli.candidates import Candidate
-from pydantic_ai_gepa.cli.eval import _write_trace_file
+from pydantic_ai_gepa.cli.eval import _write_trace_file, run_eval_once
 from pydantic_ai_gepa.cli.layout import (
     ensure_layout,
     latest_run_id,
@@ -39,6 +40,22 @@ AGENT_MODULE_SOURCE = textwrap.dedent("""
         name="geo-agent",
     )
 """).lstrip()
+
+
+def test_validation_role_requires_explicit_validation_dataset(repo: Path) -> None:
+    with pytest.raises(typer.BadParameter, match="requires validation_dataset"):
+        run_eval_once(
+            candidate_file=None,
+            minibatch_id=None,
+            size=1,
+            seed=0,
+            epoch=0,
+            run_id=None,
+            concurrency=1,
+            max_iterations=2,
+            threshold=0.999,
+            dataset_role="validation",
+        )
 
 
 SKILL_AGENT_MODULE_SOURCE = textwrap.dedent("""

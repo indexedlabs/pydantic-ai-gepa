@@ -18,6 +18,11 @@ from pydantic_ai_gepa.engines import (
     ReflectionContext,
     get_engine,
 )
+from pydantic_ai_gepa.engines.base import CandidateEvaluation
+from pydantic_ai_gepa.engines.coding_agent_engine import (
+    _CandidatePoolEntry,
+    _select_pareto_parent,
+)
 from pydantic_ai_gepa.gepa_graph.models import CandidateMap, ComponentValue
 from pydantic_ai_gepa.types import MetricResult, RolloutOutput
 
@@ -46,6 +51,35 @@ def _candidate(text: str) -> CandidateMap:
     return {"instructions": ComponentValue(name="instructions", text=text)}
 
 
+def test_pareto_parent_selection_handles_partial_coordinate_overlap() -> None:
+    pool = [
+        _CandidatePoolEntry(
+            _candidate("first"),
+            CandidateEvaluation(
+                score=0.5,
+                records=[],
+                side_info={},
+                num_cases=2,
+                per_case_scores={"shared": 1.0, "first-only": 0.0},
+            ),
+            0,
+        ),
+        _CandidatePoolEntry(
+            _candidate("second"),
+            CandidateEvaluation(
+                score=0.5,
+                records=[],
+                side_info={},
+                num_cases=2,
+                per_case_scores={"shared": 0.0, "second-only": 1.0},
+            ),
+            1,
+        ),
+    ]
+
+    assert _select_pareto_parent(pool, seed=0, epoch=0) in pool
+
+
 def test_registry_constructs_coding_agent_engine() -> None:
     """Importing the engines package registers the built-in coding-agent engine."""
 
@@ -68,6 +102,137 @@ async def test_coding_agent_engine_accepts_an_improving_proposal() -> None:
 
     config = EngineConfig(
         engine="coding_agent",
+        max_metric_calls=12,
+        engine_config={
+            "propose": propose,
+            "minibatch_size": 3,
+            "max_proposals_per_run": 1,
+        },
+    )
+    budget = BudgetTracker(12)
+
+    result = await get_engine("coding_agent", config).run(_task(), config, budget)
+
+    assert result.best_candidate["instructions"].text == "correct"
+    assert result.best_score == 1.0
+    assert budget.spent == result.num_metric_calls == 12
+    assert [event.kind for event in result.history].count("accepted") == 1
+    assert contexts[0].minibatch_records
+    assert contexts[0].report.startswith("# Eval report")
+
+
+@pytest.mark.asyncio
+async def test_coding_agent_engine_keeps_validation_evidence_out_of_reflection() -> (
+    None
+):
+    """Validation feedback and cases influence selection without entering context."""
+
+    agent = Agent(TestModel(custom_output_text="response"), instructions="seed")
+    train = Case(name="train-visible", inputs="train", expected_output="response")
+    validation = Case(
+        name="validation-secret", inputs="validation", expected_output="response"
+    )
+
+    def metric(case: Case[str, str, Any], output: RolloutOutput[Any]) -> MetricResult:
+        del output
+        override = agent._override_instructions.get()
+        instructions = override.value if override is not None else agent._instructions
+        correct = "correct" in "\n".join(str(item) for item in instructions)
+        return MetricResult(
+            score=float(correct),
+            feedback=(
+                "VALIDATION SECRET" if case.name == "validation-secret" else "train fix"
+            ),
+        )
+
+    task = OptimizationTask(
+        agent=agent, trainset=[train], valset=[validation], metric=metric
+    )
+    contexts: list[ReflectionContext] = []
+
+    async def propose(context: ReflectionContext) -> CandidateMap:
+        contexts.append(context)
+        return _candidate("correct")
+
+    config = EngineConfig(
+        engine="coding_agent",
+        max_metric_calls=4,
+        engine_config={
+            "propose": propose,
+            "minibatch_size": 1,
+            "max_proposals_per_run": 1,
+        },
+    )
+    result = await get_engine("coding_agent", config).run(
+        task, config, BudgetTracker(4)
+    )
+
+    assert result.best_candidate["instructions"].text == "correct"
+    assert [record.case_id for record in contexts[0].minibatch_records] == [
+        "train-visible"
+    ]
+    assert "VALIDATION SECRET" not in contexts[0].report
+    assert "VALIDATION SECRET" not in repr(result.history)
+    assert result.history[-1].data["validation_evaluations"] == 2
+
+
+@pytest.mark.asyncio
+async def test_coding_agent_engine_does_not_adopt_validation_regression() -> None:
+    """A training improvement cannot replace a stronger validation incumbent."""
+
+    agent = Agent(TestModel(custom_output_text="response"), instructions="seed")
+    train = Case(name="train", inputs="train", expected_output="response")
+    validation = Case(
+        name="validation", inputs="validation", expected_output="response"
+    )
+
+    def metric(case: Case[str, str, Any], output: RolloutOutput[Any]) -> MetricResult:
+        del output
+        override = agent._override_instructions.get()
+        instructions = "\n".join(
+            str(item)
+            for item in (
+                override.value if override is not None else agent._instructions
+            )
+        )
+        proposal = "proposal" in instructions
+        score = proposal if case.name == "train" else not proposal
+        return MetricResult(score=float(score), feedback=f"feedback for {case.name}")
+
+    task = OptimizationTask(
+        agent=agent, trainset=[train], valset=[validation], metric=metric
+    )
+
+    async def propose(context: ReflectionContext) -> CandidateMap:
+        return _candidate("proposal")
+
+    config = EngineConfig(
+        engine="coding_agent",
+        max_metric_calls=4,
+        engine_config={
+            "propose": propose,
+            "minibatch_size": 1,
+            "max_proposals_per_run": 1,
+        },
+    )
+    result = await get_engine("coding_agent", config).run(
+        task, config, BudgetTracker(4)
+    )
+
+    assert result.best_candidate["instructions"].text == "seed"
+    assert result.best_score == 1.0
+    assert any(event.kind == "validation_rejected" for event in result.history)
+
+
+@pytest.mark.asyncio
+async def test_coding_agent_engine_skips_validation_for_non_improvement() -> None:
+    """Only a training-improved proposal consumes another validation pass."""
+
+    async def propose(context: ReflectionContext) -> CandidateMap:
+        return _candidate("still wrong")
+
+    config = EngineConfig(
+        engine="coding_agent",
         max_metric_calls=9,
         engine_config={
             "propose": propose,
@@ -75,16 +240,12 @@ async def test_coding_agent_engine_accepts_an_improving_proposal() -> None:
             "max_proposals_per_run": 1,
         },
     )
-    budget = BudgetTracker(9)
+    result = await get_engine("coding_agent", config).run(
+        _task(), config, BudgetTracker(9)
+    )
 
-    result = await get_engine("coding_agent", config).run(_task(), config, budget)
-
-    assert result.best_candidate["instructions"].text == "correct"
-    assert result.best_score == 1.0
-    assert budget.spent == result.num_metric_calls == 9
-    assert [event.kind for event in result.history].count("accepted") == 1
-    assert contexts[0].minibatch_records
-    assert contexts[0].report.startswith("# Eval report")
+    assert result.history[-1].data["validation_evaluations"] == 1
+    assert result.num_metric_calls == 9
 
 
 @pytest.mark.asyncio
@@ -122,7 +283,7 @@ async def test_coding_agent_engine_repeats_matched_case_evaluations() -> None:
 
     config = EngineConfig(
         engine="coding_agent",
-        max_metric_calls=7,
+        max_metric_calls=8,
         engine_config={
             "propose": propose,
             "minibatch_size": 1,
@@ -131,7 +292,7 @@ async def test_coding_agent_engine_repeats_matched_case_evaluations() -> None:
             "acceptance_max_repetitions": 3,
         },
     )
-    budget = BudgetTracker(7)
+    budget = BudgetTracker(8)
 
     result = await get_engine("coding_agent", config).run(
         _task(case_count=1), config, budget
@@ -141,7 +302,7 @@ async def test_coding_agent_engine_repeats_matched_case_evaluations() -> None:
     assert accepted.data["baseline_sample_count"] == 3
     assert accepted.data["candidate_sample_count"] == 3
     assert accepted.data["verdict"] == "accepted"
-    assert result.num_metric_calls == budget.spent == 7
+    assert result.num_metric_calls == budget.spent == 8
 
 
 @pytest.mark.asyncio
@@ -150,7 +311,7 @@ async def test_coding_agent_engine_preserves_noisy_overlap_as_inconclusive() -> 
     agent = Agent(TestModel(custom_output_text="response"), instructions="seed")
     case = Case(name="case-noisy", inputs="input", expected_output="response")
     samples = {
-        "seed": iter([0.40, 0.60, 0.50, 0.50]),
+        "seed": iter([0.50, 0.40, 0.60, 0.50]),
         "proposal": iter([0.45, 0.65, 0.55]),
     }
 
@@ -217,7 +378,7 @@ async def test_coding_agent_engine_stops_after_a_budget_overshoot() -> None:
 
     assert result.best_candidate["instructions"].text == "seed"
     assert result.num_metric_calls == budget.spent == 3
-    assert any(event.kind == "budget_overshoot" for event in result.history)
+    assert any(event.kind == "budget_exhausted" for event in result.history)
 
 
 @pytest.mark.asyncio

@@ -350,6 +350,13 @@ class ParetoLog:
                 count += 1
         return count
 
+    def count_budget_rows(self) -> int:
+        """Count training and validation evaluations charged to run budget."""
+
+        return sum(
+            self.count_rows(scope=scope) for scope in ("acceptance", "validation")
+        )
+
     def front(self, *, mode: str = "instance") -> list[ParetoRow]:
         """Return the selectable Pareto front with complete matching coordinates.
 
@@ -402,6 +409,17 @@ class ParetoLog:
             if row.extra.get("selectable", True) is not False
             and row.extra.get("outcome") != "infrastructure_failure"
             and row.extra.get("row_scope", "acceptance") == "acceptance"
+        ]
+
+    def validation_rows(self) -> list[ParetoRow]:
+        """Return held-out selection rows, excluding infrastructure failures."""
+
+        return [
+            row
+            for row in self.iter_rows()
+            if row.extra.get("selectable", True) is not False
+            and row.extra.get("outcome") != "infrastructure_failure"
+            and row.extra.get("row_scope") == "validation"
         ]
 
 

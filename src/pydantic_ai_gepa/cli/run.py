@@ -1,15 +1,15 @@
 """`gepa run` — managed external-reflection optimization loop.
 
 This command group keeps the coding agent in the reflector role while the CLI
-owns loop state. `start` evaluates minibatches until reflection is useful;
-`continue` evaluates the edited component baseline or git tree against the
-same mini-valset, compares against the pre-reflection baseline, and either
-pauses with discard guidance or advances to the next reflection point.
+owns loop state. `start` evaluates training minibatches until reflection is
+useful; `continue` first compares the edited candidate on that same training
+minibatch, then uses held-out validation to decide whether to adopt it.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -101,6 +101,10 @@ class RunState:
     best_candidate_id: str | None = None
     best_commit_sha: str | None = None
     best_mean_score: float | None = None
+    validation_seeded: bool = False
+    validation_evaluations: int = 0
+    validation_dataset_path: str | None = None
+    validation_dataset_digest: str | None = None
     # Vector runs preserve their initial scored identity for generic periodic
     # incumbent-vs-run-start re-baselines. The mapping is intentionally
     # opaque to the optimizer apart from the documented identity fields.
@@ -173,6 +177,10 @@ class RunState:
             "best_candidate_id": self.best_candidate_id,
             "best_commit_sha": self.best_commit_sha,
             "best_mean_score": self.best_mean_score,
+            "validation_seeded": self.validation_seeded,
+            "validation_evaluations": self.validation_evaluations,
+            "validation_dataset_path": self.validation_dataset_path,
+            "validation_dataset_digest": self.validation_dataset_digest,
             "run_start_baseline": self.run_start_baseline,
             "accepted_promotion_count": self.accepted_promotion_count,
             "lanes": self.lanes,
@@ -290,6 +298,10 @@ class RunState:
                 if data.get("best_mean_score") is not None
                 else None
             ),
+            validation_seeded=bool(data.get("validation_seeded", False)),
+            validation_evaluations=int(data.get("validation_evaluations", 0)),
+            validation_dataset_path=data.get("validation_dataset_path"),
+            validation_dataset_digest=data.get("validation_dataset_digest"),
             run_start_baseline=(
                 dict(data["run_start_baseline"])
                 if isinstance(data.get("run_start_baseline"), dict)
@@ -412,7 +424,11 @@ def _infrastructure_failure_comparison(
     """Build the persisted, non-selectable result for a failed comparison."""
 
     first_summary = outcomes[0].summary
-    reports = [str(outcome.summary["report_path"]) for outcome in outcomes]
+    reports = [
+        str(outcome.summary["report_path"])
+        for outcome in outcomes
+        if outcome.summary.get("report_path")
+    ]
     traces = [
         str(outcome.summary["trace_path"])
         for outcome in outcomes
@@ -434,13 +450,17 @@ def _infrastructure_failure_comparison(
         "minibatch_id": str(first_summary["minibatch_id"]),
         "candidate_id": str(first_summary["candidate_id"]),
         "candidate_commit_sha": first_summary.get("commit_sha"),
-        "candidate_report_path": reports[-1],
+        "candidate_report_path": reports[-1] if reports else None,
         "candidate_report_paths": reports,
         "candidate_trace_path": traces[-1] if traces else None,
         "candidate_trace_paths": traces,
         "valid_samples_before_failure": list(valid_samples),
         "evaluation_error_count": len(failures),
-        "evaluation_errors": [failure.to_dict() for failure in failures],
+        "evaluation_errors": (
+            list(first_summary.get("evaluation_errors") or [])
+            if first_summary.get("dataset_role") == "validation"
+            else [failure.to_dict() for failure in failures]
+        ),
     }
     if phase == "candidate":
         comparison.update(
@@ -583,6 +603,177 @@ def _mark_best_candidate(
     )
 
 
+def _held_out_validation_enabled(root: Path | None = None) -> bool:
+    return GepaConfig.load(config_path(root)).validation_dataset is not None
+
+
+def _validation_dataset_identity(root: Path | None = None) -> tuple[str, str]:
+    project_root = (root or repo_root()).resolve()
+    cfg = GepaConfig.load(config_path(project_root))
+    if cfg.validation_dataset is None:
+        raise typer.BadParameter(
+            "Held-out validation requires validation_dataset in gepa.toml."
+        )
+    path = project_root / cfg.validation_dataset
+    try:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise typer.BadParameter(
+            f"Could not read held-out validation dataset at {path}: {exc}"
+        ) from exc
+    return cfg.validation_dataset, digest
+
+
+def _assert_validation_dataset_unchanged(
+    state: RunState,
+    *,
+    workspace_root: Path | None = None,
+    candidate_root: Path | None = None,
+) -> None:
+    """Fail closed if config or candidate edits changed the pinned validation set."""
+
+    primary_root = (workspace_root or repo_root()).resolve()
+    configured_path, digest = _validation_dataset_identity(primary_root)
+    if (
+        state.validation_dataset_path != configured_path
+        or state.validation_dataset_digest != digest
+    ):
+        raise typer.BadParameter(
+            "Held-out validation dataset changed after run start; restore the "
+            "pinned gepa.toml and validation data before continuing."
+        )
+    if candidate_root is None or candidate_root.resolve() == primary_root:
+        return
+
+    primary_config = config_path(primary_root).resolve()
+    try:
+        config_relative = primary_config.relative_to(primary_root)
+    except ValueError:
+        config_relative = None
+    if config_relative is not None:
+        candidate_config = candidate_root / config_relative
+        if candidate_config.is_file():
+            candidate_cfg = GepaConfig.load(candidate_config)
+            if candidate_cfg.validation_dataset != configured_path:
+                raise typer.BadParameter(
+                    "Candidate changed validation_dataset in gepa.toml; held-out "
+                    "selection configuration is immutable during a run."
+                )
+    validation_path = Path(configured_path)
+    if not validation_path.is_absolute():
+        candidate_validation = candidate_root / validation_path
+        if (
+            candidate_validation.is_file()
+            and hashlib.sha256(candidate_validation.read_bytes()).hexdigest()
+            != state.validation_dataset_digest
+        ):
+            raise typer.BadParameter(
+                "Candidate changed the held-out validation dataset; restore the "
+                "pinned data before selection."
+            )
+
+
+def _evaluate_validation_candidate(
+    state: RunState,
+    *,
+    candidate_root: Path | None = None,
+    workspace_root: Path | None = None,
+    lane: str | None = None,
+) -> tuple[RunState, EvalOutcome]:
+    """Score the current candidate on held-out validation without reflection artifacts."""
+
+    _assert_validation_dataset_unchanged(
+        state,
+        workspace_root=workspace_root,
+        candidate_root=candidate_root,
+    )
+    outcome = run_eval_once(
+        candidate_file=None,
+        minibatch_id=None,
+        size=state.size,
+        seed=state.seed,
+        epoch=0,
+        run_id=state.run_id,
+        concurrency=state.concurrency,
+        max_iterations=state.max_iterations,
+        threshold=state.threshold,
+        capture_traces=False,
+        candidate_source=state.candidate_source,
+        lane=lane,
+        candidate_root=candidate_root,
+        workspace_root=workspace_root,
+        row_scope="validation",
+        dataset_role="validation",
+        persist_report=False,
+        redact_selection_evidence=True,
+    )
+    return (
+        _with_timestamp(
+            state,
+            iterations=int(outcome.summary["iterations"]),
+            validation_evaluations=state.validation_evaluations + 1,
+        ),
+        outcome,
+    )
+
+
+def _mark_best_from_validation(state: RunState, outcome: EvalOutcome) -> RunState:
+    """Adopt a validation-scored candidate as the current optimization parent."""
+
+    return _with_timestamp(
+        _mark_best_candidate(state, outcome),
+        validation_seeded=True,
+    )
+
+
+def _validation_improved(state: RunState, outcome: EvalOutcome) -> bool:
+    if outcome.summary.get("selectable") is False:
+        return False
+    if state.best_mean_score is None:
+        return True
+    return (
+        float(outcome.summary["mean_score"])
+        > state.best_mean_score + state.acceptance_min_delta
+    )
+
+
+def _ensure_validation_seed(
+    state: RunState,
+) -> tuple[RunState, list[EvalOutcome]]:
+    """Evaluate the seed once so every later adoption is validation-guided."""
+
+    if (
+        not _held_out_validation_enabled()
+        or state.validation_seeded
+        or state.iterations >= state.max_iterations
+    ):
+        return state, []
+    validation_path, validation_digest = _validation_dataset_identity()
+    state = _with_timestamp(
+        state,
+        validation_dataset_path=validation_path,
+        validation_dataset_digest=validation_digest,
+    )
+    state, outcome = _evaluate_validation_candidate(state)
+    failures = _outcome_infrastructure_failures(outcome)
+    if failures:
+        comparison = _infrastructure_failure_comparison(
+            state, [outcome], phase="baseline", failures=failures
+        )
+        comparison["reason_code"] = "validation_rollout_failed"
+        state = _with_timestamp(
+            state,
+            status=(
+                "paused_after_infrastructure_error"
+                if state.iterations < state.max_iterations
+                else "done"
+            ),
+            last_comparison=comparison,
+        )
+        return state, [outcome]
+    return _mark_best_from_validation(state, outcome), [outcome]
+
+
 def _consume_candidate_verdict(state: RunState, *, accepted: bool) -> RunState:
     """Record one completed reflection verdict without changing lifecycle state."""
 
@@ -661,7 +852,13 @@ def _capture_reflection_baseline(
     """Measure the stochastic baseline before yielding the tree for edits."""
 
     remaining_iterations = state.max_iterations - state.iterations
-    affordable_repetitions = max(1, (remaining_iterations + 1) // 2)
+    # Reserve one evaluation for held-out validation after a training-improved
+    # proposal. With r baseline samples total, the remaining spend is
+    # (r - 1) additional baselines + r candidate samples + 1 validation.
+    if _held_out_validation_enabled():
+        affordable_repetitions = max(1, remaining_iterations // 2)
+    else:
+        affordable_repetitions = max(1, (remaining_iterations + 1) // 2)
     target_repetitions = min(state.acceptance_max_repetitions, affordable_repetitions)
     outcomes = [first_outcome]
     first_failures = _outcome_infrastructure_failures(first_outcome)
@@ -720,6 +917,10 @@ def _advance_to_reflection_or_done(
 ) -> tuple[RunState, list[EvalOutcome]]:
     outcomes: list[EvalOutcome] = []
     state = _with_timestamp(_clear_reflection_baseline(state), status="running")
+    state, validation_outcomes = _ensure_validation_seed(state)
+    outcomes.extend(validation_outcomes)
+    if state.status == "paused_after_infrastructure_error":
+        return state, outcomes
     while state.iterations < state.max_iterations:
         state, outcome = _fresh_baseline_outcome(state)
         outcomes.append(outcome)
@@ -740,15 +941,21 @@ def _advance_to_reflection_or_done(
             infrastructure_retry_minibatch_id=None,
             last_comparison=None,
         )
-        if outcome.n_failures == 0 and state.best_candidate_id is None:
+        if (
+            not _held_out_validation_enabled()
+            and outcome.n_failures == 0
+            and state.best_candidate_id is None
+        ):
             state = _mark_best_candidate(state, outcome)
-
         if state.iterations >= state.max_iterations:
-            if state.best_candidate_id is None:
+            if state.best_candidate_id is None and not _held_out_validation_enabled():
                 state = _mark_best_candidate(state, outcome)
             return _mark_done(state), outcomes
 
         if outcome.n_failures > 0:
+            validation_reserve = 1 if _held_out_validation_enabled() else 0
+            if state.max_iterations - state.iterations < 1 + validation_reserve:
+                return _mark_done(state), outcomes
             state, baseline_outcomes = _capture_reflection_baseline(state, outcome)
             outcomes.extend(baseline_outcomes[1:])
             return state, outcomes
@@ -772,9 +979,10 @@ def _evaluate_reflected_candidate(
         typer.echo("Run state is missing reflection baseline samples.", err=True)
         raise typer.Exit(code=1)
 
+    validation_reserve = 1 if _held_out_validation_enabled() else 0
     max_candidate_samples = min(
         len(state.reflection_baseline_samples),
-        state.max_iterations - state.iterations,
+        state.max_iterations - state.iterations - validation_reserve,
     )
     if max_candidate_samples < 1:
         typer.echo(
@@ -1103,7 +1311,8 @@ def _write_final_report(
 ) -> tuple[Path, str]:
     pareto = ParetoLog(state.run_id, root)
     rows = pareto.iter_rows()
-    selectable_rows = pareto.selectable_rows()
+    validation_rows = pareto.validation_rows()
+    selectable_rows = validation_rows or pareto.selectable_rows()
     path = final_report_path(state.run_id, root)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1113,6 +1322,7 @@ def _write_final_report(
         f"- run_id: {state.run_id}",
         f"- status: {state.status}",
         f"- iterations: {state.iterations}/{state.max_iterations}",
+        f"- validation_evaluations: {state.validation_evaluations}",
         f"- pareto_log: {ParetoLog(state.run_id, root).path}",
     ]
     if overshoot:
@@ -1248,10 +1458,16 @@ def _emit_status(
                 "Restore the baseline or revise the candidate, then run:"
             )
         else:
-            typer.echo(
-                "Candidate did not beat the reflection baseline. Recommendation: "
-                "discard or revise the edits, then run:"
-            )
+            if comparison.get("rejection_reason") == "validation":
+                typer.echo(
+                    "Candidate improved the training minibatch but did not improve "
+                    "held-out validation. Discard or revise the edits, then run:"
+                )
+            else:
+                typer.echo(
+                    "Candidate did not beat the reflection baseline. Recommendation: "
+                    "discard or revise the edits, then run:"
+                )
         typer.echo(f"  gepa run continue --run-id {state.run_id}")
         if comparison:
             typer.echo(
@@ -1268,6 +1484,11 @@ def _emit_status(
                 )
             typer.echo(f"Candidate report: {comparison['candidate_report_path']}")
             typer.echo(f"Candidate trace: {comparison['candidate_trace_path']}")
+            if comparison.get("validation_evaluated"):
+                typer.echo(
+                    "Held-out validation was used for selection; no validation "
+                    "report or trace was exposed to reflection."
+                )
             if comparison.get("discard_command"):
                 typer.echo(
                     "To discard the git candidate and restore the reflection "
@@ -1372,7 +1593,7 @@ def start(
         help="Total evaluation-row budget for this managed run.",
     ),
     size: int = typer.Option(
-        10, "--size", help="Number of cases in each sampled mini-valset."
+        10, "--size", help="Number of cases in each sampled training minibatch."
     ),
     seed: int = typer.Option(0, "--seed", help="Deterministic minibatch seed."),
     epoch: int = typer.Option(0, "--epoch", help="Initial minibatch epoch."),
@@ -1390,7 +1611,7 @@ def start(
         3,
         "--acceptance-repetitions",
         help=(
-            "Initial repeated evaluations per candidate on the saved mini-valset. "
+            "Initial repeated evaluations per candidate on the saved training minibatch. "
             "Use more than one for stochastic pipelines."
         ),
     ),
@@ -1707,13 +1928,71 @@ def continue_(
             )
             outcomes.extend(comparison_outcomes)
 
+        validation_outcome: EvalOutcome | None = None
+        if (
+            _held_out_validation_enabled()
+            and comparison.get("outcome") == "valid"
+            and comparison["improved"]
+        ):
+            training_verdict = str(comparison["verdict"])
+            training_mean = float(comparison["candidate_mean_score"])
+            state, validation_outcome = _evaluate_validation_candidate(state)
+            outcomes.append(validation_outcome)
+            failures = _outcome_infrastructure_failures(validation_outcome)
+            if failures:
+                state, validation_failure = _pause_after_infrastructure_failure(
+                    state,
+                    [validation_outcome],
+                    phase="candidate",
+                    failures=failures,
+                )
+                validation_failure.update(
+                    {
+                        "training_verdict": training_verdict,
+                        "training_mean_score": training_mean,
+                        "validation_evaluated": True,
+                        "validation_improved": False,
+                        "rejection_reason": "validation_infrastructure_failure",
+                    }
+                )
+                comparison = validation_failure
+                state = _with_timestamp(state, last_comparison=comparison)
+            else:
+                validation_improved = _validation_improved(state, validation_outcome)
+                comparison.update(
+                    {
+                        "training_verdict": training_verdict,
+                        "training_mean_score": training_mean,
+                        "validation_evaluated": True,
+                        "validation_improved": validation_improved,
+                        "validation_mean_score": float(
+                            validation_outcome.summary["mean_score"]
+                        ),
+                        "prior_best_validation_mean_score": state.best_mean_score,
+                        "improved": validation_improved,
+                        "verdict": "accepted" if validation_improved else "rejected",
+                        "rejection_reason": (
+                            None if validation_improved else "validation"
+                        ),
+                        "recommendation": (
+                            "keep_and_advance"
+                            if validation_improved
+                            else "discard_or_revise"
+                        ),
+                    }
+                )
+                state = _with_timestamp(state, last_comparison=comparison)
+
         if comparison["improved"]:
             state = _consume_candidate_verdict(state, accepted=True)
-            state = _mark_best_candidate(
-                state,
-                comparison_outcomes[-1],
-                mean_score=float(comparison["candidate_mean_score"]),
-            )
+            if validation_outcome is not None:
+                state = _mark_best_from_validation(state, validation_outcome)
+            else:
+                state = _mark_best_candidate(
+                    state,
+                    comparison_outcomes[-1],
+                    mean_score=float(comparison["candidate_mean_score"]),
+                )
         if state.iterations >= state.max_iterations:
             state = _mark_done(state)
         elif comparison["improved"]:

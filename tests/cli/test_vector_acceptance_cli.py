@@ -201,6 +201,47 @@ def _start(repo: Path, *, repetitions: int = 1) -> tuple[dict[str, object], RunS
     return payload, RunState.from_dict(json.loads(path.read_text(encoding="utf-8")))
 
 
+def test_vector_mode_never_persists_validation_assertions(
+    vector_repo: Path,
+) -> None:
+    config = vector_repo / ".gepa" / "gepa.toml"
+    config.write_text(
+        _config().replace(
+            'dataset = ".gepa/dataset.jsonl"\n',
+            'dataset = ".gepa/dataset.jsonl"\n'
+            'validation_dataset = ".gepa/validation.jsonl"\n',
+        ),
+        encoding="utf-8",
+    )
+    (vector_repo / ".gepa" / "validation.jsonl").write_text(
+        json.dumps(
+            {
+                "name": "secret-vector-validation",
+                "inputs": "private",
+                "expected_output": "good",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _git(vector_repo, "add", ".gepa/gepa.toml", ".gepa/validation.jsonl")
+    _git(vector_repo, "commit", "-m", "Configure held-out validation")
+
+    payload, state = _start(vector_repo)
+    run_id = str(payload["run_id"])
+
+    assert state.validation_evaluations == 1
+    vectors = VectorRecordStore(vector_records_path(run_id, vector_repo)).records()
+    assert len(vectors) == len(state.reflection_baseline_samples)
+    run_root = vector_repo / ".gepa" / "runs" / run_id
+    persisted = "\n".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in run_root.rglob("*")
+        if path.is_file()
+    )
+    assert "secret-vector-validation" not in persisted
+
+
 def test_candidate_gate_allows_meta_files_and_parses_rename_paths(
     vector_repo: Path,
 ) -> None:

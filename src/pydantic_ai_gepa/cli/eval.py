@@ -35,7 +35,7 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Sequence, cast
+from typing import Any, Iterator, Literal, Sequence, cast
 
 import typer
 
@@ -79,6 +79,7 @@ from .layout import (
 )
 from .metrics import default_substring_metric
 from .runs import (
+    Minibatch,
     MinibatchStore,
     ParetoLog,
     ParetoRow,
@@ -132,7 +133,7 @@ def _resolve_run_id(run_id: str | None, root: Path | None = None) -> str:
 
 
 def _count_evals_in_run(run_id: str, root: Path | None = None) -> int:
-    rows = ParetoLog(run_id, root).count_rows()
+    rows = ParetoLog(run_id, root).count_budget_rows()
     # A gate rejection intentionally has no Pareto row. Read its explicit
     # managed-run counter so the normal pre-evaluation hard budget gate still
     # stops repeated reflect -> gate-reject cycles.
@@ -211,7 +212,7 @@ def _objective_scores(
 class EvalOutcome:
     records: list[EvaluationRecord]
     summary: dict[str, Any]
-    report_path: Path
+    report_path: Path | None
     trace_path: Path | None
 
     @property
@@ -367,6 +368,9 @@ def run_eval_once(
     selected_case_ids: Sequence[str] | None = None,
     supplemental_records: Sequence[EvaluationRecord] = (),
     write_pareto: bool = True,
+    dataset_role: Literal["training", "validation"] = "training",
+    persist_report: bool = True,
+    redact_selection_evidence: bool = False,
 ) -> EvalOutcome:
     """Evaluate one baseline/candidate and append the standard run artifacts.
 
@@ -381,6 +385,14 @@ def run_eval_once(
     corresponding Python project inside the lane worktree — candidate
     identity, cwd, and module imports resolve there).
     """
+    if dataset_role == "validation":
+        # Held-out evidence is selection-only by contract. Derive every
+        # redaction control from the role so a future caller cannot
+        # accidentally persist reflection-visible validation artifacts.
+        capture_traces = False
+        persist_report = False
+        redact_selection_evidence = True
+
     primary_project_root = (workspace_root or repo_root()).resolve()
     active_candidate_project = (candidate_root or primary_project_root).resolve()
     cfg = GepaConfig.load(config_path(primary_project_root))
@@ -397,7 +409,15 @@ def run_eval_once(
         case_factory = resolve_case_factory(cfg)
         skills_fs = resolve_skills(cfg, root=active_candidate_project)
 
-    dataset_path = primary_project_root / cfg.dataset
+    if dataset_role == "validation":
+        if cfg.validation_dataset is None:
+            raise typer.BadParameter(
+                "Held-out validation requires validation_dataset in gepa.toml."
+            )
+        configured_dataset = cfg.validation_dataset
+    else:
+        configured_dataset = cfg.dataset
+    dataset_path = primary_project_root / configured_dataset
     cases = load_dataset(dataset_path)
     if not cases:
         typer.echo(f"Dataset {dataset_path} is empty.", err=True)
@@ -499,7 +519,24 @@ def run_eval_once(
 
     run_dir(active_run_id, workspace_root).mkdir(parents=True, exist_ok=True)
     minibatch_store = MinibatchStore(active_run_id, workspace_root)
-    if case_id is not None:
+    if dataset_role == "validation":
+        if minibatch_id is not None or case_id is not None:
+            raise typer.BadParameter(
+                "Held-out validation always evaluates its complete dataset."
+            )
+        validation_ids = tuple(dataset_case_ids(cases))
+        validation_digest = hashlib.sha256(
+            json.dumps(validation_ids).encode("utf-8")
+        ).hexdigest()[:12]
+        minibatch = Minibatch(
+            id=f"validation-{validation_digest}",
+            case_ids=list(validation_ids),
+            seed=seed,
+            epoch=0,
+            size=len(validation_ids),
+            sampled_at=utc_now_iso(),
+        )
+    elif case_id is not None:
         if minibatch_id is not None:
             raise typer.BadParameter(
                 "--case selection cannot be combined with a minibatch id."
@@ -681,6 +718,11 @@ def run_eval_once(
     )
     selectable = not infrastructure_failures and metric_selectable
     pareto_status = "infrastructure_failure" if infrastructure_failures else status
+    persisted_errors = (
+        [{"error_kind": failure.error_kind} for failure in infrastructure_failures]
+        if redact_selection_evidence
+        else [failure.to_dict() for failure in infrastructure_failures]
+    )
 
     if write_pareto:
         pareto = ParetoLog(active_run_id, workspace_root)
@@ -694,41 +736,47 @@ def run_eval_once(
                 ),
                 component_overrides_id=candidate_overrides_id,
                 minibatch_id=minibatch.id,
-                per_case_scores=per_case,
+                per_case_scores={} if redact_selection_evidence else per_case,
                 mean_score=mean,
                 status=pareto_status,
                 summary=f"{pareto_status} eval of {candidate.id} on minibatch {minibatch.id} (mean={mean:.3f})",
                 timestamp=utc_now_iso(),
                 lane=lane,
-                objective_scores=objective_scores,
-                per_case_objective_scores=per_case_objective_scores,
+                objective_scores={} if redact_selection_evidence else objective_scores,
+                per_case_objective_scores=(
+                    {} if redact_selection_evidence else per_case_objective_scores
+                ),
                 extra={
                     "eval_id": eval_id,
                     "outcome": evaluation_outcome,
                     "selectable": selectable,
-                    "evaluation_errors": [
-                        failure.to_dict() for failure in infrastructure_failures
-                    ],
+                    "evaluation_errors": persisted_errors,
                     "row_scope": row_scope,
+                    "dataset_role": dataset_role,
                 },
             )
         )
 
-    # Write the per-case report next to the pareto log.
-    reports_dir = run_dir(active_run_id, workspace_root) / "reports"
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    report_path = reports_dir / f"{iteration:04d}-{eval_id}-{candidate.id}.md"
-    report_path.write_text(
-        _format_failures(
-            records,
-            threshold=threshold,
-            candidate_source=source,
-            redact_scores=cfg.acceptance.mode == "vector",
-        ),
-        encoding="utf-8",
-    )
-    if infrastructure_failures:
-        append_infrastructure_failures_to_report(report_path, infrastructure_failures)
+    # Validation evidence is selection-only. Do not persist a report or trace
+    # that an external reflection agent could inspect.
+    report_path: Path | None = None
+    if persist_report:
+        reports_dir = run_dir(active_run_id, workspace_root) / "reports"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        report_path = reports_dir / f"{iteration:04d}-{eval_id}-{candidate.id}.md"
+        report_path.write_text(
+            _format_failures(
+                records,
+                threshold=threshold,
+                candidate_source=source,
+                redact_scores=cfg.acceptance.mode == "vector",
+            ),
+            encoding="utf-8",
+        )
+        if infrastructure_failures:
+            append_infrastructure_failures_to_report(
+                report_path, infrastructure_failures
+            )
     trace_path = (
         _write_trace_file(
             path=planned_trace_path,
@@ -762,20 +810,27 @@ def run_eval_once(
         "eval_id": eval_id,
         "evaluation_outcome": evaluation_outcome,
         "selectable": selectable,
-        "evaluation_errors": [failure.to_dict() for failure in infrastructure_failures],
+        "evaluation_errors": persisted_errors,
         "mean_score": mean,
-        "objective_scores": objective_scores,
-        "per_case_objective_scores": per_case_objective_scores,
-        "n_cases": len(records),
-        "n_failures": len([record for record in records if record.score < threshold]),
+        "objective_scores": {} if redact_selection_evidence else objective_scores,
+        "per_case_objective_scores": (
+            {} if redact_selection_evidence else per_case_objective_scores
+        ),
+        "n_cases": None if redact_selection_evidence else len(records),
+        "n_failures": (
+            None
+            if redact_selection_evidence
+            else len([record for record in records if record.score < threshold])
+        ),
         "iterations": iteration,
         "max_iterations": max_iterations,
-        "report_path": str(report_path),
+        "report_path": str(report_path) if report_path else None,
         "trace_path": str(trace_path) if trace_path else None,
         "row_scope": row_scope,
+        "dataset_role": dataset_role,
     }
 
-    if cfg.acceptance.mode == "vector":
+    if cfg.acceptance.mode == "vector" and dataset_role == "training":
         assertions, latency = side_info_vector(records)
         repetition = vector_repetition if vector_repetition is not None else iteration
         incumbent_hash = vector_incumbent_hash or candidate.id

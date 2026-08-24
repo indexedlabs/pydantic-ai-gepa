@@ -76,6 +76,14 @@ def init(
             "Defaults to `<workspace>/dataset.jsonl` for the active --gepa-dir."
         ),
     ),
+    validation_dataset: str | None = typer.Option(
+        None,
+        "--validation-dataset",
+        help=(
+            "Optional held-out validation JSONL used to select candidates. "
+            "When omitted, managed runs retain legacy training-only selection."
+        ),
+    ),
     metric: str | None = typer.Option(
         None,
         "--metric",
@@ -147,6 +155,7 @@ def init(
         cfg_path = write_default_config(
             agent,
             resolved_dataset,
+            validation_dataset=validation_dataset,
             evaluate=evaluate,
             candidate_source=cast(CandidateSource, candidate_source),
             metric=metric,
@@ -213,8 +222,13 @@ def init(
     workspace_hint = "" if dirname == ".gepa" else f" --gepa-dir {dirname}"
     typer.echo(
         "Next steps:\n"
-        f"  1. Write dataset cases as JSONL at {resolved_dataset}\n"
-        f"  2. Run `gepa{workspace_hint} eval --size N` to score the baseline + write the per-case report"
+        f"  1. Write reflection-training cases as JSONL at {resolved_dataset}\n"
+        + (
+            f"     Write held-out validation cases at {validation_dataset}\n"
+            if validation_dataset
+            else ""
+        )
+        + f"  2. Run `gepa{workspace_hint} eval --size N` to score the baseline + write the per-case report"
     )
 
 

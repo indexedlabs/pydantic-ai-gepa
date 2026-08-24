@@ -75,6 +75,7 @@ def test_config_parse_minimal(tmp_path: Path) -> None:
     cfg = GepaConfig.load(cfg_path)
     assert cfg.agent == "pkg.agents:my_agent"
     assert cfg.dataset == ".gepa/dataset.jsonl"
+    assert cfg.validation_dataset is None
     assert cfg.defaults == {}
     assert cfg.stall_threshold == 5
 
@@ -98,6 +99,21 @@ def test_config_parse_with_defaults(tmp_path: Path) -> None:
     assert cfg.agent == "pkg.agents:other"
     assert cfg.dataset == "data/cases.jsonl"
     assert cfg.defaults == {"minibatch_size": 5, "max_iterations": 20}
+
+
+def test_config_parse_with_held_out_validation(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "gepa.toml"
+    cfg_path.write_text(
+        'agent = "pkg.agents:other"\n'
+        'dataset = "data/train.jsonl"\n'
+        'validation_dataset = "data/validation.jsonl"\n',
+        encoding="utf-8",
+    )
+
+    cfg = GepaConfig.load(cfg_path)
+
+    assert cfg.dataset == "data/train.jsonl"
+    assert cfg.validation_dataset == "data/validation.jsonl"
 
 
 def test_config_parse_with_skills(tmp_path: Path) -> None:

@@ -334,6 +334,24 @@ def test_default_workspace_unchanged_when_flag_omitted(empty_repo: Path) -> None
     assert 'dataset = ".gepa/dataset.jsonl"' in body
 
 
+def test_init_writes_held_out_validation_dataset(empty_repo: Path) -> None:
+    result = _run(
+        "init",
+        "--agent",
+        "agent_pkg.agents:agent",
+        "--dataset",
+        "data/train.jsonl",
+        "--validation-dataset",
+        "data/validation.jsonl",
+    )
+
+    assert result.exit_code == 0, result.output
+    body = (empty_repo / ".gepa" / "gepa.toml").read_text(encoding="utf-8")
+    assert 'dataset = "data/train.jsonl"' in body
+    assert 'validation_dataset = "data/validation.jsonl"' in body
+    assert "held-out validation cases at data/validation.jsonl" in result.output
+
+
 def test_parallel_workspaces_isolated(empty_repo: Path) -> None:
     """Two workspaces in the same repo do not collide."""
     first = _run(
