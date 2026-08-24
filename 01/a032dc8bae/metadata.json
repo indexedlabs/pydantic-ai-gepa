@@ -1,0 +1,14 @@
+{
+  "checkpoint_id": "01a032dc8bae",
+  "created_at": "2026-08-24T08:21:50.312965+00:00",
+  "branch_name": "codex/comparator-aware-validation",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "30cfbaa2a48a5e4e46b85f0a5bd84c5190db28d9"
+  ],
+  "entity_touches": [
+    ".mighty/loro/edges/01a032dc-8ae2-7a61-afb1-b749ceea1312.loro",
+    ".mighty/loro/records/01a0327d-f168-7de2-8014-cfa1b1fca584.loro",
+    ".mighty/loro/records/01a032dc-8aa4-7b62-979d-7eaf012c7278.loro"
+  ]
+}
