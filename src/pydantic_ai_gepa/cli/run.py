@@ -680,6 +680,7 @@ def _evaluate_validation_candidate(
     workspace_root: Path | None = None,
     lane: str | None = None,
     vector_incumbent_hash: str | None = None,
+    vector_repetition: int | None = None,
 ) -> tuple[RunState, EvalOutcome]:
     """Score the current candidate on held-out validation without reflection artifacts."""
 
@@ -705,6 +706,7 @@ def _evaluate_validation_candidate(
         workspace_root=workspace_root,
         row_scope="validation",
         vector_incumbent_hash=vector_incumbent_hash,
+        vector_repetition=vector_repetition,
         dataset_role="validation",
         persist_report=False,
         redact_selection_evidence=True,

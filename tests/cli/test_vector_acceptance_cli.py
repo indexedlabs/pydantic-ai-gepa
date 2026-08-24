@@ -135,7 +135,9 @@ def vector_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pat
         "        kind = context.get('comparison_kind')\n"
         "        statuses = [case['quality']['status'] for record in request.candidate for case in record.assertions.values()]\n"
         "        case_ids = [case_id for record in request.candidate for case_id in record.assertions]\n"
-        "        held_out_vector = case_ids == ['secret-vector-validation']\n"
+        "        if kind == 'validation_selection' and (len(request.incumbent) < 2 or len(request.candidate) < 2):\n"
+        "            raise ValueError('validation selection requires replicated vectors')\n"
+        "        held_out_vector = set(case_ids) == {'secret-vector-validation'}\n"
         "        verdict = 'rejected' if kind == 'run_start_rebaseline' or (kind == 'validation_selection' and (context.get('lane') == 'lane-3' or not held_out_vector)) else 'accepted'\n"
         "        ranking = ({'lane-1': 1.0, 'lane-2': 2.0, 'lane-3': 3.0}.get(context.get('lane'), 1.0),)\n"
         "        return VectorComparison(verdict, ranking_key=ranking, display_score=1.0, detail={\n"
@@ -330,9 +332,9 @@ def test_vector_validation_uses_comparator_ranking_without_persisting_detail(
     )
     assert final.best_commit_sha == resolved["lane-2"].candidate_sha
     assert final.best_commit_sha != resolved["lane-3"].candidate_sha
-    assert final.validation_evaluations == 5
+    assert final.validation_evaluations == 9
     validation_rows = ParetoLog(run_id, vector_repo).validation_rows()
-    assert len(validation_rows) == 5
+    assert len(validation_rows) == 9
     assert all(row.per_case_scores == {} for row in validation_rows)
 
     run_root = vector_repo / ".gepa" / "runs" / run_id
@@ -404,8 +406,8 @@ def test_vector_validation_resume_restarts_one_comparable_round(
         json.loads((vector_repo / ".gepa" / "runs" / run_id / "state.json").read_text())
     )
     assert final.best_commit_sha == resolved["lane-2"].candidate_sha
-    assert final.validation_evaluations == 6
-    assert len(ParetoLog(run_id, vector_repo).validation_rows()) == 6
+    assert final.validation_evaluations == 11
+    assert len(ParetoLog(run_id, vector_repo).validation_rows()) == 11
 
 
 def test_validation_ranking_key_requires_finite_non_boolean_numbers() -> None:

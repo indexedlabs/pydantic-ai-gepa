@@ -707,10 +707,11 @@ def _phase_promote(
             invalidated.append(lane_state.lane)
 
     # 3. Training verdicts are consumed from lane state (memoized by the lane
-    #    eval). Every training-accepted proposal is then scored once on held-out
-    #    validation. Vector mode also scores the incumbent once and applies the
-    #    configured comparator entirely in memory. Validation writes no
-    #    reports/traces/vectors, so its evidence never enters a reflection packet.
+    #    eval). Every training-accepted proposal is then scored on held-out
+    #    validation. Vector mode scores the incumbent and every proposal for
+    #    the configured maximum repetition count, then applies the configured
+    #    comparator entirely in memory. Validation writes no reports, traces,
+    #    or vectors, so its evidence never enters a reflection packet.
     accepted = [lane_state for lane_state in valid if lane_state.verdict == "accepted"]
     config = GepaConfig.load(config_path(workspace_root))
     validation_enabled = config.validation_dataset is not None
@@ -718,7 +719,7 @@ def _phase_promote(
     validation_results = dict(ctx.get("validation_results") or {})
     from .run import _evaluate_validation_candidate
 
-    incumbent_vector: VectorRecord | None = None
+    incumbent_vectors: tuple[VectorRecord, ...] = ()
     missing_validation = [
         lane_state
         for lane_state in accepted
@@ -727,7 +728,7 @@ def _phase_promote(
     if vector_validation and missing_validation and validation_results:
         # Validation vectors are intentionally never persisted. An interrupted
         # round must therefore restart in full so every lane is compared with
-        # the same freshly scored incumbent vector.
+        # the same freshly scored incumbent repetitions.
         validation_results = {}
         ctx["validation_results"] = {}
         missing_validation = list(accepted)
@@ -742,18 +743,25 @@ def _phase_promote(
         validation_comparator = resolve_vector_comparator(
             str(config.acceptance.comparator), expected_root=workspace_root
         )
+        incumbent_outcomes = []
+        validation_repetitions = state.acceptance_max_repetitions
         with _validation_incumbent_root(
             workspace_root, str(baseline_sha)
         ) as incumbent_root:
-            with _chdir(incumbent_root):
-                state, incumbent_outcome = _evaluate_validation_candidate(
-                    state,
-                    candidate_root=incumbent_root,
-                    workspace_root=workspace_root,
-                    lane="incumbent:validation",
-                )
-        incumbent_failures = evaluation_infrastructure_failures(
-            incumbent_outcome.records
+            for repetition in range(1, validation_repetitions + 1):
+                with _chdir(incumbent_root):
+                    state, incumbent_outcome = _evaluate_validation_candidate(
+                        state,
+                        candidate_root=incumbent_root,
+                        workspace_root=workspace_root,
+                        lane="incumbent:validation",
+                        vector_repetition=repetition,
+                    )
+                incumbent_outcomes.append(incumbent_outcome)
+        incumbent_failures = tuple(
+            failure
+            for outcome in incumbent_outcomes
+            for failure in evaluation_infrastructure_failures(outcome.records)
         )
         if incumbent_failures:
             failure_history = dict(ctx.get("validation_infrastructure_failures") or {})
@@ -772,8 +780,12 @@ def _phase_promote(
                 err=True,
             )
             raise typer.Exit(code=1)
-        incumbent_vector = incumbent_outcome.selection_vector
-        if incumbent_vector is None:
+        incumbent_vectors = tuple(
+            outcome.selection_vector
+            for outcome in incumbent_outcomes
+            if outcome.selection_vector is not None
+        )
+        if len(incumbent_vectors) != validation_repetitions:
             raise typer.BadParameter(
                 "Vector held-out validation requires a vector metric record."
             )
@@ -831,19 +843,28 @@ def _phase_promote(
             if lane_state.candidate_project_path
             else candidate_project_root(workspace_root, worktree)
         )
-        with _chdir(candidate_root):
-            state, validation_outcome = _evaluate_validation_candidate(
-                state,
-                candidate_root=candidate_root,
-                workspace_root=workspace_root,
-                lane=validation_lane,
-                vector_incumbent_hash=(
-                    incumbent_vector.key.candidate_hash
-                    if incumbent_vector is not None
-                    else None
-                ),
-            )
-        failures = evaluation_infrastructure_failures(validation_outcome.records)
+        validation_outcomes = []
+        repetitions = state.acceptance_max_repetitions if vector_validation else 1
+        for repetition in range(1, repetitions + 1):
+            with _chdir(candidate_root):
+                state, validation_outcome = _evaluate_validation_candidate(
+                    state,
+                    candidate_root=candidate_root,
+                    workspace_root=workspace_root,
+                    lane=validation_lane,
+                    vector_incumbent_hash=(
+                        incumbent_vectors[0].key.candidate_hash
+                        if incumbent_vectors
+                        else None
+                    ),
+                    vector_repetition=(repetition if vector_validation else None),
+                )
+            validation_outcomes.append(validation_outcome)
+        failures = tuple(
+            failure
+            for outcome in validation_outcomes
+            for failure in evaluation_infrastructure_failures(outcome.records)
+        )
         if failures:
             failure_history = dict(ctx.get("validation_infrastructure_failures") or {})
             failure_history[lane_state.lane] = {
@@ -862,14 +883,24 @@ def _phase_promote(
             )
             raise typer.Exit(code=1)
         result: dict[str, Any] = {
-            "candidate_id": validation_outcome.summary["candidate_id"],
-            "commit_sha": validation_outcome.summary.get("commit_sha"),
-            "mean_score": float(validation_outcome.summary["mean_score"]),
-            "selectable": validation_outcome.summary.get("selectable") is not False,
+            "candidate_id": validation_outcomes[-1].summary["candidate_id"],
+            "commit_sha": validation_outcomes[-1].summary.get("commit_sha"),
+            "mean_score": sum(
+                float(outcome.summary["mean_score"]) for outcome in validation_outcomes
+            )
+            / len(validation_outcomes),
+            "selectable": all(
+                outcome.summary.get("selectable") is not False
+                for outcome in validation_outcomes
+            ),
         }
         if vector_validation:
-            candidate_vector = validation_outcome.selection_vector
-            if incumbent_vector is None or candidate_vector is None:
+            candidate_vectors = tuple(
+                outcome.selection_vector
+                for outcome in validation_outcomes
+                if outcome.selection_vector is not None
+            )
+            if not incumbent_vectors or len(candidate_vectors) != repetitions:
                 raise typer.BadParameter(
                     "Vector held-out validation requires incumbent and candidate "
                     "vector metric records."
@@ -878,10 +909,10 @@ def _phase_promote(
             validation_comparison = compare_vectors(
                 validation_comparator,
                 VectorComparisonRequest(
-                    incumbent=(incumbent_vector,),
-                    candidate=(candidate_vector,),
-                    attempt=1,
-                    escalation=0,
+                    incumbent=incumbent_vectors,
+                    candidate=candidate_vectors,
+                    attempt=repetitions,
+                    escalation=max(0, repetitions - state.acceptance_repetitions),
                     journal_context={
                         "run_id": run_id,
                         "lane": lane_state.lane,
