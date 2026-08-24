@@ -1699,6 +1699,23 @@ def start(
         typer.echo("--candidate-source must be 'components' or 'git'.", err=True)
         raise typer.Exit(code=2)
     cfg = GepaConfig.load(config_path())
+    vector_validation = (
+        cfg.validation_dataset is not None and cfg.acceptance.mode == "vector"
+    )
+    if vector_validation and lanes == 0:
+        typer.echo(
+            "Vector held-out validation requires --lanes greater than zero; "
+            "the synchronous loop supports scalar validation only.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if vector_validation and resolved_max_repetitions < 2:
+        typer.echo(
+            "Vector held-out validation requires at least two maximum "
+            "acceptance repetitions.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
     resolved_stall_threshold = (
         cfg.stall_threshold if stall_threshold is None else stall_threshold
     )

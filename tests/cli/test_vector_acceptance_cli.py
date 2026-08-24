@@ -302,6 +302,48 @@ def test_vector_mode_never_persists_validation_assertions(
     assert "secret-vector-validation" not in persisted
 
 
+def test_vector_validation_requires_lane_selection(vector_repo: Path) -> None:
+    _configure_validation(vector_repo, pinned_scorer=True)
+
+    result = _run(
+        "--gepa-dir",
+        str(vector_repo / ".gepa"),
+        "run",
+        "start",
+        "--lanes",
+        "0",
+        "--size",
+        "2",
+    )
+
+    assert result.exit_code == 2
+    assert "requires --lanes greater than zero" in result.output
+
+
+def test_vector_validation_requires_replicated_maximum(
+    vector_repo: Path,
+) -> None:
+    _configure_validation(vector_repo, pinned_scorer=True)
+
+    result = _run(
+        "--gepa-dir",
+        str(vector_repo / ".gepa"),
+        "run",
+        "start",
+        "--lanes",
+        "1",
+        "--size",
+        "2",
+        "--acceptance-repetitions",
+        "1",
+        "--acceptance-max-repetitions",
+        "1",
+    )
+
+    assert result.exit_code == 2
+    assert "requires at least two maximum acceptance repetitions" in result.output
+
+
 def test_vector_validation_uses_comparator_ranking_without_persisting_detail(
     vector_repo: Path,
 ) -> None:

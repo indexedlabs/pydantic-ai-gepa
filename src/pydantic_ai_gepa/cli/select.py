@@ -1212,11 +1212,11 @@ def _phase_journal(
         validation_rounds = int(ctx.get("validation_rounds", 0))
         overshoot_bound = (
             state.lanes * state.acceptance_max_repetitions
-            + validation_rounds * (state.lanes + 1)
+            + validation_rounds * (state.lanes + 1) * state.acceptance_max_repetitions
         )
         bound_detail = (
             "lanes x acceptance max-repetitions, plus completed vector "
-            "validation rounds"
+            "validation rounds x (lanes + incumbent) x max-repetitions"
         )
     else:
         overshoot_bound = state.lanes * (state.acceptance_max_repetitions + 1)
