@@ -14,8 +14,9 @@ phase on the next invocation:
    partial result + diff summary, mark ``stalled``; pydanticaigepa-dec-4tw),
    invalidate lanes whose candidate no longer descends from the frozen
    baseline commit, validate every training-accepted candidate on the held-out
-   dataset, pick the highest-scoring validation improvement, promote it to
-   the run's best (the primary checkout is reset only when clean and still on
+   dataset, use aggregate score in scalar mode or the configured comparator in
+   vector mode, promote the winning validation improvement to the run's best
+   (the primary checkout is reset only when clean and still on
    the old best — user work is never destroyed), journal the winner, and emit
    ``merge_opportunity`` for accepted lane pairs with disjoint diffs (merging
    itself is always delegated to the coding agent — never auto-merged).
@@ -53,6 +54,7 @@ they are memoized by the lane eval processes and never re-derived here.
 from __future__ import annotations
 
 import json
+import math
 import os
 import signal
 import subprocess
@@ -96,6 +98,8 @@ from .layout import (
     candidate_project_root,
     config_path,
     final_report_path,
+    git_root,
+    insert_repo_root_on_path,
     journal_path,
     run_dir,
     run_state_path,
@@ -600,6 +604,61 @@ def _emit_merge_opportunities(
 # ----------------------------- phases -----------------------------------
 
 
+@contextmanager
+def _validation_incumbent_root(workspace_root: Path, commit_sha: str) -> Iterator[Path]:
+    """Yield the exact incumbent tree without touching the primary checkout."""
+
+    primary_head, primary_dirty = _primary_checkout_state(workspace_root)
+    if primary_head == commit_sha and not primary_dirty:
+        yield workspace_root
+        return
+
+    import tempfile
+
+    repository = git_root(workspace_root)
+    removal_failed = False
+    try:
+        with tempfile.TemporaryDirectory(prefix="gepa-validation-incumbent-") as temp:
+            checkout = Path(temp) / "worktree"
+            _git(repository, "worktree", "add", "--detach", str(checkout), commit_sha)
+            try:
+                yield candidate_project_root(workspace_root, checkout)
+            finally:
+                try:
+                    _git(repository, "worktree", "remove", "--force", str(checkout))
+                except subprocess.CalledProcessError:
+                    removal_failed = True
+    finally:
+        if removal_failed:
+            try:
+                _git(repository, "worktree", "prune")
+            except subprocess.CalledProcessError:
+                typer.echo(
+                    "Warning: could not prune the temporary validation worktree; "
+                    "run `git worktree prune` before the next selection.",
+                    err=True,
+                )
+
+
+def _numeric_ranking_key(raw: Any, *, label: str) -> tuple[float, ...]:
+    if not isinstance(raw, (list, tuple)):
+        raise typer.BadParameter(f"{label} ranking_key must be a numeric tuple.")
+    ranking: list[float] = []
+    for item in raw:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise typer.BadParameter(f"{label} ranking_key must be a numeric tuple.")
+        try:
+            number = float(item)
+        except OverflowError as exc:
+            raise typer.BadParameter(
+                f"{label} ranking_key values must be finite."
+            ) from exc
+        if not math.isfinite(number):
+            raise typer.BadParameter(f"{label} ranking_key values must be finite.")
+        ranking.append(number)
+    return tuple(ranking)
+
+
 def _phase_promote(
     workspace_root: Path, state: Any, ctx: dict[str, Any]
 ) -> tuple[Any, dict[str, Any], str]:
@@ -649,28 +708,100 @@ def _phase_promote(
 
     # 3. Training verdicts are consumed from lane state (memoized by the lane
     #    eval). Every training-accepted proposal is then scored once on held-out
-    #    validation. Validation writes no reports/traces, so its evidence never
-    #    enters a reflection packet.
+    #    validation. Vector mode also scores the incumbent once and applies the
+    #    configured comparator entirely in memory. Validation writes no
+    #    reports/traces/vectors, so its evidence never enters a reflection packet.
     accepted = [lane_state for lane_state in valid if lane_state.verdict == "accepted"]
     config = GepaConfig.load(config_path(workspace_root))
     validation_enabled = config.validation_dataset is not None
+    vector_validation = validation_enabled and config.acceptance.mode == "vector"
     validation_results = dict(ctx.get("validation_results") or {})
     from .run import _evaluate_validation_candidate
+
+    incumbent_vector: VectorRecord | None = None
+    missing_validation = [
+        lane_state
+        for lane_state in accepted
+        if lane_state.lane not in validation_results
+    ]
+    if vector_validation and missing_validation and validation_results:
+        # Validation vectors are intentionally never persisted. An interrupted
+        # round must therefore restart in full so every lane is compared with
+        # the same freshly scored incumbent vector.
+        validation_results = {}
+        ctx["validation_results"] = {}
+        missing_validation = list(accepted)
+
+    validation_comparator = None
+    if vector_validation and missing_validation:
+        ctx["validation_rounds"] = int(ctx.get("validation_rounds", 0)) + 1
+        state = _checkpoint(state, workspace_root, "promote", ctx)
+        # Held-out selection is run-owned: candidates may change their own
+        # unpinned scorer code, but never the comparator that ranks lanes.
+        insert_repo_root_on_path(workspace_root)
+        validation_comparator = resolve_vector_comparator(
+            str(config.acceptance.comparator), expected_root=workspace_root
+        )
+        with _validation_incumbent_root(
+            workspace_root, str(baseline_sha)
+        ) as incumbent_root:
+            with _chdir(incumbent_root):
+                state, incumbent_outcome = _evaluate_validation_candidate(
+                    state,
+                    candidate_root=incumbent_root,
+                    workspace_root=workspace_root,
+                    lane="incumbent:validation",
+                )
+        incumbent_failures = evaluation_infrastructure_failures(
+            incumbent_outcome.records
+        )
+        if incumbent_failures:
+            failure_history = dict(ctx.get("validation_infrastructure_failures") or {})
+            failure_history["incumbent"] = {
+                "evaluation_error_count": len(incumbent_failures),
+                "error_kinds": sorted(
+                    {failure.error_kind or "unknown" for failure in incumbent_failures}
+                ),
+            }
+            ctx["validation_infrastructure_failures"] = failure_history
+            state = _checkpoint(state, workspace_root, "promote", ctx)
+            typer.echo(
+                "Held-out validation failed for the incumbent; no selection "
+                "decision was memoized. Recover the evaluator and retry "
+                "`gepa run select`.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        incumbent_vector = incumbent_outcome.selection_vector
+        if incumbent_vector is None:
+            raise typer.BadParameter(
+                "Vector held-out validation requires a vector metric record."
+            )
+        failure_history = dict(ctx.get("validation_infrastructure_failures") or {})
+        failure_history.pop("incumbent", None)
+        if failure_history:
+            ctx["validation_infrastructure_failures"] = failure_history
+        else:
+            ctx.pop("validation_infrastructure_failures", None)
 
     for lane_state in accepted if validation_enabled else []:
         if lane_state.lane in validation_results:
             continue
         validation_lane = f"{lane_state.lane}:validation"
-        recovered_row = next(
-            (
-                row
-                for row in reversed(ParetoLog(run_id, workspace_root).iter_rows())
-                if row.extra.get("row_scope") == "validation"
-                and row.extra.get("outcome") == "valid"
-                and row.lane == validation_lane
-                and row.commit_sha == lane_state.candidate_sha
-            ),
-            None,
+        recovered_row = (
+            next(
+                (
+                    row
+                    for row in reversed(ParetoLog(run_id, workspace_root).iter_rows())
+                    if row.extra.get("row_scope") == "validation"
+                    and row.extra.get("outcome") == "valid"
+                    and row.lane == validation_lane
+                    and row.commit_sha == lane_state.candidate_sha
+                ),
+                None,
+            )
+            if not vector_validation
+            else None
         )
         if recovered_row is not None:
             ledger = ParetoLog(run_id, workspace_root)
@@ -706,6 +837,11 @@ def _phase_promote(
                 candidate_root=candidate_root,
                 workspace_root=workspace_root,
                 lane=validation_lane,
+                vector_incumbent_hash=(
+                    incumbent_vector.key.candidate_hash
+                    if incumbent_vector is not None
+                    else None
+                ),
             )
         failures = evaluation_infrastructure_failures(validation_outcome.records)
         if failures:
@@ -725,12 +861,61 @@ def _phase_promote(
                 err=True,
             )
             raise typer.Exit(code=1)
-        validation_results[lane_state.lane] = {
+        result: dict[str, Any] = {
             "candidate_id": validation_outcome.summary["candidate_id"],
             "commit_sha": validation_outcome.summary.get("commit_sha"),
             "mean_score": float(validation_outcome.summary["mean_score"]),
             "selectable": validation_outcome.summary.get("selectable") is not False,
         }
+        if vector_validation:
+            candidate_vector = validation_outcome.selection_vector
+            if incumbent_vector is None or candidate_vector is None:
+                raise typer.BadParameter(
+                    "Vector held-out validation requires incumbent and candidate "
+                    "vector metric records."
+                )
+            assert validation_comparator is not None
+            validation_comparison = compare_vectors(
+                validation_comparator,
+                VectorComparisonRequest(
+                    incumbent=(incumbent_vector,),
+                    candidate=(candidate_vector,),
+                    attempt=1,
+                    escalation=0,
+                    journal_context={
+                        "run_id": run_id,
+                        "lane": lane_state.lane,
+                        "iteration": lane_state.iteration,
+                        "comparison_kind": "validation_selection",
+                        "accepted_promotion_count": state.accepted_promotion_count,
+                        "run_start_baseline": state.run_start_baseline,
+                    },
+                ),
+            )
+            ranking_key = _numeric_ranking_key(
+                validation_comparison.ranking_key,
+                label="Vector validation comparison",
+            )
+            prior_arities = {
+                len(
+                    _numeric_ranking_key(
+                        item["comparison"]["ranking_key"],
+                        label="Vector validation comparison",
+                    )
+                )
+                for item in validation_results.values()
+                if isinstance(item, dict) and isinstance(item.get("comparison"), dict)
+            }
+            if prior_arities and prior_arities != {len(ranking_key)}:
+                raise typer.BadParameter(
+                    "Vector validation comparison ranking_key must have identical "
+                    "arity for every lane."
+                )
+            result["comparison"] = {
+                "verdict": validation_comparison.verdict,
+                "ranking_key": list(ranking_key),
+            }
+        validation_results[lane_state.lane] = result
         failure_history = dict(ctx.get("validation_infrastructure_failures") or {})
         failure_history.pop(lane_state.lane, None)
         if failure_history:
@@ -740,7 +925,15 @@ def _phase_promote(
         ctx["validation_results"] = validation_results
         state = _checkpoint(state, workspace_root, "promote", ctx)
 
-    if validation_enabled:
+    if vector_validation:
+        selectable_candidates = [
+            lane_state
+            for lane_state in accepted
+            if validation_results[lane_state.lane]["selectable"]
+            and validation_results[lane_state.lane]["comparison"]["verdict"]
+            == "accepted"
+        ]
+    elif validation_enabled:
         prior_best = state.best_mean_score
         selectable_candidates = [
             lane_state
@@ -756,7 +949,21 @@ def _phase_promote(
         selectable_candidates = accepted
     winner: LaneState | None = None
     if selectable_candidates:
-        if validation_enabled:
+        if vector_validation:
+
+            def validation_rank(
+                lane_state: LaneState,
+            ) -> tuple[float | str, ...]:
+                ranking = _numeric_ranking_key(
+                    validation_results[lane_state.lane]["comparison"].get(
+                        "ranking_key", []
+                    ),
+                    label="Vector validation comparison",
+                )
+                return tuple(-item for item in ranking) + (lane_state.lane,)
+
+            winner = sorted(selectable_candidates, key=validation_rank)[0]
+        elif validation_enabled:
             winner = sorted(
                 selectable_candidates,
                 key=lambda lane_state: (
@@ -825,11 +1032,10 @@ def _phase_promote(
     #    otherwise promotion happens in run state only (user work is never
     #    destroyed).
     comparison = _load_comparison(winner)
-    winner_mean = (
-        float(validation_results[winner.lane]["mean_score"])
-        if validation_enabled
-        else comparison.get("candidate_mean", comparison.get("display_score"))
-    )
+    if validation_enabled:
+        winner_mean = float(validation_results[winner.lane]["mean_score"])
+    else:
+        winner_mean = comparison.get("candidate_mean", comparison.get("display_score"))
     if winner_mean is None and winner.eval_samples:
         winner_mean = sum(winner.eval_samples) / len(winner.eval_samples)
     resolved_winner_mean = (
@@ -906,11 +1112,17 @@ def _phase_promote(
     # (primary reset, journal entry), so a crash here never leaves the
     # on-disk ctx claiming primary_promoted=False for a reset that happened.
     state = _checkpoint(state, workspace_root, "promote", ctx)
-    selection_detail = (
-        f"on held-out validation (mean {float(resolved_winner_mean):.4f})"
-        if validation_enabled
-        else f"(delta {(winner.verdict_delta or 0.0):+.4f})"
-    )
+    if vector_validation:
+        ranking_key = validation_results[winner.lane]["comparison"]["ranking_key"]
+        selection_detail = (
+            f"by held-out validation comparator (ranking key {tuple(ranking_key)})"
+        )
+    elif validation_enabled:
+        selection_detail = (
+            f"on held-out validation (mean {float(resolved_winner_mean):.4f})"
+        )
+    else:
+        selection_detail = f"(delta {(winner.verdict_delta or 0.0):+.4f})"
     typer.echo(
         f"Promoted lane {winner.lane} {selection_detail} as the run's best: "
         f"{winner_sha[:12]}"
@@ -964,12 +1176,25 @@ def _phase_journal(
     rows = ParetoLog(run_id, workspace_root).count_budget_rows()
     ctx["budget_rows"] = rows
     ctx["overshoot"] = max(0, rows - state.max_iterations)
-    overshoot_bound = state.lanes * (state.acceptance_max_repetitions + 1)
+    config = GepaConfig.load(config_path(workspace_root))
+    if config.validation_dataset is not None and config.acceptance.mode == "vector":
+        validation_rounds = int(ctx.get("validation_rounds", 0))
+        overshoot_bound = (
+            state.lanes * state.acceptance_max_repetitions
+            + validation_rounds * (state.lanes + 1)
+        )
+        bound_detail = (
+            "lanes x acceptance max-repetitions, plus completed vector "
+            "validation rounds"
+        )
+    else:
+        overshoot_bound = state.lanes * (state.acceptance_max_repetitions + 1)
+        bound_detail = "lanes x (acceptance max-repetitions + validation)"
     if ctx["overshoot"] > overshoot_bound:
         typer.echo(
             f"Warning: budget overshoot {ctx['overshoot']} exceeds the "
-            f"lockstep bound {overshoot_bound} (lanes x (acceptance "
-            "max-repetitions + validation)); investigate eval accounting.",
+            f"lockstep bound {overshoot_bound} ({bound_detail}); "
+            "investigate eval accounting.",
             err=True,
         )
     # budget_low early warning (dec-d0d): emitted once per iteration while
