@@ -1,0 +1,9 @@
+{
+  "checkpoint_id": "01a0331ecaed",
+  "created_at": "2026-08-24T09:34:11.628257+00:00",
+  "branch_name": "codex/replicated-heldout-validation",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "90417cf759001622dc6b92f79b3827c0136869a8"
+  ]
+}
