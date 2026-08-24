@@ -9,9 +9,10 @@ import sys
 import textwrap
 from dataclasses import replace
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 from pydantic_ai_gepa.cli import app as gepa_app
@@ -32,6 +33,7 @@ from pydantic_ai_gepa.cli.layout import (
 from pydantic_ai_gepa.cli.probe import component_hash
 from pydantic_ai_gepa.cli.run import RunState
 from pydantic_ai_gepa.cli.runs import ParetoLog
+from pydantic_ai_gepa.cli.select import _numeric_ranking_key
 from pydantic_ai_gepa.evaluation import EvaluationRecord
 from pydantic_ai_gepa.types import RolloutOutput
 from pydantic_ai_gepa.vector_acceptance import (
@@ -118,7 +120,7 @@ def vector_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pat
     (package / "metric.py").write_text(
         "from pydantic_ai_gepa import MetricResult\n"
         "def metric(case, output):\n"
-        "    status = 'pass' if output == 'good' else 'fail'\n"
+        "    status = 'preferred' if output == 'preferred' else ('pass' if output == 'good' else 'fail')\n"
         "    return MetricResult(float(status == 'pass'), side_info={\n"
         "        'assertions': {'quality': {'status': status}},\n"
         "        'latency': {'engine': 1.0},\n"
@@ -130,9 +132,15 @@ def vector_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pat
         "class Comparator:\n"
         "    def compare(self, request):\n"
         "        context = dict(request.journal_context)\n"
-        "        verdict = 'rejected' if context.get('comparison_kind') == 'run_start_rebaseline' else 'accepted'\n"
-        "        return VectorComparison(verdict, display_score=1.0, detail={\n"
+        "        kind = context.get('comparison_kind')\n"
+        "        statuses = [case['quality']['status'] for record in request.candidate for case in record.assertions.values()]\n"
+        "        case_ids = [case_id for record in request.candidate for case_id in record.assertions]\n"
+        "        held_out_vector = case_ids == ['secret-vector-validation']\n"
+        "        verdict = 'rejected' if kind == 'run_start_rebaseline' or (kind == 'validation_selection' and (context.get('lane') == 'lane-3' or not held_out_vector)) else 'accepted'\n"
+        "        ranking = ({'lane-1': 1.0, 'lane-2': 2.0, 'lane-3': 3.0}.get(context.get('lane'), 1.0),)\n"
+        "        return VectorComparison(verdict, ranking_key=ranking, display_score=1.0, detail={\n"
         "            'context': context,\n"
+        "            **({'held_out_private_detail': {'statuses': statuses, 'case_ids': case_ids}} if kind == 'validation_selection' else {}),\n"
         "            'incumbent_records': len(request.incumbent),\n"
         "            'candidate_records': len(request.candidate),\n"
         "        })\n"
@@ -180,14 +188,16 @@ def vector_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pat
             sys.modules.pop(name, None)
 
 
-def _start(repo: Path, *, repetitions: int = 1) -> tuple[dict[str, object], RunState]:
+def _start(
+    repo: Path, *, repetitions: int = 1, lanes: int = 1
+) -> tuple[dict[str, object], RunState]:
     result = _run(
         "--gepa-dir",
         str(repo / ".gepa"),
         "run",
         "start",
         "--lanes",
-        "1",
+        str(lanes),
         "--size",
         "2",
         "--acceptance-repetitions",
@@ -199,6 +209,54 @@ def _start(repo: Path, *, repetitions: int = 1) -> tuple[dict[str, object], RunS
     payload = _run_payload(result.output)
     path = repo / ".gepa" / "runs" / str(payload["run_id"]) / "state.json"
     return payload, RunState.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+
+def _configure_validation(repo: Path, *, pinned_scorer: bool) -> None:
+    config = repo / ".gepa" / "gepa.toml"
+    config.write_text(
+        _config(pinned_scorer=pinned_scorer).replace(
+            'dataset = ".gepa/dataset.jsonl"\n',
+            'dataset = ".gepa/dataset.jsonl"\n'
+            'validation_dataset = ".gepa/validation.jsonl"\n',
+        ),
+        encoding="utf-8",
+    )
+    (repo / ".gepa" / "validation.jsonl").write_text(
+        json.dumps(
+            {
+                "name": "secret-vector-validation",
+                "inputs": "private",
+                "expected_output": "good",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", ".gepa/gepa.toml", ".gepa/validation.jsonl")
+    _git(repo, "commit", "-m", "Configure vector validation")
+
+
+def _continue_vector_lane(repo: Path, run_id: str, lane: str, value: str) -> LaneState:
+    state = load_lane_state(repo, run_id, lane)
+    worktree = Path(str(state.worktree_path))
+    (worktree / "score.txt").write_text(value, encoding="utf-8")
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(worktree)
+        continued = _run(
+            "--gepa-dir",
+            str(repo / ".gepa"),
+            "lane",
+            "continue",
+            lane,
+            "--run-id",
+            run_id,
+            "--foreground",
+        )
+    finally:
+        os.chdir(previous_cwd)
+    assert continued.exit_code == 0, continued.output
+    return load_lane_state(repo, run_id, lane)
 
 
 def test_vector_mode_never_persists_validation_assertions(
@@ -240,6 +298,121 @@ def test_vector_mode_never_persists_validation_assertions(
         if path.is_file()
     )
     assert "secret-vector-validation" not in persisted
+
+
+def test_vector_validation_uses_comparator_ranking_without_persisting_detail(
+    vector_repo: Path,
+) -> None:
+    _configure_validation(vector_repo, pinned_scorer=True)
+
+    payload, _ = _start(vector_repo, lanes=3)
+    run_id = str(payload["run_id"])
+    resolved: dict[str, LaneState] = {}
+    for lane, value in (
+        ("lane-1", "good\n"),
+        ("lane-2", "preferred\n"),
+        ("lane-3", "preferred\n"),
+    ):
+        resolved[lane] = _continue_vector_lane(vector_repo, run_id, lane, value)
+
+    selected = _run(
+        "--gepa-dir",
+        str(vector_repo / ".gepa"),
+        "run",
+        "select",
+        "--run-id",
+        run_id,
+    )
+
+    assert selected.exit_code == 0, selected.output
+    final = RunState.from_dict(
+        json.loads((vector_repo / ".gepa" / "runs" / run_id / "state.json").read_text())
+    )
+    assert final.best_commit_sha == resolved["lane-2"].candidate_sha
+    assert final.best_commit_sha != resolved["lane-3"].candidate_sha
+    assert final.validation_evaluations == 5
+    validation_rows = ParetoLog(run_id, vector_repo).validation_rows()
+    assert len(validation_rows) == 5
+    assert all(row.per_case_scores == {} for row in validation_rows)
+
+    run_root = vector_repo / ".gepa" / "runs" / run_id
+    persisted = "\n".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in run_root.rglob("*")
+        if path.is_file()
+    )
+    assert "secret-vector-validation" not in persisted
+    assert "held_out_private_detail" not in persisted
+
+
+def test_vector_validation_resume_restarts_one_comparable_round(
+    vector_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pydantic_ai_gepa.cli.select as select_module
+
+    _configure_validation(vector_repo, pinned_scorer=True)
+    payload, _ = _start(vector_repo, lanes=2)
+    run_id = str(payload["run_id"])
+    resolved = {
+        "lane-1": _continue_vector_lane(vector_repo, run_id, "lane-1", "good\n"),
+        "lane-2": _continue_vector_lane(vector_repo, run_id, "lane-2", "preferred\n"),
+    }
+
+    original_checkpoint = select_module._checkpoint
+    crashed = False
+
+    def crash_after_first_lane_result(
+        state: Any,
+        workspace_root: Path,
+        phase: str | None,
+        context: dict[str, Any] | None,
+    ) -> Any:
+        nonlocal crashed
+        result = original_checkpoint(state, workspace_root, phase, context)
+        if (
+            not crashed
+            and isinstance(context, dict)
+            and len(context.get("validation_results", {})) == 1
+        ):
+            crashed = True
+            raise RuntimeError("simulated crash during vector validation")
+        return result
+
+    monkeypatch.setattr(select_module, "_checkpoint", crash_after_first_lane_result)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        _run(
+            "--gepa-dir",
+            str(vector_repo / ".gepa"),
+            "run",
+            "select",
+            "--run-id",
+            run_id,
+        )
+
+    monkeypatch.setattr(select_module, "_checkpoint", original_checkpoint)
+    resumed = _run(
+        "--gepa-dir",
+        str(vector_repo / ".gepa"),
+        "run",
+        "select",
+        "--run-id",
+        run_id,
+    )
+
+    assert resumed.exit_code == 0, resumed.output
+    final = RunState.from_dict(
+        json.loads((vector_repo / ".gepa" / "runs" / run_id / "state.json").read_text())
+    )
+    assert final.best_commit_sha == resolved["lane-2"].candidate_sha
+    assert final.validation_evaluations == 6
+    assert len(ParetoLog(run_id, vector_repo).validation_rows()) == 6
+
+
+def test_validation_ranking_key_requires_finite_non_boolean_numbers() -> None:
+    assert _numeric_ranking_key([1, 2.5], label="test") == (1.0, 2.5)
+    for invalid in ([True], [float("inf")], [10**1000], ["1"]):
+        with pytest.raises(typer.BadParameter, match="ranking_key"):
+            _numeric_ranking_key(invalid, label="test")
 
 
 def test_candidate_gate_allows_meta_files_and_parses_rename_paths(

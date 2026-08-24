@@ -214,6 +214,7 @@ class EvalOutcome:
     summary: dict[str, Any]
     report_path: Path | None
     trace_path: Path | None
+    selection_vector: VectorRecord | None = None
 
     @property
     def n_failures(self) -> int:
@@ -830,11 +831,12 @@ def run_eval_once(
         "dataset_role": dataset_role,
     }
 
-    if cfg.acceptance.mode == "vector" and dataset_role == "training":
+    selection_vector: VectorRecord | None = None
+    if cfg.acceptance.mode == "vector":
         assertions, latency = side_info_vector(records)
         repetition = vector_repetition if vector_repetition is not None else iteration
         incumbent_hash = vector_incumbent_hash or candidate.id
-        vector = VectorRecord(
+        selection_vector = VectorRecord(
             key=VectorRecordKey(
                 run_id=active_run_id,
                 inventory_hash=inventory_hash(list(minibatch.case_ids)),
@@ -867,16 +869,18 @@ def run_eval_once(
             if infrastructure_failures
             else None,
         )
-        VectorRecordStore(vector_records_path(active_run_id, workspace_root)).append(
-            vector
-        )
-        summary["vector_record"] = vector.to_dict()
+        if dataset_role == "training":
+            VectorRecordStore(
+                vector_records_path(active_run_id, workspace_root)
+            ).append(selection_vector)
+            summary["vector_record"] = selection_vector.to_dict()
 
     return EvalOutcome(
         records=records,
         summary=summary,
         report_path=report_path,
         trace_path=trace_path,
+        selection_vector=selection_vector,
     )
 
 
