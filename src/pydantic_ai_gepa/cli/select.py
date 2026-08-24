@@ -13,8 +13,8 @@ phase on the next invocation:
 1. ``promote`` — invalidate stragglers (terminate the eval pid, journal the
    partial result + diff summary, mark ``stalled``; pydanticaigepa-dec-4tw),
    invalidate lanes whose candidate no longer descends from the frozen
-   baseline commit, pick the winner among the memoized ``accepted`` verdicts
-   (highest delta, ties broken by lane id order), promote the winner commit to
+   baseline commit, validate every training-accepted candidate on the held-out
+   dataset, pick the highest-scoring validation improvement, promote it to
    the run's best (the primary checkout is reset only when clean and still on
    the old best — user work is never destroyed), journal the winner, and emit
    ``merge_opportunity`` for accepted lane pairs with disjoint diffs (merging
@@ -647,32 +647,139 @@ def _phase_promote(
             _invalidate_cross_baseline(workspace_root, state, lane_state)
             invalidated.append(lane_state.lane)
 
-    # 3. Winner selection: vector runs use the comparator's opaque ranking
-    #    tuple; scalar runs retain the historical delta ordering. Verdicts are consumed
-    #    from lane state (memoized by the lane eval) — never re-derived here.
+    # 3. Training verdicts are consumed from lane state (memoized by the lane
+    #    eval). Every training-accepted proposal is then scored once on held-out
+    #    validation. Validation writes no reports/traces, so its evidence never
+    #    enters a reflection packet.
     accepted = [lane_state for lane_state in valid if lane_state.verdict == "accepted"]
-    winner: LaneState | None = None
-    if accepted:
-        vector_mode = (
-            GepaConfig.load(config_path(workspace_root)).acceptance.mode == "vector"
+    config = GepaConfig.load(config_path(workspace_root))
+    validation_enabled = config.validation_dataset is not None
+    validation_results = dict(ctx.get("validation_results") or {})
+    from .run import _evaluate_validation_candidate
+
+    for lane_state in accepted if validation_enabled else []:
+        if lane_state.lane in validation_results:
+            continue
+        validation_lane = f"{lane_state.lane}:validation"
+        recovered_row = next(
+            (
+                row
+                for row in reversed(ParetoLog(run_id, workspace_root).iter_rows())
+                if row.extra.get("row_scope") == "validation"
+                and row.extra.get("outcome") == "valid"
+                and row.lane == validation_lane
+                and row.commit_sha == lane_state.candidate_sha
+            ),
+            None,
         )
+        if recovered_row is not None:
+            ledger = ParetoLog(run_id, workspace_root)
+            validation_results[lane_state.lane] = {
+                "candidate_id": recovered_row.candidate_id,
+                "commit_sha": recovered_row.commit_sha,
+                "mean_score": recovered_row.mean_score,
+                "selectable": recovered_row.extra.get("selectable") is not False,
+            }
+            ctx["validation_results"] = validation_results
+            state = replace(
+                state,
+                iterations=max(state.iterations, ledger.count_budget_rows()),
+                validation_evaluations=len(
+                    [
+                        row
+                        for row in ledger.iter_rows()
+                        if row.extra.get("row_scope") == "validation"
+                    ]
+                ),
+            )
+            state = _checkpoint(state, workspace_root, "promote", ctx)
+            continue
+        worktree = Path(str(lane_state.worktree_path))
+        candidate_root = (
+            Path(lane_state.candidate_project_path)
+            if lane_state.candidate_project_path
+            else candidate_project_root(workspace_root, worktree)
+        )
+        with _chdir(candidate_root):
+            state, validation_outcome = _evaluate_validation_candidate(
+                state,
+                candidate_root=candidate_root,
+                workspace_root=workspace_root,
+                lane=validation_lane,
+            )
+        failures = evaluation_infrastructure_failures(validation_outcome.records)
+        if failures:
+            failure_history = dict(ctx.get("validation_infrastructure_failures") or {})
+            failure_history[lane_state.lane] = {
+                "evaluation_error_count": len(failures),
+                "error_kinds": sorted(
+                    {failure.error_kind or "unknown" for failure in failures}
+                ),
+            }
+            ctx["validation_infrastructure_failures"] = failure_history
+            state = _checkpoint(state, workspace_root, "promote", ctx)
+            typer.echo(
+                f"Held-out validation failed for {lane_state.lane}; no selection "
+                "decision was memoized. Recover the evaluator and retry "
+                "`gepa run select`.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        validation_results[lane_state.lane] = {
+            "candidate_id": validation_outcome.summary["candidate_id"],
+            "commit_sha": validation_outcome.summary.get("commit_sha"),
+            "mean_score": float(validation_outcome.summary["mean_score"]),
+            "selectable": validation_outcome.summary.get("selectable") is not False,
+        }
+        failure_history = dict(ctx.get("validation_infrastructure_failures") or {})
+        failure_history.pop(lane_state.lane, None)
+        if failure_history:
+            ctx["validation_infrastructure_failures"] = failure_history
+        else:
+            ctx.pop("validation_infrastructure_failures", None)
+        ctx["validation_results"] = validation_results
+        state = _checkpoint(state, workspace_root, "promote", ctx)
 
-        def rank(lane_state: LaneState) -> tuple[float | str, ...]:
-            if not vector_mode:
-                return (-(lane_state.verdict_delta or 0.0), lane_state.lane)
-            raw = _load_comparison(lane_state).get("ranking_key", [])
-            if not isinstance(raw, list) or not all(
-                isinstance(item, (int, float)) for item in raw
-            ):
-                raise typer.BadParameter(
-                    "Vector comparison ranking_key must be a numeric tuple."
-                )
-            return tuple(-float(item) for item in raw) + (lane_state.lane,)
+    if validation_enabled:
+        prior_best = state.best_mean_score
+        selectable_candidates = [
+            lane_state
+            for lane_state in accepted
+            if validation_results[lane_state.lane]["selectable"]
+            and (
+                prior_best is None
+                or float(validation_results[lane_state.lane]["mean_score"])
+                > prior_best + state.acceptance_min_delta
+            )
+        ]
+    else:
+        selectable_candidates = accepted
+    winner: LaneState | None = None
+    if selectable_candidates:
+        if validation_enabled:
+            winner = sorted(
+                selectable_candidates,
+                key=lambda lane_state: (
+                    -float(validation_results[lane_state.lane]["mean_score"]),
+                    lane_state.lane,
+                ),
+            )[0]
+        else:
+            vector_mode = config.acceptance.mode == "vector"
 
-        winner = sorted(
-            accepted,
-            key=rank,
-        )[0]
+            def training_rank(lane_state: LaneState) -> tuple[float | str, ...]:
+                if not vector_mode:
+                    return (-(lane_state.verdict_delta or 0.0), lane_state.lane)
+                raw = _load_comparison(lane_state).get("ranking_key", [])
+                if not isinstance(raw, list) or not all(
+                    isinstance(item, (int, float)) for item in raw
+                ):
+                    raise typer.BadParameter(
+                        "Vector comparison ranking_key must be a numeric tuple."
+                    )
+                return tuple(-float(item) for item in raw) + (lane_state.lane,)
+
+            winner = sorted(selectable_candidates, key=training_rank)[0]
     losers = [lane_state.lane for lane_state in valid if lane_state is not winner]
 
     ctx.update(
@@ -694,13 +801,21 @@ def _phase_promote(
     if winner is None:
         from .run import _consume_candidate_verdict
 
-        if any(
-            lane_state.verdict in {"rejected", "equivalent"} for lane_state in valid
-        ):
+        counts_as_failed_hypothesis = (
+            bool(accepted)
+            if validation_enabled
+            else any(
+                lane_state.verdict in {"rejected", "equivalent"} for lane_state in valid
+            )
+        )
+        if counts_as_failed_hypothesis:
             state = _consume_candidate_verdict(state, accepted=False)
+        reason = (
+            "improved held-out validation" if validation_enabled else "was accepted"
+        )
         typer.echo(
-            "No lane was accepted; no promotion. All resolved lanes are "
-            "journaled as losers and lanes re-fan onto the current best."
+            f"No lane {reason}; no promotion. All resolved lanes are journaled "
+            "as losers and re-fan onto the current best."
         )
         ctx["primary_promoted"] = False
         return state, ctx, "journal"
@@ -710,9 +825,16 @@ def _phase_promote(
     #    otherwise promotion happens in run state only (user work is never
     #    destroyed).
     comparison = _load_comparison(winner)
-    winner_mean = comparison.get("candidate_mean", comparison.get("display_score"))
+    winner_mean = (
+        float(validation_results[winner.lane]["mean_score"])
+        if validation_enabled
+        else comparison.get("candidate_mean", comparison.get("display_score"))
+    )
     if winner_mean is None and winner.eval_samples:
         winner_mean = sum(winner.eval_samples) / len(winner.eval_samples)
+    resolved_winner_mean = (
+        float(winner_mean) if winner_mean is not None else state.best_mean_score
+    )
     winner_candidate_id = (
         comparison.get("candidate_id") or str(winner.candidate_sha)[:12]
     )
@@ -734,7 +856,7 @@ def _phase_promote(
         winner,
         candidate_id=str(winner_candidate_id),
     )
-    acceptance = GepaConfig.load(config_path(workspace_root)).acceptance
+    acceptance = config.acceptance
     scheduled_run_start_rebaseline = bool(
         acceptance.mode == "vector"
         and acceptance.rebaseline_interval is not None
@@ -769,16 +891,14 @@ def _phase_promote(
         state,
         best_candidate_id=str(winner_candidate_id),
         best_commit_sha=winner_sha,
-        best_mean_score=(
-            float(winner_mean) if winner_mean is not None else state.best_mean_score
-        ),
+        best_mean_score=resolved_winner_mean,
         accepted_promotion_count=promotion_count,
     )
     from .run import _consume_candidate_verdict
 
     state = _consume_candidate_verdict(state, accepted=True)
     ctx["primary_promoted"] = primary_promoted
-    ctx["winner_mean"] = winner_mean
+    ctx["winner_mean"] = resolved_winner_mean
     ctx["accepted_promotion_count"] = promotion_count
     ctx["scheduled_run_start_rebaseline"] = scheduled_run_start_rebaseline
     # Checkpoint immediately after the promotion decision: the recorded phase
@@ -786,15 +906,20 @@ def _phase_promote(
     # (primary reset, journal entry), so a crash here never leaves the
     # on-disk ctx claiming primary_promoted=False for a reset that happened.
     state = _checkpoint(state, workspace_root, "promote", ctx)
+    selection_detail = (
+        f"on held-out validation (mean {float(resolved_winner_mean):.4f})"
+        if validation_enabled
+        else f"(delta {(winner.verdict_delta or 0.0):+.4f})"
+    )
     typer.echo(
-        f"Promoted lane {winner.lane} (delta {(winner.verdict_delta or 0.0):+.4f}) "
-        f"as the run's best: {winner_sha[:12]}"
+        f"Promoted lane {winner.lane} {selection_detail} as the run's best: "
+        f"{winner_sha[:12]}"
         + ("" if primary_promoted else " (run state only; primary untouched)")
     )
 
     # 5. merge_opportunity for accepted lanes with disjoint diffs.
-    if len(accepted) >= 2:
-        _emit_merge_opportunities(workspace_root, state, ctx, accepted)
+    if len(selectable_candidates) >= 2:
+        _emit_merge_opportunities(workspace_root, state, ctx, selectable_candidates)
     else:
         ctx["merge_pairs"] = []
 
@@ -836,15 +961,15 @@ def _phase_journal(
 
     # Budget enforcement (dec-msy): the pareto ledger is the sole budget
     # authority; the stop condition for lane runs is checked here, not per-eval.
-    rows = ParetoLog(run_id, workspace_root).count_rows()
+    rows = ParetoLog(run_id, workspace_root).count_budget_rows()
     ctx["budget_rows"] = rows
     ctx["overshoot"] = max(0, rows - state.max_iterations)
-    overshoot_bound = state.lanes * state.acceptance_max_repetitions
+    overshoot_bound = state.lanes * (state.acceptance_max_repetitions + 1)
     if ctx["overshoot"] > overshoot_bound:
         typer.echo(
             f"Warning: budget overshoot {ctx['overshoot']} exceeds the "
-            f"lockstep bound {overshoot_bound} (lanes x acceptance "
-            "max-repetitions); investigate eval accounting.",
+            f"lockstep bound {overshoot_bound} (lanes x (acceptance "
+            "max-repetitions + validation)); investigate eval accounting.",
             err=True,
         )
     # budget_low early warning (dec-d0d): emitted once per iteration while
@@ -1247,7 +1372,7 @@ def _phase_rebaseline(
         )
 
     ledger = ParetoLog(run_id, workspace_root)
-    remaining = state.max_iterations - ledger.count_rows()
+    remaining = state.max_iterations - ledger.count_budget_rows()
     affordable_repetitions = max(1, (remaining + 1) // 2)
     target_repetitions = min(state.acceptance_max_repetitions, affordable_repetitions)
 
@@ -1419,7 +1544,7 @@ def _phase_finalize(
     from .run import _write_final_report
 
     run_id = state.run_id
-    rows = ParetoLog(run_id, workspace_root).count_rows()
+    rows = ParetoLog(run_id, workspace_root).count_budget_rows()
     overshoot = max(0, rows - state.max_iterations)
     state = replace(state, iterations=rows, status="done")
 

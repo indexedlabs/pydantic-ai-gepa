@@ -15,6 +15,7 @@ from ..gepa_graph.models import CandidateMap
 from .base import (
     BudgetExhausted,
     BudgetTracker,
+    CandidateEvaluation,
     EngineConfig,
     EngineEvent,
     EngineResult,
@@ -36,6 +37,15 @@ class ReflectionContext:
 
 
 Proposer: TypeAlias = Callable[[ReflectionContext], Awaitable[CandidateMap]]
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidatePoolEntry:
+    """One validation-scored candidate available for Pareto parent selection."""
+
+    candidate: CandidateMap
+    evaluation: CandidateEvaluation
+    index: int
 
 
 class CodingAgentEngine:
@@ -86,12 +96,48 @@ class CodingAgentEngine:
             "acceptance_min_delta", 0.0
         )
 
-        best = _copy_candidate(await task.seed_candidate())
-        train_loader = await task.train_loader()
-        all_ids = list(await train_loader.all_ids())
         starting_spend = budget.spent
         engine_budget = BudgetTracker(config.max_metric_calls)
         history: list[EngineEvent] = []
+        seed = _copy_candidate(await task.seed_candidate())
+        seed_evaluation = await self._evaluate_validation(
+            task=task,
+            candidate=seed,
+            budget=budget,
+            engine_budget=engine_budget,
+            history=history,
+            stage="seed_validation",
+        )
+        if seed_evaluation is None:
+            history.append(
+                EngineEvent(
+                    kind="summary",
+                    data={
+                        "iterations": 0,
+                        "proposals": 0,
+                        "stop_reason": "budget_exhausted",
+                        "validation_evaluations": 0,
+                    },
+                )
+            )
+            return EngineResult(
+                engine=self.name,
+                best_candidate=seed,
+                best_score=0.0,
+                num_metric_calls=budget.spent - starting_spend,
+                history=history,
+            )
+
+        pool = [_CandidatePoolEntry(seed, seed_evaluation, 0)]
+        best_entry = pool[0]
+        history.append(
+            EngineEvent(
+                kind="validation_evaluated",
+                data=_validation_event_data(best_entry, stage="seed"),
+            )
+        )
+        train_loader = await task.train_loader()
+        all_ids = list(await train_loader.all_ids())
         epoch = 0
         iterations = 0
         proposals = 0
@@ -103,6 +149,13 @@ class CodingAgentEngine:
             and not engine_budget.exhausted
             and proposals < max_proposals
         ):
+            if (
+                config.stop_at_score is not None
+                and best_entry.evaluation.score >= config.stop_at_score
+            ):
+                stop_reason = "stop_at_score"
+                break
+            parent = _select_pareto_parent(pool, seed=config.seed, epoch=epoch)
             minibatch_ids = _sample_minibatch(
                 all_ids,
                 size=minibatch_size,
@@ -146,7 +199,7 @@ class CodingAgentEngine:
                 try:
                     baseline_records = await self._evaluate_minibatch(
                         task=task,
-                        candidate=best,
+                        candidate=parent.candidate,
                         minibatch=minibatch,
                         concurrency=concurrency,
                         budget=budget,
@@ -174,12 +227,6 @@ class CodingAgentEngine:
             baseline_records = baseline_batches[0]
             baseline_samples = [_mean_score(records) for records in baseline_batches]
             baseline_score = sum(baseline_samples) / len(baseline_samples)
-            if (
-                config.stop_at_score is not None
-                and baseline_score >= config.stop_at_score
-            ):
-                stop_reason = "stop_at_score"
-                break
             if budget.exhausted or engine_budget.exhausted:
                 stop_reason = "budget_exhausted"
                 break
@@ -205,7 +252,7 @@ class CodingAgentEngine:
                 continue
 
             context = ReflectionContext(
-                candidate=_copy_candidate(best),
+                candidate=_copy_candidate(parent.candidate),
                 minibatch_records=failures,
                 report=_format_failure_report(baseline_records, failure_threshold),
                 iteration=iterations,
@@ -266,14 +313,42 @@ class CodingAgentEngine:
             proposal_score = comparison_result.candidate_mean
             comparison = {
                 "iteration": iterations,
+                "parent_index": parent.index,
                 "baseline_score": comparison_result.baseline_mean,
                 "proposal_score": proposal_score,
                 "minibatch_case_ids": [record.case_id for record in baseline_records],
                 **comparison_result.to_dict(),
             }
             if comparison_result.improved:
-                best = _copy_candidate(proposal)
-                history.append(EngineEvent(kind="accepted", data=comparison))
+                history.append(EngineEvent(kind="minibatch_improved", data=comparison))
+                validation = await self._evaluate_validation(
+                    task=task,
+                    candidate=proposal,
+                    budget=budget,
+                    engine_budget=engine_budget,
+                    history=history,
+                    stage="proposal_validation",
+                )
+                if validation is None:
+                    stop_reason = "budget_exhausted"
+                    break
+                candidate_entry = _CandidatePoolEntry(
+                    _copy_candidate(proposal), validation, len(pool)
+                )
+                pool.append(candidate_entry)
+                validation_data = {
+                    **comparison,
+                    **_validation_event_data(candidate_entry, stage="proposal"),
+                }
+                if validation.selectable and candidate_entry.index in _pareto_indices(
+                    pool
+                ):
+                    history.append(EngineEvent(kind="accepted", data=validation_data))
+                else:
+                    history.append(
+                        EngineEvent(kind="validation_rejected", data=validation_data)
+                    )
+                best_entry = _best_validation_entry(pool)
             else:
                 history.append(
                     EngineEvent(kind=comparison_result.verdict, data=comparison)
@@ -290,13 +365,6 @@ class CodingAgentEngine:
         ):
             stop_reason = "max_iterations"
 
-        final_score, final_evaluation_charged = await self._score_final_candidate(
-            task=task,
-            candidate=best,
-            budget=budget,
-            engine_budget=engine_budget,
-            history=history,
-        )
         history.append(
             EngineEvent(
                 kind="summary",
@@ -304,14 +372,15 @@ class CodingAgentEngine:
                     "iterations": iterations,
                     "proposals": proposals,
                     "stop_reason": stop_reason,
-                    "final_evaluation_charged": final_evaluation_charged,
+                    "validation_evaluations": len(pool),
+                    "pareto_candidates": sorted(_pareto_indices(pool)),
                 },
             )
         )
         return EngineResult(
             engine=self.name,
-            best_candidate=best,
-            best_score=final_score,
+            best_candidate=_copy_candidate(best_entry.candidate),
+            best_score=best_entry.evaluation.score,
             num_metric_calls=budget.spent - starting_spend,
             history=history,
         )
@@ -347,7 +416,7 @@ class CodingAgentEngine:
             capture_traces=True,
         )
 
-    async def _score_final_candidate(
+    async def _evaluate_validation(
         self,
         *,
         task: OptimizationTask,
@@ -355,8 +424,9 @@ class CodingAgentEngine:
         budget: BudgetTracker,
         engine_budget: BudgetTracker,
         history: list[EngineEvent],
-    ) -> tuple[float, bool]:
-        """Score the winner on the valset and charge that fair comparison.
+        stage: str,
+    ) -> CandidateEvaluation | None:
+        """Score one candidate on validation without exposing feedback to reflection.
 
         Both budgets are reserved before evaluator invocation. If a provider
         raises after starting a rollout, the call remains accounted; a
@@ -366,36 +436,35 @@ class CodingAgentEngine:
         if case_count > engine_budget.remaining:
             history.append(
                 EngineEvent(
-                    kind="budget_overshoot",
-                    message="Final valset evaluation exceeded the engine metric-call budget.",
+                    kind="budget_exhausted",
+                    message="Validation evaluation exceeded the engine metric-call budget.",
                     data={
-                        "stage": "final_valset",
+                        "stage": stage,
                         "requested": case_count,
                         "budget_remaining": budget.remaining,
                         "engine_budget_remaining": engine_budget.remaining,
                     },
                 )
             )
-            return 0.0, False
+            return None
         try:
             budget.preflight(case_count)
         except BudgetExhausted:
             history.append(
                 EngineEvent(
-                    kind="budget_overshoot",
-                    message="Final valset evaluation exceeded the shared metric-call budget.",
+                    kind="budget_exhausted",
+                    message="Validation evaluation exceeded the shared metric-call budget.",
                     data={
-                        "stage": "final_valset",
+                        "stage": stage,
                         "requested": case_count,
                         "budget_remaining": budget.remaining,
                         "engine_budget_remaining": engine_budget.remaining,
                     },
                 )
             )
-            return 0.0, False
+            return None
         engine_budget.spend(case_count)
-        final_evaluation = await task.evaluate(candidate, budget=budget)
-        return final_evaluation.score, True
+        return await task.evaluate(candidate, budget=budget, capture_traces=False)
 
     def _spend_or_record_overshoot(
         self,
@@ -477,6 +546,85 @@ def _copy_candidate(candidate: CandidateMap) -> CandidateMap:
     """Isolate retained candidates from proposer-side mutation."""
     return {
         name: component.model_copy(deep=True) for name, component in candidate.items()
+    }
+
+
+def _pareto_indices(pool: Sequence[_CandidatePoolEntry]) -> set[int]:
+    """Return candidates that are not dominated on complete validation scores."""
+
+    selectable = [entry for entry in pool if entry.evaluation.selectable]
+    front: set[int] = set()
+    for candidate in selectable:
+        scores = candidate.evaluation.per_case_scores
+        if not scores:
+            continue
+        dominated = False
+        for other in selectable:
+            if other.index == candidate.index:
+                continue
+            other_scores = other.evaluation.per_case_scores
+            if set(other_scores) != set(scores):
+                continue
+            if all(other_scores[key] >= score for key, score in scores.items()) and any(
+                other_scores[key] > score for key, score in scores.items()
+            ):
+                dominated = True
+                break
+        if not dominated:
+            front.add(candidate.index)
+    return front
+
+
+def _select_pareto_parent(
+    pool: Sequence[_CandidatePoolEntry], *, seed: int, epoch: int
+) -> _CandidatePoolEntry:
+    """Select a validation-Pareto parent weighted by per-instance wins."""
+
+    front_indices = _pareto_indices(pool)
+    front = [entry for entry in pool if entry.index in front_indices]
+    if not front:
+        return _best_validation_entry(pool)
+    shared_case_ids = set(front[0].evaluation.per_case_scores)
+    for entry in front[1:]:
+        shared_case_ids.intersection_update(entry.evaluation.per_case_scores)
+    case_ids = sorted(shared_case_ids)
+    weights = {entry.index: 0 for entry in front}
+    for case_id in case_ids:
+        best_score = max(entry.evaluation.per_case_scores[case_id] for entry in front)
+        for entry in front:
+            if entry.evaluation.per_case_scores[case_id] == best_score:
+                weights[entry.index] += 1
+    total = sum(weights.values())
+    if total == 0:
+        return _best_validation_entry(front)
+    choice = random.Random(seed + epoch).randrange(total)
+    cumulative = 0
+    for entry in sorted(front, key=lambda item: item.index):
+        cumulative += weights[entry.index]
+        if choice < cumulative:
+            return entry
+    return front[-1]
+
+
+def _best_validation_entry(
+    pool: Sequence[_CandidatePoolEntry],
+) -> _CandidatePoolEntry:
+    """Return the highest aggregate selectable validation candidate."""
+
+    selectable = [entry for entry in pool if entry.evaluation.selectable]
+    candidates = selectable or list(pool)
+    return max(candidates, key=lambda entry: (entry.evaluation.score, -entry.index))
+
+
+def _validation_event_data(entry: _CandidatePoolEntry, *, stage: str) -> dict[str, Any]:
+    """Expose selection scores without leaking validation feedback or outputs."""
+
+    return {
+        "stage": stage,
+        "candidate_index": entry.index,
+        "validation_score": entry.evaluation.score,
+        "validation_case_scores": dict(entry.evaluation.per_case_scores),
+        "selectable": entry.evaluation.selectable,
     }
 
 

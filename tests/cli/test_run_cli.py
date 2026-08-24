@@ -138,6 +138,89 @@ def test_run_start_defaults_match_minibatch_evaluation(repo: Path) -> None:
     assert len(baseline_samples) == 3
 
 
+def test_held_out_validation_selects_without_exposing_reflection_evidence(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pydantic_ai_gepa.cli import run as run_module
+
+    validation_cases = [
+        {"name": "secret-validation-alpha", "inputs": "?", "expected_output": "Paris"},
+        {"name": "secret-validation-beta", "inputs": "?", "expected_output": "Berlin"},
+    ]
+    validation_path = repo / ".gepa" / "validation.jsonl"
+    validation_path.write_text(
+        "\n".join(json.dumps(row) for row in validation_cases) + "\n",
+        encoding="utf-8",
+    )
+    config = repo / ".gepa" / "gepa.toml"
+    config.write_text(
+        config.read_text(encoding="utf-8")
+        + 'validation_dataset = ".gepa/validation.jsonl"\n',
+        encoding="utf-8",
+    )
+
+    started = _run(
+        "run",
+        "start",
+        "--size",
+        "2",
+        "--max-iterations",
+        "6",
+        "--acceptance-repetitions",
+        "1",
+    )
+    assert started.exit_code == 0, started.output
+    start_payload = _run_payload(started.output)
+    assert start_payload["status"] == "paused_for_reflection"
+    assert start_payload["validation_seeded"] is True
+    assert start_payload["validation_evaluations"] == 1
+
+    original = run_module.run_eval_once
+    calls: list[dict[str, object]] = []
+
+    def training_wins_validation_loses(**kwargs):
+        calls.append(kwargs)
+        outcome = original(**kwargs)
+        if kwargs.get("dataset_role", "training") == "training":
+            outcome.summary["mean_score"] = 1.0
+        elif kwargs.get("dataset_role") == "validation":
+            outcome.summary["mean_score"] = 0.0
+        return outcome
+
+    monkeypatch.setattr(run_module, "run_eval_once", training_wins_validation_loses)
+    result = _run("run", "continue", "--run-id", str(start_payload["run_id"]))
+
+    assert result.exit_code == 0, result.output
+    payload = _run_payload(result.output)
+    comparison = payload["last_comparison"]
+    assert isinstance(comparison, dict)
+    assert comparison["training_verdict"] == "accepted"
+    assert comparison["validation_improved"] is False
+    assert comparison["rejection_reason"] == "validation"
+    assert payload["status"] == "paused_after_candidate_eval"
+    assert payload["validation_evaluations"] == 2
+    assert [call.get("dataset_role", "training") for call in calls] == [
+        "training",
+        "validation",
+    ]
+    assert calls[-1]["capture_traces"] is False
+    assert calls[-1]["persist_report"] is False
+    assert calls[-1]["redact_selection_evidence"] is True
+
+    run_root = repo / ".gepa" / "runs" / str(start_payload["run_id"])
+    persisted = "\n".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in run_root.rglob("*")
+        if path.is_file()
+    )
+    assert "secret-validation-alpha" not in persisted
+    assert "secret-validation-beta" not in persisted
+    validation_rows = ParetoLog(str(start_payload["run_id"])).validation_rows()
+    assert len(validation_rows) == 2
+    assert all(not row.per_case_scores for row in validation_rows)
+    assert ParetoLog(str(start_payload["run_id"])).count_budget_rows() == 4
+
+
 def test_stall_block_appears_after_five_non_promoting_verdicts_and_clears(
     repo: Path,
 ) -> None:

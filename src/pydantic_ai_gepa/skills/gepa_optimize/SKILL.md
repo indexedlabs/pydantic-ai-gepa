@@ -63,6 +63,7 @@ test, provider, credential, or worker failures.
 gepa init \
   --agent mypkg.agents:my_agent \
   --metric mypkg.metrics:my_metric \
+  --validation-dataset .gepa/validation.jsonl \
   --install-skill
 ```
 
@@ -75,9 +76,13 @@ What each flag does:
 - `--evaluate MODULE:ATTR` — git-mode alternative to `--agent`; points at a
   plain task callable.
 - `--metric MODULE:ATTR` — optional. An async (or sync) callable `(case, output) -> MetricResult | float`. Omit it to use the default substring/equality scorer, which is only useful for trivial expected-output strings.
+- `--validation-dataset PATH` — optional held-out selection set. Configure it
+  for validation-guided GEPA; never inspect its cases, reports, or traces while
+  acting as the reflector.
 - `--install-skill` — drops this SKILL.md into `<repo>/.agents/skills/gepa-optimize/` so coding agents auto-discover it. Pass it the first time.
 
-Then write the dataset cases at `.gepa/dataset.jsonl` — one JSON object per line:
+Write reflection-training cases at `.gepa/dataset.jsonl` and held-out selection
+cases at `.gepa/validation.jsonl`, one JSON object per line:
 
 ```json
 {"name": "case-1", "inputs": "...", "expected_output": "...", "metadata": {}}
@@ -112,6 +117,7 @@ This writes the following top-level configuration:
 candidate_source = "git"
 evaluate = "mypkg.eval:evaluate"
 dataset = ".gepa/dataset.jsonl"
+validation_dataset = ".gepa/validation.jsonl"
 metric = "mypkg.eval:metric"
 ```
 
@@ -157,10 +163,12 @@ git diff; git add <files>; git commit -m "Improve ..."
 gepa run continue --run-id <run_id>
 ```
 
-`continue` evaluates the new commit on the same minibatch as the reflection
-baseline. When it improves, `best_candidate_id` and `best_commit_sha` advance
-to that commit and the run moves to the next reflection point. When it does
-not improve, the CLI pauses with:
+`continue` first evaluates the new commit on the same training minibatch as
+the reflection baseline. Only a training improvement spends a full held-out
+validation evaluation. Validation—not the training minibatch—decides whether
+`best_candidate_id` and `best_commit_sha` advance. The CLI persists no
+validation report, trace, per-case score, or minibatch manifest for reflection.
+When either gate rejects the candidate, the CLI pauses with:
 
 ```text
 git reset --hard <reflection_baseline_commit_sha>
@@ -218,14 +226,16 @@ gepa run start --max-iterations 100 --size 5 --acceptance-repetitions 3 --accept
 read the printed report_path and trace_path
 reflect on the failures; edit .gepa/components/<slot>.md or source code
 gepa run continue --run-id <run_id>
-if verdict=accepted, keep the candidate and let the run advance
+if verdict=accepted, the candidate improved training and held-out validation; keep it and advance
 if verdict=rejected or equivalent, discard/revise your edits and continue again
 if verdict=inconclusive, do not count it as a failed hypothesis; revise it or end without a false decision
 if it pauses_for_reflection, inspect the new report/trace and reflect again
 repeat until the JSON summary says status=done and prints final_report_path
 ```
 
-`gepa run start` evaluates sampled mini-valsets until at least one case falls below `--threshold`, then pauses and writes:
+`gepa run start` scores the seed on held-out validation, then evaluates sampled
+reflection-training minibatches until at least one case falls below
+`--threshold`. It pauses and writes:
 
 - `reflection_baseline_report_path`
 - `reflection_baseline_report_paths`
@@ -236,10 +246,12 @@ repeat until the JSON summary says status=done and prints final_report_path
 - `next_command`
 
 `gepa run continue` evaluates your edited baseline against the same saved
-mini-valset. With repeated acceptance enabled, it compares rollout-level mean
+training minibatch. With repeated acceptance enabled, it compares rollout-level mean
 samples and reports the observed variance, confidence interval, practical
 minimum delta, and `accepted`, `rejected`, `equivalent`, or `inconclusive`
-verdict. Only `accepted` advances the baseline. Repetitions remain full
+training verdict. A training-accepted proposal is then evaluated once on the
+complete held-out validation dataset, and only a validation improvement
+advances the baseline. Repetitions remain full
 end-to-end evaluations; they do not freeze intermediate pipeline output or
 pretend model randomness is seeded. At `--max-iterations`, the CLI prints and
 writes `final_report.md`.
@@ -308,8 +320,11 @@ Minibatch sampling is deterministic in `(seed, epoch)` over the dataset. Use the
 
 ### `--max-iterations`
 
-Hard cap on eval rows in a single run. Repeated baseline and candidate
-evaluations each consume rows from this same budget. In the managed loop,
+Hard cap on eval rows in a single run. Repeated training baseline/candidate
+evaluations and held-out validation evaluations all consume rows from this
+same budget. One validation row evaluates the complete validation dataset, so
+row count is a lifecycle bound rather than a direct model-call or cost bound.
+In the managed loop,
 `gepa run start` persists the budget and each `gepa run continue` advances
 until it either pauses for reflection or reaches `status=done`. In one-off
 `gepa eval`, exceeding the cap exits with code 70.
@@ -481,8 +496,9 @@ emits the `verdict` event; you will see it from `gepa next`.
 ### Selection, merges, and stalls
 
 - **`selection_due` → `gepa run select --run-id <run_id>`.** Select is the
-  single sequential authority: it promotes the best accepted lane to the
-  run's best, journals every loser (diff summary, verdict, delta) before
+  single sequential authority: it validation-scores every training-accepted
+  lane, promotes the strongest held-out improvement to the run's best,
+  journals every loser (diff summary, verdict, delta) before
   deleting its branch, invalidates stragglers, enforces the budget, and
   re-fans every lane onto the new best with a fresh shared baseline and new
   `lane_ready` events. Never run `gepa run continue` in a lane run — it
@@ -503,7 +519,7 @@ emits the `verdict` event; you will see it from `gepa next`.
   returns the lane to paused; uncommitted worktree content is never
   auto-deleted. Then re-dispatch the reflector with the same packet path.
 - **`budget_low` → tighten dispatches.** Emitted when remaining evals fall
-  below lanes × `--acceptance-max-repetitions`. Prefer cheap, high-confidence
+  below lanes × (`--acceptance-max-repetitions` + one validation eval). Prefer cheap, high-confidence
   edits from here and expect `run_done` soon.
 - **`run_done` → stop.** Read `final_report_path` for the outcome (including
   any budget overshoot) and restore the best commit with `git checkout
@@ -524,7 +540,7 @@ Prefer lanes when ALL of these hold:
 
 Stay on the single-path loop (`gepa run start` / `gepa run continue` without
 `--lanes`) when the budget is tight (lanes spend up to N ×
-`--acceptance-max-repetitions` evals in flight per iteration), when
+(`--acceptance-max-repetitions` + one validation eval) in flight per iteration), when
 reflections are sequential by nature (each depends on the last verdict), or
 when you are in component mode.
 
