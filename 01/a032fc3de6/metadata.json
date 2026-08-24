@@ -1,0 +1,9 @@
+{
+  "checkpoint_id": "01a032fc3de6",
+  "created_at": "2026-08-24T08:56:26.930283+00:00",
+  "branch_name": "codex/comparator-aware-validation",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "54c8cf9a72c955c3c29ace3d1660e0bf9237b287"
+  ]
+}
