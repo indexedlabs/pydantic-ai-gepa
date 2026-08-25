@@ -286,6 +286,26 @@ async def test_monty_repl_timeout_does_not_poison_future_calls(
 
 
 @pytest.mark.asyncio
+async def test_monty_repl_failed_call_rolls_back_partial_state(
+    monkeypatch, tmp_path
+) -> None:
+    _write_trace_context(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    toolset = create_trace_toolset("run-1", 0)
+    run_python_repl = toolset.tools["run_python_repl"].function
+
+    await run_python_repl("stable = 'committed'")
+    failed_result = await run_python_repl("partial = 'discarded'\n1 / 0")
+    stable_result = await run_python_repl("stable")
+    partial_result = await run_python_repl("partial")
+
+    assert "ZeroDivisionError: division by zero" in failed_result
+    assert stable_result == "committed"
+    assert "NameError: name 'partial' is not defined" in partial_result
+
+
+@pytest.mark.asyncio
 async def test_host_line_helpers_inspect_large_files_without_full_read(
     monkeypatch, tmp_path
 ) -> None:

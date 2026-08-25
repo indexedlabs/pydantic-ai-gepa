@@ -22,6 +22,8 @@ else:
         str | bool | int | float | None | list["JsonValue"] | dict[str, "JsonValue"],
     )
 
+_MONTY_REQUEST_TIMEOUT_SECONDS = 15.0
+
 
 class SandboxExecutionResult(BaseModel):
     """Structured result returned by the sandbox tool."""
@@ -91,7 +93,10 @@ async def _run_python_in_sandbox(
         output_lines_buffer.append(text)
 
     try:
-        async with pydantic_monty.AsyncMonty(max_processes=1) as pool:
+        async with pydantic_monty.AsyncMonty(
+            max_processes=1,
+            request_timeout=_MONTY_REQUEST_TIMEOUT_SECONDS,
+        ) as pool:
             async with pool.checkout(
                 script_name="example_sandbox.py",
                 limits=pydantic_monty.ResourceLimits(
