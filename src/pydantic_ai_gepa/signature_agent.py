@@ -51,7 +51,7 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
     Example:
         ```python
         from pydantic_ai import Agent
-        from pydantic_ai.durable_exec.temporal import TemporalAgent
+        from pydantic_ai.durable_exec.temporal import TemporalDurability
         from pydantic_ai_gepa import SignatureAgent
         from pydantic import BaseModel, Field
 
@@ -70,14 +70,12 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
             'openai:gpt-4o',
             instructions="You're an expert in geography.",
             name='geography',
+            capabilities=[TemporalDurability()],
         )
-
-        # Wrap with Temporal if needed
-        temporal_agent = TemporalAgent(agent)
 
         # Add signature support (output_type inferred from wrapped agent)
         signature_agent = SignatureAgent(
-            temporal_agent,
+            agent,
             input_type=Query,
         )
 
@@ -105,7 +103,7 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         """Initialize the SignatureAgent wrapper.
 
         Args:
-            wrapped: The agent to wrap (can be any AbstractAgent, including TemporalAgent).
+            wrapped: The agent to wrap. Durable agents can carry a capability such as TemporalDurability.
             input_type: The structured input specification (BaseModel subclass or BoundInputSpec).
             output_type: Optional output type or spec expected from the wrapped agent.
             append_instructions: If True, append signature instructions to the agent's instructions.
