@@ -1,7 +1,8 @@
 from typing import ClassVar
 from pydantic import BaseModel
-from pydantic_ai_gepa import SignatureAgent
 from pydantic_ai import Agent
+from pydantic_ai_gepa import SignatureAgent
+from pydantic_ai_gepa.input_type import generate_user_content
 
 
 class MyInput(BaseModel):
@@ -35,3 +36,13 @@ def test_custom_encoder_via_init():
 
     comps = sig_agent.input_spec.get_gepa_components()
     assert comps["signature:MyInput:encoder"].strip() == custom_script.strip()
+
+
+def test_custom_encoder_executes_in_monty_session():
+    candidate = {
+        "signature:MyInput:encoder": MyInput.base_encoder_script,
+    }
+
+    content = generate_user_content(MyInput(name="Ada"), candidate=candidate)
+
+    assert content == ["My Markdown Input:\n- Name: Ada"]

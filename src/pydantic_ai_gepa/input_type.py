@@ -556,11 +556,16 @@ class _InputModelView(_InputShared):
                 def host_json_dumps(obj: Any) -> str:
                     return json.dumps(obj, indent=2)
 
-                m = pydantic_monty.Monty(encoder_script, inputs=["data"])
-                encoded_str = m.run(
-                    inputs={"data": data_dict},
-                    external_functions={"json_dumps": host_json_dumps},
-                )
+                with pydantic_monty.Monty(max_processes=1) as pool:
+                    with pool.checkout(
+                        script_name="input_encoder.py",
+                        type_check=False,
+                    ) as session:
+                        encoded_str = session.feed_run(
+                            encoder_script,
+                            inputs={"data": data_dict},
+                            external_lookup={"json_dumps": host_json_dumps},
+                        )
 
                 user_content: list[UserContent] = []
                 user_content.extend(registry.attachments)
