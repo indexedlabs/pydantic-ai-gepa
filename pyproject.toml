@@ -29,7 +29,7 @@ dependencies = [
     "rich>=13.7.1",
     "logfire>=4.14.2",
     "PyYAML>=6.0.0",
-    "pydantic-monty>=0.0.17",
+    "pydantic-monty>=0.0.19",
     "typer>=0.12.0",
 ]
 

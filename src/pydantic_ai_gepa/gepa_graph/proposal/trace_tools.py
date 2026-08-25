@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import weakref
 from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from pydantic_ai import Agent, FunctionToolset
 
@@ -23,6 +24,8 @@ _MONTY_LIMITS = {
     "max_memory": 128 * 1024 * 1024,
     "max_recursion_depth": 1000,
 }
+_MONTY_REQUEST_TIMEOUT_SECONDS = 15.0
+_MONTY_PRINT_LIMIT_BYTES = 1024 * 1024
 _MAX_HOST_LINE_LIMIT = 1000
 _MAX_HOST_LINE_CHARS = 20_000
 _MAX_HOST_BATCH_BYTES = 4 * 1024 * 1024
@@ -30,7 +33,7 @@ _LINE_COUNT_CHUNK_SIZE = 1024 * 1024
 MONTY_REPL_PROMPT_GUIDANCE = """
 ### `run_python_repl` environment
 - The REPL is `pydantic-monty`, a sandboxed Python subset, not CPython. It is persistent across calls within one reflection agent run, so variables and helper functions stay bound.
-- Each call has a 10-second execution budget, plus memory and recursion limits. A timed-out call does not make the REPL unusable; preserve useful intermediate state in variables.
+- Each call has a 10-second execution budget, plus memory and recursion limits. State is committed only after a successful call; a failed or timed-out call rolls back to the last successful state and does not make the REPL unusable.
 - Return values come from the final expression. `print(...)` writes to stdout and returns `None`, so end scripts with a bare value such as `summary`, `rows[:5]`, or `{"failures": failures}`.
 - Supported syntax includes assignments, `if`/`else`, `for`/`while`, `def`, `lambda`, `try`/`except`, `raise`, comprehensions, and f-strings.
 - Unsupported syntax includes `with` statements, `class` definitions, `match`, and `yield`. Do not use context managers, generators, or custom classes.
@@ -497,10 +500,13 @@ def create_trace_toolset(
 
         base_dir.mkdir(parents=True, exist_ok=True)
         mount = pydantic_monty.MountDir(
-            _MONTY_CONTEXT_ROOT,
-            base_dir,
+            host_path=base_dir,
+            virtual_path=_MONTY_CONTEXT_ROOT,
             mode="read-only",
         )
+        close_mount = getattr(mount, "close", None)
+        if close_mount is not None:
+            weakref.finalize(toolset, close_mount)
         external_functions = {
             "host_file_size": _host_file_size,
             "host_line_count": _host_line_count,
@@ -517,40 +523,42 @@ def create_trace_toolset(
             "host_search_span": _host_search_span,
         }
 
-        def _reset_repl_timer(repl: Any) -> Any:
-            # Monty's duration limit is cumulative for a REPL tracker. Loading a
-            # snapshot preserves state but resets the tracker's start time.
-            return pydantic_monty.MontyRepl.load(repl.dump())
-
-        def _new_repl():
-            repl = pydantic_monty.MontyRepl(
-                script_name="trace_analysis.py",
-                limits=_MONTY_LIMITS,
-            )
-            repl.feed_run(
-                _MONTY_SETUP_SCRIPT,
-                mount=mount,
-                external_functions=external_functions,
-            )
-            return _reset_repl_timer(repl)
+        def _new_repl() -> bytes:
+            with pydantic_monty.Monty(
+                max_processes=1,
+                request_timeout=_MONTY_REQUEST_TIMEOUT_SECONDS,
+            ) as pool:
+                with pool.checkout(
+                    script_name="trace_analysis.py",
+                    limits=cast(pydantic_monty.ResourceLimits, _MONTY_LIMITS),
+                    type_check=False,
+                ) as repl:
+                    repl.feed_run(
+                        _MONTY_SETUP_SCRIPT,
+                        mount=mount,
+                        external_lookup=external_functions,
+                    )
+                    return repl.dump()
 
         def _execute_repl(session_state: dict[str, Any], python_code: str) -> str:
-            repl = _reset_repl_timer(session_state["repl"])
-            session_state["repl"] = repl
-            try:
-                result = repl.feed_run(
-                    python_code,
-                    mount=mount,
-                    external_functions=external_functions,
-                )
-                return str(result)
-            finally:
-                try:
-                    session_state["repl"] = _reset_repl_timer(repl)
-                except Exception:
-                    session_state["repl"] = repl
+            with pydantic_monty.Monty(
+                max_processes=1,
+                request_timeout=_MONTY_REQUEST_TIMEOUT_SECONDS,
+            ) as pool:
+                with pool.checkout() as repl:
+                    repl.load_session(session_state["repl"])
+                    result = repl.feed_run(
+                        python_code,
+                        mount=mount,
+                        external_lookup=external_functions,
+                        print_callback=pydantic_monty.CollectString(
+                            max_bytes=_MONTY_PRINT_LIMIT_BYTES
+                        ),
+                    )
+                    session_state["repl"] = repl.dump()
+                    return str(result)
 
-        session = {"repl": _new_repl()}
+        session: dict[str, Any] = {"repl": None}
         session_lock = asyncio.Lock()
         spawned_agent_count = 0
         spawned_agent_lock = asyncio.Lock()
@@ -611,6 +619,8 @@ def create_trace_toolset(
             """
             async with session_lock:
                 try:
+                    if session["repl"] is None:
+                        session["repl"] = await asyncio.to_thread(_new_repl)
                     return await asyncio.to_thread(_execute_repl, session, python_code)
                 except Exception as e:
                     return f"Error executing REPL code: {e}"
@@ -635,7 +645,7 @@ def create_trace_toolset(
             return await _spawn_child_agent(instructions)
 
         async def _run_child_agent(current_prompt: str, spawn_index: int) -> str:
-            child_session = {"repl": _new_repl()}
+            child_session: dict[str, Any] = {"repl": None}
             child_session_lock = asyncio.Lock()
 
             child_toolset = FunctionToolset[None]()
@@ -655,6 +665,8 @@ def create_trace_toolset(
                 """
                 async with child_session_lock:
                     try:
+                        if child_session["repl"] is None:
+                            child_session["repl"] = await asyncio.to_thread(_new_repl)
                         return await asyncio.to_thread(
                             _execute_repl, child_session, python_code
                         )

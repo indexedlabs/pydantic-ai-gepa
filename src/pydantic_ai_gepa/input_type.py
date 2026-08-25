@@ -7,7 +7,7 @@ from contextlib import contextmanager
 import html
 import json
 from dataclasses import is_dataclass, replace
-from typing import Annotated, Any, Generic, TypeVar, get_args, get_origin
+from typing import Annotated, Any, Generic, TypeVar, cast, get_args, get_origin
 
 try:
     import pydantic_monty
@@ -55,6 +55,14 @@ def encode_input(data):
 
 encode_input(data)
 """
+
+_MONTY_ENCODER_LIMITS = {
+    "max_duration_secs": 5.0,
+    "max_memory": 128 * 1024 * 1024,
+    "max_recursion_depth": 1000,
+}
+_MONTY_ENCODER_REQUEST_TIMEOUT_SECONDS = 10.0
+_MONTY_ENCODER_PRINT_LIMIT_BYTES = 1024 * 1024
 
 
 class SignatureSuffix:
@@ -556,11 +564,23 @@ class _InputModelView(_InputShared):
                 def host_json_dumps(obj: Any) -> str:
                     return json.dumps(obj, indent=2)
 
-                m = pydantic_monty.Monty(encoder_script, inputs=["data"])
-                encoded_str = m.run(
-                    inputs={"data": data_dict},
-                    external_functions={"json_dumps": host_json_dumps},
-                )
+                with pydantic_monty.Monty(
+                    max_processes=1,
+                    request_timeout=_MONTY_ENCODER_REQUEST_TIMEOUT_SECONDS,
+                ) as pool:
+                    with pool.checkout(
+                        script_name="input_encoder.py",
+                        limits=cast(Any, _MONTY_ENCODER_LIMITS),
+                        type_check=False,
+                    ) as session:
+                        encoded_str = session.feed_run(
+                            encoder_script,
+                            inputs={"data": data_dict},
+                            external_lookup={"json_dumps": host_json_dumps},
+                            print_callback=pydantic_monty.CollectString(
+                                max_bytes=_MONTY_ENCODER_PRINT_LIMIT_BYTES
+                            ),
+                        )
 
                 user_content: list[UserContent] = []
                 user_content.extend(registry.attachments)

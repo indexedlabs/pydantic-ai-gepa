@@ -347,7 +347,7 @@ Only use `clear_message_history` sparingly when absolutely necessary to avoid br
 
 ### `run_python_repl` environment
 - The REPL is `pydantic-monty`, a sandboxed Python subset, not CPython. It is persistent across calls within one reflection agent run, so variables and helper functions stay bound.
-- Each call has a 10-second execution budget, plus memory and recursion limits. A timed-out call does not make the REPL unusable; preserve useful intermediate state in variables.
+- Each call has a 10-second execution budget, plus memory and recursion limits. State is committed only after a successful call; a failed or timed-out call rolls back to the last successful state and does not make the REPL unusable.
 - Return values come from the final expression. `print(...)` writes to stdout and returns `None`, so end scripts with a bare value such as `summary`, `rows[:5]`, or `{"failures": failures}`.
 - Supported syntax includes assignments, `if`/`else`, `for`/`while`, `def`, `lambda`, `try`/`except`, `raise`, comprehensions, and f-strings.
 - Unsupported syntax includes `with` statements, `class` definitions, `match`, and `yield`. Do not use context managers, generators, or custom classes.
@@ -853,7 +853,7 @@ Only use `clear_message_history` sparingly when absolutely necessary to avoid br
 
 ### `run_python_repl` environment
 - The REPL is `pydantic-monty`, a sandboxed Python subset, not CPython. It is persistent across calls within one reflection agent run, so variables and helper functions stay bound.
-- Each call has a 10-second execution budget, plus memory and recursion limits. A timed-out call does not make the REPL unusable; preserve useful intermediate state in variables.
+- Each call has a 10-second execution budget, plus memory and recursion limits. State is committed only after a successful call; a failed or timed-out call rolls back to the last successful state and does not make the REPL unusable.
 - Return values come from the final expression. `print(...)` writes to stdout and returns `None`, so end scripts with a bare value such as `summary`, `rows[:5]`, or `{"failures": failures}`.
 - Supported syntax includes assignments, `if`/`else`, `for`/`while`, `def`, `lambda`, `try`/`except`, `raise`, comprehensions, and f-strings.
 - Unsupported syntax includes `with` statements, `class` definitions, `match`, and `yield`. Do not use context managers, generators, or custom classes.
@@ -1206,7 +1206,7 @@ Only use `clear_message_history` sparingly when absolutely necessary to avoid br
 
 ### `run_python_repl` environment
 - The REPL is `pydantic-monty`, a sandboxed Python subset, not CPython. It is persistent across calls within one reflection agent run, so variables and helper functions stay bound.
-- Each call has a 10-second execution budget, plus memory and recursion limits. A timed-out call does not make the REPL unusable; preserve useful intermediate state in variables.
+- Each call has a 10-second execution budget, plus memory and recursion limits. State is committed only after a successful call; a failed or timed-out call rolls back to the last successful state and does not make the REPL unusable.
 - Return values come from the final expression. `print(...)` writes to stdout and returns `None`, so end scripts with a bare value such as `summary`, `rows[:5]`, or `{"failures": failures}`.
 - Supported syntax includes assignments, `if`/`else`, `for`/`while`, `def`, `lambda`, `try`/`except`, `raise`, comprehensions, and f-strings.
 - Unsupported syntax includes `with` statements, `class` definitions, `match`, and `yield`. Do not use context managers, generators, or custom classes.
