@@ -1,0 +1,9 @@
+{
+  "checkpoint_id": "01a03b264181",
+  "created_at": "2026-08-25T22:59:18.078999+00:00",
+  "branch_name": "codex/pydantic-ai-v2",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "c3ece9841bd673a3c4b2aa053b148f437f64dab5"
+  ]
+}
