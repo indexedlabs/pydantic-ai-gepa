@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from pydantic_ai import Agent, FunctionToolset
 
@@ -497,8 +497,8 @@ def create_trace_toolset(
 
         base_dir.mkdir(parents=True, exist_ok=True)
         mount = pydantic_monty.MountDir(
-            _MONTY_CONTEXT_ROOT,
-            base_dir,
+            host_path=base_dir,
+            virtual_path=_MONTY_CONTEXT_ROOT,
             mode="read-only",
         )
         external_functions = {
@@ -517,38 +517,31 @@ def create_trace_toolset(
             "host_search_span": _host_search_span,
         }
 
-        def _reset_repl_timer(repl: Any) -> Any:
-            # Monty's duration limit is cumulative for a REPL tracker. Loading a
-            # snapshot preserves state but resets the tracker's start time.
-            return pydantic_monty.MontyRepl.load(repl.dump())
-
-        def _new_repl():
-            repl = pydantic_monty.MontyRepl(
-                script_name="trace_analysis.py",
-                limits=_MONTY_LIMITS,
-            )
-            repl.feed_run(
-                _MONTY_SETUP_SCRIPT,
-                mount=mount,
-                external_functions=external_functions,
-            )
-            return _reset_repl_timer(repl)
+        def _new_repl() -> bytes:
+            with pydantic_monty.Monty(max_processes=1) as pool:
+                with pool.checkout(
+                    script_name="trace_analysis.py",
+                    limits=cast(pydantic_monty.ResourceLimits, _MONTY_LIMITS),
+                    type_check=False,
+                ) as repl:
+                    repl.feed_run(
+                        _MONTY_SETUP_SCRIPT,
+                        mount=mount,
+                        external_lookup=external_functions,
+                    )
+                    return repl.dump()
 
         def _execute_repl(session_state: dict[str, Any], python_code: str) -> str:
-            repl = _reset_repl_timer(session_state["repl"])
-            session_state["repl"] = repl
-            try:
-                result = repl.feed_run(
-                    python_code,
-                    mount=mount,
-                    external_functions=external_functions,
-                )
-                return str(result)
-            finally:
-                try:
-                    session_state["repl"] = _reset_repl_timer(repl)
-                except Exception:
-                    session_state["repl"] = repl
+            with pydantic_monty.Monty(max_processes=1) as pool:
+                with pool.checkout() as repl:
+                    repl.load_session(session_state["repl"])
+                    result = repl.feed_run(
+                        python_code,
+                        mount=mount,
+                        external_lookup=external_functions,
+                    )
+                    session_state["repl"] = repl.dump()
+                    return str(result)
 
         session = {"repl": _new_repl()}
         session_lock = asyncio.Lock()

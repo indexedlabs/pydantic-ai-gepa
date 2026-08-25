@@ -87,20 +87,24 @@ async def _run_python_in_sandbox(
     started = time.perf_counter()
     output_lines_buffer: list[str] = []
 
-    def _print_callback(fd: Literal["stdout"], text: str) -> None:
+    def _print_callback(fd: Literal["stdout", "stderr"], text: str) -> None:
         output_lines_buffer.append(text)
 
     try:
-        monty = pydantic_monty.Monty(code)
-        return_value = await pydantic_monty.run_monty_async(
-            monty,
-            inputs=dict(inputs) if inputs else None,
-            print_callback=_print_callback,
-            limits=pydantic_monty.ResourceLimits(
-                max_duration_secs=10.0,
-                max_memory=500_000_000,
-            ),
-        )
+        async with pydantic_monty.AsyncMonty(max_processes=1) as pool:
+            async with pool.checkout(
+                script_name="example_sandbox.py",
+                limits=pydantic_monty.ResourceLimits(
+                    max_duration_secs=10.0,
+                    max_memory=500_000_000,
+                ),
+                type_check=False,
+            ) as session:
+                return_value = await session.feed_run(
+                    code,
+                    inputs=dict(inputs) if inputs else None,
+                    print_callback=_print_callback,
+                )
     except Exception as exc:  # pragma: no cover - surfaced to the model instead
         elapsed = time.perf_counter() - started
         return SandboxExecutionResult(
