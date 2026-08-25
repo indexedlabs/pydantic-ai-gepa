@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from pydantic_ai import Agent, FunctionToolset
+from pydantic_monty import ResourceLimits
 
 from ...types import DEFAULT_MAX_SPAWNED_AGENTS
 from .trace_store import StructuredTraceStore
@@ -19,7 +20,7 @@ class ClearMessageHistoryException(Exception):
 
 
 _MONTY_CONTEXT_ROOT = "/ctx"
-_MONTY_LIMITS = {
+_MONTY_LIMITS: ResourceLimits = {
     "max_duration_secs": 10.0,
     "max_memory": 128 * 1024 * 1024,
     "max_recursion_depth": 1000,
@@ -197,8 +198,8 @@ def create_trace_toolset(
     candidate_idx: int,
     reflection_model: Any = "gpt-4o-mini",
     max_spawned_agents: int = DEFAULT_MAX_SPAWNED_AGENTS,
-) -> FunctionToolset[None]:
-    toolset = FunctionToolset[None]()
+) -> FunctionToolset[object]:
+    toolset = FunctionToolset[object]()
     base_dir = Path(f".gepa_cache/runs/{run_id}/candidates/{candidate_idx}").resolve()
     max_spawned_agents = max(0, int(max_spawned_agents))
 
@@ -648,7 +649,7 @@ def create_trace_toolset(
             child_session: dict[str, Any] = {"repl": None}
             child_session_lock = asyncio.Lock()
 
-            child_toolset = FunctionToolset[None]()
+            child_toolset = FunctionToolset[object]()
 
             @child_toolset.tool_plain
             async def run_python_repl(python_code: str) -> str:
@@ -699,21 +700,26 @@ def create_trace_toolset(
             )
             agent = Agent(reflection_model, system_prompt=system_prompt)
 
-            loop_count = 0
-            while True:
-                loop_count += 1
-                if loop_count > 20:
-                    return "Error: Child agent exceeded maximum clear_message_history loops (20)."
-                try:
-                    result = await agent.run(current_prompt, toolsets=[child_toolset])
-                    return result.output
-                except ClearMessageHistoryException as e:
-                    current_prompt = (
-                        f"History cleared. You previously left yourself this note to continue:\n\n{e.next_context}\n\n"
-                        "Your Python REPL state is intact."
-                    )
-                except Exception as e:
-                    return f"Error running sub-agent: {e}"
+            try:
+                loop_count = 0
+                while True:
+                    loop_count += 1
+                    if loop_count > 20:
+                        return "Error: Child agent exceeded maximum clear_message_history loops (20)."
+                    try:
+                        result = await agent.run(
+                            current_prompt, toolsets=[child_toolset]
+                        )
+                        return result.output
+                    except ClearMessageHistoryException as e:
+                        current_prompt = (
+                            f"History cleared. You previously left yourself this note to continue:\n\n{e.next_context}\n\n"
+                            "Your Python REPL state is intact."
+                        )
+                    except Exception as e:
+                        return f"Error running sub-agent: {e}"
+            finally:
+                child_session["repl"].__exit__(None, None, None)
 
     except ImportError:
         pass

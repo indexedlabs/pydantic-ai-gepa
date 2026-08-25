@@ -45,10 +45,11 @@ async def test_evaluate_candidate_dataset_helper() -> None:
     base_agent = Agent(TestModel(custom_output_text="alpha"), instructions="Seed")
 
     dataset = Dataset(
+        name="candidate-evaluation",
         cases=[
             Case(name="case-0", inputs={"text": "a"}, expected_output="alpha"),
             Case(name="case-1", inputs={"text": "b"}, expected_output="beta"),
-        ]
+        ],
     )
 
     class InputModel(BaseModel):
@@ -244,6 +245,7 @@ async def test_make_reflective_dataset():
                         {
                             "kind": "response",
                             "model_name": "test",
+                            "provider_name": "test",
                             "timestamp": "2023-01-01T08:00:00+00:00",
                             "parts": [
                                 {
@@ -261,6 +263,7 @@ async def test_make_reflective_dataset():
                                 "cache_audio_read_tokens": 0,
                                 "output_audio_tokens": 0,
                                 "details": {},
+                                "cost": None,
                             },
                         },
                     ],
@@ -273,6 +276,7 @@ async def test_make_reflective_dataset():
                         "cache_audio_read_tokens": 0,
                         "output_audio_tokens": 0,
                         "details": {},
+                        "cost": None,
                         "requests": 1,
                         "tool_calls": 0,
                     },

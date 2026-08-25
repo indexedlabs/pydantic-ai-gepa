@@ -6,7 +6,7 @@ from typing import Any, Sequence, cast
 
 import pytest
 
-from pydantic_graph.beta.graph import EndMarker, GraphTask
+from pydantic_graph import EndMarker, GraphTask
 
 from pydantic_ai_gepa.adapter import Adapter
 from pydantic_ai_gepa.gepa_graph.datasets import ListDataLoader

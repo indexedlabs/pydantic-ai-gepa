@@ -12,7 +12,7 @@ import logfire
 from pydantic import BaseModel, ConfigDict, Field
 
 from pydantic_ai import usage as _usage
-from pydantic_graph.beta.graph import EndMarker, GraphTask
+from pydantic_graph import EndMarker, GraphTask
 
 from .adapters.agent_adapter import create_adapter
 from .cache import CacheManager

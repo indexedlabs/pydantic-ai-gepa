@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence, cast
 
 import logfire
-from pydantic_graph.beta import StepContext
+from pydantic_graph import StepContext
 from pydantic_ai import FunctionToolset
 from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.models import KnownModelName, Model
@@ -125,7 +125,7 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
     # can pass arbitrary toolsets — including bare ``FunctionToolset``
     # instances built via ``@toolset.tool_plain`` and external
     # ``AbstractToolset`` subclasses — without violating the type.
-    component_toolsets: list[AbstractToolset[None]] = []
+    component_toolsets: list[AbstractToolset[object]] = []
 
     if state.config.reflection_config and state.config.reflection_config.journal_file:
         from ..proposal.journal_tools import create_journal_toolset
@@ -462,8 +462,8 @@ def _build_component_selection_toolset(
     state: GepaState,
     deps: GepaDeps,
     parent_idx: int,
-) -> FunctionToolset:
-    toolset: FunctionToolset[None] = FunctionToolset()
+) -> FunctionToolset[object]:
+    toolset: FunctionToolset[object] = FunctionToolset()
 
     def _candidate() -> CandidateProgram:
         return state.candidates[parent_idx]
@@ -795,7 +795,7 @@ async def _propose_new_texts(
     components: Sequence[str] | None,
     model: Model | KnownModelName | str,
     model_settings: ModelSettings | None = None,
-    component_toolsets: Sequence[AbstractToolset[None]] | None = None,
+    component_toolsets: Sequence[AbstractToolset[object]] | None = None,
 ) -> ProposalResult:
     proposal = deps.proposal_generator
     kwargs: dict[str, Any] = dict(

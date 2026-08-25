@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Sequence, cast
 
 import pytest
-from pydantic_graph.beta import StepContext
+from pydantic_graph import StepContext
 from pydantic_evals import Case
 
 from pydantic_ai_gepa.adapter import Adapter, SharedReflectiveDataset

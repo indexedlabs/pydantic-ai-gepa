@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Iterator
 
 import pytest
+from click.testing import Result
 from typer.testing import CliRunner
 
 from pydantic_ai_gepa.cli import app as gepa_app
@@ -20,7 +21,7 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     yield tmp_path
 
 
-def _run(*argv: str, input_: str | None = None) -> object:
+def _run(*argv: str, input_: str | None = None) -> Result:
     return CliRunner().invoke(gepa_app, list(argv), input=input_)
 
 

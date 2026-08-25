@@ -334,12 +334,12 @@ class ToolOptimizationManager:
 
     async def _prepare_wrapper(
         self, ctx: RunContext[Any], tool_defs: list[ToolDefinition]
-    ) -> list[ToolDefinition] | None:
+    ) -> list[ToolDefinition]:
         prepared = tool_defs
         if self._base_prepare:
             prepared_result = await self._base_prepare(ctx, tool_defs)
             if prepared_result is None:
-                return None
+                return []
             prepared = prepared_result
 
         self._catalog.ingest(prepared)
@@ -478,12 +478,12 @@ class OutputToolOptimizationManager:
 
     async def _prepare_wrapper(
         self, ctx: RunContext[Any], tool_defs: list[ToolDefinition]
-    ) -> list[ToolDefinition] | None:
+    ) -> list[ToolDefinition]:
         prepared = tool_defs
         if self._base_prepare:
             prepared_result = await self._base_prepare(ctx, tool_defs)
             if prepared_result is None:
-                return None
+                return []
             prepared = prepared_result
 
         self._catalog.ingest(prepared)

@@ -13,7 +13,7 @@ import subprocess
 import sys
 import textwrap
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 import pytest
 from click.testing import Result
@@ -201,8 +201,8 @@ def _write_state(repo: Path, state: RunState) -> None:
 
 def _journal_outcomes(
     repo: Path, run_id: str, *, lane: str | None = None, outcome: str | None = None
-) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
     for line in (
         (repo / ".gepa" / "journal.jsonl").read_text(encoding="utf-8").splitlines()
     ):
@@ -220,9 +220,7 @@ def _journal_outcomes(
     return rows
 
 
-def _events(
-    repo: Path, run_id: str, type_: str | None = None
-) -> list[dict[str, object]]:
+def _events(repo: Path, run_id: str, type_: str | None = None) -> list[dict[str, Any]]:
     events_dir = repo / ".gepa" / "runs" / run_id / "events"
     events = [
         json.loads(p.read_text()) for p in sorted(events_dir.iterdir()) if p.is_file()

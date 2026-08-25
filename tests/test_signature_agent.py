@@ -25,7 +25,7 @@ from pydantic_ai_gepa.input_type import (
 from pydantic_ai import Agent, ToolDefinition
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 from pydantic_ai.models.test import TestModel
-from pydantic_ai.durable_exec.temporal import TemporalAgent
+from pydantic_ai.durable_exec.temporal import TemporalDurability
 
 
 def _component_map(entries: dict[str, str]) -> CandidateMap:
@@ -101,7 +101,7 @@ Ask a question about geography.
 Inputs:
 
 - `<question>` (str): The geography question to ask
-- `<region>` (UnionType[str, NoneType]): Specific region to focus on, if applicable\
+- `<region>` (Union[str, NoneType]): Specific region to focus on, if applicable\
 """
     )
     assert request.instructions == snapshot("""\
@@ -112,7 +112,7 @@ Ask a question about geography.
 Inputs:
 
 - `<question>` (str): The geography question to ask
-- `<region>` (UnionType[str, NoneType]): Specific region to focus on, if applicable\
+- `<region>` (Union[str, NoneType]): Specific region to focus on, if applicable\
 """)
 
 
@@ -165,7 +165,7 @@ Focus on European capitals.
 Inputs:
 
 - `<question>` (str): The capital city question
-- `<region>` (UnionType[str, NoneType]): Specific region to focus on, if applicable\
+- `<region>` (Union[str, NoneType]): Specific region to focus on, if applicable\
 """
     )
     assert request.instructions is not None
@@ -177,7 +177,7 @@ Focus on European capitals.
 Inputs:
 
 - `<question>` (str): The capital city question
-- `<region>` (UnionType[str, NoneType]): Specific region to focus on, if applicable\
+- `<region>` (Union[str, NoneType]): Specific region to focus on, if applicable\
 """)
 
 
@@ -300,7 +300,7 @@ Focus on major waterways and their importance.
 Inputs:
 
 - `<question>` (str): Geographic inquiry:
-- `<region>` (UnionType[str, NoneType]): Area of focus:\
+- `<region>` (Union[str, NoneType]): Area of focus:\
 """)
 
     user_content = generate_user_content(sig)
@@ -419,7 +419,7 @@ def _normalize_instructions_text(instructions: Any) -> str:
 
 
 def test_temporal_signature_agent_preserves_instructions_with_history():
-    """TemporalAgent wrapping should not drop base instructions on follow-ups."""
+    """Temporal durability should not drop base instructions on follow-ups."""
     test_model = TestModel(custom_output_text="ok")
 
     base_agent = Agent(
@@ -427,11 +427,11 @@ def test_temporal_signature_agent_preserves_instructions_with_history():
         instructions="Base instructions.",
         output_type=str,
         name="geo",
+        capabilities=[TemporalDurability()],
     )
 
-    temporal_agent = TemporalAgent(base_agent)
     signature_agent = SignatureAgent(
-        temporal_agent,
+        base_agent,
         input_type=GeographyQuery,
         output_type=str,
     )
@@ -552,6 +552,7 @@ def test_signature_agent_tool_candidate_modifies_definitions():
                     "type": "object",
                 },
                 description="Format content for downstream processing.",
+                toolset_id="<agent>",
             )
         ]
     )
@@ -585,6 +586,7 @@ def test_signature_agent_tool_candidate_modifies_definitions():
                     "type": "object",
                 },
                 description="Polish the incoming copy for publication.",
+                toolset_id="<agent>",
             )
         ]
     )
@@ -612,6 +614,7 @@ def test_signature_agent_tool_candidate_modifies_definitions():
                     "type": "object",
                 },
                 description="Format content for downstream processing.",
+                toolset_id="<agent>",
             )
         ]
     )
@@ -646,6 +649,7 @@ def test_signature_agent_tool_candidate_modifies_definitions():
                         "type": "object",
                     },
                     description="Apply brand voice polishing.",
+                    toolset_id="<agent>",
                 )
             ]
         )
@@ -673,6 +677,7 @@ def test_signature_agent_tool_candidate_modifies_definitions():
                     "type": "object",
                 },
                 description="Format content for downstream processing.",
+                toolset_id="<agent>",
             )
         ]
     )

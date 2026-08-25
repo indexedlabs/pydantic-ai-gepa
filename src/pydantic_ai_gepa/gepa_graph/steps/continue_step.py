@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from pydantic_graph.beta import StepContext
+from pydantic_graph import StepContext
 
 from ..deps import GepaDeps
 from ..models import GepaResult, GepaState

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Iterator
 
 import pytest
+from click.testing import Result
 from typer.testing import CliRunner
 
 from pydantic_ai_gepa.cli import app as gepa_app
@@ -18,6 +19,7 @@ from pydantic_ai_gepa.cli.events import (
     AckRejected,
     EventDraft,
     EventError,
+    EventType,
     LaneScan,
     LaneScanResult,
     SelectionDueSignal,
@@ -46,7 +48,7 @@ def run_id(repo: Path) -> str:
     return new_run_id()
 
 
-def _run(*argv: str) -> object:
+def _run(*argv: str) -> Result:
     return CliRunner().invoke(gepa_app, list(argv))
 
 
@@ -408,7 +410,9 @@ def test_help_documents_exit_codes() -> None:
 # ---------- adversarial-review hardening (PR #28 review) ----------
 
 
-def _draft(event_type: str = "verdict", lane: str | None = "lane-1") -> EventDraft:
+def _draft(
+    event_type: EventType = "verdict", lane: str | None = "lane-1"
+) -> EventDraft:
     payload = {"verdict": "accepted", "delta": 0.5, "comparison_path": "/tmp/c.json"}
     return EventDraft(type=event_type, lane=lane, payload=payload)
 

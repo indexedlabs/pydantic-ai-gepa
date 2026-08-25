@@ -41,7 +41,7 @@ def _resolve_model() -> Model | KnownModelName | str:
     return os.environ.get("GEPA_EXAMPLE_MODEL", DEFAULT_MODEL)
 
 
-agent: Agent[None, str] = Agent(
+agent: Agent[object, str] = Agent(
     _resolve_model(),
     instructions=(
         "You handle customer service messages. Pick a tool and call it. Then "

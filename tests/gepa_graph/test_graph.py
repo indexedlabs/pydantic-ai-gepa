@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence, cast
 
-from pydantic_graph.beta import Graph
+from pydantic_graph import Graph
 
 from pydantic_ai_gepa.adapter import Adapter, SharedReflectiveDataset
 from pydantic_ai_gepa.gepa_graph.graph import create_gepa_graph

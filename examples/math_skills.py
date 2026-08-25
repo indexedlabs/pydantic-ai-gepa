@@ -70,6 +70,7 @@ class MathProblemMetadata:
 
 # Challenging math cases spanning boundary, reasoning, and degenerate scenarios
 dataset = Dataset[MathProblemInput, MathProblemOutput, MathProblemMetadata](
+    name="math-skills",
     cases=[
         Case(
             name="comb-100-5",
@@ -554,7 +555,7 @@ dataset = Dataset[MathProblemInput, MathProblemOutput, MathProblemMetadata](
                 ideal_expression="(lambda: [t := [0, 1, 1], [t.append(sum(t[-3:])) for _ in range(28)], t[-1]][2])()",
             ),
         ),
-    ]
+    ],
 )
 
 # agent_model = InspectingModel(infer_model("openai:gpt-5-nano"))
@@ -572,7 +573,7 @@ agent = Agent(
     tools=[run_python_tool],
 )
 
-signature_agent: SignatureAgent[None, MathProblemOutput] = SignatureAgent(
+signature_agent: SignatureAgent[object, MathProblemOutput] = SignatureAgent(
     agent,
     input_type=MathProblemInput,
     optimize_tools=True,

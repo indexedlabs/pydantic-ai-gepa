@@ -23,7 +23,7 @@ class OutputModel(BaseModel):
     result: str = Field(description="original result description")
 
 
-def _make_agent() -> Agent[None, OutputModel]:
+def _make_agent() -> Agent[object, OutputModel]:
     return Agent(
         TestModel(custom_output_args=OutputModel(result="ok")),
         output_type=OutputModel,

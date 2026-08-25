@@ -70,7 +70,7 @@ def teacher_model() -> str:
     return os.environ.get("GEPA_TEACHER_MODEL", student_model())
 
 
-def make_agent() -> Agent[None, ClassificationOutput]:
+def make_agent() -> Agent[object, ClassificationOutput]:
     """Use the same environment-variable model override pattern as other demos."""
     if has_real_model():
         model = student_model()

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Iterator
 
 import pytest
+from click.testing import Result
 from typer.testing import CliRunner
 
 from pydantic_ai_gepa.cli import app as gepa_app
@@ -64,7 +65,7 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
             sys.modules.pop(name, None)
 
 
-def _run(*argv: str, input_: str | None = None) -> object:
+def _run(*argv: str, input_: str | None = None) -> Result:
     # click 8.3 merged stderr into stdout by default; we read result.output for both.
     return CliRunner().invoke(gepa_app, list(argv), input=input_)
 
@@ -149,7 +150,9 @@ def test_set_reads_from_stdin(repo: Path) -> None:
     )
     assert result.exit_code == 0, result.output
     store = ComponentStore(repo)
-    assert store.read("instructions").startswith("From stdin.")
+    stored = store.read("instructions")
+    assert stored is not None
+    assert stored.startswith("From stdin.")
 
 
 def test_set_rejects_inline_content_flag(repo: Path) -> None:

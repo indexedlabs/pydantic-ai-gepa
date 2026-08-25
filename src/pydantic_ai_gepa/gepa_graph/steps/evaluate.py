@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Sequence
 
 import logfire
-from pydantic_graph.beta import StepContext
+from pydantic_graph import StepContext
 
 from pydantic_evals import Case
 from ..deps import GepaDeps

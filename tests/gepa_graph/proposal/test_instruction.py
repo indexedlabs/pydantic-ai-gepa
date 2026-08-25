@@ -940,6 +940,7 @@ async def test_end_to_end_with_real_agent_and_tools() -> None:
             ModelResponse,
             ToolCallPart,
             ToolReturnPart,
+            UserPromptPart,
         )
 
         # Check if there's a tool return in the messages
@@ -978,7 +979,7 @@ async def test_end_to_end_with_real_agent_and_tools() -> None:
             for msg in messages:
                 if isinstance(msg, ModelRequest):
                     for part in msg.parts:
-                        if hasattr(part, "content"):
+                        if isinstance(part, UserPromptPart):
                             content = str(part.content)
                             if "San Francisco" in content:
                                 location = "San Francisco"

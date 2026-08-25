@@ -4,7 +4,7 @@ from pydantic_ai import FunctionToolset
 import logfire
 
 
-def create_journal_toolset(journal_file: str) -> FunctionToolset[None]:
+def create_journal_toolset(journal_file: str) -> FunctionToolset[object]:
     toolset = FunctionToolset()
     journal_path = Path(journal_file)
 

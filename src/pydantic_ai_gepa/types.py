@@ -83,7 +83,7 @@ class ReflectionConfig:
     - Custom evaluation criteria to consider
     """
 
-    additional_toolsets: Sequence[AbstractToolset[None]] = field(default_factory=list)
+    additional_toolsets: Sequence[AbstractToolset[object]] = field(default_factory=list)
     """Extra toolsets the reflection agent receives alongside the built-in
     trace / journal / component-selection toolsets.
 

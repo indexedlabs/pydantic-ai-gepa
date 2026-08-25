@@ -5,8 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
-from pydantic_graph.beta import Graph
-from pydantic_graph.beta.graph import EndMarker, GraphTask
+from pydantic_graph import EndMarker, Graph, GraphTask
 
 if TYPE_CHECKING:
     from ..adapter import Adapter

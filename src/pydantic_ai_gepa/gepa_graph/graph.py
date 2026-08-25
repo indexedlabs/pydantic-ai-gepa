@@ -5,8 +5,7 @@ from __future__ import annotations
 from types import NoneType
 from typing import TYPE_CHECKING, Literal
 
-from pydantic_graph.beta import Graph, GraphBuilder, StepContext
-from pydantic_graph.beta.util import TypeExpression
+from pydantic_graph import Graph, GraphBuilder, StepContext, TypeExpression
 
 from .deps import GepaDeps
 from .models import GepaConfig, GepaResult, GepaState

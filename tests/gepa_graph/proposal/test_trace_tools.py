@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 import json
+from typing import Any, cast
 
 import pytest
 
@@ -193,7 +194,7 @@ async def test_monty_repl_reads_trace_context_and_persists_state(
         "spawn_agent",
     }.issubset(toolset.tools)
 
-    run_python_repl = toolset.tools["run_python_repl"].function
+    run_python_repl = cast(Any, toolset.tools["run_python_repl"].function)
 
     count_result = await run_python_repl(
         "rows = [json_loads(line) for line in read_file('traces/traces.jsonl').splitlines()]\n"
@@ -221,7 +222,7 @@ async def test_structured_trace_helpers_query_view_and_search_spans(
     monkeypatch.chdir(tmp_path)
 
     toolset = create_trace_toolset("run-1", 0)
-    run_python_repl = toolset.tools["run_python_repl"].function
+    run_python_repl = cast(Any, toolset.tools["run_python_repl"].function)
 
     overview_result = await run_python_repl(
         "overview = trace_overview()\n"
@@ -275,7 +276,7 @@ async def test_monty_repl_timeout_does_not_poison_future_calls(
     )
 
     toolset = create_trace_toolset("run-1", 0)
-    run_python_repl = toolset.tools["run_python_repl"].function
+    run_python_repl = cast(Any, toolset.tools["run_python_repl"].function)
 
     await run_python_repl("marker = 'still here'")
     timeout_result = await run_python_repl("while True:\n    pass")
@@ -313,7 +314,7 @@ async def test_host_line_helpers_inspect_large_files_without_full_read(
     monkeypatch.chdir(tmp_path)
 
     toolset = create_trace_toolset("run-1", 0)
-    run_python_repl = toolset.tools["run_python_repl"].function
+    run_python_repl = cast(Any, toolset.tools["run_python_repl"].function)
 
     size_result = await run_python_repl("file_size('large.log')")
     line_count_result = await run_python_repl("line_count('large.log')")
@@ -401,7 +402,7 @@ async def test_monty_repl_mount_is_read_only_and_context_bound(
     monkeypatch.chdir(tmp_path)
 
     toolset = create_trace_toolset("run-1", 0)
-    run_python_repl = toolset.tools["run_python_repl"].function
+    run_python_repl = cast(Any, toolset.tools["run_python_repl"].function)
 
     outside_result = await run_python_repl("read_file('/tmp/not-allowed')")
     outside_host_result = await run_python_repl("line_count('/tmp/not-allowed')")
@@ -431,7 +432,7 @@ def test_clear_message_history_tool_raises_control_exception(tmp_path, monkeypat
     monkeypatch.chdir(tmp_path)
 
     toolset = create_trace_toolset("run-1", 0)
-    clear_message_history = toolset.tools["clear_message_history"].function
+    clear_message_history = cast(Any, toolset.tools["clear_message_history"].function)
 
     with pytest.raises(ClearMessageHistoryException) as exc_info:
         clear_message_history("continue with cached rows")
@@ -473,8 +474,8 @@ async def test_spawn_agent_uses_fresh_monty_repl_with_trace_context(
     )
 
     toolset = create_trace_toolset("run-1", 0)
-    parent_run_python_repl = toolset.tools["run_python_repl"].function
-    spawn_agent = toolset.tools["spawn_agent"].function
+    parent_run_python_repl = cast(Any, toolset.tools["run_python_repl"].function)
+    spawn_agent = cast(Any, toolset.tools["spawn_agent"].function)
 
     await parent_run_python_repl("marker = 'parent-local'")
     first_result = await spawn_agent("inspect child one")
@@ -510,7 +511,7 @@ async def test_spawn_agent_enforces_shared_recursive_limit(
     )
 
     toolset = create_trace_toolset("run-1", 0, max_spawned_agents=1)
-    spawn_agent = toolset.tools["spawn_agent"].function
+    spawn_agent = cast(Any, toolset.tools["spawn_agent"].function)
 
     result = await spawn_agent("top child")
 

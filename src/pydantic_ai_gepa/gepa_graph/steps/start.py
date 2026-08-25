@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic_graph.beta import StepContext
+from pydantic_graph import StepContext
 
 from ..deps import GepaDeps
 from ..example_bank import InMemoryExampleBank
