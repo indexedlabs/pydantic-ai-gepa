@@ -194,13 +194,19 @@ def _optimization_result(candidate: dict[str, str]) -> GepaOptimizationResult:
 
 @pytest.mark.asyncio
 async def test_apply_best_yields_agent_with_candidate_capability() -> None:
-    model = TestModel(custom_output_text="answer")
+    model = TestModel(call_tools=[], custom_output_text="answer")
     agent = Agent(
         model,
         instructions="Seed instructions.",
         capabilities=[
             InstructionCapability("Capability guidance."),
             CallableInstructionCapability(lambda ctx: "Callable guidance."),
+            InstructionCapability(
+                "Deferred guidance.",
+                id="deferred-guidance",
+                description="Load deferred guidance.",
+                defer_loading=True,
+            ),
         ],
         name="apply-best",
     )
@@ -236,20 +242,31 @@ async def test_apply_best_yields_agent_with_candidate_capability() -> None:
     assert request.instructions.count("Run capability guidance.") == 1
     assert request.instructions.count("Callable guidance.") == 1
     assert request.instructions.count("Factory capability guidance.") == 1
+    assert "Deferred guidance." not in request.instructions
     assert request.instructions.count("Caller guidance.") == 1
     assert model.last_model_request_parameters is not None
-    [tool] = model.last_model_request_parameters.function_tools
+    tool = next(
+        tool
+        for tool in model.last_model_request_parameters.function_tools
+        if tool.name == "lookup"
+    )
     assert tool.description == "Look up the optimized value."
 
 
 @pytest.mark.asyncio
 async def test_apply_best_to_signature_retains_all_instruction_sources() -> None:
     agent = Agent(
-        TestModel(custom_output_text="answer"),
+        TestModel(call_tools=[], custom_output_text="answer"),
         instructions="Seed instructions.",
         capabilities=[
             InstructionCapability("Capability guidance."),
             CallableInstructionCapability(lambda ctx: "Callable guidance."),
+            InstructionCapability(
+                "Deferred guidance.",
+                id="deferred-guidance",
+                description="Load deferred guidance.",
+                defer_loading=True,
+            ),
         ],
         name="signature-apply-best",
     )
@@ -277,6 +294,7 @@ async def test_apply_best_to_signature_retains_all_instruction_sources() -> None
     assert request.instructions.count("Run capability guidance.") == 1
     assert request.instructions.count("Callable guidance.") == 1
     assert request.instructions.count("Factory capability guidance.") == 1
+    assert "Deferred guidance." not in request.instructions
     assert request.instructions.count("Answer a structured question.") == 1
     assert request.instructions.count("Caller guidance.") == 1
     assert applied.input_spec is signature_agent.input_spec

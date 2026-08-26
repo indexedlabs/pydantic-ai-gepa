@@ -21,6 +21,8 @@ async def resolved_capability_instructions(ctx: RunContext[Any]) -> str | None:
     """Render instructions after capability functions have resolved for a run."""
     rendered: list[str] = []
     for capability in ctx.capabilities.values():
+        if capability.defer_loading is True:
+            continue
         for instruction in _normalize_instructions(capability.get_instructions()):
             if isinstance(instruction, str):
                 rendered.append(instruction)
