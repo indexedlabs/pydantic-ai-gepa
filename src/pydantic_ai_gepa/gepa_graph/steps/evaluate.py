@@ -38,14 +38,14 @@ async def evaluate_step(ctx: StepContext[GepaState, GepaDeps, None]) -> None:
     if ctx.deps.memory_exporter is not None:
         from pathlib import Path
 
-        from ...trace_capabilities import select_spans_by_trace_id
+        from ...trace_capabilities import drain_spans_by_trace_id
 
         trace_ids = {
             trace_id
             for output in results.outputs
             if (trace_id := output.trace_id) is not None
         }
-        spans = select_spans_by_trace_id(ctx.deps.memory_exporter, trace_ids)
+        spans = drain_spans_by_trace_id(ctx.deps.memory_exporter, trace_ids)
         if spans:
             from ..proposal.trace_store import span_to_jsonl_line
 

@@ -20,7 +20,7 @@ from pydantic_ai_gepa.gepa_graph.proposal.instruction import (
     TrajectoryAnalysis,
 )
 from pydantic_ai_gepa.runner import optimize_agent
-from pydantic_ai_gepa.adapters.agent_adapter import AgentAdapterTrajectory
+from pydantic_ai_gepa.adapters.agent_adapter import AgentAdapter, AgentAdapterTrajectory
 from pydantic_ai_gepa.types import MetricResult, ReflectionConfig, RolloutOutput
 from pydantic_evals import Case
 
@@ -600,3 +600,36 @@ def test_cache_key_stability():
         # Should still get cache hit
         result = cache.get_cached_metric_result(case2, 0, output, candidate1)
         assert result == MetricResult(score=0.9, feedback="Good")
+
+
+@pytest.mark.asyncio
+async def test_cached_agent_run_does_not_replay_stale_trace_identity() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cache = CacheManager(cache_dir=tmpdir, enabled=True, verbose=False)
+        adapter = AgentAdapter(
+            agent=Agent(TestModel(custom_output_text="answer"), instructions="Base"),
+            metric=lambda case, output: MetricResult(score=1.0),
+            cache_manager=cache,
+        )
+        case = _prompt_case("Hello", name="trace-cache")
+        candidate = {
+            "instructions": ComponentValue(name="instructions", text="Optimized")
+        }
+
+        first = await adapter.process_case(
+            case,
+            0,
+            capture_traces=True,
+            candidate=candidate,
+        )
+        second = await adapter.process_case(
+            case,
+            0,
+            capture_traces=True,
+            candidate=candidate,
+        )
+
+        assert first["output"].trace_id is not None
+        assert second["output"].trace_id is None
+        assert second["output"].trace_completeness is None
+        assert second["trajectory"].trace_id is None

@@ -312,15 +312,6 @@ class ToolOptimizationManager:
             filtered[key] = value
         return filtered or None
 
-    async def _prepare_wrapper(
-        self, ctx: RunContext[Any], tool_defs: list[ToolDefinition]
-    ) -> list[ToolDefinition]:
-        return await self.prepare_tools(
-            ctx,
-            tool_defs,
-            candidate=self._candidate_var.get(),
-        )
-
     async def prepare_tools(
         self,
         ctx: RunContext[Any],
@@ -457,15 +448,6 @@ class OutputToolOptimizationManager:
             key: value for key, value in candidate.items() if key.startswith("output:")
         }
         return filtered or None
-
-    async def _prepare_wrapper(
-        self, ctx: RunContext[Any], tool_defs: list[ToolDefinition]
-    ) -> list[ToolDefinition]:
-        return await self.prepare_output_tools(
-            ctx,
-            tool_defs,
-            candidate=self._candidate_var.get(),
-        )
 
     async def prepare_output_tools(
         self,

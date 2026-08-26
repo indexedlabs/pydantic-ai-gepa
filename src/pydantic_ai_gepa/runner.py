@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Mapping, cast
 
@@ -17,8 +17,7 @@ from pydantic_graph import EndMarker, GraphTask
 from .adapters.agent_adapter import create_adapter
 from .cache import CacheManager
 from .components import (
-    apply_candidate_to_agent,
-    apply_candidate_to_agent_and_input_type,
+    applied_candidate_agent,
     ensure_component_values,
     extract_seed_candidate_with_input_type,
 )
@@ -34,7 +33,7 @@ from .gepa_graph.models import (
     GepaResult,
     GepaState,
 )
-from .input_type import InputSpec
+from .input_type import InputSpec, build_input_spec
 from .reflection import ReflectionSampler
 from .skills import SkillsFS
 from .skills.models import SkillCapability
@@ -88,17 +87,20 @@ class GepaOptimizationResult(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     @contextmanager
-    def apply_best(self, agent: AbstractAgent[Any, Any]) -> Iterator[None]:
+    def apply_best(
+        self, agent: AbstractAgent[Any, Any]
+    ) -> Iterator[AbstractAgent[Any, Any]]:
         """Apply the best candidate to an agent as a context manager.
 
         Args:
             agent: The agent to apply the best candidate to.
 
         Yields:
-            None while the context is active.
+            An agent view that injects optimized tool/output components as a
+            run-scoped Pydantic AI capability. Use the yielded agent for runs.
         """
-        with apply_candidate_to_agent(agent, self.best_candidate):
-            yield
+        with applied_candidate_agent(agent, self.best_candidate) as applied_agent:
+            yield applied_agent
 
     def improvement_ratio(self) -> float | None:
         """Calculate the improvement ratio from original to best.
@@ -116,7 +118,7 @@ class GepaOptimizationResult(BaseModel):
         *,
         agent: AbstractAgent[Any, Any],
         input_type: InputSpec[BaseModel] | None = None,
-    ) -> Iterator[None]:
+    ) -> Iterator[AbstractAgent[Any, Any]]:
         """Apply the best candidate to an agent and optional signature.
 
         Args:
@@ -124,12 +126,17 @@ class GepaOptimizationResult(BaseModel):
             input_type: Optional structured input specification to also apply the candidate to.
 
         Yields:
-            None while the context is active.
+            The candidate-applied agent to use for runs.
         """
-        with apply_candidate_to_agent_and_input_type(
-            self.best_candidate, agent=agent, input_type=input_type
-        ):
-            yield
+        with ExitStack() as stack:
+            applied_agent = stack.enter_context(
+                applied_candidate_agent(agent, self.best_candidate)
+            )
+            if input_type is not None:
+                stack.enter_context(
+                    build_input_spec(input_type).apply_candidate(self.best_candidate)
+                )
+            yield applied_agent
 
 
 async def optimize_agent(
@@ -370,6 +377,7 @@ async def optimize_agent(
         config,
         seed_candidate=normalized_seed_candidate,
         memory_exporter=memory_exporter,
+        trace_collector=adapter.trace_collector,
     )
     if deterministic_proposer is not None:
         deps.proposal_generator = deterministic_proposer
@@ -433,6 +441,8 @@ async def optimize_agent(
             exception=exc,
         )
         return _fallback_result(normalized_seed_candidate)
+    finally:
+        adapter.trace_collector.shutdown()
 
     if gepa_result is None:
         raise RuntimeError("GEPA optimization did not produce a result.")

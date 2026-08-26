@@ -10,11 +10,13 @@ import pytest
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.messages import ModelRequest
+from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart
+from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import ToolDefinition
 
-from pydantic_ai_gepa import SignatureAgent
+from pydantic_ai_gepa import GepaOptimizationResult, SignatureAgent
+from pydantic_ai_gepa.gepa_graph.models import ComponentValue
 from pydantic_ai_gepa.tool_components import (
     GepaCandidateCapability,
     ToolOptimizationManager,
@@ -23,6 +25,7 @@ from pydantic_ai_gepa.tool_components import (
 from pydantic_ai_gepa.trace_capabilities import (
     GepaTraceCollector,
     GepaTraceContext,
+    drain_spans_by_trace_id,
 )
 
 
@@ -83,6 +86,50 @@ async def test_candidate_capabilities_are_isolated_across_concurrent_runs() -> N
     )
 
 
+@pytest.mark.asyncio
+async def test_signature_candidate_capabilities_are_isolated_in_concurrent_runs() -> (
+    None
+):
+    observations: dict[str, str | None] = {}
+
+    async def capture_model(messages: list[Any], info: Any) -> ModelResponse:
+        await asyncio.sleep(0)
+        message_text = str(messages)
+        case_name = "first" if "first" in message_text else "second"
+        [tool] = info.function_tools
+        observations[case_name] = tool.description
+        return ModelResponse(parts=[TextPart(content="answer")])
+
+    agent = Agent(FunctionModel(capture_model), name="concurrent-signature")
+
+    @agent.tool_plain
+    def lookup(query: str) -> str:
+        """Look up a value."""
+        return query
+
+    signature_agent = SignatureAgent(
+        agent,
+        input_type=SignatureInput,
+        output_type=str,
+        optimize_tools=True,
+    )
+    await asyncio.gather(
+        signature_agent.run_signature(
+            SignatureInput(question="first"),
+            candidate={"tool:lookup:description": "First run lookup."},
+        ),
+        signature_agent.run_signature(
+            SignatureInput(question="second"),
+            candidate={"tool:lookup:description": "Second run lookup."},
+        ),
+    )
+
+    assert observations == {
+        "first": "First run lookup.",
+        "second": "Second run lookup.",
+    }
+
+
 def test_optimizer_setup_does_not_mutate_pydantic_ai_capability_internals() -> None:
     agent = Agent(TestModel(), name="private-boundary")
     root_capability = agent._root_capability
@@ -107,6 +154,86 @@ class RecordingCapability(AbstractCapability[Any]):
                 "metadata": ctx.metadata,
             }
         )
+
+
+@dataclass
+class InstructionCapability(AbstractCapability[Any]):
+    instruction: str
+
+    def get_instructions(self):
+        return [self.instruction]
+
+
+def _optimization_result(candidate: dict[str, str]) -> GepaOptimizationResult:
+    components = {
+        name: ComponentValue(name=name, text=text) for name, text in candidate.items()
+    }
+    return GepaOptimizationResult(
+        best_candidate=components,
+        best_score=1.0,
+        original_candidate={},
+        original_score=0.0,
+        num_iterations=1,
+        num_metric_calls=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_apply_best_yields_agent_with_candidate_capability() -> None:
+    model = TestModel(custom_output_text="answer")
+    agent = Agent(model, instructions="Seed instructions.", name="apply-best")
+
+    @agent.tool_plain
+    def lookup(query: str) -> str:
+        """Look up the original value."""
+        return query
+
+    get_or_create_tool_optimizer(agent)
+    result = _optimization_result(
+        {
+            "instructions": "Optimized instructions.",
+            "tool:lookup:description": "Look up the optimized value.",
+        }
+    )
+
+    with result.apply_best(agent) as optimized_agent:
+        run_result = await optimized_agent.run("question")
+
+    request = run_result.all_messages()[0]
+    assert isinstance(request, ModelRequest)
+    assert request.instructions == "Optimized instructions."
+    assert model.last_model_request_parameters is not None
+    [tool] = model.last_model_request_parameters.function_tools
+    assert tool.description == "Look up the optimized value."
+
+
+@pytest.mark.asyncio
+async def test_apply_best_to_signature_retains_all_instruction_sources() -> None:
+    agent = Agent(
+        TestModel(custom_output_text="answer"),
+        instructions="Seed instructions.",
+        capabilities=[InstructionCapability("Capability guidance.")],
+        name="signature-apply-best",
+    )
+    signature_agent = SignatureAgent(agent, input_type=SignatureInput, output_type=str)
+    result = _optimization_result({"instructions": "Optimized instructions."})
+
+    with result.apply_best_to(
+        agent=signature_agent, input_type=SignatureInput
+    ) as applied:
+        assert applied is signature_agent
+        run_result = await signature_agent.run_signature(
+            SignatureInput(question="Why?"),
+            instructions="Caller guidance.",
+        )
+
+    request = run_result.all_messages()[0]
+    assert isinstance(request, ModelRequest)
+    assert request.instructions is not None
+    assert "Optimized instructions." in request.instructions
+    assert "Capability guidance." in request.instructions
+    assert "Answer a structured question." in request.instructions
+    assert "Caller guidance." in request.instructions
 
 
 @pytest.mark.asyncio
@@ -179,6 +306,9 @@ async def test_trace_collector_correlates_participating_nested_agent() -> None:
         and format(span.context.trace_id, "032x") == context.trace_id
         for span in spans
     )
+    drained = drain_spans_by_trace_id(collector.exporter, {context.trace_id})
+    assert drained == spans
+    assert collector.exporter.get_finished_spans() == ()
 
 
 @pytest.mark.asyncio

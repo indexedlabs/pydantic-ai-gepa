@@ -57,6 +57,7 @@ async def optimize(
             config,
             seed_candidate=normalized_seed,
             memory_exporter=memory_exporter,
+            trace_collector=trace_collector,
         )
     else:
         resolved_deps = deps

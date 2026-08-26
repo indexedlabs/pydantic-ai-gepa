@@ -187,6 +187,7 @@ class _StubProposalGenerator(InstructionProposalGenerator):
         model_settings: Any = None,
         example_bank: Any = None,
         component_toolsets: Any = None,
+        capabilities: Any = None,
     ) -> ProposalResult:
         self.calls += 1
         self.last_reflective_data = reflective_data
@@ -460,6 +461,7 @@ async def test_reflect_step_skips_candidate_eval_on_noop_proposal() -> None:
             model_settings: Any = None,
             example_bank: Any = None,
             component_toolsets: Any = None,
+            capabilities: Any = None,
         ) -> ProposalResult:
             self.calls += 1
             self.last_reflective_data = reflective_data

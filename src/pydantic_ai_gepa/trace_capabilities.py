@@ -22,6 +22,7 @@ from pydantic_ai.models.instrumented import InstrumentationSettings
 from pydantic_ai.run import AgentRunResult
 
 TraceCompleteness = Literal["root-only", "full"]
+DEFAULT_MAX_RETAINED_SPANS = 100_000
 
 
 def select_spans_by_trace_id(
@@ -29,12 +30,27 @@ def select_spans_by_trace_id(
     trace_ids: set[str],
 ) -> tuple[ReadableSpan, ...]:
     """Select finished spans without clearing or timing-partitioning the exporter."""
-    numeric_trace_ids = {int(trace_id, 16) for trace_id in trace_ids}
+    numeric_trace_ids: set[int] = set()
+    for trace_id in trace_ids:
+        try:
+            numeric_trace_ids.add(int(trace_id, 16))
+        except ValueError:
+            continue
     return tuple(
         span
         for span in exporter.get_finished_spans()
         if span.context is not None and span.context.trace_id in numeric_trace_ids
     )
+
+
+def drain_spans_by_trace_id(
+    exporter: InMemorySpanExporter,
+    trace_ids: set[str],
+) -> tuple[ReadableSpan, ...]:
+    """Select one completed batch and release all retained batch spans."""
+    spans = select_spans_by_trace_id(exporter, trace_ids)
+    exporter.clear()
+    return spans
 
 
 @dataclass(slots=True)
@@ -96,8 +112,13 @@ class GepaTraceContextCapability(AbstractCapability[Any]):
 class GepaTraceCollector:
     """Own an isolated tracer provider and select spans by correlated trace ID."""
 
-    def __init__(self, *, include_content: bool = True) -> None:
-        self._exporter = InMemorySpanExporter()
+    def __init__(
+        self,
+        *,
+        include_content: bool = True,
+        max_retained_spans: int = DEFAULT_MAX_RETAINED_SPANS,
+    ) -> None:
+        self._exporter = InMemorySpanExporter(max_spans=max_retained_spans)
         self._provider = TracerProvider()
         self._provider.add_span_processor(SimpleSpanProcessor(self._exporter))
         self._settings = InstrumentationSettings(

@@ -428,10 +428,23 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         run_instructions: AgentInstructions[AgentDepsT] | None,
     ):
         """Replace only literal base instructions for an optimized candidate."""
-        if not candidate or "instructions" not in candidate:
+        has_contextual_override = self._has_instruction_override()
+        if (
+            not (candidate and "instructions" in candidate)
+            and not has_contextual_override
+        ):
             return nullcontext()
-        _, instruction_functions = self._resolve_base_instructions_split()
-        override: list[Any] = [candidate["instructions"], *instruction_functions]
+        base_literal, instruction_functions = self._resolve_base_instructions_split()
+        optimized_literal = (
+            candidate["instructions"]
+            if candidate and "instructions" in candidate
+            else base_literal
+        )
+        override: list[Any] = []
+        if optimized_literal is not None:
+            override.append(optimized_literal)
+        override.extend(instruction_functions)
+        override.extend(self._base_capability_instructions())
         if run_instructions is not None:
             if isinstance(run_instructions, Sequence) and not isinstance(
                 run_instructions, str
@@ -442,12 +455,38 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         instructions: Any = override[0] if len(override) == 1 else tuple(override)
         return self.wrapped.override(instructions=instructions)
 
-    @staticmethod
+    def _has_instruction_override(self) -> bool:
+        agent: AbstractAgent[Any, Any] | WrapperAgent[Any, Any] = self.wrapped
+        while True:
+            override_manager = getattr(agent, "_override_instructions", None)
+            if override_manager is not None:
+                override = override_manager.get()
+                if override is not None and override.value is not None:
+                    return True
+            if isinstance(agent, WrapperAgent):
+                agent = agent.wrapped
+                continue
+            return False
+
+    def _base_capability_instructions(self) -> list[Any]:
+        agent: AbstractAgent[Any, Any] | WrapperAgent[Any, Any] = self.wrapped
+        while isinstance(agent, WrapperAgent):
+            agent = agent.wrapped
+        instructions = agent.root_capability.get_instructions()
+        if instructions is None:
+            return []
+        if isinstance(instructions, Sequence) and not isinstance(instructions, str):
+            return list(instructions)
+        return [instructions]
+
     def _instructions_argument(
+        self,
         candidate: dict[str, str] | None,
         run_instructions: AgentInstructions[AgentDepsT] | None,
     ) -> AgentInstructions[AgentDepsT] | None:
-        if candidate and "instructions" in candidate:
+        if (
+            candidate and "instructions" in candidate
+        ) or self._has_instruction_override():
             return None
         return run_instructions
 

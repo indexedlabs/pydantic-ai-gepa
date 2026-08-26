@@ -15,6 +15,7 @@ from .selectors import BatchSampler, CandidateSelector, ComponentSelector
 
 if TYPE_CHECKING:
     from ..adapter import Adapter
+    from ..trace_capabilities import GepaTraceCollector
     from .proposal import InstructionProposalGenerator, MergeProposalBuilder
 
 
@@ -34,3 +35,4 @@ class GepaDeps:
     model_settings: ModelSettings | None = None
     seed_candidate: CandidateMap | None = None
     memory_exporter: InMemorySpanExporter | None = None
+    trace_collector: "GepaTraceCollector | None" = None

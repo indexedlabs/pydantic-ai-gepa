@@ -21,6 +21,7 @@ from ..types import DEFAULT_MAX_SPAWNED_AGENTS, DEFAULT_REFLECTION_REQUEST_LIMIT
 
 if TYPE_CHECKING:
     from ..adapter import Adapter
+    from ..trace_capabilities import GepaTraceCollector
 
 
 def create_deps(
@@ -29,6 +30,7 @@ def create_deps(
     *,
     seed_candidate: CandidateMap | None = None,
     memory_exporter: "Any" = None,
+    trace_collector: "GepaTraceCollector | None" = None,
 ) -> GepaDeps:
     """Construct :class:`GepaDeps` instances for a GEPA run.
 
@@ -38,6 +40,7 @@ def create_deps(
         seed_candidate: Optional initial candidate mapping injected into ``GepaDeps``
             for consumption by :class:`StartStep`.
         memory_exporter: Optional InMemorySpanExporter used for capturing OTel traces.
+        trace_collector: Optional run-owned collector for reflector instrumentation.
     """
     from .proposal import InstructionProposalGenerator, MergeProposalBuilder
 
@@ -84,6 +87,7 @@ def create_deps(
         model_settings=reflection_model_settings,
         seed_candidate=seed_candidate,
         memory_exporter=memory_exporter,
+        trace_collector=trace_collector,
     )
 
 

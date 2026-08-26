@@ -12,6 +12,7 @@ from typing import Any, Mapping, Sequence, cast
 import logfire
 from pydantic_graph import StepContext
 from pydantic_ai import FunctionToolset
+from pydantic_ai.capabilities import AgentCapability
 from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.models import KnownModelName, Model
 from pydantic_ai.settings import ModelSettings
@@ -28,6 +29,7 @@ from ..deps import GepaDeps
 from ..evaluation import EvaluationResults
 from ..models import CandidateMap, CandidateProgram, ComponentValue, GepaState
 from ..proposal.instruction import ProposalResult
+from ...trace_capabilities import GepaTraceContext, drain_spans_by_trace_id
 from ...skill_components import (
     apply_candidate_to_skills,
     materialize_skill_components_for_path,
@@ -216,6 +218,19 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
         eval_results=parent_results,
         components=components_for_dataset,
     )
+    reflector_trace_context: GepaTraceContext | None = None
+    reflector_capabilities: Sequence[AgentCapability[object]] | None = None
+    if deps.trace_collector is not None:
+        reflector_trace_context = GepaTraceContext(
+            gepa_run_id=state.run_id,
+            candidate_id=str(parent_idx),
+            case_id=f"reflection-{state.iteration}",
+            agent_run_id=f"gepa-reflector-{state.iteration}-{parent_idx}",
+        )
+        reflector_capabilities = cast(
+            Sequence[AgentCapability[object]],
+            deps.trace_collector.capabilities(reflector_trace_context),
+        )
     with logfire.span(
         "propose new texts",
         parent_idx=parent_idx,
@@ -232,7 +247,30 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
             model=reflection_model,
             model_settings=deps.model_settings,
             component_toolsets=component_toolsets if component_toolsets else None,
+            capabilities=reflector_capabilities,
         )
+
+        if deps.trace_collector is not None and reflector_trace_context is not None:
+            deps.trace_collector.spans_for(reflector_trace_context)
+            if reflector_trace_context.trace_id is not None:
+                spans = drain_spans_by_trace_id(
+                    deps.trace_collector.exporter,
+                    {reflector_trace_context.trace_id},
+                )
+                if spans:
+                    from ..proposal.trace_store import span_to_jsonl_line
+
+                    reflector_dir = Path(
+                        f".gepa_cache/runs/{state.run_id}/candidates/{parent_idx}/reflector_traces"
+                    )
+                    reflector_dir.mkdir(parents=True, exist_ok=True)
+                    with open(
+                        reflector_dir / "traces.jsonl",
+                        "a",
+                        encoding="utf-8",
+                    ) as reflector_file:
+                        for span in spans:
+                            reflector_file.write(span_to_jsonl_line(span))
 
         component_metadata = (
             proposal_result.component_metadata
@@ -394,7 +432,7 @@ async def _evaluate_minibatch(
     if capture_traces and deps.memory_exporter is not None:
         from pathlib import Path
 
-        from ...trace_capabilities import select_spans_by_trace_id
+        from ...trace_capabilities import drain_spans_by_trace_id
 
         trace_ids = {
             trace_id
@@ -406,7 +444,7 @@ async def _evaluate_minibatch(
             for output in results.outputs
             if (trace_id := output.trace_id) is not None
         )
-        spans = select_spans_by_trace_id(deps.memory_exporter, trace_ids)
+        spans = drain_spans_by_trace_id(deps.memory_exporter, trace_ids)
         if spans:
             from ..proposal.trace_store import span_to_jsonl_line
 
@@ -791,6 +829,7 @@ async def _propose_new_texts(
     model: Model | KnownModelName | str,
     model_settings: ModelSettings | None = None,
     component_toolsets: Sequence[AbstractToolset[object]] | None = None,
+    capabilities: Sequence[AgentCapability[object]] | None = None,
 ) -> ProposalResult:
     proposal = deps.proposal_generator
     kwargs: dict[str, Any] = dict(
@@ -808,6 +847,13 @@ async def _propose_new_texts(
             for p in propose_sig.parameters.values()
         ):
             kwargs["component_toolsets"] = component_toolsets
+    if capabilities is not None:
+        propose_sig = inspect.signature(proposal.propose_texts)
+        if "capabilities" in propose_sig.parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in propose_sig.parameters.values()
+        ):
+            kwargs["capabilities"] = capabilities
 
     return await proposal.propose_texts(**kwargs)
 

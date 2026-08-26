@@ -10,6 +10,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent, UsageLimits
+from pydantic_ai.capabilities import AgentCapability
 from pydantic_ai.models import KnownModelName, Model
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.toolsets import AbstractToolset
@@ -338,6 +339,7 @@ class InstructionProposalGenerator:
         model_settings: ModelSettings | None = None,
         example_bank: InMemoryExampleBank | None = None,
         component_toolsets: Sequence[AbstractToolset[object]] | None = None,
+        capabilities: Sequence[AgentCapability[object]] | None = None,
     ) -> ProposalResult:
         """Propose new texts for each component via the structured agent.
 
@@ -432,6 +434,7 @@ class InstructionProposalGenerator:
                         toolsets=toolsets if toolsets else None,
                         instructions=runtime_instructions,
                         usage_limits=UsageLimits(request_limit=self._request_limit),
+                        capabilities=capabilities,
                     )
                     break
                 except ClearMessageHistoryException as e:

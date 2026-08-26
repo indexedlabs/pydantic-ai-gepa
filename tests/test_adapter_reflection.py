@@ -183,3 +183,26 @@ async def test_run_with_trace_returns_trajectory_on_usage_limit() -> None:
     record = trajectory.to_reflective_record()
     assert record["messages"], "reflective record should include serialized messages"
     assert "request_limit" in (record["error"] or "")
+
+
+@pytest.mark.asyncio
+async def test_metric_failure_retains_completed_run_trace_identity() -> None:
+    agent = Agent(TestModel(custom_output_text="answer"), instructions="Base")
+
+    def failing_metric(case: Case[Any, Any, Any], output: RolloutOutput[Any]):
+        raise RuntimeError("metric failed")
+
+    adapter = AgentAdapter(agent=agent, metric=failing_metric)
+    result = await adapter.process_case(
+        Case(name="metric-failure", inputs="Hello", metadata={}),
+        0,
+        capture_traces=True,
+        candidate=_candidate_map("Base"),
+    )
+
+    output = result["output"]
+    assert output.success is False
+    assert output.error_kind == "tool"
+    assert output.trace_id is not None
+    assert output.trace_completeness == "root-only"
+    assert result["trajectory"].trace_id == output.trace_id

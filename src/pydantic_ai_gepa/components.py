@@ -13,12 +13,36 @@ from .gepa_graph.models import CandidateMap, ComponentValue
 from .input_type import InputSpec, build_input_spec
 from .signature_agent import SignatureAgent
 from .tool_components import (
+    build_candidate_capability,
     get_tool_optimizer,
     get_output_tool_optimizer,
 )
 
 if TYPE_CHECKING:
     from pydantic_ai.agent import AbstractAgent
+
+
+class AppliedCandidateAgent(WrapperAgent[Any, Any]):
+    """Agent view that injects an optimized candidate as a run capability."""
+
+    def __init__(
+        self,
+        wrapped: AbstractAgent[Any, Any],
+        candidate: CandidateMap,
+    ) -> None:
+        super().__init__(wrapped)
+        self._candidate_capability = build_candidate_capability(wrapped, candidate)
+
+    def iter(self, *args: Any, **kwargs: Any):
+        """Forward a run while adding the candidate capability."""
+        capabilities: list[Any] = list(kwargs.pop("capabilities", None) or ())
+        if self._candidate_capability is not None:
+            capabilities.append(self._candidate_capability)
+        return self.wrapped.iter(
+            *args,
+            capabilities=tuple(capabilities) or None,
+            **kwargs,
+        )
 
 
 def ensure_component_values(
@@ -176,6 +200,22 @@ def apply_candidate_to_agent(
             )
             stack.enter_context(target_agent.override(instructions=override_payload))
         yield
+
+
+@contextmanager
+def applied_candidate_agent(
+    agent: AbstractAgent[Any, Any],
+    candidate: CandidateMap | None,
+) -> Iterator[AbstractAgent[Any, Any]]:
+    """Yield an agent view that applies every candidate component per run."""
+    candidate_map = candidate or {}
+    with apply_candidate_to_agent(agent, candidate_map):
+        if isinstance(agent, SignatureAgent):
+            # SignatureAgent already adds the contextual candidate capability
+            # in run_signature(), while retaining its signature-specific API.
+            yield agent
+        else:
+            yield AppliedCandidateAgent(agent, candidate_map)
 
 
 def get_component_names(

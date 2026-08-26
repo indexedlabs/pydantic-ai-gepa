@@ -8,11 +8,11 @@ import inspect
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import ExitStack
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import json
 import os
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, cast
 from uuid import uuid4
 
 import logfire
@@ -798,6 +798,8 @@ class _BaseAgentAdapter(
     ) -> dict[str, Any]:
         """Process a single Case and return the metric evaluation."""
         metric_result: MetricResult | None = None
+        output: RolloutOutput[Any] | None = None
+        trajectory: AgentAdapterTrajectory | None = None
         case_name = self._case_identifier(case, case_index)
         try:
             if self.cache_manager and candidate:
@@ -810,7 +812,23 @@ class _BaseAgentAdapter(
                 )
 
                 if cached_agent_result is not None:
-                    trajectory, output = cached_agent_result
+                    cached_trajectory, output = cached_agent_result
+                    trajectory = cast(
+                        AgentAdapterTrajectory | None,
+                        cached_trajectory,
+                    )
+                    output = replace(
+                        output,
+                        trace_id=None,
+                        trace_completeness=None,
+                    )
+                    if trajectory is not None:
+                        trajectory = replace(
+                            trajectory,
+                            trace_id=None,
+                            root_span_id=None,
+                            trace_completeness=None,
+                        )
                 else:
                     if capture_traces:
                         trajectory, output = await self._run_with_trace(
@@ -908,8 +926,12 @@ class _BaseAgentAdapter(
                 candidate_keys=sorted(candidate.keys()) if candidate else None,
                 exc_info=True,
             )
-            output = RolloutOutput.from_error(exc, kind=error_kind)
-            trajectory = (
+            failed_output = RolloutOutput.from_error(exc, kind=error_kind)
+            if output is not None:
+                failed_output.trace_id = output.trace_id
+                failed_output.trace_completeness = output.trace_completeness
+            output = failed_output
+            failed_trajectory = (
                 AgentAdapterTrajectory(
                     messages=[],
                     instructions=None,
@@ -923,6 +945,11 @@ class _BaseAgentAdapter(
                 if capture_traces and error_kind == "tool"
                 else None
             )
+            if failed_trajectory is not None and trajectory is not None:
+                failed_trajectory.trace_id = trajectory.trace_id
+                failed_trajectory.root_span_id = trajectory.root_span_id
+                failed_trajectory.trace_completeness = trajectory.trace_completeness
+            trajectory = failed_trajectory
             error_result: dict[str, Any] = {
                 "output": output,
                 "score": 0.0,
