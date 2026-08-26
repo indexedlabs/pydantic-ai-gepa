@@ -86,6 +86,7 @@ class GepaEngine:
             gepa_config,
             seed_candidate=seed_candidate,
             memory_exporter=None,
+            trace_collector=adapter.trace_collector,
         )
         graph = create_gepa_graph(config=gepa_config)
         # Reserve before the graph can invoke a rollout. The graph's own cap
@@ -106,6 +107,8 @@ class GepaEngine:
         except UsageBudgetExceeded:
             state.mark_stopped(reason="Usage budget exceeded")
             gepa_result = GepaResult.from_state(state)
+        finally:
+            adapter.close()
 
         num_metric_calls = state.total_evaluations
         history: list[EngineEvent] = []

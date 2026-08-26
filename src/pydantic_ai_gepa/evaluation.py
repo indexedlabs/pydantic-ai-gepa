@@ -136,6 +136,7 @@ async def evaluate_candidate_dataset(
 
         eval_span.set_attribute("logfire.experiment.metadata", experiment_metadata)
 
+    adapter.close()
     return records
 
 

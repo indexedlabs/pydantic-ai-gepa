@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel
 from pydantic_ai.agent.wrapper import WrapperAgent
 
-from .gepa_graph.models import CandidateMap, ComponentValue
+from .gepa_graph.models import CandidateMap, ComponentValue, candidate_texts
 from .input_type import InputSpec, build_input_spec
 from .signature_agent import SignatureAgent
 from .tool_components import (
@@ -31,6 +31,7 @@ class AppliedCandidateAgent(WrapperAgent[Any, Any]):
         candidate: CandidateMap,
     ) -> None:
         super().__init__(wrapped)
+        self._candidate = candidate_texts(candidate)
         self._candidate_capability = build_candidate_capability(wrapped, candidate)
 
     def iter(self, *args: Any, **kwargs: Any):
@@ -85,13 +86,28 @@ class AppliedCandidateAgent(WrapperAgent[Any, Any]):
         """Forward SignatureAgent's structured run API when available."""
         if not isinstance(self.wrapped, SignatureAgent):
             raise AttributeError("Wrapped agent does not support run_signature()")
+        kwargs.setdefault("candidate", self._candidate)
         return await self.wrapped.run_signature(*args, **kwargs)
 
     def run_signature_sync(self, *args: Any, **kwargs: Any):
         """Forward SignatureAgent's synchronous structured run API."""
         if not isinstance(self.wrapped, SignatureAgent):
             raise AttributeError("Wrapped agent does not support run_signature_sync()")
+        kwargs.setdefault("candidate", self._candidate)
         return self.wrapped.run_signature_sync(*args, **kwargs)
+
+    def run_signature_stream(self, *args: Any, **kwargs: Any):
+        """Forward SignatureAgent's structured streaming API."""
+        if not isinstance(self.wrapped, SignatureAgent):
+            raise AttributeError(
+                "Wrapped agent does not support run_signature_stream()"
+            )
+        kwargs.setdefault("candidate", self._candidate)
+        return self.wrapped.run_signature_stream(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        """Expose wrapped-agent extensions such as SignatureAgent.input_spec."""
+        return getattr(self.wrapped, name)
 
 
 def _normalized_instructions(instructions: Any) -> list[Any]:
@@ -265,12 +281,14 @@ def apply_candidate_to_agent(
         if output_optimizer:
             stack.enter_context(output_optimizer.candidate_context(candidate_map))
         override_value: list[Any] = []
-        if instructions:
+        if instructions_value is not None:
             override_value.append(instructions)
-        override_value.extend(instruction_callbacks)
-        override_value.extend(
-            _normalized_instructions(target_agent.root_capability.get_instructions())
-        )
+            override_value.extend(instruction_callbacks)
+            override_value.extend(
+                _normalized_instructions(
+                    target_agent.root_capability.get_instructions()
+                )
+            )
         if override_value:
             override_payload: Any = (
                 override_value[0] if len(override_value) == 1 else tuple(override_value)

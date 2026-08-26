@@ -211,10 +211,10 @@ async def test_apply_best_yields_agent_with_candidate_capability() -> None:
     request = run_result.all_messages()[0]
     assert isinstance(request, ModelRequest)
     assert request.instructions is not None
-    assert "Optimized instructions." in request.instructions
-    assert "Capability guidance." in request.instructions
-    assert "Run capability guidance." in request.instructions
-    assert "Caller guidance." in request.instructions
+    assert request.instructions.count("Optimized instructions.") == 1
+    assert request.instructions.count("Capability guidance.") == 1
+    assert request.instructions.count("Run capability guidance.") == 1
+    assert request.instructions.count("Caller guidance.") == 1
     assert model.last_model_request_parameters is not None
     [tool] = model.last_model_request_parameters.function_tools
     assert tool.description == "Look up the optimized value."
@@ -244,11 +244,41 @@ async def test_apply_best_to_signature_retains_all_instruction_sources() -> None
     request = run_result.all_messages()[0]
     assert isinstance(request, ModelRequest)
     assert request.instructions is not None
-    assert "Optimized instructions." in request.instructions
-    assert "Capability guidance." in request.instructions
-    assert "Run capability guidance." in request.instructions
-    assert "Answer a structured question." in request.instructions
-    assert "Caller guidance." in request.instructions
+    assert request.instructions.count("Optimized instructions.") == 1
+    assert request.instructions.count("Capability guidance.") == 1
+    assert request.instructions.count("Run capability guidance.") == 1
+    assert request.instructions.count("Answer a structured question.") == 1
+    assert request.instructions.count("Caller guidance.") == 1
+    assert applied.input_spec is signature_agent.input_spec
+    assert callable(applied.run_signature_stream)
+
+
+@pytest.mark.asyncio
+async def test_tool_only_candidate_preserves_seed_and_capability_instructions() -> None:
+    model = TestModel(custom_output_text="answer")
+    agent = Agent(
+        model,
+        instructions="Seed instructions.",
+        capabilities=[InstructionCapability("Capability guidance.")],
+    )
+
+    @agent.tool_plain
+    def lookup(query: str) -> str:
+        """Original lookup."""
+        return query
+
+    get_or_create_tool_optimizer(agent)
+    result = _optimization_result({"tool:lookup:description": "Optimized lookup."})
+
+    with result.apply_best(agent) as applied:
+        run_result = await applied.run("question")
+
+    request = run_result.all_messages()[0]
+    assert isinstance(request, ModelRequest)
+    assert request.instructions == "Seed instructions.\nCapability guidance."
+    assert model.last_model_request_parameters is not None
+    [tool] = model.last_model_request_parameters.function_tools
+    assert tool.description == "Optimized lookup."
 
 
 @pytest.mark.asyncio
