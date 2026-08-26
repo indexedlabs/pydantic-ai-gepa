@@ -22,13 +22,13 @@ class ExampleInput(BaseModel):
     )
 
 
-def create_example_bank_tools(bank: InMemoryExampleBank) -> FunctionToolset:
+def create_example_bank_tools(bank: InMemoryExampleBank) -> FunctionToolset[object]:
     """Create tools for the reflection agent to manage examples.
 
     These tools allow the reflection agent to iteratively curate the example
     bank by adding, removing, and testing examples.
     """
-    toolset: FunctionToolset[None] = FunctionToolset()
+    toolset: FunctionToolset[object] = FunctionToolset()
 
     @toolset.tool_plain
     def add_example(title: str, keywords: list[str], content: str) -> str:

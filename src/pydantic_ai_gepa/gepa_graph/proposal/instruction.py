@@ -10,6 +10,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent, UsageLimits
+from pydantic_ai.capabilities import AgentCapability
 from pydantic_ai.models import KnownModelName, Model
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.toolsets import AbstractToolset
@@ -212,7 +213,9 @@ def _toolset_has_tool(toolset: object, tool_name: str) -> bool:
     return False
 
 
-def _skills_tools_enabled(component_toolsets: Sequence[AbstractToolset[None]]) -> bool:
+def _skills_tools_enabled(
+    component_toolsets: Sequence[AbstractToolset[object]],
+) -> bool:
     # Detect whether the reflection toolset included skills tools (which only happens
     # when `skills` is enabled in the runner).
     return any(
@@ -227,7 +230,9 @@ def _skills_tools_enabled(component_toolsets: Sequence[AbstractToolset[None]]) -
     )
 
 
-def _trace_tools_enabled(component_toolsets: Sequence[AbstractToolset[None]]) -> bool:
+def _trace_tools_enabled(
+    component_toolsets: Sequence[AbstractToolset[object]],
+) -> bool:
     # Trace tools are only attached when the run has span files on disk; their
     # absence means the adapter produced no instrumented traces.
     return any(
@@ -235,7 +240,9 @@ def _trace_tools_enabled(component_toolsets: Sequence[AbstractToolset[None]]) ->
     )
 
 
-def _journal_tools_enabled(component_toolsets: Sequence[AbstractToolset[None]]) -> bool:
+def _journal_tools_enabled(
+    component_toolsets: Sequence[AbstractToolset[object]],
+) -> bool:
     return any(
         _toolset_has_tool(toolset, "read_journal_entries")
         or _toolset_has_tool(toolset, "append_journal_entry")
@@ -331,7 +338,8 @@ class InstructionProposalGenerator:
         model: Model | KnownModelName | str,
         model_settings: ModelSettings | None = None,
         example_bank: InMemoryExampleBank | None = None,
-        component_toolsets: Sequence[AbstractToolset[None]] | None = None,
+        component_toolsets: Sequence[AbstractToolset[object]] | None = None,
+        capabilities: Sequence[AgentCapability[object]] | None = None,
     ) -> ProposalResult:
         """Propose new texts for each component via the structured agent.
 
@@ -380,7 +388,7 @@ class InstructionProposalGenerator:
         )
 
         try:
-            toolsets: list[AbstractToolset[None]] = []
+            toolsets: list[AbstractToolset[object]] = []
             runtime_instructions_parts: list[str] = []
             if example_bank is not None:
                 toolsets.append(create_example_bank_tools(example_bank))
@@ -426,6 +434,7 @@ class InstructionProposalGenerator:
                         toolsets=toolsets if toolsets else None,
                         instructions=runtime_instructions,
                         usage_limits=UsageLimits(request_limit=self._request_limit),
+                        capabilities=capabilities,
                     )
                     break
                 except ClearMessageHistoryException as e:

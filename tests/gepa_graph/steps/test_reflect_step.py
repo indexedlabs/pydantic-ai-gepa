@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 import pytest
-from pydantic_graph.beta import StepContext
+from pydantic_graph import StepContext
 from pydantic_evals import Case
 
 from pydantic_ai_gepa.adapter import (
@@ -187,6 +187,7 @@ class _StubProposalGenerator(InstructionProposalGenerator):
         model_settings: Any = None,
         example_bank: Any = None,
         component_toolsets: Any = None,
+        capabilities: Any = None,
     ) -> ProposalResult:
         self.calls += 1
         self.last_reflective_data = reflective_data
@@ -460,6 +461,7 @@ async def test_reflect_step_skips_candidate_eval_on_noop_proposal() -> None:
             model_settings: Any = None,
             example_bank: Any = None,
             component_toolsets: Any = None,
+            capabilities: Any = None,
         ) -> ProposalResult:
             self.calls += 1
             self.last_reflective_data = reflective_data
@@ -612,7 +614,7 @@ async def test_reflect_step_forwards_reflection_config_additional_toolsets() -> 
 
     from pydantic_ai_gepa.types import ReflectionConfig
 
-    extra_toolset: FunctionToolset[None] = FunctionToolset()
+    extra_toolset: FunctionToolset[object] = FunctionToolset()
 
     @extra_toolset.tool_plain
     def custom_reflector_probe(prompt: str) -> str:

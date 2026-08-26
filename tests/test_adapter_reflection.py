@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -9,6 +10,7 @@ from pydantic_ai import Agent, UsageLimits
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import ToolDefinition
+from opentelemetry.sdk.trace import TracerProvider
 
 from pydantic_evals import Case
 
@@ -171,6 +173,11 @@ async def test_run_with_trace_returns_trajectory_on_usage_limit() -> None:
     assert trajectory is not None
     assert output.success is False
     assert trajectory.error is not None
+    assert trajectory.trace_id is not None
+    assert trajectory.root_span_id is not None
+    assert trajectory.trace_completeness == "root-only"
+    assert output.trace_id == trajectory.trace_id
+    assert output.trace_completeness == trajectory.trace_completeness
     assert trajectory.messages, "usage-limit trajectories should capture prompts"
     assert any(isinstance(message, ModelRequest) for message in trajectory.messages), (
         "expected to capture the synthesized user request"
@@ -178,3 +185,63 @@ async def test_run_with_trace_returns_trajectory_on_usage_limit() -> None:
     record = trajectory.to_reflective_record()
     assert record["messages"], "reflective record should include serialized messages"
     assert "request_limit" in (record["error"] or "")
+
+
+@pytest.mark.asyncio
+async def test_metric_failure_retains_completed_run_trace_identity() -> None:
+    agent = Agent(TestModel(custom_output_text="answer"), instructions="Base")
+
+    def failing_metric(case: Case[Any, Any, Any], output: RolloutOutput[Any]):
+        raise RuntimeError("metric failed")
+
+    adapter = AgentAdapter(agent=agent, metric=failing_metric)
+    result = await adapter.process_case(
+        Case(name="metric-failure", inputs="Hello", metadata={}),
+        0,
+        capture_traces=True,
+        candidate=_candidate_map("Base"),
+    )
+
+    output = result["output"]
+    assert output.success is False
+    assert output.error_kind == "tool"
+    assert output.trace_id is not None
+    assert output.trace_completeness == "root-only"
+    assert result["trajectory"].trace_id == output.trace_id
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cases_start_distinct_traces_under_ambient_parent() -> None:
+    adapter = AgentAdapter(
+        agent=Agent(TestModel(custom_output_text="answer"), instructions="Base"),
+        metric=lambda case, output: MetricResult(score=1.0),
+    )
+    ambient_provider = TracerProvider(shutdown_on_exit=False)
+    ambient_tracer = ambient_provider.get_tracer("test")
+    candidate = _candidate_map("Base")
+
+    try:
+        with ambient_tracer.start_as_current_span("ambient") as ambient_span:
+            results = await asyncio.gather(
+                *(
+                    adapter.process_case(
+                        Case(name=f"case-{index}", inputs="Hello", metadata={}),
+                        index,
+                        capture_traces=True,
+                        candidate=candidate,
+                    )
+                    for index in range(3)
+                )
+            )
+            ambient_trace_id = format(
+                ambient_span.get_span_context().trace_id,
+                "032x",
+            )
+
+        trace_ids = {result["output"].trace_id for result in results}
+        assert None not in trace_ids
+        assert len(trace_ids) == len(results)
+        assert ambient_trace_id not in trace_ids
+    finally:
+        adapter.trace_collector.shutdown()
+        ambient_provider.shutdown()

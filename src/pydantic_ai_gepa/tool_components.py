@@ -11,11 +11,7 @@ from typing import Any, Iterable, Iterator, Mapping, cast
 from pydantic_ai import RunContext
 from pydantic_ai.agent import AbstractAgent
 from pydantic_ai.agent.wrapper import WrapperAgent
-from pydantic_ai.capabilities import (
-    CombinedCapability,
-    PrepareOutputTools,
-    PrepareTools,
-)
+from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.native_tools import AbstractNativeTool
 from pydantic_ai.tools import ToolDefinition
 
@@ -30,17 +26,6 @@ def _unwrap_agent(agent: AbstractAgent[Any, Any]) -> AbstractAgent[Any, Any]:
     while isinstance(current, WrapperAgent):
         current = current.wrapped
     return current
-
-
-def _append_agent_capability(agent: AbstractAgent[Any, Any], capability: Any) -> bool:
-    root_capability = getattr(agent, "_root_capability", None)
-    if not isinstance(root_capability, CombinedCapability):
-        return False
-
-    setattr(
-        agent, "_root_capability", CombinedCapability([root_capability, capability])
-    )
-    return True
 
 
 def _description_key(tool_name: str) -> str:
@@ -223,8 +208,6 @@ class ToolOptimizationManager:
         *,
         allowed_tools: set[str] | None = None,
     ) -> None:
-        self._base_agent = _unwrap_agent(agent)
-        self._base_prepare = getattr(self._base_agent, "_prepare_tools", None)
         self._candidate_var: contextvars.ContextVar[ToolCandidate | None] = (
             contextvars.ContextVar("gepa_tool_candidate", default=None)
         )
@@ -233,16 +216,9 @@ class ToolOptimizationManager:
         # When None, all tools are optimized. When a set, only those tools are optimized.
         self._allowed_tools: set[str] | None = allowed_tools
 
-        # Install wrapper only once.
-        if getattr(self._base_agent, "_gepa_tool_prepare_wrapper", None) is None:
-            setattr(
-                self._base_agent, "_gepa_tool_prepare_wrapper", self._prepare_wrapper
-            )
-            installed = _append_agent_capability(
-                self._base_agent, PrepareTools(self._prepare_wrapper)
-            )
-            if not installed:
-                self._base_agent._prepare_tools = self._prepare_wrapper  # type: ignore[attr-defined]
+        # ``agent`` remains in the constructor for API compatibility. Candidate
+        # preparation is installed per run by ``GepaCandidateCapability``.
+        _ = agent
 
     def allow_tool(self, tool_name: str) -> None:
         """Add a tool to the allowed set for optimization.
@@ -278,6 +254,10 @@ class ToolOptimizationManager:
     def latest_native_tools(self) -> list[AbstractNativeTool]:
         """Return the most recent native tools observed."""
         return list(self._latest_native_tools)
+
+    def current_candidate(self) -> ToolCandidate | None:
+        """Return the legacy context-bound candidate, if one is active."""
+        return self._candidate_var.get()
 
     @contextmanager
     def candidate_context(
@@ -332,31 +312,33 @@ class ToolOptimizationManager:
             filtered[key] = value
         return filtered or None
 
-    async def _prepare_wrapper(
-        self, ctx: RunContext[Any], tool_defs: list[ToolDefinition]
-    ) -> list[ToolDefinition] | None:
-        prepared = tool_defs
-        if self._base_prepare:
-            prepared_result = await self._base_prepare(ctx, tool_defs)
-            if prepared_result is None:
-                return None
-            prepared = prepared_result
+    async def prepare_tools(
+        self,
+        ctx: RunContext[Any],
+        tool_defs: list[ToolDefinition],
+        *,
+        candidate: CandidateMap | Mapping[str, ComponentValue | str] | None,
+    ) -> list[ToolDefinition]:
+        """Capture and prepare function tools for one capability-bound run."""
+        _ = ctx
+        self._catalog.ingest(tool_defs)
 
-        self._catalog.ingest(prepared)
-
-        candidate = self._candidate_var.get()
+        candidate_map = self._normalize_candidate(candidate)
+        candidate_text = candidate_texts(candidate_map)
+        filtered_candidate = self._filter_candidate(candidate_text or None)
+        candidate = filtered_candidate
         if not candidate:
-            return prepared
+            return tool_defs
 
         modified: list[ToolDefinition] = []
         changed = False
-        for tool_def in prepared:
+        for tool_def in tool_defs:
             new_def = self._apply_candidate_to_tool(tool_def, candidate)
             if new_def is not tool_def:
                 changed = True
             modified.append(new_def)
 
-        return modified if changed else prepared
+        return modified if changed else tool_defs
 
     def _apply_candidate_to_tool(
         self, tool_def: ToolDefinition, candidate: ToolCandidate
@@ -401,30 +383,21 @@ class OutputToolOptimizationManager:
     """Manage output tool component extraction and candidate application."""
 
     def __init__(self, agent: AbstractAgent[Any, Any]) -> None:
-        self._base_agent = _unwrap_agent(agent)
-        self._base_prepare = getattr(self._base_agent, "_prepare_output_tools", None)
         self._candidate_var: contextvars.ContextVar[ToolCandidate | None] = (
             contextvars.ContextVar("gepa_output_tool_candidate", default=None)
         )
         self._catalog = OutputToolComponentCatalog()
-
-        if getattr(self._base_agent, "_gepa_output_tool_prepare_wrapper", None) is None:
-            setattr(
-                self._base_agent,
-                "_gepa_output_tool_prepare_wrapper",
-                self._prepare_wrapper,
-            )
-            installed = _append_agent_capability(
-                self._base_agent, PrepareOutputTools(self._prepare_wrapper)
-            )
-            if not installed:
-                self._base_agent._prepare_output_tools = self._prepare_wrapper  # type: ignore[attr-defined]
+        _ = agent
 
     def get_seed_components(self) -> dict[str, str]:
         return self._catalog.seed_snapshot()
 
     def get_component_keys(self) -> list[str]:
         return self._catalog.component_keys()
+
+    def current_candidate(self) -> ToolCandidate | None:
+        """Return the legacy context-bound candidate, if one is active."""
+        return self._candidate_var.get()
 
     def record_model_request(
         self,
@@ -476,31 +449,32 @@ class OutputToolOptimizationManager:
         }
         return filtered or None
 
-    async def _prepare_wrapper(
-        self, ctx: RunContext[Any], tool_defs: list[ToolDefinition]
-    ) -> list[ToolDefinition] | None:
-        prepared = tool_defs
-        if self._base_prepare:
-            prepared_result = await self._base_prepare(ctx, tool_defs)
-            if prepared_result is None:
-                return None
-            prepared = prepared_result
+    async def prepare_output_tools(
+        self,
+        ctx: RunContext[Any],
+        tool_defs: list[ToolDefinition],
+        *,
+        candidate: CandidateMap | Mapping[str, ComponentValue | str] | None,
+    ) -> list[ToolDefinition]:
+        """Capture and prepare output tools for one capability-bound run."""
+        _ = ctx
+        self._catalog.ingest(tool_defs)
 
-        self._catalog.ingest(prepared)
-
-        candidate = self._candidate_var.get()
+        candidate_map = self._normalize_candidate(candidate)
+        candidate_text = candidate_texts(candidate_map)
+        candidate = self._filter_candidate(candidate_text or None)
         if not candidate:
-            return prepared
+            return tool_defs
 
         modified: list[ToolDefinition] = []
         changed = False
-        for tool_def in prepared:
+        for tool_def in tool_defs:
             new_def = self._apply_candidate_to_tool(tool_def, candidate)
             if new_def is not tool_def:
                 changed = True
             modified.append(new_def)
 
-        return modified if changed else prepared
+        return modified if changed else tool_defs
 
     def _apply_candidate_to_tool(
         self, tool_def: ToolDefinition, candidate: ToolCandidate
@@ -539,6 +513,75 @@ class OutputToolOptimizationManager:
         if updates:
             return replace(tool_def, **updates)
         return tool_def
+
+
+@dataclass
+class GepaCandidateCapability(AbstractCapability[Any]):
+    """Apply one GEPA candidate through Pydantic AI's public prepare hooks."""
+
+    candidate: CandidateMap | Mapping[str, ComponentValue | str] | None = None
+    tool_optimizer: ToolOptimizationManager | None = None
+    output_tool_optimizer: OutputToolOptimizationManager | None = None
+
+    @classmethod
+    def get_serialization_name(cls) -> None:
+        """Candidate capabilities contain runtime managers and are not serializable."""
+        return None
+
+    async def prepare_tools(
+        self,
+        ctx: RunContext[Any],
+        tool_defs: list[ToolDefinition],
+    ) -> list[ToolDefinition]:
+        if self.tool_optimizer is None:
+            return tool_defs
+        return await self.tool_optimizer.prepare_tools(
+            ctx,
+            tool_defs,
+            candidate=self.candidate,
+        )
+
+    async def prepare_output_tools(
+        self,
+        ctx: RunContext[Any],
+        tool_defs: list[ToolDefinition],
+    ) -> list[ToolDefinition]:
+        if self.output_tool_optimizer is None:
+            return tool_defs
+        return await self.output_tool_optimizer.prepare_output_tools(
+            ctx,
+            tool_defs,
+            candidate=self.candidate,
+        )
+
+
+def build_candidate_capability(
+    agent: AbstractAgent[Any, Any],
+    candidate: CandidateMap | Mapping[str, ComponentValue | str] | None,
+) -> GepaCandidateCapability | None:
+    """Build the run-scoped candidate capability configured for ``agent``."""
+    tool_optimizer = get_tool_optimizer(agent)
+    output_tool_optimizer = get_output_tool_optimizer(agent)
+    if tool_optimizer is None and output_tool_optimizer is None:
+        return None
+    effective_candidate: CandidateMap | Mapping[str, ComponentValue | str] | None = (
+        candidate
+    )
+    if effective_candidate is None:
+        contextual_candidate: dict[str, str] = {}
+        if tool_optimizer is not None and tool_optimizer.current_candidate():
+            contextual_candidate.update(tool_optimizer.current_candidate() or {})
+        if (
+            output_tool_optimizer is not None
+            and output_tool_optimizer.current_candidate()
+        ):
+            contextual_candidate.update(output_tool_optimizer.current_candidate() or {})
+        effective_candidate = contextual_candidate or None
+    return GepaCandidateCapability(
+        candidate=effective_candidate,
+        tool_optimizer=tool_optimizer,
+        output_tool_optimizer=output_tool_optimizer,
+    )
 
 
 def get_tool_optimizer(

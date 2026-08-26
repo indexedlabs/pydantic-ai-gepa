@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from pydantic_graph.beta import StepContext
+from pydantic_graph import StepContext
 
 from typing import Literal, Sequence, cast
 

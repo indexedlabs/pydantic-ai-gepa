@@ -329,7 +329,10 @@ class TestSearchExamplesToolCapturedDuringAgentRun:
         )
         from pydantic_ai_gepa.gepa_graph.example_bank import InMemoryExampleBank
         from pydantic_ai_gepa.types import ExampleBankConfig
-        from pydantic_ai_gepa.tool_components import get_or_create_tool_optimizer
+        from pydantic_ai_gepa.tool_components import (
+            build_candidate_capability,
+            get_or_create_tool_optimizer,
+        )
 
         # Create an agent with tool optimization enabled
         agent = Agent(
@@ -356,7 +359,9 @@ class TestSearchExamplesToolCapturedDuringAgentRun:
         )
 
         # Run the agent with the toolset - this triggers _prepare_tools hook
-        await agent.run("Hello", toolsets=[toolset])
+        capability = build_candidate_capability(agent, None)
+        assert capability is not None
+        await agent.run("Hello", toolsets=[toolset], capabilities=[capability])
 
         # After running: search_examples components should be captured
         seed_after = optimizer.get_seed_components()
@@ -397,7 +402,10 @@ class TestSearchExamplesToolCapturedDuringAgentRun:
         )
         from pydantic_ai_gepa.gepa_graph.example_bank import InMemoryExampleBank
         from pydantic_ai_gepa.types import ExampleBankConfig
-        from pydantic_ai_gepa.tool_components import get_or_create_tool_optimizer
+        from pydantic_ai_gepa.tool_components import (
+            build_candidate_capability,
+            get_or_create_tool_optimizer,
+        )
 
         agent = Agent(
             model=TestModel(),
@@ -415,7 +423,9 @@ class TestSearchExamplesToolCapturedDuringAgentRun:
             k=3,
         )
 
-        await agent.run("Hello", toolsets=[toolset])
+        capability = build_candidate_capability(agent, None)
+        assert capability is not None
+        await agent.run("Hello", toolsets=[toolset], capabilities=[capability])
 
         # Components should be captured regardless of allowed_tools setting
         seed = optimizer.get_seed_components()
@@ -432,7 +442,10 @@ class TestSearchExamplesToolCapturedDuringAgentRun:
         )
         from pydantic_ai_gepa.gepa_graph.example_bank import InMemoryExampleBank
         from pydantic_ai_gepa.types import ExampleBankConfig
-        from pydantic_ai_gepa.tool_components import get_or_create_tool_optimizer
+        from pydantic_ai_gepa.tool_components import (
+            build_candidate_capability,
+            get_or_create_tool_optimizer,
+        )
 
         agent = Agent(
             model=TestModel(),
@@ -450,7 +463,9 @@ class TestSearchExamplesToolCapturedDuringAgentRun:
             k=3,
         )
 
-        await agent.run("Hello", toolsets=[toolset])
+        capability = build_candidate_capability(agent, None)
+        assert capability is not None
+        await agent.run("Hello", toolsets=[toolset], capabilities=[capability])
 
         # The catalog ingests ALL tools, so seed_components includes search_examples
         seed = optimizer.get_seed_components()

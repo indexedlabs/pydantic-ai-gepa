@@ -142,7 +142,8 @@ def test_to_user_content_with_nested_models():
     }
 
     system_instructions = generate_system_instructions(query, candidate=candidate)
-    assert system_instructions == snapshot("""
+    assert system_instructions == snapshot("""\
+
 Help the customer quickly
 
 Inputs:
@@ -150,7 +151,7 @@ Inputs:
 - `<customer_name>` (str): OPTIMIZED: Customer full legal name
 - `<query>` (str): The customer's question or issue
 - `<billing_address>` (Address): Customer's billing address
-- `<shipping_address>` (UnionType[Address, NoneType]): Optional shipping address
+- `<shipping_address>` (Union[Address, NoneType]): Optional shipping address
 
 Schemas:
 

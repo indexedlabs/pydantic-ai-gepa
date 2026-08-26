@@ -63,6 +63,7 @@ async def test_optimize_agent_minimal_flow():
     ]
 
     dataset = Dataset(
+        name="optimize-agent",
         cases=[
             Case(
                 name=f"case-{i}",
@@ -73,7 +74,7 @@ async def test_optimize_agent_minimal_flow():
                 expected_output=_label_for_token(tok),
             )
             for i, tok in enumerate(tokens)
-        ]
+        ],
     )
 
     # Agent returns a fixed label; we are not testing real model behavior here
@@ -156,6 +157,7 @@ async def test_optimize_agent_minimal_flow_with_signature():
     ]
 
     dataset = Dataset(
+        name="optimize-signature-agent",
         cases=[
             Case(
                 name=f"case-{i}",
@@ -163,7 +165,7 @@ async def test_optimize_agent_minimal_flow_with_signature():
                 expected_output=_label_for_token(tok),
             )
             for i, tok in enumerate(tokens)
-        ]
+        ],
     )
 
     # Agent returns a fixed label; we are not testing real model behavior here

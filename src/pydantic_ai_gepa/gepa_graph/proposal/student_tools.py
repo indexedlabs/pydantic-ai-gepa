@@ -29,7 +29,7 @@ def create_example_search_tool(
     bank: InMemoryExampleBank,
     instruction: str,
     k: int = 3,
-) -> FunctionToolset:
+) -> FunctionToolset[object]:
     """Create the example search tool for the student agent.
 
     This tool allows the student agent to search for relevant few-shot
@@ -40,7 +40,7 @@ def create_example_search_tool(
         instruction: Description of when to use this tool.
         k: Number of examples to retrieve.
     """
-    toolset: FunctionToolset[None] = FunctionToolset()
+    toolset: FunctionToolset[object] = FunctionToolset()
 
     @toolset.tool_plain(description=instruction)
     def search_examples(query: str) -> str:
@@ -69,11 +69,11 @@ def create_skills_toolset(
     search_backend: SkillsSearchProvider | None = None,
     candidate: dict[str, Any] | None = None,
     capabilities: set[SkillCapability] | None = None,
-) -> FunctionToolset:
+) -> FunctionToolset[object]:
     """Create a skills toolset backed by a SkillsFS (or overlay)."""
     if capabilities is None:
         capabilities = {SkillCapability.READ}
-    toolset: FunctionToolset[None] = FunctionToolset()
+    toolset: FunctionToolset[object] = FunctionToolset()
     backend = search_backend or LocalSkillsSearchProvider()
 
     def _hash_text(text: str) -> str:

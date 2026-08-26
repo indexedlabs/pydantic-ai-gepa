@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Sequence
 
 import logfire
-from pydantic_graph.beta import StepContext
+from pydantic_graph import StepContext
 
 from pydantic_evals import Case
 from ..deps import GepaDeps
@@ -38,7 +38,14 @@ async def evaluate_step(ctx: StepContext[GepaState, GepaDeps, None]) -> None:
     if ctx.deps.memory_exporter is not None:
         from pathlib import Path
 
-        spans = ctx.deps.memory_exporter.get_finished_spans()
+        from ...trace_capabilities import drain_spans_by_trace_id
+
+        trace_ids = {
+            trace_id
+            for output in results.outputs
+            if (trace_id := output.trace_id) is not None
+        }
+        spans = drain_spans_by_trace_id(ctx.deps.memory_exporter, trace_ids)
         if spans:
             from ..proposal.trace_store import span_to_jsonl_line
 
@@ -51,8 +58,6 @@ async def evaluate_step(ctx: StepContext[GepaState, GepaDeps, None]) -> None:
             with open(traces_file, "a", encoding="utf-8") as f:
                 for span in spans:
                     f.write(span_to_jsonl_line(span))
-
-        ctx.deps.memory_exporter.clear()
 
     state.record_evaluation_errors(
         candidate_idx=candidate.idx,

@@ -83,7 +83,7 @@ class ReflectionConfig:
     - Custom evaluation criteria to consider
     """
 
-    additional_toolsets: Sequence[AbstractToolset[None]] = field(default_factory=list)
+    additional_toolsets: Sequence[AbstractToolset[object]] = field(default_factory=list)
     """Extra toolsets the reflection agent receives alongside the built-in
     trace / journal / component-selection toolsets.
 
@@ -137,13 +137,26 @@ class RolloutOutput(Generic[OutputT]):
     error_message: str | None = None
     error_kind: Literal["tool", "system"] | None = None
     usage: _usage.RunUsage | None = None
+    trace_id: str | None = None
+    trace_completeness: Literal["root-only", "full"] | None = None
 
     @classmethod
     def from_success(
-        cls, result: OutputT, *, usage: _usage.RunUsage | None = None
+        cls,
+        result: OutputT,
+        *,
+        usage: _usage.RunUsage | None = None,
+        trace_id: str | None = None,
+        trace_completeness: Literal["root-only", "full"] | None = None,
     ) -> "RolloutOutput[OutputT]":
         """Create from successful execution."""
-        return cls(result=result, success=True, usage=usage)
+        return cls(
+            result=result,
+            success=True,
+            usage=usage,
+            trace_id=trace_id,
+            trace_completeness=trace_completeness,
+        )
 
     @classmethod
     def from_error(
@@ -152,6 +165,8 @@ class RolloutOutput(Generic[OutputT]):
         *,
         kind: Literal["tool", "system"] | None = None,
         usage: _usage.RunUsage | None = None,
+        trace_id: str | None = None,
+        trace_completeness: Literal["root-only", "full"] | None = None,
     ) -> "RolloutOutput[OutputT]":
         """Create from failed execution."""
         return cls(
@@ -160,6 +175,8 @@ class RolloutOutput(Generic[OutputT]):
             error_message=str(error),
             error_kind=kind,
             usage=usage,
+            trace_id=trace_id,
+            trace_completeness=trace_completeness,
         )
 
 

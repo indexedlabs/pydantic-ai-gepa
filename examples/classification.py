@@ -39,6 +39,7 @@ class ClassificationMetadata:
 
 # Define a challenging dataset with ambiguous cases that force specific classifications
 dataset = Dataset[ClassificationInput, ClassificationOutput, ClassificationMetadata](
+    name="classification",
     cases=[
         # Extremely ambiguous cases - could genuinely be any category
         Case(
@@ -240,7 +241,7 @@ dataset = Dataset[ClassificationInput, ClassificationOutput, ClassificationMetad
                 category="negative"
             ),  # Forcing decline interpretation
         ),
-    ]
+    ],
 )
 
 agent = Agent(

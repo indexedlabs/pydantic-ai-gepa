@@ -19,6 +19,7 @@ from .inspection import (
 )
 from .exceptions import UsageBudgetExceeded
 from .runner import GepaOptimizationResult, optimize_agent
+from .components import AppliedCandidateAgent
 from .compose import (
     FairVote,
     OmniPlan,
@@ -53,6 +54,12 @@ from .input_type import (
     get_gepa_components,
 )
 from .signature_agent import SignatureAgent
+from .tool_components import GepaCandidateCapability
+from .trace_capabilities import (
+    GepaTraceCollector,
+    GepaTraceContext,
+    GepaTraceContextCapability,
+)
 from .skills import SkillsFS
 from .skills.search import (
     InMemorySkillsSearchProvider,
@@ -84,6 +91,7 @@ __all__ = [
     "OmniPlan",
     "FairVote",
     "GepaOptimizationResult",
+    "AppliedCandidateAgent",
     "Adapter",
     "AgentAdapter",
     "SignatureAgentAdapter",
@@ -109,6 +117,10 @@ __all__ = [
     "build_input_spec",
     "SignatureSuffix",
     "SignatureAgent",
+    "GepaCandidateCapability",
+    "GepaTraceCollector",
+    "GepaTraceContext",
+    "GepaTraceContextCapability",
     "SkillsFS",
     "SkillsSearchProvider",
     "LocalSkillsSearchProvider",

@@ -20,7 +20,7 @@ from pydantic_ai_gepa.cli.store import (
 from pydantic_ai_gepa.skills import SkillsFS
 
 
-def _make_agent() -> Agent[None, str]:
+def _make_agent() -> Agent[object, str]:
     agent = Agent(
         TestModel(),
         instructions="You are a helpful test assistant.",

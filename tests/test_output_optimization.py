@@ -23,7 +23,7 @@ class OutputModel(BaseModel):
     result: str = Field(description="original result description")
 
 
-def _make_agent() -> Agent[None, OutputModel]:
+def _make_agent() -> Agent[object, OutputModel]:
     return Agent(
         TestModel(custom_output_args=OutputModel(result="ok")),
         output_type=OutputModel,
@@ -80,8 +80,11 @@ async def test_candidate_applies_to_output_tool_definitions():
         param_key: ComponentValue(name=param_key, text="improved result guidance"),
     }
 
-    with optimizer.candidate_context(candidate):
-        prepared = await optimizer._prepare_wrapper(None, tool_defs)  # type: ignore[arg-type]
+    prepared = await optimizer.prepare_output_tools(
+        None,  # type: ignore[arg-type]
+        tool_defs,
+        candidate=candidate,
+    )
 
     assert prepared is not None
     updated = prepared[0]

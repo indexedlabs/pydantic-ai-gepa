@@ -11,7 +11,7 @@ from ...cli.notes import load_note as read_note
 from ...cli.notes import notes_index
 
 
-def create_note_toolset(notes_dir: Path) -> FunctionToolset[None]:
+def create_note_toolset(notes_dir: Path) -> FunctionToolset[object]:
     """Build a note loader whose tool description includes the metadata index."""
 
     toolset = FunctionToolset()

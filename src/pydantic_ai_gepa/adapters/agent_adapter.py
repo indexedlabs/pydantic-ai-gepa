@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import ExitStack
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import json
 import os
+import weakref
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, cast
+from uuid import uuid4
 
 import logfire
 
@@ -60,11 +63,13 @@ from ..skills import SkillsFS
 from ..skills.models import SkillCapability
 from ..skills.search import SkillsSearchProvider
 from ..tool_components import (
+    build_candidate_capability,
     get_or_create_output_tool_optimizer,
     get_or_create_tool_optimizer,
     get_output_tool_optimizer,
     get_tool_optimizer,
 )
+from ..trace_capabilities import GepaTraceCollector, GepaTraceContext
 from ..types import (
     MetadataWithMessageHistory,
     MetricResult,
@@ -433,6 +438,9 @@ class AgentAdapterTrajectory(Trajectory):
     case: Case[Any, Any, Any] | None = None
     metric_feedback: str | None = None
     metric_side_info: dict[str, Any] | None = None
+    trace_id: str | None = None
+    root_span_id: str | None = None
+    trace_completeness: Literal["root-only", "full"] | None = None
 
     def _extract_user_content(self, part: UserPromptPart) -> str:
         if isinstance(part.content, str):
@@ -577,6 +585,9 @@ class AgentAdapterTrajectory(Trajectory):
             "error": self.error,
             "messages": self._serialize_messages_with_instructions(),
             "run_usage": self.usage or None,
+            "trace_id": self.trace_id,
+            "root_span_id": self.root_span_id,
+            "trace_completeness": self.trace_completeness,
         }
 
         # Add tools if available (function + output combined)
@@ -645,10 +656,25 @@ class _BaseAgentAdapter(
         self._gepa_usage_limits = gepa_usage_limits
         self._gepa_usage = _usage.RunUsage()
         self._gepa_usage_lock = asyncio.Lock()
+        self._trace_run_id = uuid4().hex
+        self._trace_collector = GepaTraceCollector()
+        self._trace_finalizer = weakref.finalize(
+            self,
+            self._trace_collector.shutdown,
+        )
         if self.optimize_tools:
             self._configure_tool_optimizer()
         if self.optimize_output_type:
             self._configure_output_tool_optimizer()
+
+    @property
+    def trace_collector(self) -> GepaTraceCollector:
+        """Return the run-owned collector used for traced evaluations."""
+        return self._trace_collector
+
+    def close(self) -> None:
+        """Release the adapter's run-owned tracing resources."""
+        self._trace_finalizer()
 
     def _configure_tool_optimizer(self) -> None:
         """Install tool optimization support for plain agents when requested."""
@@ -781,6 +807,8 @@ class _BaseAgentAdapter(
     ) -> dict[str, Any]:
         """Process a single Case and return the metric evaluation."""
         metric_result: MetricResult | None = None
+        output: RolloutOutput[Any] | None = None
+        trajectory: AgentAdapterTrajectory | None = None
         case_name = self._case_identifier(case, case_index)
         try:
             if self.cache_manager and candidate:
@@ -793,7 +821,23 @@ class _BaseAgentAdapter(
                 )
 
                 if cached_agent_result is not None:
-                    trajectory, output = cached_agent_result
+                    cached_trajectory, output = cached_agent_result
+                    trajectory = cast(
+                        AgentAdapterTrajectory | None,
+                        cached_trajectory,
+                    )
+                    output = replace(
+                        output,
+                        trace_id=None,
+                        trace_completeness=None,
+                    )
+                    if trajectory is not None:
+                        trajectory = replace(
+                            trajectory,
+                            trace_id=None,
+                            root_span_id=None,
+                            trace_completeness=None,
+                        )
                 else:
                     if capture_traces:
                         trajectory, output = await self._run_with_trace(
@@ -891,8 +935,12 @@ class _BaseAgentAdapter(
                 candidate_keys=sorted(candidate.keys()) if candidate else None,
                 exc_info=True,
             )
-            output = RolloutOutput.from_error(exc, kind=error_kind)
-            trajectory = (
+            failed_output = RolloutOutput.from_error(exc, kind=error_kind)
+            if output is not None:
+                failed_output.trace_id = output.trace_id
+                failed_output.trace_completeness = output.trace_completeness
+            output = failed_output
+            failed_trajectory = (
                 AgentAdapterTrajectory(
                     messages=[],
                     instructions=None,
@@ -906,6 +954,11 @@ class _BaseAgentAdapter(
                 if capture_traces and error_kind == "tool"
                 else None
             )
+            if failed_trajectory is not None and trajectory is not None:
+                failed_trajectory.trace_id = trajectory.trace_id
+                failed_trajectory.root_span_id = trajectory.root_span_id
+                failed_trajectory.trace_completeness = trajectory.trace_completeness
+            trajectory = failed_trajectory
             error_result: dict[str, Any] = {
                 "output": output,
                 "score": 0.0,
@@ -968,6 +1021,30 @@ class _BaseAgentAdapter(
     ) -> str:
         return case.name or f"case-{case_index}"
 
+    def _new_trace_context(
+        self,
+        case: Case[InputT, OutputT, MetadataT],
+        case_index: int,
+        candidate: CandidateMap | None,
+    ) -> GepaTraceContext:
+        candidate_payload = candidate_texts(candidate)
+        candidate_id = hashlib.sha256(
+            json.dumps(candidate_payload, sort_keys=True).encode()
+        ).hexdigest()[:16]
+        case_id = self._case_identifier(case, case_index)
+        return GepaTraceContext(
+            gepa_run_id=self._trace_run_id,
+            candidate_id=candidate_id,
+            case_id=case_id,
+            agent_run_id=f"gepa-{uuid4().hex}",
+        )
+
+    def _finalize_trace_context(
+        self,
+        trace_context: GepaTraceContext,
+    ) -> None:
+        self._trace_collector.spans_for(trace_context)
+
     def _gather_messages(
         self,
         *,
@@ -1001,17 +1078,30 @@ class _BaseAgentAdapter(
         usage_kwargs = self._usage_kwargs()
         message_history = self._message_history_for_case(case)
         case_name = self._case_identifier(case, case_index)
+        trace_context = self._new_trace_context(case, case_index, candidate)
+        usage_kwargs.update(
+            {
+                "run_id": trace_context.agent_run_id,
+                "metadata": {
+                    "gepa_run_id": trace_context.gepa_run_id,
+                    "gepa_candidate_id": trace_context.candidate_id,
+                    "gepa_case_id": trace_context.case_id,
+                },
+                "capabilities": list(self._trace_collector.capabilities(trace_context)),
+            }
+        )
         try:
-            with capture_run_messages() as run_messages:
-                captured_messages = run_messages
-                run_result = await self._invoke_agent(
-                    case,
-                    candidate=candidate,
-                    message_history=message_history,
-                    usage_kwargs=usage_kwargs,
-                    example_bank=example_bank,
-                )
-                messages = run_result.new_messages()
+            with self._trace_collector.root_context():
+                with capture_run_messages() as run_messages:
+                    captured_messages = run_messages
+                    run_result = await self._invoke_agent(
+                        case,
+                        candidate=candidate,
+                        message_history=message_history,
+                        usage_kwargs=usage_kwargs,
+                        example_bank=example_bank,
+                    )
+                    messages = run_result.new_messages()
             run_usage = run_result.usage
             await self._record_gepa_usage(run_usage)
         except InspectionAborted:
@@ -1019,6 +1109,7 @@ class _BaseAgentAdapter(
         except UsageBudgetExceeded:
             raise
         except _UsageLimitExceeded as exc:
+            self._finalize_trace_context(trace_context)
             logfire.warn("Agent run usage limit reached", case_id=case_name)
             all_messages = self._gather_messages(
                 messages=messages,
@@ -1041,12 +1132,21 @@ class _BaseAgentAdapter(
                 error=str(exc),
                 usage={},
                 case=case,
+                trace_id=trace_context.trace_id,
+                root_span_id=trace_context.root_span_id,
+                trace_completeness=trace_context.completeness,
             )
-            output = RolloutOutput.from_error(exc, kind="system")
+            output = RolloutOutput.from_error(
+                exc,
+                kind="system",
+                trace_id=trace_context.trace_id,
+                trace_completeness=trace_context.completeness,
+            )
             return trajectory, output
         except Exception as exc:
             if is_provider_stop_error(exc):
                 raise
+            self._finalize_trace_context(trace_context)
             error_kind = _classify_exception(exc)
             logfire.error(
                 "AgentAdapter run_with_trace failed",
@@ -1077,11 +1177,20 @@ class _BaseAgentAdapter(
                     error=str(exc),
                     usage={},
                     case=case,
+                    trace_id=trace_context.trace_id,
+                    root_span_id=trace_context.root_span_id,
+                    trace_completeness=trace_context.completeness,
                 )
-            output = RolloutOutput.from_error(exc, kind=error_kind)
+            output = RolloutOutput.from_error(
+                exc,
+                kind=error_kind,
+                trace_id=trace_context.trace_id,
+                trace_completeness=trace_context.completeness,
+            )
             return trajectory, output
 
         assert run_result is not None
+        self._finalize_trace_context(trace_context)
         final_messages = self._gather_messages(
             messages=messages,
             captured_messages=captured_messages,
@@ -1104,8 +1213,16 @@ class _BaseAgentAdapter(
             error=None,
             usage=asdict(run_usage) if run_usage else {},
             case=case,
+            trace_id=trace_context.trace_id,
+            root_span_id=trace_context.root_span_id,
+            trace_completeness=trace_context.completeness,
         )
-        output = RolloutOutput.from_success(final_output, usage=run_usage)
+        output = RolloutOutput.from_success(
+            final_output,
+            usage=run_usage,
+            trace_id=trace_context.trace_id,
+            trace_completeness=trace_context.completeness,
+        )
         return trajectory, output
 
     async def _run_simple(
@@ -1117,27 +1234,53 @@ class _BaseAgentAdapter(
     ) -> RolloutOutput[Any]:
         usage_kwargs = self._usage_kwargs()
         case_name = self._case_identifier(case, case_index)
+        trace_context = self._new_trace_context(case, case_index, candidate)
+        usage_kwargs.update(
+            {
+                "run_id": trace_context.agent_run_id,
+                "metadata": {
+                    "gepa_run_id": trace_context.gepa_run_id,
+                    "gepa_candidate_id": trace_context.candidate_id,
+                    "gepa_case_id": trace_context.case_id,
+                },
+                "capabilities": list(self._trace_collector.capabilities(trace_context)),
+            }
+        )
         try:
-            result = await self._invoke_agent(
-                case,
-                candidate=candidate,
-                message_history=self._message_history_for_case(case),
-                usage_kwargs=usage_kwargs,
-                example_bank=example_bank,
-            )
+            with self._trace_collector.root_context():
+                result = await self._invoke_agent(
+                    case,
+                    candidate=candidate,
+                    message_history=self._message_history_for_case(case),
+                    usage_kwargs=usage_kwargs,
+                    example_bank=example_bank,
+                )
             run_usage = result.usage
             await self._record_gepa_usage(run_usage)
-            return RolloutOutput.from_success(result.output, usage=run_usage)
+            self._finalize_trace_context(trace_context)
+            return RolloutOutput.from_success(
+                result.output,
+                usage=run_usage,
+                trace_id=trace_context.trace_id,
+                trace_completeness=trace_context.completeness,
+            )
         except InspectionAborted:
             raise
         except UsageBudgetExceeded:
             raise
         except _UsageLimitExceeded as exc:
+            self._finalize_trace_context(trace_context)
             logfire.warn("Agent run usage limit reached", case_id=case_name)
-            return RolloutOutput.from_error(exc, kind="system")
+            return RolloutOutput.from_error(
+                exc,
+                kind="system",
+                trace_id=trace_context.trace_id,
+                trace_completeness=trace_context.completeness,
+            )
         except Exception as exc:
             if is_provider_stop_error(exc):
                 raise
+            self._finalize_trace_context(trace_context)
             error_kind = _classify_exception(exc)
             logfire.error(
                 "AgentAdapter run_simple failed",
@@ -1145,7 +1288,12 @@ class _BaseAgentAdapter(
                 error_kind=error_kind,
                 candidate_keys=sorted(candidate.keys()) if candidate else None,
             )
-            return RolloutOutput.from_error(exc, kind=error_kind)
+            return RolloutOutput.from_error(
+                exc,
+                kind=error_kind,
+                trace_id=trace_context.trace_id,
+                trace_completeness=trace_context.completeness,
+            )
 
     def _build_toolsets(
         self,
@@ -1321,6 +1469,12 @@ class AgentAdapter(
                 run_kwargs["model"] = OptimizableModel(model)  # type: ignore
         elif "model" in run_kwargs:
             run_kwargs["model"] = model
+
+        candidate_capability = build_candidate_capability(self.agent, candidate)
+        if candidate_capability is not None:
+            capabilities: list[Any] = list(run_kwargs.get("capabilities") or ())
+            capabilities.append(candidate_capability)
+            run_kwargs["capabilities"] = capabilities
 
         return await self.agent.run(
             prompt,

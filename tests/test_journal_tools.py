@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Any, cast
 from pydantic_ai_gepa.gepa_graph.proposal.journal_tools import create_journal_toolset
 
 
@@ -7,17 +8,17 @@ def test_journal_tools(tmp_path: Path):
     toolset = create_journal_toolset(str(journal_file))
 
     # Test reading empty journal
-    result = toolset.tools["read_journal_entries"].function()  # type: ignore
+    result = cast(Any, toolset.tools["read_journal_entries"].function)()
     assert "No previous journal" in result
 
     # Test appending an entry
-    result = toolset.tools["append_journal_entry"].function(
+    result = cast(Any, toolset.tools["append_journal_entry"].function)(
         insight="The API is rate limited",
         strategy="Add exponential backoff",  # type: ignore
     )
     assert "Successfully" in result
 
     # Test reading the journal
-    result = toolset.tools["read_journal_entries"].function()  # type: ignore
+    result = cast(Any, toolset.tools["read_journal_entries"].function)()
     assert "rate limited" in result
     assert "backoff" in result

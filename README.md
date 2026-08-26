@@ -90,6 +90,22 @@ print(result.best_candidate.components)
 # }
 ```
 
+Apply every optimized component through the agent yielded by the result context:
+
+```python
+with result.apply_best(agent) as optimized_agent:
+    run_result = await optimized_agent.run("...")
+```
+
+The yielded view injects tool and output-schema changes as run-scoped Pydantic AI
+capabilities. Calling the original `agent` inside the context is not equivalent and
+does not apply those capability-backed components.
+
+GEPA evaluation and reflection runs use a run-owned OpenTelemetry provider for
+correlated trace capture. This intentionally isolates optimization traces from the
+application's global Logfire/OpenTelemetry provider; ordinary runs of the original
+agent retain their configured instrumentation.
+
 ## Quick Start
 
 ```bash
