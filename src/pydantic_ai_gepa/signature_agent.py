@@ -32,6 +32,7 @@ from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import AgentDepsT, DeferredToolResults
 from pydantic_ai.toolsets import AbstractToolset
 
+from .capability_instructions import resolved_capability_instructions
 from .input_type import BoundInputSpec, InputSpec, build_input_spec
 from .tool_components import (
     ToolOptimizationManager,
@@ -426,7 +427,6 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         self,
         candidate: dict[str, str] | None,
         run_instructions: AgentInstructions[AgentDepsT] | None,
-        capabilities: Sequence[AgentCapability[AgentDepsT]] | None,
     ):
         """Replace only literal base instructions for an optimized candidate."""
         has_contextual_override = self._has_instruction_override()
@@ -445,13 +445,8 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         if optimized_literal is not None:
             override.append(optimized_literal)
         override.extend(instruction_functions)
-        override.extend(self._base_capability_instructions())
-        for capability in capabilities or ():
-            get_instructions = getattr(capability, "get_instructions", None)
-            if get_instructions is not None:
-                override.extend(
-                    self._normalize_capability_instructions(get_instructions())
-                )
+        if resolved_capability_instructions not in instruction_functions:
+            override.append(resolved_capability_instructions)
         if run_instructions is not None:
             if isinstance(run_instructions, Sequence) and not isinstance(
                 run_instructions, str
@@ -474,22 +469,6 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
                 agent = agent.wrapped
                 continue
             return False
-
-    def _base_capability_instructions(self) -> list[Any]:
-        agent: AbstractAgent[Any, Any] | WrapperAgent[Any, Any] = self.wrapped
-        while isinstance(agent, WrapperAgent):
-            agent = agent.wrapped
-        return self._normalize_capability_instructions(
-            agent.root_capability.get_instructions()
-        )
-
-    @staticmethod
-    def _normalize_capability_instructions(instructions: Any) -> list[Any]:
-        if instructions is None:
-            return []
-        if isinstance(instructions, Sequence) and not isinstance(instructions, str):
-            return list(instructions)
-        return [instructions]
 
     def _instructions_argument(
         self,
@@ -661,7 +640,6 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         with self._candidate_instruction_override(
             candidate,
             run_instructions,
-            capabilities,
         ):
             return await self.wrapped.run(
                 user_prompt=normalized_user_prompt,
@@ -826,7 +804,6 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         with self._candidate_instruction_override(
             candidate,
             run_instructions,
-            capabilities,
         ):
             return self.wrapped.run_sync(
                 user_prompt=normalized_user_prompt,
@@ -992,7 +969,6 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         with self._candidate_instruction_override(
             candidate,
             run_instructions,
-            capabilities,
         ):
             async with self.wrapped.run_stream(
                 user_prompt=normalized_user_prompt,

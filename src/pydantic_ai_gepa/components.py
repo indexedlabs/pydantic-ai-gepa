@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel
 from pydantic_ai.agent.wrapper import WrapperAgent
 
+from .capability_instructions import resolved_capability_instructions
 from .gepa_graph.models import CandidateMap, ComponentValue, candidate_texts
 from .input_type import InputSpec, build_input_spec
 from .signature_agent import SignatureAgent
@@ -42,10 +43,6 @@ class AppliedCandidateAgent(WrapperAgent[Any, Any]):
         active_override = _active_instruction_override(self.wrapped)
         if active_override is not None:
             instructions = _normalized_instructions(active_override)
-            for capability in capabilities:
-                instructions.extend(
-                    _normalized_instructions(capability.get_instructions())
-                )
             instructions.extend(
                 _normalized_instructions(kwargs.pop("instructions", None))
             )
@@ -284,11 +281,7 @@ def apply_candidate_to_agent(
         if instructions_value is not None:
             override_value.append(instructions)
             override_value.extend(instruction_callbacks)
-            override_value.extend(
-                _normalized_instructions(
-                    target_agent.root_capability.get_instructions()
-                )
-            )
+            override_value.append(resolved_capability_instructions)
         if override_value:
             override_payload: Any = (
                 override_value[0] if len(override_value) == 1 else tuple(override_value)

@@ -103,40 +103,41 @@ async def evaluate_candidate_dataset(
                 )
             )
 
-    with logfire.span(
-        f"evaluate {task_name}",
-        name=task_name,
-        task_name=task_name,
-        dataset_name=dataset_name,
-        n_cases=total_cases,
-        candidate_components=len(candidate_map),
-        **extra_attributes,
-    ) as eval_span:
-        with adapter.apply_candidate(candidate_map):
-            await asyncio.gather(
-                *(run_case(idx, case) for idx, case in enumerate(cases))
-            )
+    try:
+        with logfire.span(
+            f"evaluate {task_name}",
+            name=task_name,
+            task_name=task_name,
+            dataset_name=dataset_name,
+            n_cases=total_cases,
+            candidate_components=len(candidate_map),
+            **extra_attributes,
+        ) as eval_span:
+            with adapter.apply_candidate(candidate_map):
+                await asyncio.gather(
+                    *(run_case(idx, case) for idx, case in enumerate(cases))
+                )
 
-        experiment_metadata: dict[str, Any] = {"n_cases": total_cases}
-        if dataset_name:
-            experiment_metadata["dataset_name"] = dataset_name
-        if candidate_text_map:
-            experiment_metadata["candidate_keys"] = sorted(candidate_text_map)
+            experiment_metadata: dict[str, Any] = {"n_cases": total_cases}
+            if dataset_name:
+                experiment_metadata["dataset_name"] = dataset_name
+            if candidate_text_map:
+                experiment_metadata["candidate_keys"] = sorted(candidate_text_map)
 
-        if records:
-            average_score = sum(record.score for record in records) / len(records)
-            experiment_metadata["average_score"] = average_score
-            experiment_metadata["averages"] = {
-                "assertions": average_score,
-                "scores": {"metric_score": average_score},
-                "labels": {},
-                "metrics": {"metric_score": average_score},
-            }
-            eval_span.set_attribute("assertion_pass_rate", average_score)
+            if records:
+                average_score = sum(record.score for record in records) / len(records)
+                experiment_metadata["average_score"] = average_score
+                experiment_metadata["averages"] = {
+                    "assertions": average_score,
+                    "scores": {"metric_score": average_score},
+                    "labels": {},
+                    "metrics": {"metric_score": average_score},
+                }
+                eval_span.set_attribute("assertion_pass_rate", average_score)
 
-        eval_span.set_attribute("logfire.experiment.metadata", experiment_metadata)
-
-    adapter.close()
+            eval_span.set_attribute("logfire.experiment.metadata", experiment_metadata)
+    finally:
+        adapter.close()
     return records
 
 

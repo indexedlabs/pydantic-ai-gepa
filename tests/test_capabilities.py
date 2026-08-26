@@ -164,6 +164,20 @@ class InstructionCapability(AbstractCapability[Any]):
         return [self.instruction]
 
 
+@dataclass
+class CallableInstructionCapability(AbstractCapability[Any]):
+    instruction: Any
+
+    def get_instructions(self):
+        return [self.instruction]
+
+
+async def instruction_capability_factory(
+    ctx: RunContext[Any],
+) -> AbstractCapability[Any]:
+    return InstructionCapability("Factory capability guidance.")
+
+
 def _optimization_result(candidate: dict[str, str]) -> GepaOptimizationResult:
     components = {
         name: ComponentValue(name=name, text=text) for name, text in candidate.items()
@@ -184,7 +198,10 @@ async def test_apply_best_yields_agent_with_candidate_capability() -> None:
     agent = Agent(
         model,
         instructions="Seed instructions.",
-        capabilities=[InstructionCapability("Capability guidance.")],
+        capabilities=[
+            InstructionCapability("Capability guidance."),
+            CallableInstructionCapability(lambda ctx: "Callable guidance."),
+        ],
         name="apply-best",
     )
 
@@ -205,7 +222,10 @@ async def test_apply_best_yields_agent_with_candidate_capability() -> None:
         run_result = await optimized_agent.run(
             "question",
             instructions="Caller guidance.",
-            capabilities=[InstructionCapability("Run capability guidance.")],
+            capabilities=[
+                InstructionCapability("Run capability guidance."),
+                instruction_capability_factory,
+            ],
         )
 
     request = run_result.all_messages()[0]
@@ -214,6 +234,8 @@ async def test_apply_best_yields_agent_with_candidate_capability() -> None:
     assert request.instructions.count("Optimized instructions.") == 1
     assert request.instructions.count("Capability guidance.") == 1
     assert request.instructions.count("Run capability guidance.") == 1
+    assert request.instructions.count("Callable guidance.") == 1
+    assert request.instructions.count("Factory capability guidance.") == 1
     assert request.instructions.count("Caller guidance.") == 1
     assert model.last_model_request_parameters is not None
     [tool] = model.last_model_request_parameters.function_tools
@@ -225,7 +247,10 @@ async def test_apply_best_to_signature_retains_all_instruction_sources() -> None
     agent = Agent(
         TestModel(custom_output_text="answer"),
         instructions="Seed instructions.",
-        capabilities=[InstructionCapability("Capability guidance.")],
+        capabilities=[
+            InstructionCapability("Capability guidance."),
+            CallableInstructionCapability(lambda ctx: "Callable guidance."),
+        ],
         name="signature-apply-best",
     )
     signature_agent = SignatureAgent(agent, input_type=SignatureInput, output_type=str)
@@ -238,7 +263,10 @@ async def test_apply_best_to_signature_retains_all_instruction_sources() -> None
         run_result = await applied.run_signature(
             SignatureInput(question="Why?"),
             instructions="Caller guidance.",
-            capabilities=[InstructionCapability("Run capability guidance.")],
+            capabilities=[
+                InstructionCapability("Run capability guidance."),
+                instruction_capability_factory,
+            ],
         )
 
     request = run_result.all_messages()[0]
@@ -247,6 +275,8 @@ async def test_apply_best_to_signature_retains_all_instruction_sources() -> None
     assert request.instructions.count("Optimized instructions.") == 1
     assert request.instructions.count("Capability guidance.") == 1
     assert request.instructions.count("Run capability guidance.") == 1
+    assert request.instructions.count("Callable guidance.") == 1
+    assert request.instructions.count("Factory capability guidance.") == 1
     assert request.instructions.count("Answer a structured question.") == 1
     assert request.instructions.count("Caller guidance.") == 1
     assert applied.input_spec is signature_agent.input_spec

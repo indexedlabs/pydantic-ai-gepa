@@ -19,6 +19,7 @@ from .inspection import (
 )
 from .exceptions import UsageBudgetExceeded
 from .runner import GepaOptimizationResult, optimize_agent
+from .components import AppliedCandidateAgent
 from .compose import (
     FairVote,
     OmniPlan,
@@ -90,6 +91,7 @@ __all__ = [
     "OmniPlan",
     "FairVote",
     "GepaOptimizationResult",
+    "AppliedCandidateAgent",
     "Adapter",
     "AgentAdapter",
     "SignatureAgentAdapter",
