@@ -9,13 +9,15 @@ from typing import Any, cast
 import pytest
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.capabilities import AbstractCapability, Capability
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.toolsets import AbstractToolset, ToolsetTool
 from pydantic_ai.tools import ToolDefinition
 
 from pydantic_ai_gepa import GepaOptimizationResult, SignatureAgent
+from pydantic_ai_gepa.cli.store import introspect_agent
 from pydantic_ai_gepa.gepa_graph.models import ComponentValue
 from pydantic_ai_gepa.tool_components import (
     GepaCandidateCapability,
@@ -33,6 +35,23 @@ class SignatureInput(BaseModel):
     """Answer a structured question."""
 
     question: str = Field(description="Question to answer.")
+
+
+def capability_lookup(query: str) -> str:
+    """Look up a capability-owned value.
+
+    Args:
+        query: Value to look up.
+    """
+    return query
+
+
+def _lookup_capability(*, instructions: str) -> Capability[Any]:
+    return Capability(
+        id="lookup",
+        instructions=instructions,
+        tools=[capability_lookup],
+    )
 
 
 def _tool_definition() -> ToolDefinition:
@@ -140,6 +159,181 @@ def test_optimizer_setup_does_not_mutate_pydantic_ai_capability_internals() -> N
     assert not hasattr(agent, "_gepa_tool_prepare_wrapper")
     assert not hasattr(agent, "_prepare_tools")
     assert not hasattr(agent, "_prepare_output_tools")
+
+
+def test_introspection_discovers_constructor_capability_tools_before_run() -> None:
+    model = TestModel(custom_output_text="answer")
+    agent = Agent(
+        model,
+        name="capability-introspection",
+        capabilities=[_lookup_capability(instructions="Use lookup for exact values.")],
+    )
+    signature_agent = SignatureAgent(
+        agent,
+        input_type=SignatureInput,
+        optimize_tools=True,
+    )
+
+    slots = introspect_agent(signature_agent)
+
+    assert model.last_model_request_parameters is None
+    assert slots["tool:capability_lookup:description"] == (
+        "Look up a capability-owned value."
+    )
+    assert slots["tool:capability_lookup:param:query"] == "Value to look up."
+
+
+@dataclass
+class RuntimeOnlyToolset(AbstractToolset[Any]):
+    get_tools_calls: int = 0
+
+    @property
+    def id(self) -> str:
+        return "runtime-only"
+
+    async def get_tools(
+        self,
+        ctx: RunContext[Any],
+    ) -> dict[str, ToolsetTool[Any]]:
+        self.get_tools_calls += 1
+        return {}
+
+    async def call_tool(
+        self,
+        name: str,
+        tool_args: dict[str, Any],
+        ctx: RunContext[Any],
+        tool: ToolsetTool[Any],
+    ) -> Any:
+        raise AssertionError("Static introspection must not call runtime tools.")
+
+
+def test_introspection_does_not_execute_runtime_toolset_hooks() -> None:
+    runtime_toolset = RuntimeOnlyToolset()
+    agent = Agent(
+        TestModel(),
+        name="runtime-only-capability",
+        capabilities=[Capability(id="runtime", toolsets=[runtime_toolset])],
+    )
+
+    introspect_agent(SignatureAgent(agent, input_type=SignatureInput))
+
+    assert runtime_toolset.get_tools_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_capability_backed_agents_apply_independent_first_run_candidates() -> (
+    None
+):
+    first_model = TestModel(custom_output_text="first")
+    second_model = TestModel(custom_output_text="second")
+    first = SignatureAgent(
+        Agent(
+            first_model,
+            name="first-capability-agent",
+            instructions="Handle lookup requests.",
+            capabilities=[
+                _lookup_capability(instructions="Use first lookup capability.")
+            ],
+        ),
+        input_type=SignatureInput,
+        optimize_tools=True,
+    )
+    second = SignatureAgent(
+        Agent(
+            second_model,
+            name="second-capability-agent",
+            instructions="Handle lookup requests.",
+            capabilities=[
+                _lookup_capability(instructions="Use second lookup capability.")
+            ],
+        ),
+        input_type=SignatureInput,
+        optimize_tools=True,
+    )
+
+    await asyncio.gather(
+        first.run_signature(
+            SignatureInput(question="First?"),
+            candidate={
+                "instructions": "Prefer exact first-party values.",
+                "tool:capability_lookup:description": "Look up the first value.",
+                "tool:capability_lookup:param:query": "First value to look up.",
+            },
+        ),
+        second.run_signature(
+            SignatureInput(question="Second?"),
+            candidate={
+                "instructions": "Prefer exact second-party values.",
+                "tool:capability_lookup:description": "Look up the second value.",
+                "tool:capability_lookup:param:query": "Second value to look up.",
+            },
+        ),
+    )
+
+    assert first_model.last_model_request_parameters is not None
+    assert second_model.last_model_request_parameters is not None
+    first_tool = first_model.last_model_request_parameters.function_tools[0]
+    second_tool = second_model.last_model_request_parameters.function_tools[0]
+    assert first_tool.description == "Look up the first value."
+    assert second_tool.description == "Look up the second value."
+    assert (
+        first_tool.parameters_json_schema["properties"]["query"]["description"]
+        == "First value to look up."
+    )
+    assert (
+        second_tool.parameters_json_schema["properties"]["query"]["description"]
+        == "Second value to look up."
+    )
+
+    await asyncio.gather(
+        first.run_signature(SignatureInput(question="First baseline?")),
+        second.run_signature(SignatureInput(question="Second baseline?")),
+    )
+
+    assert first_model.last_model_request_parameters is not None
+    assert second_model.last_model_request_parameters is not None
+    first_baseline = first_model.last_model_request_parameters.function_tools[0]
+    second_baseline = second_model.last_model_request_parameters.function_tools[0]
+    assert first_baseline.description == "Look up a capability-owned value."
+    assert second_baseline.description == "Look up a capability-owned value."
+
+
+@pytest.mark.asyncio
+async def test_signature_candidate_preserves_constructor_capability_instructions() -> (
+    None
+):
+    agent = Agent(
+        TestModel(custom_output_text="answer"),
+        name="capability-instructions",
+        instructions="Handle structured requests.",
+        capabilities=[_lookup_capability(instructions="Use lookup for exact values.")],
+    )
+    signature_agent = SignatureAgent(agent, input_type=SignatureInput)
+
+    result = await signature_agent.run_signature(
+        SignatureInput(question="Why?"),
+        candidate={"instructions": "Prefer authoritative values."},
+        capabilities=[Capability(instructions="Honor caller-scoped guidance.")],
+    )
+
+    request = result.all_messages()[0]
+    assert isinstance(request, ModelRequest)
+    assert request.instructions is not None
+    assert "Handle structured requests." not in request.instructions
+    assert "Use lookup for exact values." in request.instructions
+    assert "Honor caller-scoped guidance." in request.instructions
+    assert "Prefer authoritative values." in request.instructions
+
+    baseline = await signature_agent.run_signature(
+        SignatureInput(question="Baseline?"),
+    )
+    baseline_request = baseline.all_messages()[0]
+    assert isinstance(baseline_request, ModelRequest)
+    assert baseline_request.instructions is not None
+    assert "Handle structured requests." in baseline_request.instructions
+    assert "Use lookup for exact values." in baseline_request.instructions
+    assert "Prefer authoritative values." not in baseline_request.instructions
 
 
 @dataclass

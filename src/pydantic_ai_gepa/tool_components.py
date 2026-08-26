@@ -659,25 +659,30 @@ def get_or_create_output_tool_optimizer(
 def _collect_registered_tool_defs(
     agent: AbstractAgent[Any, Any],
 ) -> list[ToolDefinition]:
-    """Return ToolDefinition objects for currently registered function tools."""
-    toolset = getattr(agent, "_function_toolset", None)
-    tools = getattr(toolset, "tools", None) if toolset is not None else None
-    if not isinstance(tools, dict):
-        return []
+    """Return definitions exposed synchronously by public agent toolsets."""
+    definitions: dict[str, ToolDefinition] = {}
 
-    definitions: list[ToolDefinition] = []
-    for tool in tools.values():
-        schema = getattr(tool, "function_schema", None)
-        json_schema = getattr(schema, "json_schema", None)
-        if not isinstance(json_schema, dict):
-            continue
-        description = getattr(tool, "description", None)
-        name = getattr(tool, "name", getattr(tool, "__name__", "tool"))
-        definitions.append(
-            ToolDefinition(
-                name=name,
-                description=description,
-                parameters_json_schema=json_schema,
+    def collect(toolset: Any) -> None:
+        tools = getattr(toolset, "tools", None)
+        if not isinstance(tools, dict):
+            return
+        for tool in tools.values():
+            schema = getattr(tool, "function_schema", None)
+            json_schema = getattr(schema, "json_schema", None)
+            if not isinstance(json_schema, dict):
+                continue
+            description = getattr(tool, "description", None)
+            name = getattr(tool, "name", getattr(tool, "__name__", "tool"))
+            definitions.setdefault(
+                name,
+                ToolDefinition(
+                    name=name,
+                    description=description,
+                    parameters_json_schema=json_schema,
+                ),
             )
-        )
-    return definitions
+
+    toolsets = getattr(agent, "toolsets", ())
+    for toolset in toolsets:
+        toolset.apply(collect)
+    return list(definitions.values())
