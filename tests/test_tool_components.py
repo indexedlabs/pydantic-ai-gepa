@@ -46,6 +46,22 @@ class _DummyAgent:
         self.model = None
 
 
+class _FailingToolsetsAgent:
+    @property
+    def toolsets(self) -> tuple[()]:
+        raise RuntimeError("Toolsets are not connected.")
+
+
+def test_optimizer_setup_tolerates_unavailable_agent_toolsets() -> None:
+    from pydantic_ai_gepa.tool_components import get_or_create_tool_optimizer
+
+    agent = cast(AbstractAgent[Any, Any], _FailingToolsetsAgent())
+
+    manager = get_or_create_tool_optimizer(agent)
+
+    assert manager.get_seed_components() == {}
+
+
 def test_catalog_ingest_records_seed_components() -> None:
     catalog = ToolComponentCatalog()
     tool_def = _make_tool_definition()

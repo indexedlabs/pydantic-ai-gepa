@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextvars
+import logging
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -13,11 +14,27 @@ from pydantic_ai.agent import AbstractAgent
 from pydantic_ai.agent.wrapper import WrapperAgent
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.native_tools import AbstractNativeTool
+from pydantic_ai.toolsets import (
+    AbstractToolset,
+    CombinedToolset,
+    DeferredLoadingToolset,
+    DynamicToolset,
+    FilteredToolset,
+    FunctionToolset,
+    IncludeReturnSchemasToolset,
+    PrefixedToolset,
+    PreparedToolset,
+    RenamedToolset,
+    SetMetadataToolset,
+    WrapperToolset,
+)
 from pydantic_ai.tools import ToolDefinition
 
 from .gepa_graph.models import CandidateMap, ComponentValue, candidate_texts
 
 ToolCandidate = dict[str, str]
+
+logger = logging.getLogger(__name__)
 
 
 def _unwrap_agent(agent: AbstractAgent[Any, Any]) -> AbstractAgent[Any, Any]:
@@ -659,25 +676,87 @@ def get_or_create_output_tool_optimizer(
 def _collect_registered_tool_defs(
     agent: AbstractAgent[Any, Any],
 ) -> list[ToolDefinition]:
-    """Return ToolDefinition objects for currently registered function tools."""
-    toolset = getattr(agent, "_function_toolset", None)
-    tools = getattr(toolset, "tools", None) if toolset is not None else None
-    if not isinstance(tools, dict):
+    """Return model-visible definitions exposed by static public toolsets."""
+    definitions: dict[str, ToolDefinition] = {}
+
+    try:
+        toolsets = tuple(agent.toolsets)
+    except Exception:
+        logger.debug(
+            "Skipping static GEPA tool discovery for agent type %s",
+            type(agent).__qualname__,
+            exc_info=True,
+        )
         return []
 
-    definitions: list[ToolDefinition] = []
-    for tool in tools.values():
-        schema = getattr(tool, "function_schema", None)
-        json_schema = getattr(schema, "json_schema", None)
-        if not isinstance(json_schema, dict):
-            continue
-        description = getattr(tool, "description", None)
-        name = getattr(tool, "name", getattr(tool, "__name__", "tool"))
-        definitions.append(
-            ToolDefinition(
-                name=name,
-                description=description,
-                parameters_json_schema=json_schema,
-            )
+    for toolset in toolsets:
+        for tool_def in _collect_static_toolset_defs_safely(toolset):
+            definitions.setdefault(tool_def.name, tool_def)
+    return list(definitions.values())
+
+
+def _collect_static_toolset_defs_safely(
+    toolset: AbstractToolset[Any],
+) -> list[ToolDefinition]:
+    try:
+        return _collect_static_toolset_defs(toolset)
+    except Exception:
+        logger.debug(
+            "Skipping static GEPA toolset discovery for type %s",
+            type(toolset).__qualname__,
+            exc_info=True,
         )
-    return definitions
+        return []
+
+
+def _collect_static_toolset_defs(
+    toolset: AbstractToolset[Any],
+) -> list[ToolDefinition]:
+    if isinstance(toolset, (FilteredToolset, DynamicToolset)):
+        return []
+
+    if isinstance(toolset, PrefixedToolset):
+        return [
+            replace(tool_def, name=f"{toolset.prefix}_{tool_def.name}")
+            for tool_def in _collect_static_toolset_defs_safely(toolset.wrapped)
+        ]
+
+    if isinstance(toolset, RenamedToolset):
+        original_to_new_name = {
+            original_name: new_name
+            for new_name, original_name in toolset.name_map.items()
+        }
+        return [
+            replace(
+                tool_def,
+                name=original_to_new_name.get(tool_def.name, tool_def.name),
+            )
+            for tool_def in _collect_static_toolset_defs_safely(toolset.wrapped)
+        ]
+
+    if isinstance(toolset, CombinedToolset):
+        return [
+            tool_def
+            for nested_toolset in toolset.toolsets
+            for tool_def in _collect_static_toolset_defs_safely(nested_toolset)
+        ]
+
+    deterministic_prepared_toolsets = (
+        DeferredLoadingToolset,
+        IncludeReturnSchemasToolset,
+        SetMetadataToolset,
+    )
+    if isinstance(toolset, PreparedToolset) and not isinstance(
+        toolset, deterministic_prepared_toolsets
+    ):
+        return []
+
+    if isinstance(toolset, FunctionToolset):
+        return [
+            tool.tool_def for tool in toolset.tools.values() if tool.prepare is None
+        ]
+
+    if isinstance(toolset, WrapperToolset):
+        return _collect_static_toolset_defs_safely(toolset.wrapped)
+
+    return []
