@@ -234,22 +234,6 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
             component_toolsets=component_toolsets if component_toolsets else None,
         )
 
-        # Capture and save the Reflector's own trace data (tool calls, reasoning)
-        if deps.memory_exporter is not None:
-            spans = deps.memory_exporter.get_finished_spans()
-            if spans:
-                from ..proposal.trace_store import span_to_jsonl_line
-
-                reflector_dir = Path(
-                    f".gepa_cache/runs/{state.run_id}/candidates/{parent_idx}/reflector_traces"
-                )
-                reflector_dir.mkdir(parents=True, exist_ok=True)
-                reflector_file = reflector_dir / "traces.jsonl"
-                with open(reflector_file, "a", encoding="utf-8") as f:
-                    for span in spans:
-                        f.write(span_to_jsonl_line(span))
-            deps.memory_exporter.clear()
-
         component_metadata = (
             proposal_result.component_metadata
             if state.config.track_component_hypotheses
@@ -410,7 +394,19 @@ async def _evaluate_minibatch(
     if capture_traces and deps.memory_exporter is not None:
         from pathlib import Path
 
-        spans = deps.memory_exporter.get_finished_spans()
+        from ...trace_capabilities import select_spans_by_trace_id
+
+        trace_ids = {
+            trace_id
+            for trajectory in results.trajectories or ()
+            if (trace_id := getattr(trajectory, "trace_id", None)) is not None
+        }
+        trace_ids.update(
+            trace_id
+            for output in results.outputs
+            if (trace_id := output.trace_id) is not None
+        )
+        spans = select_spans_by_trace_id(deps.memory_exporter, trace_ids)
         if spans:
             from ..proposal.trace_store import span_to_jsonl_line
 
@@ -422,7 +418,6 @@ async def _evaluate_minibatch(
             with open(traces_file, "a", encoding="utf-8") as f:
                 for span in spans:
                     f.write(span_to_jsonl_line(span))
-        deps.memory_exporter.clear()
     return results
 
 

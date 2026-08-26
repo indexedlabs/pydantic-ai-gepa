@@ -47,24 +47,10 @@ async def optimize(
     normalized_seed = _coerce_seed_candidate(seed_candidate)
 
     if deps is None:
-        from opentelemetry import trace
-        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-        from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
-            InMemorySpanExporter,
+        trace_collector = getattr(adapter, "trace_collector", None)
+        memory_exporter = (
+            trace_collector.exporter if trace_collector is not None else None
         )
-
-        memory_exporter = InMemorySpanExporter()
-        processor = SimpleSpanProcessor(memory_exporter)
-        provider = trace.get_tracer_provider()
-
-        # Extract real provider from ProxyTracerProvider if logfire or opentelemetry wraps it
-        if hasattr(provider, "_active_tracer_provider"):
-            provider = getattr(provider, "_active_tracer_provider")
-        if hasattr(provider, "provider"):  # Handle logfire's wrapper
-            provider = getattr(provider, "provider")
-
-        if hasattr(provider, "add_span_processor"):
-            provider.add_span_processor(processor)  # type: ignore
 
         resolved_deps = create_deps(
             adapter,

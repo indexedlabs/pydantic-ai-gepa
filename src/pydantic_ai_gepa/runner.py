@@ -363,24 +363,7 @@ async def optimize_agent(
         track_component_hypotheses=track_component_hypotheses,
     )
 
-    from opentelemetry import trace
-    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
-        InMemorySpanExporter,
-    )
-
-    memory_exporter = InMemorySpanExporter()
-    processor = SimpleSpanProcessor(memory_exporter)
-    provider = trace.get_tracer_provider()
-
-    # Extract real provider from ProxyTracerProvider if logfire or opentelemetry wraps it
-    if hasattr(provider, "_active_tracer_provider"):
-        provider = getattr(provider, "_active_tracer_provider")
-    if hasattr(provider, "provider"):  # Handle logfire's wrapper
-        provider = getattr(provider, "provider")
-
-    if hasattr(provider, "add_span_processor"):
-        provider.add_span_processor(processor)  # type: ignore
+    memory_exporter = adapter.trace_collector.exporter
 
     deps = create_deps(
         adapter,

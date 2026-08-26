@@ -171,6 +171,11 @@ async def test_run_with_trace_returns_trajectory_on_usage_limit() -> None:
     assert trajectory is not None
     assert output.success is False
     assert trajectory.error is not None
+    assert trajectory.trace_id is not None
+    assert trajectory.root_span_id is not None
+    assert trajectory.trace_completeness == "root-only"
+    assert output.trace_id == trajectory.trace_id
+    assert output.trace_completeness == trajectory.trace_completeness
     assert trajectory.messages, "usage-limit trajectories should capture prompts"
     assert any(isinstance(message, ModelRequest) for message in trajectory.messages), (
         "expected to capture the synthesized user request"

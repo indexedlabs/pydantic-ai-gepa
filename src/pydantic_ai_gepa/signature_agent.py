@@ -5,28 +5,37 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Sequence
 from contextlib import (
     AbstractAsyncContextManager,
-    ExitStack,
     asynccontextmanager,
     nullcontext,
 )
-from typing import TYPE_CHECKING, Any, overload
-
-from typing_extensions import Never
+from typing import TYPE_CHECKING, Any, cast, overload
 
 from pydantic import BaseModel
-from pydantic_ai import messages as _messages, models, usage as _usage
+from pydantic_ai import (
+    AgentCapability,
+    AgentRetries,
+    AgentSpec,
+    CancellationToken,
+    messages as _messages,
+    models,
+    usage as _usage,
+)
 from pydantic_ai.agent import AgentRunResult, EventStreamHandler, WrapperAgent
-from pydantic_ai.agent.abstract import RunOutputDataT, Instructions
+from pydantic_ai.agent.abstract import (
+    AgentInstructions,
+    AgentMetadata,
+    RunOutputDataT,
+)
 from pydantic_ai.output import OutputDataT, OutputSpec
 from pydantic_ai.result import StreamedRunResult
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import AgentDepsT, DeferredToolResults
 from pydantic_ai.toolsets import AbstractToolset
 
-from .gepa_graph.models import CandidateMap, ComponentValue
 from .input_type import BoundInputSpec, InputSpec, build_input_spec
 from .tool_components import (
     ToolOptimizationManager,
+    build_candidate_capability,
     get_or_create_tool_optimizer,
     get_or_create_output_tool_optimizer,
     get_output_tool_optimizer,
@@ -263,7 +272,7 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         literal_base: str | None,
         instruction_functions: Sequence[Any],
         system_instructions: str | None,
-    ) -> Instructions[AgentDepsT] | None:
+    ) -> AgentInstructions[AgentDepsT] | None:
         """Compose the override that ``agent.run(instructions=...)`` receives.
 
         Order matters: literal (candidate or seed) first, then the agent's
@@ -292,7 +301,7 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         candidate: dict[str, str] | None,
         message_history: Sequence[_messages.ModelMessage] | None,
         user_prompt: UserPromptInput | None,
-    ) -> tuple[UserPromptInput | None, Instructions[AgentDepsT] | None]:
+    ) -> tuple[UserPromptInput | None, AgentInstructions[AgentDepsT] | None]:
         """Prepare the user prompt and instructions override for a run."""
         self._require_input_instance(input_instance, input_spec)
         if user_prompt is not None and message_history is None:
@@ -311,22 +320,14 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
             input_instance, input_spec, candidate
         )
 
-        literal_base, instruction_functions = self._resolve_base_instructions_split()
-        if candidate and "instructions" in candidate:
-            # GEPA mutates the literal text; drop the original literal and use
-            # the candidate's optimized version. Function-based instructions
-            # registered via `@agent.instructions` stay attached so dynamic
-            # context (e.g. per-case metadata) still reaches the model.
-            literal_base = candidate["instructions"]
-
         instructions_override = self._compose_instructions_override(
-            literal_base,
-            instruction_functions,
+            None,
+            (),
             system_instructions,
         )
         return run_user_prompt, instructions_override
 
-    def _resolve_base_instructions(self) -> Instructions[AgentDepsT] | None:
+    def _resolve_base_instructions(self) -> AgentInstructions[AgentDepsT] | None:
         """Return the effective base instructions for the wrapped agent.
 
         Preserved for callers that want the raw, unsplit instructions list.
@@ -409,21 +410,65 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
             return user_prompt
         return (user_prompt,)
 
-    def _tool_candidate_context(self, candidate: dict[str, str] | None):
-        """Context manager that applies tool candidate overrides if enabled."""
-        if not self._tool_optimizer or candidate is None:
-            return nullcontext()
-        return self._tool_optimizer.candidate_context(candidate)
+    def _run_capabilities(
+        self,
+        candidate: dict[str, str] | None,
+        capabilities: Sequence[AgentCapability[AgentDepsT]] | None,
+    ) -> tuple[AgentCapability[AgentDepsT], ...] | None:
+        """Compose caller capabilities with the run-scoped GEPA candidate."""
+        combined = list(capabilities or ())
+        candidate_capability = build_candidate_capability(self.wrapped, candidate)
+        if candidate_capability is not None:
+            combined.append(candidate_capability)
+        return tuple(combined) or None
 
-    def _output_tool_candidate_context(self, candidate: dict[str, str] | None):
-        """Context manager that applies output tool candidate overrides if enabled."""
-        if not self._output_tool_optimizer or candidate is None:
+    def _candidate_instruction_override(
+        self,
+        candidate: dict[str, str] | None,
+        run_instructions: AgentInstructions[AgentDepsT] | None,
+    ):
+        """Replace only literal base instructions for an optimized candidate."""
+        if not candidate or "instructions" not in candidate:
             return nullcontext()
-        # Convert dict[str, str] to CandidateMap for the optimizer
-        candidate_map: CandidateMap = {
-            k: ComponentValue(name=k, text=v) for k, v in candidate.items()
-        }
-        return self._output_tool_optimizer.candidate_context(candidate_map)
+        _, instruction_functions = self._resolve_base_instructions_split()
+        override: list[Any] = [candidate["instructions"], *instruction_functions]
+        if run_instructions is not None:
+            if isinstance(run_instructions, Sequence) and not isinstance(
+                run_instructions, str
+            ):
+                override.extend(run_instructions)
+            else:
+                override.append(run_instructions)
+        instructions: Any = override[0] if len(override) == 1 else tuple(override)
+        return self.wrapped.override(instructions=instructions)
+
+    @staticmethod
+    def _instructions_argument(
+        candidate: dict[str, str] | None,
+        run_instructions: AgentInstructions[AgentDepsT] | None,
+    ) -> AgentInstructions[AgentDepsT] | None:
+        if candidate and "instructions" in candidate:
+            return None
+        return run_instructions
+
+    @staticmethod
+    def _run_instructions(
+        signature_instructions: AgentInstructions[AgentDepsT] | None,
+        caller_instructions: AgentInstructions[AgentDepsT] | None,
+    ) -> AgentInstructions[AgentDepsT] | None:
+        """Append explicit per-run instructions to the signature instructions."""
+        if signature_instructions is None:
+            return caller_instructions
+        if caller_instructions is None:
+            return signature_instructions
+
+        parts: list[Any] = []
+        for value in (signature_instructions, caller_instructions):
+            if isinstance(value, Sequence) and not isinstance(value, str):
+                parts.extend(value)
+            else:
+                parts.append(value)
+        return cast(AgentInstructions[AgentDepsT], tuple(parts))
 
     @overload
     async def run_signature(
@@ -433,16 +478,24 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         output_type: None = None,
         candidate: dict[str, str] | None = None,
         user_prompt: UserPromptInput | None = None,
-        message_history: list[_messages.ModelMessage] | None = None,
+        message_history: Sequence[_messages.ModelMessage] | None = None,
         deferred_tool_results: DeferredToolResults | None = None,
+        conversation_id: str | None = None,
+        run_id: str | None = None,
         model: models.Model | models.KnownModelName | str | None = None,
+        instructions: AgentInstructions[AgentDepsT] = None,
         deps: AgentDepsT = None,
         model_settings: ModelSettings | None = None,
         usage_limits: _usage.UsageLimits | None = None,
+        cancellation_token: CancellationToken | None = None,
         usage: _usage.RunUsage | None = None,
+        metadata: AgentMetadata[AgentDepsT] | None = None,
+        retries: int | AgentRetries | None = None,
         infer_name: bool = True,
         toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
         event_stream_handler: EventStreamHandler[AgentDepsT] | None = None,
+        capabilities: Sequence[AgentCapability[AgentDepsT]] | None = None,
+        spec: dict[str, Any] | AgentSpec | None = None,
     ) -> AgentRunResult[OutputDataT]: ...
 
     @overload
@@ -453,16 +506,24 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         output_type: OutputSpec[RunOutputDataT] | type[RunOutputDataT],
         candidate: dict[str, str] | None = None,
         user_prompt: UserPromptInput | None = None,
-        message_history: list[_messages.ModelMessage] | None = None,
+        message_history: Sequence[_messages.ModelMessage] | None = None,
         deferred_tool_results: DeferredToolResults | None = None,
+        conversation_id: str | None = None,
+        run_id: str | None = None,
         model: models.Model | models.KnownModelName | str | None = None,
+        instructions: AgentInstructions[AgentDepsT] = None,
         deps: AgentDepsT = None,
         model_settings: ModelSettings | None = None,
         usage_limits: _usage.UsageLimits | None = None,
+        cancellation_token: CancellationToken | None = None,
         usage: _usage.RunUsage | None = None,
+        metadata: AgentMetadata[AgentDepsT] | None = None,
+        retries: int | AgentRetries | None = None,
         infer_name: bool = True,
         toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
         event_stream_handler: EventStreamHandler[AgentDepsT] | None = None,
+        capabilities: Sequence[AgentCapability[AgentDepsT]] | None = None,
+        spec: dict[str, Any] | AgentSpec | None = None,
     ) -> AgentRunResult[RunOutputDataT]: ...
 
     async def run_signature(
@@ -472,17 +533,24 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         output_type: OutputSpec[RunOutputDataT] | type[RunOutputDataT] | None = None,
         candidate: dict[str, str] | None = None,
         user_prompt: UserPromptInput | None = None,
-        message_history: list[_messages.ModelMessage] | None = None,
+        message_history: Sequence[_messages.ModelMessage] | None = None,
         deferred_tool_results: DeferredToolResults | None = None,
+        conversation_id: str | None = None,
+        run_id: str | None = None,
         model: models.Model | models.KnownModelName | str | None = None,
+        instructions: AgentInstructions[AgentDepsT] = None,
         deps: AgentDepsT = None,
         model_settings: ModelSettings | None = None,
         usage_limits: _usage.UsageLimits | None = None,
+        cancellation_token: CancellationToken | None = None,
         usage: _usage.RunUsage | None = None,
+        metadata: AgentMetadata[AgentDepsT] | None = None,
+        retries: int | AgentRetries | None = None,
         infer_name: bool = True,
         toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
         event_stream_handler: EventStreamHandler[AgentDepsT] | None = None,
-        **_deprecated_kwargs: Never,
+        capabilities: Sequence[AgentCapability[AgentDepsT]] | None = None,
+        spec: dict[str, Any] | AgentSpec | None = None,
     ) -> AgentRunResult[Any]:
         """Run the agent with a signature-based prompt.
 
@@ -538,29 +606,29 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         if wrapped_has_validators and effective_output_type == wrapped_output_type:
             run_output_type = None
 
-        with ExitStack() as stack:
-            stack.enter_context(self._tool_candidate_context(candidate))
-            stack.enter_context(self._output_tool_candidate_context(candidate))
-
-            if instructions_override is not None:
-                stack.enter_context(
-                    self.wrapped.override(instructions=instructions_override)
-                )
-
+        run_instructions = self._run_instructions(instructions_override, instructions)
+        with self._candidate_instruction_override(candidate, run_instructions):
             return await self.wrapped.run(
                 user_prompt=normalized_user_prompt,
                 output_type=run_output_type,
                 message_history=message_history,
                 deferred_tool_results=deferred_tool_results,
+                conversation_id=conversation_id,
+                run_id=run_id,
                 model=model,
+                instructions=self._instructions_argument(candidate, run_instructions),
                 deps=deps,
                 model_settings=model_settings,
                 usage_limits=usage_limits,
+                cancellation_token=cancellation_token,
                 usage=usage,
+                metadata=metadata,
+                retries=retries,
                 infer_name=infer_name,
                 toolsets=toolsets,
                 event_stream_handler=event_stream_handler,
-                **_deprecated_kwargs,
+                capabilities=self._run_capabilities(candidate, capabilities),
+                spec=spec,
             )
 
     @overload
@@ -571,16 +639,24 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         output_type: None = None,
         candidate: dict[str, str] | None = None,
         user_prompt: UserPromptInput | None = None,
-        message_history: list[_messages.ModelMessage] | None = None,
+        message_history: Sequence[_messages.ModelMessage] | None = None,
         deferred_tool_results: DeferredToolResults | None = None,
+        conversation_id: str | None = None,
+        run_id: str | None = None,
         model: models.Model | models.KnownModelName | str | None = None,
+        instructions: AgentInstructions[AgentDepsT] = None,
         deps: AgentDepsT = None,
         model_settings: ModelSettings | None = None,
         usage_limits: _usage.UsageLimits | None = None,
+        cancellation_token: CancellationToken | None = None,
         usage: _usage.RunUsage | None = None,
+        metadata: AgentMetadata[AgentDepsT] | None = None,
+        retries: int | AgentRetries | None = None,
         infer_name: bool = True,
         toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
         event_stream_handler: EventStreamHandler[AgentDepsT] | None = None,
+        capabilities: Sequence[AgentCapability[AgentDepsT]] | None = None,
+        spec: dict[str, Any] | AgentSpec | None = None,
     ) -> AgentRunResult[OutputDataT]: ...
 
     @overload
@@ -591,16 +667,24 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         output_type: OutputSpec[RunOutputDataT] | type[RunOutputDataT],
         candidate: dict[str, str] | None = None,
         user_prompt: UserPromptInput | None = None,
-        message_history: list[_messages.ModelMessage] | None = None,
+        message_history: Sequence[_messages.ModelMessage] | None = None,
         deferred_tool_results: DeferredToolResults | None = None,
+        conversation_id: str | None = None,
+        run_id: str | None = None,
         model: models.Model | models.KnownModelName | str | None = None,
+        instructions: AgentInstructions[AgentDepsT] = None,
         deps: AgentDepsT = None,
         model_settings: ModelSettings | None = None,
         usage_limits: _usage.UsageLimits | None = None,
+        cancellation_token: CancellationToken | None = None,
         usage: _usage.RunUsage | None = None,
+        metadata: AgentMetadata[AgentDepsT] | None = None,
+        retries: int | AgentRetries | None = None,
         infer_name: bool = True,
         toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
         event_stream_handler: EventStreamHandler[AgentDepsT] | None = None,
+        capabilities: Sequence[AgentCapability[AgentDepsT]] | None = None,
+        spec: dict[str, Any] | AgentSpec | None = None,
     ) -> AgentRunResult[RunOutputDataT]: ...
 
     def run_signature_sync(
@@ -610,17 +694,24 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         output_type: OutputSpec[RunOutputDataT] | type[RunOutputDataT] | None = None,
         candidate: dict[str, str] | None = None,
         user_prompt: UserPromptInput | None = None,
-        message_history: list[_messages.ModelMessage] | None = None,
+        message_history: Sequence[_messages.ModelMessage] | None = None,
         deferred_tool_results: DeferredToolResults | None = None,
+        conversation_id: str | None = None,
+        run_id: str | None = None,
         model: models.Model | models.KnownModelName | str | None = None,
+        instructions: AgentInstructions[AgentDepsT] = None,
         deps: AgentDepsT = None,
         model_settings: ModelSettings | None = None,
         usage_limits: _usage.UsageLimits | None = None,
+        cancellation_token: CancellationToken | None = None,
         usage: _usage.RunUsage | None = None,
+        metadata: AgentMetadata[AgentDepsT] | None = None,
+        retries: int | AgentRetries | None = None,
         infer_name: bool = True,
         toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
         event_stream_handler: EventStreamHandler[AgentDepsT] | None = None,
-        **_deprecated_kwargs: Never,
+        capabilities: Sequence[AgentCapability[AgentDepsT]] | None = None,
+        spec: dict[str, Any] | AgentSpec | None = None,
     ) -> AgentRunResult[Any]:
         """Synchronously run the agent with a signature-based prompt.
 
@@ -676,29 +767,29 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         if wrapped_has_validators and effective_output_type == wrapped_output_type:
             run_output_type = None
 
-        with ExitStack() as stack:
-            stack.enter_context(self._tool_candidate_context(candidate))
-            stack.enter_context(self._output_tool_candidate_context(candidate))
-
-            if instructions_override is not None:
-                stack.enter_context(
-                    self.wrapped.override(instructions=instructions_override)
-                )
-
+        run_instructions = self._run_instructions(instructions_override, instructions)
+        with self._candidate_instruction_override(candidate, run_instructions):
             return self.wrapped.run_sync(
                 user_prompt=normalized_user_prompt,
                 output_type=run_output_type,
                 message_history=message_history,
                 deferred_tool_results=deferred_tool_results,
+                conversation_id=conversation_id,
+                run_id=run_id,
                 model=model,
+                instructions=self._instructions_argument(candidate, run_instructions),
                 deps=deps,
                 model_settings=model_settings,
                 usage_limits=usage_limits,
+                cancellation_token=cancellation_token,
                 usage=usage,
+                metadata=metadata,
+                retries=retries,
                 infer_name=infer_name,
                 toolsets=toolsets,
                 event_stream_handler=event_stream_handler,
-                **_deprecated_kwargs,
+                capabilities=self._run_capabilities(candidate, capabilities),
+                spec=spec,
             )
 
     @overload
@@ -709,16 +800,24 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         output_type: None = None,
         candidate: dict[str, str] | None = None,
         user_prompt: UserPromptInput | None = None,
-        message_history: list[_messages.ModelMessage] | None = None,
+        message_history: Sequence[_messages.ModelMessage] | None = None,
         deferred_tool_results: DeferredToolResults | None = None,
+        conversation_id: str | None = None,
+        run_id: str | None = None,
         model: models.Model | models.KnownModelName | str | None = None,
+        instructions: AgentInstructions[AgentDepsT] = None,
         deps: AgentDepsT = None,
         model_settings: ModelSettings | None = None,
         usage_limits: _usage.UsageLimits | None = None,
+        cancellation_token: CancellationToken | None = None,
         usage: _usage.RunUsage | None = None,
+        metadata: AgentMetadata[AgentDepsT] | None = None,
+        retries: int | AgentRetries | None = None,
         infer_name: bool = True,
         toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
         event_stream_handler: EventStreamHandler[AgentDepsT] | None = None,
+        capabilities: Sequence[AgentCapability[AgentDepsT]] | None = None,
+        spec: dict[str, Any] | AgentSpec | None = None,
     ) -> AbstractAsyncContextManager[StreamedRunResult[AgentDepsT, OutputDataT]]: ...
 
     @overload
@@ -729,16 +828,24 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         output_type: OutputSpec[RunOutputDataT] | type[RunOutputDataT],
         candidate: dict[str, str] | None = None,
         user_prompt: UserPromptInput | None = None,
-        message_history: list[_messages.ModelMessage] | None = None,
+        message_history: Sequence[_messages.ModelMessage] | None = None,
         deferred_tool_results: DeferredToolResults | None = None,
+        conversation_id: str | None = None,
+        run_id: str | None = None,
         model: models.Model | models.KnownModelName | str | None = None,
+        instructions: AgentInstructions[AgentDepsT] = None,
         deps: AgentDepsT = None,
         model_settings: ModelSettings | None = None,
         usage_limits: _usage.UsageLimits | None = None,
+        cancellation_token: CancellationToken | None = None,
         usage: _usage.RunUsage | None = None,
+        metadata: AgentMetadata[AgentDepsT] | None = None,
+        retries: int | AgentRetries | None = None,
         infer_name: bool = True,
         toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
         event_stream_handler: EventStreamHandler[AgentDepsT] | None = None,
+        capabilities: Sequence[AgentCapability[AgentDepsT]] | None = None,
+        spec: dict[str, Any] | AgentSpec | None = None,
     ) -> AbstractAsyncContextManager[StreamedRunResult[AgentDepsT, RunOutputDataT]]: ...
 
     @asynccontextmanager
@@ -749,17 +856,24 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         output_type: OutputSpec[RunOutputDataT] | type[RunOutputDataT] | None = None,
         candidate: dict[str, str] | None = None,
         user_prompt: UserPromptInput | None = None,
-        message_history: list[_messages.ModelMessage] | None = None,
+        message_history: Sequence[_messages.ModelMessage] | None = None,
         deferred_tool_results: DeferredToolResults | None = None,
+        conversation_id: str | None = None,
+        run_id: str | None = None,
         model: models.Model | models.KnownModelName | str | None = None,
+        instructions: AgentInstructions[AgentDepsT] = None,
         deps: AgentDepsT = None,
         model_settings: ModelSettings | None = None,
         usage_limits: _usage.UsageLimits | None = None,
+        cancellation_token: CancellationToken | None = None,
         usage: _usage.RunUsage | None = None,
+        metadata: AgentMetadata[AgentDepsT] | None = None,
+        retries: int | AgentRetries | None = None,
         infer_name: bool = True,
         toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
         event_stream_handler: EventStreamHandler[AgentDepsT] | None = None,
-        **_deprecated_kwargs: Never,
+        capabilities: Sequence[AgentCapability[AgentDepsT]] | None = None,
+        spec: dict[str, Any] | AgentSpec | None = None,
     ) -> AsyncIterator[StreamedRunResult[AgentDepsT, Any]]:
         """Stream the agent execution with a signature-based prompt.
 
@@ -815,43 +929,28 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         if wrapped_has_validators and effective_output_type == wrapped_output_type:
             run_output_type = None
 
-        with (
-            self._tool_candidate_context(candidate),
-            self._output_tool_candidate_context(candidate),
-        ):
-            if instructions_override is None:
-                async with self.wrapped.run_stream(
-                    user_prompt=normalized_user_prompt,
-                    output_type=run_output_type,
-                    message_history=message_history,
-                    deferred_tool_results=deferred_tool_results,
-                    model=model,
-                    deps=deps,
-                    model_settings=model_settings,
-                    usage_limits=usage_limits,
-                    usage=usage,
-                    infer_name=infer_name,
-                    toolsets=toolsets,
-                    event_stream_handler=event_stream_handler,
-                    **_deprecated_kwargs,
-                ) as stream:
-                    yield stream
-                return
-
-            with self.wrapped.override(instructions=instructions_override):
-                async with self.wrapped.run_stream(
-                    user_prompt=normalized_user_prompt,
-                    output_type=run_output_type,
-                    message_history=message_history,
-                    deferred_tool_results=deferred_tool_results,
-                    model=model,
-                    deps=deps,
-                    model_settings=model_settings,
-                    usage_limits=usage_limits,
-                    usage=usage,
-                    infer_name=infer_name,
-                    toolsets=toolsets,
-                    event_stream_handler=event_stream_handler,
-                    **_deprecated_kwargs,
-                ) as stream:
-                    yield stream
+        run_instructions = self._run_instructions(instructions_override, instructions)
+        with self._candidate_instruction_override(candidate, run_instructions):
+            async with self.wrapped.run_stream(
+                user_prompt=normalized_user_prompt,
+                output_type=run_output_type,
+                message_history=message_history,
+                deferred_tool_results=deferred_tool_results,
+                conversation_id=conversation_id,
+                run_id=run_id,
+                model=model,
+                instructions=self._instructions_argument(candidate, run_instructions),
+                deps=deps,
+                model_settings=model_settings,
+                usage_limits=usage_limits,
+                cancellation_token=cancellation_token,
+                usage=usage,
+                metadata=metadata,
+                retries=retries,
+                infer_name=infer_name,
+                toolsets=toolsets,
+                event_stream_handler=event_stream_handler,
+                capabilities=self._run_capabilities(candidate, capabilities),
+                spec=spec,
+            ) as stream:
+                yield stream

@@ -331,7 +331,7 @@ def test_create_cached_metric():
 
 
 @pytest.mark.asyncio
-async def test_optimize_agent_with_caching():
+async def test_optimize_agent_with_caching(monkeypatch: pytest.MonkeyPatch):
     """Test that optimize_agent works with caching enabled."""
     with tempfile.TemporaryDirectory() as tmpdir:
         # Create a simple dataset
@@ -348,6 +348,24 @@ async def test_optimize_agent_with_caching():
 
         # Track metric calls
         metric_calls = []
+        cache_hits: list[str] = []
+
+        original_get_cached_metric_result = CacheManager.get_cached_metric_result
+
+        def tracking_get_cached_metric_result(
+            *args: Any, **kwargs: Any
+        ) -> MetricResult | None:
+            cached_result = original_get_cached_metric_result(*args, **kwargs)
+            if cached_result is not None:
+                case = args[1]
+                cache_hits.append(case.name)
+            return cached_result
+
+        monkeypatch.setattr(
+            CacheManager,
+            "get_cached_metric_result",
+            tracking_get_cached_metric_result,
+        )
 
         def metric(case, output):
             metric_calls.append(case.name)
@@ -395,6 +413,7 @@ async def test_optimize_agent_with_caching():
 
         # Clear metric calls
         metric_calls.clear()
+        cache_hits.clear()
 
         # Second run should use cache for overlapping evaluations
         result2 = await optimize_agent(
@@ -409,9 +428,12 @@ async def test_optimize_agent_with_caching():
             cache_verbose=False,
         )
 
-        # Should have fewer metric calls due to caching
+        # Every baseline evaluation should be reused. The optimizer may spend the
+        # freed metric budget evaluating a new proposal, so total metric calls are
+        # not itself a reliable cache-hit signal for resumable optimization.
         second_run_calls = len(metric_calls)
-        assert second_run_calls < first_run_calls
+        assert set(cache_hits) == {case.name for case in trainset}
+        assert second_run_calls <= first_run_calls
 
         # Results should be consistent
         assert result2.original_candidate == result1.original_candidate
