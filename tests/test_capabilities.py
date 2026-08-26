@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, cast
 
 import pytest
 from pydantic import BaseModel, Field
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import Agent, RunContext, Tool
 from pydantic_ai.capabilities import AbstractCapability, Capability
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
-from pydantic_ai.toolsets import AbstractToolset, ToolsetTool
+from pydantic_ai.toolsets import AbstractToolset, FunctionToolset, ToolsetTool
 from pydantic_ai.tools import ToolDefinition
 
 from pydantic_ai_gepa import GepaOptimizationResult, SignatureAgent
@@ -183,6 +184,174 @@ def test_introspection_discovers_constructor_capability_tools_before_run() -> No
     assert slots["tool:capability_lookup:param:query"] == "Value to look up."
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("toolset", "visible_name"),
+    [
+        (
+            FunctionToolset([capability_lookup]).prefixed("cap"),
+            "cap_capability_lookup",
+        ),
+        (
+            FunctionToolset([capability_lookup]).renamed(
+                {"renamed_lookup": "capability_lookup"}
+            ),
+            "renamed_lookup",
+        ),
+    ],
+)
+async def test_introspection_uses_model_visible_capability_tool_names(
+    toolset: AbstractToolset[Any],
+    visible_name: str,
+) -> None:
+    model = TestModel(custom_output_text="answer")
+    agent = Agent(
+        model,
+        name=f"{visible_name}-introspection",
+        capabilities=[Capability(id=visible_name, toolsets=[toolset])],
+    )
+    signature_agent = SignatureAgent(
+        agent,
+        input_type=SignatureInput,
+        optimize_tools=True,
+    )
+
+    slots = introspect_agent(signature_agent)
+
+    assert f"tool:{visible_name}:description" in slots
+    assert f"tool:{visible_name}:param:query" in slots
+    assert "tool:capability_lookup:description" not in slots
+
+    await signature_agent.run_signature(
+        SignatureInput(question="Wrapped lookup?"),
+        candidate={
+            f"tool:{visible_name}:description": "Use the model-visible lookup.",
+            f"tool:{visible_name}:param:query": "Visible value to look up.",
+        },
+    )
+
+    assert model.last_model_request_parameters is not None
+    [prepared_tool] = model.last_model_request_parameters.function_tools
+    assert prepared_tool.name == visible_name
+    assert prepared_tool.description == "Use the model-visible lookup."
+    assert (
+        prepared_tool.parameters_json_schema["properties"]["query"]["description"]
+        == "Visible value to look up."
+    )
+
+
+@pytest.mark.asyncio
+async def test_filtered_capability_tools_are_discovered_only_at_runtime() -> None:
+    filter_calls: list[str] = []
+
+    def include_tool(
+        ctx: RunContext[Any],
+        tool_definition: ToolDefinition,
+    ) -> bool:
+        _ = ctx
+        filter_calls.append(tool_definition.name)
+        return True
+
+    filtered_toolset = FunctionToolset([capability_lookup]).filtered(include_tool)
+    agent = Agent(
+        TestModel(custom_output_text="answer"),
+        name="filtered-capability",
+        capabilities=[Capability(id="filtered", toolsets=[filtered_toolset])],
+    )
+    signature_agent = SignatureAgent(
+        agent,
+        input_type=SignatureInput,
+        optimize_tools=True,
+    )
+
+    slots_before_run = introspect_agent(signature_agent)
+
+    assert "tool:capability_lookup:description" not in slots_before_run
+    assert filter_calls == []
+
+    await signature_agent.run_signature(SignatureInput(question="Filtered lookup?"))
+
+    assert filter_calls
+    assert set(filter_calls) == {"capability_lookup"}
+    slots_after_run = introspect_agent(signature_agent)
+    assert "tool:capability_lookup:description" in slots_after_run
+
+
+@pytest.mark.asyncio
+async def test_dynamic_capability_tools_are_discovered_only_at_runtime() -> None:
+    factory_calls = 0
+
+    def build_toolset(ctx: RunContext[Any]) -> FunctionToolset[Any]:
+        nonlocal factory_calls
+        _ = ctx
+        factory_calls += 1
+        return FunctionToolset([capability_lookup])
+
+    agent = Agent(
+        TestModel(custom_output_text="answer"),
+        name="dynamic-capability",
+        capabilities=[Capability(id="dynamic", toolsets=[build_toolset])],
+    )
+    signature_agent = SignatureAgent(
+        agent,
+        input_type=SignatureInput,
+        optimize_tools=True,
+    )
+
+    slots_before_run = introspect_agent(signature_agent)
+
+    assert "tool:capability_lookup:description" not in slots_before_run
+    assert factory_calls == 0
+
+    await signature_agent.run_signature(SignatureInput(question="Dynamic lookup?"))
+
+    assert factory_calls >= 1
+    slots_after_run = introspect_agent(signature_agent)
+    assert "tool:capability_lookup:description" in slots_after_run
+
+
+@pytest.mark.asyncio
+async def test_context_prepared_tools_are_not_discovered_statically() -> None:
+    prepare_calls = 0
+
+    def hide_tool(
+        ctx: RunContext[Any],
+        tool_definition: ToolDefinition,
+    ) -> None:
+        nonlocal prepare_calls
+        _ = (ctx, tool_definition)
+        prepare_calls += 1
+        return None
+
+    prepared_tool = Tool(capability_lookup, prepare=hide_tool)
+    agent = Agent(
+        TestModel(custom_output_text="answer"),
+        name="prepared-capability",
+        capabilities=[
+            Capability(
+                id="prepared",
+                toolsets=[FunctionToolset([prepared_tool])],
+            )
+        ],
+    )
+    signature_agent = SignatureAgent(
+        agent,
+        input_type=SignatureInput,
+        optimize_tools=True,
+    )
+
+    slots_before_run = introspect_agent(signature_agent)
+
+    assert "tool:capability_lookup:description" not in slots_before_run
+    assert prepare_calls == 0
+
+    await signature_agent.run_signature(SignatureInput(question="Prepared lookup?"))
+
+    assert prepare_calls >= 1
+    slots_after_run = introspect_agent(signature_agent)
+    assert "tool:capability_lookup:description" not in slots_after_run
+
+
 @dataclass
 class RuntimeOnlyToolset(AbstractToolset[Any]):
     get_tools_calls: int = 0
@@ -208,6 +377,19 @@ class RuntimeOnlyToolset(AbstractToolset[Any]):
         raise AssertionError("Static introspection must not call runtime tools.")
 
 
+@dataclass
+class FailingStaticToolset(RuntimeOnlyToolset):
+    apply_calls: int = 0
+
+    def apply(
+        self,
+        visitor: Callable[[AbstractToolset[Any]], None],
+    ) -> None:
+        _ = visitor
+        self.apply_calls += 1
+        raise RuntimeError("Static toolset is not connected.")
+
+
 def test_introspection_does_not_execute_runtime_toolset_hooks() -> None:
     runtime_toolset = RuntimeOnlyToolset()
     agent = Agent(
@@ -219,6 +401,25 @@ def test_introspection_does_not_execute_runtime_toolset_hooks() -> None:
     introspect_agent(SignatureAgent(agent, input_type=SignatureInput))
 
     assert runtime_toolset.get_tools_calls == 0
+
+
+def test_failing_static_toolset_does_not_block_other_tool_discovery() -> None:
+    failing_toolset = FailingStaticToolset()
+    agent = Agent(
+        TestModel(),
+        name="failing-static-toolset",
+        tools=[capability_lookup],
+        toolsets=[failing_toolset],
+    )
+
+    slots = introspect_agent(
+        SignatureAgent(agent, input_type=SignatureInput, optimize_tools=True)
+    )
+
+    assert slots["tool:capability_lookup:description"] == (
+        "Look up a capability-owned value."
+    )
+    assert failing_toolset.apply_calls == 0
 
 
 @pytest.mark.asyncio
