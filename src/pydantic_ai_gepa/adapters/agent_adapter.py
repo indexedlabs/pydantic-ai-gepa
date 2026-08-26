@@ -11,6 +11,7 @@ from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field, replace
 import json
 import os
+import weakref
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, cast
 from uuid import uuid4
@@ -657,6 +658,10 @@ class _BaseAgentAdapter(
         self._gepa_usage_lock = asyncio.Lock()
         self._trace_run_id = uuid4().hex
         self._trace_collector = GepaTraceCollector()
+        self._trace_finalizer = weakref.finalize(
+            self,
+            self._trace_collector.shutdown,
+        )
         if self.optimize_tools:
             self._configure_tool_optimizer()
         if self.optimize_output_type:
@@ -666,6 +671,10 @@ class _BaseAgentAdapter(
     def trace_collector(self) -> GepaTraceCollector:
         """Return the run-owned collector used for traced evaluations."""
         return self._trace_collector
+
+    def close(self) -> None:
+        """Release the adapter's run-owned tracing resources."""
+        self._trace_finalizer()
 
     def _configure_tool_optimizer(self) -> None:
         """Install tool optimization support for plain agents when requested."""
@@ -1082,16 +1091,17 @@ class _BaseAgentAdapter(
             }
         )
         try:
-            with capture_run_messages() as run_messages:
-                captured_messages = run_messages
-                run_result = await self._invoke_agent(
-                    case,
-                    candidate=candidate,
-                    message_history=message_history,
-                    usage_kwargs=usage_kwargs,
-                    example_bank=example_bank,
-                )
-                messages = run_result.new_messages()
+            with self._trace_collector.root_context():
+                with capture_run_messages() as run_messages:
+                    captured_messages = run_messages
+                    run_result = await self._invoke_agent(
+                        case,
+                        candidate=candidate,
+                        message_history=message_history,
+                        usage_kwargs=usage_kwargs,
+                        example_bank=example_bank,
+                    )
+                    messages = run_result.new_messages()
             run_usage = run_result.usage
             await self._record_gepa_usage(run_usage)
         except InspectionAborted:
@@ -1237,13 +1247,14 @@ class _BaseAgentAdapter(
             }
         )
         try:
-            result = await self._invoke_agent(
-                case,
-                candidate=candidate,
-                message_history=self._message_history_for_case(case),
-                usage_kwargs=usage_kwargs,
-                example_bank=example_bank,
-            )
+            with self._trace_collector.root_context():
+                result = await self._invoke_agent(
+                    case,
+                    candidate=candidate,
+                    message_history=self._message_history_for_case(case),
+                    usage_kwargs=usage_kwargs,
+                    example_bank=example_bank,
+                )
             run_usage = result.usage
             await self._record_gepa_usage(run_usage)
             self._finalize_trace_context(trace_context)

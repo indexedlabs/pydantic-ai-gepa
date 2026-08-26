@@ -971,6 +971,7 @@ source = { editable = "." }
 dependencies = [
     { name = "cloudpickle" },
     { name = "logfire" },
+    { name = "opentelemetry-sdk" },
     { name = "pydantic-ai-slim", extra = ["anthropic", "logfire", "openai", "retries"] },
     { name = "pydantic-evals" },
     { name = "pydantic-graph" },
@@ -998,6 +999,7 @@ dev = [
 requires-dist = [
     { name = "cloudpickle", specifier = ">=3.0.0" },
     { name = "logfire", specifier = ">=4.14.2" },
+    { name = "opentelemetry-sdk", specifier = ">=1.44.0,<2" },
     { name = "pydantic-ai-slim", extras = ["openai", "anthropic", "logfire", "retries"], specifier = ">=2.34.0,<3" },
     { name = "pydantic-evals", specifier = ">=2.34.0,<3" },
     { name = "pydantic-graph", specifier = ">=2.34.0,<3" },

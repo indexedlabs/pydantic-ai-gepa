@@ -238,17 +238,33 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
         selector=state.config.component_selector,
         components_to_update=components_to_update,
     ):
-        proposal_result = await _propose_new_texts(
-            deps=deps,
-            state=state,
-            parent=parent,
-            reflective_dataset=reflective_dataset,
-            components=components_to_update,
-            model=reflection_model,
-            model_settings=deps.model_settings,
-            component_toolsets=component_toolsets if component_toolsets else None,
-            capabilities=reflector_capabilities,
-        )
+        if deps.trace_collector is None:
+            proposal_result = await _propose_new_texts(
+                deps=deps,
+                state=state,
+                parent=parent,
+                reflective_dataset=reflective_dataset,
+                components=components_to_update,
+                model=reflection_model,
+                model_settings=deps.model_settings,
+                component_toolsets=component_toolsets if component_toolsets else None,
+                capabilities=reflector_capabilities,
+            )
+        else:
+            with deps.trace_collector.root_context():
+                proposal_result = await _propose_new_texts(
+                    deps=deps,
+                    state=state,
+                    parent=parent,
+                    reflective_dataset=reflective_dataset,
+                    components=components_to_update,
+                    model=reflection_model,
+                    model_settings=deps.model_settings,
+                    component_toolsets=(
+                        component_toolsets if component_toolsets else None
+                    ),
+                    capabilities=reflector_capabilities,
+                )
 
         if deps.trace_collector is not None and reflector_trace_context is not None:
             deps.trace_collector.spans_for(reflector_trace_context)

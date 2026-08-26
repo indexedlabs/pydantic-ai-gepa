@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from contextlib import contextmanager
+from collections.abc import Iterator
 from typing import Any, Literal
 
 from opentelemetry import trace
+from opentelemetry.context import Context, attach, detach
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
@@ -119,7 +122,7 @@ class GepaTraceCollector:
         max_retained_spans: int = DEFAULT_MAX_RETAINED_SPANS,
     ) -> None:
         self._exporter = InMemorySpanExporter(max_spans=max_retained_spans)
-        self._provider = TracerProvider()
+        self._provider = TracerProvider(shutdown_on_exit=False)
         self._provider.add_span_processor(SimpleSpanProcessor(self._exporter))
         self._settings = InstrumentationSettings(
             tracer_provider=self._provider,
@@ -150,6 +153,15 @@ class GepaTraceCollector:
     def nested_instrumentation(self) -> Instrumentation:
         """Return instrumentation a participating child agent can share."""
         return Instrumentation(settings=self._settings)
+
+    @contextmanager
+    def root_context(self) -> Iterator[None]:
+        """Detach a rollout from ambient OTel parents so each case owns a trace."""
+        token = attach(Context())
+        try:
+            yield
+        finally:
+            detach(token)
 
     def spans_for(self, context: GepaTraceContext) -> tuple[ReadableSpan, ...]:
         """Return only spans belonging to ``context`` and finalize completeness."""

@@ -17,6 +17,7 @@ from pydantic_graph import EndMarker, GraphTask
 from .adapters.agent_adapter import create_adapter
 from .cache import CacheManager
 from .components import (
+    AppliedCandidateAgent,
     applied_candidate_agent,
     ensure_component_values,
     extract_seed_candidate_with_input_type,
@@ -89,7 +90,7 @@ class GepaOptimizationResult(BaseModel):
     @contextmanager
     def apply_best(
         self, agent: AbstractAgent[Any, Any]
-    ) -> Iterator[AbstractAgent[Any, Any]]:
+    ) -> Iterator[AppliedCandidateAgent]:
         """Apply the best candidate to an agent as a context manager.
 
         Args:
@@ -118,7 +119,7 @@ class GepaOptimizationResult(BaseModel):
         *,
         agent: AbstractAgent[Any, Any],
         input_type: InputSpec[BaseModel] | None = None,
-    ) -> Iterator[AbstractAgent[Any, Any]]:
+    ) -> Iterator[AppliedCandidateAgent]:
         """Apply the best candidate to an agent and optional signature.
 
         Args:
@@ -442,7 +443,7 @@ async def optimize_agent(
         )
         return _fallback_result(normalized_seed_candidate)
     finally:
-        adapter.trace_collector.shutdown()
+        adapter.close()
 
     if gepa_result is None:
         raise RuntimeError("GEPA optimization did not produce a result.")

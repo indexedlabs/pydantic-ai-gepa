@@ -426,6 +426,7 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         self,
         candidate: dict[str, str] | None,
         run_instructions: AgentInstructions[AgentDepsT] | None,
+        capabilities: Sequence[AgentCapability[AgentDepsT]] | None,
     ):
         """Replace only literal base instructions for an optimized candidate."""
         has_contextual_override = self._has_instruction_override()
@@ -445,6 +446,12 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
             override.append(optimized_literal)
         override.extend(instruction_functions)
         override.extend(self._base_capability_instructions())
+        for capability in capabilities or ():
+            get_instructions = getattr(capability, "get_instructions", None)
+            if get_instructions is not None:
+                override.extend(
+                    self._normalize_capability_instructions(get_instructions())
+                )
         if run_instructions is not None:
             if isinstance(run_instructions, Sequence) and not isinstance(
                 run_instructions, str
@@ -472,7 +479,12 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         agent: AbstractAgent[Any, Any] | WrapperAgent[Any, Any] = self.wrapped
         while isinstance(agent, WrapperAgent):
             agent = agent.wrapped
-        instructions = agent.root_capability.get_instructions()
+        return self._normalize_capability_instructions(
+            agent.root_capability.get_instructions()
+        )
+
+    @staticmethod
+    def _normalize_capability_instructions(instructions: Any) -> list[Any]:
         if instructions is None:
             return []
         if isinstance(instructions, Sequence) and not isinstance(instructions, str):
@@ -646,7 +658,11 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
             run_output_type = None
 
         run_instructions = self._run_instructions(instructions_override, instructions)
-        with self._candidate_instruction_override(candidate, run_instructions):
+        with self._candidate_instruction_override(
+            candidate,
+            run_instructions,
+            capabilities,
+        ):
             return await self.wrapped.run(
                 user_prompt=normalized_user_prompt,
                 output_type=run_output_type,
@@ -807,7 +823,11 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
             run_output_type = None
 
         run_instructions = self._run_instructions(instructions_override, instructions)
-        with self._candidate_instruction_override(candidate, run_instructions):
+        with self._candidate_instruction_override(
+            candidate,
+            run_instructions,
+            capabilities,
+        ):
             return self.wrapped.run_sync(
                 user_prompt=normalized_user_prompt,
                 output_type=run_output_type,
@@ -969,7 +989,11 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
             run_output_type = None
 
         run_instructions = self._run_instructions(instructions_override, instructions)
-        with self._candidate_instruction_override(candidate, run_instructions):
+        with self._candidate_instruction_override(
+            candidate,
+            run_instructions,
+            capabilities,
+        ):
             async with self.wrapped.run_stream(
                 user_prompt=normalized_user_prompt,
                 output_type=run_output_type,

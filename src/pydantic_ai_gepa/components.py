@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
@@ -38,11 +38,85 @@ class AppliedCandidateAgent(WrapperAgent[Any, Any]):
         capabilities: list[Any] = list(kwargs.pop("capabilities", None) or ())
         if self._candidate_capability is not None:
             capabilities.append(self._candidate_capability)
+        active_override = _active_instruction_override(self.wrapped)
+        if active_override is not None:
+            instructions = _normalized_instructions(active_override)
+            for capability in capabilities:
+                instructions.extend(
+                    _normalized_instructions(capability.get_instructions())
+                )
+            instructions.extend(
+                _normalized_instructions(kwargs.pop("instructions", None))
+            )
+            return self._iter_with_instruction_override(
+                args,
+                kwargs,
+                tuple(capabilities) or None,
+                instructions,
+            )
         return self.wrapped.iter(
             *args,
             capabilities=tuple(capabilities) or None,
             **kwargs,
         )
+
+    @asynccontextmanager
+    async def _iter_with_instruction_override(
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        capabilities: tuple[Any, ...] | None,
+        instructions: list[Any],
+    ):
+        override: Any = (
+            instructions[0] if len(instructions) == 1 else tuple(instructions)
+        )
+        target_agent = _base_agent(self.wrapped)
+        with target_agent.override(instructions=override):
+            async with self.wrapped.iter(
+                *args,
+                instructions=None,
+                capabilities=capabilities,
+                **kwargs,
+            ) as run:
+                yield run
+
+    async def run_signature(self, *args: Any, **kwargs: Any):
+        """Forward SignatureAgent's structured run API when available."""
+        if not isinstance(self.wrapped, SignatureAgent):
+            raise AttributeError("Wrapped agent does not support run_signature()")
+        return await self.wrapped.run_signature(*args, **kwargs)
+
+    def run_signature_sync(self, *args: Any, **kwargs: Any):
+        """Forward SignatureAgent's synchronous structured run API."""
+        if not isinstance(self.wrapped, SignatureAgent):
+            raise AttributeError("Wrapped agent does not support run_signature_sync()")
+        return self.wrapped.run_signature_sync(*args, **kwargs)
+
+
+def _normalized_instructions(instructions: Any) -> list[Any]:
+    if instructions is None:
+        return []
+    if isinstance(instructions, Sequence) and not isinstance(instructions, str):
+        return list(instructions)
+    return [instructions]
+
+
+def _base_agent(agent: AbstractAgent[Any, Any]) -> AbstractAgent[Any, Any]:
+    while isinstance(agent, WrapperAgent):
+        agent = agent.wrapped
+    return agent
+
+
+def _active_instruction_override(agent: AbstractAgent[Any, Any]) -> Any | None:
+    base_agent = _base_agent(agent)
+    override_manager = getattr(base_agent, "_override_instructions", None)
+    if override_manager is None:
+        return None
+    override = override_manager.get()
+    if override is None:
+        return None
+    return override.value
 
 
 def ensure_component_values(
@@ -194,6 +268,9 @@ def apply_candidate_to_agent(
         if instructions:
             override_value.append(instructions)
         override_value.extend(instruction_callbacks)
+        override_value.extend(
+            _normalized_instructions(target_agent.root_capability.get_instructions())
+        )
         if override_value:
             override_payload: Any = (
                 override_value[0] if len(override_value) == 1 else tuple(override_value)
@@ -206,16 +283,11 @@ def apply_candidate_to_agent(
 def applied_candidate_agent(
     agent: AbstractAgent[Any, Any],
     candidate: CandidateMap | None,
-) -> Iterator[AbstractAgent[Any, Any]]:
+) -> Iterator[AppliedCandidateAgent]:
     """Yield an agent view that applies every candidate component per run."""
     candidate_map = candidate or {}
     with apply_candidate_to_agent(agent, candidate_map):
-        if isinstance(agent, SignatureAgent):
-            # SignatureAgent already adds the contextual candidate capability
-            # in run_signature(), while retaining its signature-specific API.
-            yield agent
-        else:
-            yield AppliedCandidateAgent(agent, candidate_map)
+        yield AppliedCandidateAgent(agent, candidate_map)
 
 
 def get_component_names(

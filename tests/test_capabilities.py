@@ -181,7 +181,12 @@ def _optimization_result(candidate: dict[str, str]) -> GepaOptimizationResult:
 @pytest.mark.asyncio
 async def test_apply_best_yields_agent_with_candidate_capability() -> None:
     model = TestModel(custom_output_text="answer")
-    agent = Agent(model, instructions="Seed instructions.", name="apply-best")
+    agent = Agent(
+        model,
+        instructions="Seed instructions.",
+        capabilities=[InstructionCapability("Capability guidance.")],
+        name="apply-best",
+    )
 
     @agent.tool_plain
     def lookup(query: str) -> str:
@@ -197,11 +202,19 @@ async def test_apply_best_yields_agent_with_candidate_capability() -> None:
     )
 
     with result.apply_best(agent) as optimized_agent:
-        run_result = await optimized_agent.run("question")
+        run_result = await optimized_agent.run(
+            "question",
+            instructions="Caller guidance.",
+            capabilities=[InstructionCapability("Run capability guidance.")],
+        )
 
     request = run_result.all_messages()[0]
     assert isinstance(request, ModelRequest)
-    assert request.instructions == "Optimized instructions."
+    assert request.instructions is not None
+    assert "Optimized instructions." in request.instructions
+    assert "Capability guidance." in request.instructions
+    assert "Run capability guidance." in request.instructions
+    assert "Caller guidance." in request.instructions
     assert model.last_model_request_parameters is not None
     [tool] = model.last_model_request_parameters.function_tools
     assert tool.description == "Look up the optimized value."
@@ -221,10 +234,11 @@ async def test_apply_best_to_signature_retains_all_instruction_sources() -> None
     with result.apply_best_to(
         agent=signature_agent, input_type=SignatureInput
     ) as applied:
-        assert applied is signature_agent
-        run_result = await signature_agent.run_signature(
+        assert applied.wrapped is signature_agent
+        run_result = await applied.run_signature(
             SignatureInput(question="Why?"),
             instructions="Caller guidance.",
+            capabilities=[InstructionCapability("Run capability guidance.")],
         )
 
     request = run_result.all_messages()[0]
@@ -232,6 +246,7 @@ async def test_apply_best_to_signature_retains_all_instruction_sources() -> None
     assert request.instructions is not None
     assert "Optimized instructions." in request.instructions
     assert "Capability guidance." in request.instructions
+    assert "Run capability guidance." in request.instructions
     assert "Answer a structured question." in request.instructions
     assert "Caller guidance." in request.instructions
 
