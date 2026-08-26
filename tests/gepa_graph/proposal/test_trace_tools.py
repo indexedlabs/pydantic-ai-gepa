@@ -294,7 +294,7 @@ async def test_monty_repl_failed_call_rolls_back_partial_state(
     monkeypatch.chdir(tmp_path)
 
     toolset = create_trace_toolset("run-1", 0)
-    run_python_repl = toolset.tools["run_python_repl"].function
+    run_python_repl = cast(Any, toolset.tools["run_python_repl"].function)
 
     await run_python_repl("stable = 'committed'")
     failed_result = await run_python_repl("partial = 'discarded'\n1 / 0")

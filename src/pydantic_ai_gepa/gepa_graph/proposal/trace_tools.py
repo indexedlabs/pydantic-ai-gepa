@@ -700,26 +700,21 @@ def create_trace_toolset(
             )
             agent = Agent(reflection_model, system_prompt=system_prompt)
 
-            try:
-                loop_count = 0
-                while True:
-                    loop_count += 1
-                    if loop_count > 20:
-                        return "Error: Child agent exceeded maximum clear_message_history loops (20)."
-                    try:
-                        result = await agent.run(
-                            current_prompt, toolsets=[child_toolset]
-                        )
-                        return result.output
-                    except ClearMessageHistoryException as e:
-                        current_prompt = (
-                            f"History cleared. You previously left yourself this note to continue:\n\n{e.next_context}\n\n"
-                            "Your Python REPL state is intact."
-                        )
-                    except Exception as e:
-                        return f"Error running sub-agent: {e}"
-            finally:
-                child_session["repl"].__exit__(None, None, None)
+            loop_count = 0
+            while True:
+                loop_count += 1
+                if loop_count > 20:
+                    return "Error: Child agent exceeded maximum clear_message_history loops (20)."
+                try:
+                    result = await agent.run(current_prompt, toolsets=[child_toolset])
+                    return result.output
+                except ClearMessageHistoryException as e:
+                    current_prompt = (
+                        f"History cleared. You previously left yourself this note to continue:\n\n{e.next_context}\n\n"
+                        "Your Python REPL state is intact."
+                    )
+                except Exception as e:
+                    return f"Error running sub-agent: {e}"
 
     except ImportError:
         pass

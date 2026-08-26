@@ -7,6 +7,7 @@ from contextlib import contextmanager
 import html
 import json
 from dataclasses import is_dataclass, replace
+from types import UnionType
 from typing import Annotated, Any, Generic, TypeVar, cast, get_args, get_origin
 
 try:
@@ -339,7 +340,9 @@ class _InputShared:
                 return annotation.__name__
             return str(annotation)
 
-        origin_name = getattr(origin, "__name__", str(origin))
+        origin_name = (
+            "Union" if origin is UnionType else getattr(origin, "__name__", str(origin))
+        )
         if not args:
             return origin_name
 
