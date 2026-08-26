@@ -1,0 +1,20 @@
+{
+  "checkpoint_id": "01a040560fcb",
+  "created_at": "2026-08-26T23:09:37.209010+00:00",
+  "branch_name": "codex/pydantic-ai-v2",
+  "default_branch_name": "main",
+  "related_commit_refs": [
+    "c7684af8a82163e39c188d544b883e848f8d85fa"
+  ],
+  "entity_touches": [
+    ".mighty/loro/edges/01a0404d-1346-7011-9391-1aa012b92479.loro",
+    ".mighty/loro/edges/01a04055-e287-7ea0-bf5b-5615569dea7d.loro",
+    ".mighty/loro/edges/01a04055-e2fc-7b91-9373-780dead5d9c6.loro",
+    ".mighty/loro/edges/01a04055-e372-74b2-b7f4-f61594778226.loro",
+    ".mighty/loro/messages/01a0404d-298a-76b1-8a90-5b92a97b356b.loro",
+    ".mighty/loro/messages/01a04055-e227-71c0-9aec-782e0d98e6f2.loro",
+    ".mighty/loro/messages/01a04055-e417-75c1-9fca-ba4f191a4c56.loro",
+    ".mighty/loro/records/019c7707-acde-7611-867b-4ba99eb174f0.loro",
+    ".mighty/loro/records/01a0404d-130f-7912-8c33-8f8c38bb3fa8.loro"
+  ]
+}
