@@ -32,6 +32,7 @@ from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import AgentDepsT, DeferredToolResults
 from pydantic_ai.toolsets import AbstractToolset
 
+from ._agent_instructions import declared_instructions, unwrap_instruction
 from .capability_instructions import resolved_capability_instructions
 from .input_type import BoundInputSpec, InputSpec, build_input_spec
 from .tool_components import (
@@ -367,7 +368,7 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
                 items = [value]
             literal_parts: list[str] = []
             functions: list[Any] = []
-            for item in items:
+            for item in map(unwrap_instruction, items):
                 if isinstance(item, str):
                     literal_parts.append(item)
                 else:
@@ -386,7 +387,7 @@ class SignatureAgent(WrapperAgent[AgentDepsT, OutputDataT]):
                     if split is not None:
                         return split
 
-            direct_instructions = getattr(agent, "_instructions", None)
+            direct_instructions = declared_instructions(agent)
             if direct_instructions is not None:
                 split = _split_value(direct_instructions)
                 if split is not None:

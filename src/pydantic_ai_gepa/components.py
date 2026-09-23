@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel
 from pydantic_ai.agent.wrapper import WrapperAgent
 
+from ._agent_instructions import declared_instructions
 from .capability_instructions import resolved_capability_instructions
 from .gepa_graph.models import CandidateMap, ComponentValue, candidate_texts
 from .input_type import InputSpec, build_input_spec
@@ -181,7 +182,7 @@ def extract_seed_candidate(
     # rollout time by SignatureAgent (or by pydantic-ai for plain agents),
     # so don't stringify them here (that would render `<function ... at 0x...>`
     # into the prompt).
-    raw_instructions = getattr(target_agent, "_instructions", None)
+    raw_instructions = declared_instructions(target_agent)
     if raw_instructions:
         literal_parts = [item for item in raw_instructions if isinstance(item, str)]
         candidate["instructions"] = ComponentValue(
@@ -267,7 +268,7 @@ def apply_candidate_to_agent(
     # `_instructions`. When we override with the candidate text we'd otherwise
     # drop the callbacks; preserve them so per-run dynamic context still
     # reaches the model.
-    raw_instructions = getattr(target_agent, "_instructions", None) or []
+    raw_instructions = declared_instructions(target_agent) or []
     instruction_callbacks: list[Any] = [
         item for item in raw_instructions if not isinstance(item, str)
     ]

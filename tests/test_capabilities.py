@@ -718,7 +718,9 @@ async def test_tool_only_candidate_preserves_seed_and_capability_instructions() 
 
     request = run_result.all_messages()[0]
     assert isinstance(request, ModelRequest)
-    assert request.instructions == "Seed instructions.\nCapability guidance."
+    # pydantic-ai 2.48 separates instructions from different sources with a
+    # blank line.
+    assert request.instructions == "Seed instructions.\n\nCapability guidance."
     assert model.last_model_request_parameters is not None
     [tool] = model.last_model_request_parameters.function_tools
     assert tool.description == "Optimized lookup."
