@@ -79,7 +79,14 @@ from .layout import (
     vector_records_path,
 )
 from .metrics import default_substring_metric
-from .validation import validation_dataset_path, validation_spend_path
+from .validation import (
+    public_echo,
+    harness_environment,
+    heldout_dataset,
+    validation_dataset_path,
+    private_evaluation,
+    validation_spend_path,
+)
 from .runs import (
     Minibatch,
     MinibatchStore,
@@ -353,6 +360,7 @@ def _write_trace_file(
     return path if path.exists() and path.stat().st_size > 0 else None
 
 
+@private_evaluation
 def run_eval_once(
     *,
     candidate_file: Path | None,
@@ -423,11 +431,8 @@ def run_eval_once(
         skills_fs = resolve_skills(cfg, root=active_candidate_project)
 
     if dataset_role == "validation":
-        if cfg.validation_dataset is None:
-            raise typer.BadParameter(
-                "Held-out validation requires validation_dataset in gepa.toml."
-            )
-        configured_dataset = cfg.validation_dataset
+        configured_dataset = heldout_dataset()
+        assert configured_dataset is not None
     else:
         configured_dataset = cfg.dataset
     dataset_path = (primary_project_root / configured_dataset).resolve()
@@ -444,8 +449,9 @@ def run_eval_once(
                 "Could not load held-out validation dataset."
             ) from exc
     else:
-        if cfg.validation_dataset is not None:
-            held_out_path = (primary_project_root / cfg.validation_dataset).resolve()
+        private_dataset = heldout_dataset(required=False)
+        if private_dataset is not None:
+            held_out_path = Path(private_dataset).resolve()
             if dataset_path == held_out_path or (
                 dataset_path.is_file()
                 and held_out_path.is_file()
@@ -459,7 +465,12 @@ def run_eval_once(
                 )
         cases = load_dataset(dataset_path)
     if not cases:
-        typer.echo(f"Dataset {dataset_path} is empty.", err=True)
+        typer.echo(
+            "Held-out dataset is empty."
+            if dataset_role == "validation"
+            else f"Dataset {dataset_path} is empty.",
+            err=True,
+        )
         raise typer.Exit(code=1)
 
     git_state: GitCandidateState | None = None
@@ -539,7 +550,7 @@ def run_eval_once(
     prior_count = _count_evals_in_run(active_run_id, root=workspace_root)
     if prior_count >= max_iterations:
         if not lane:  # None (single path) or empty: hard cap; lane str: advisory
-            typer.echo(
+            public_echo(
                 f"Max iterations reached ({prior_count}/{max_iterations}). "
                 "Start a new run (omit --run-id) or raise --max-iterations.",
                 err=True,
@@ -849,9 +860,8 @@ def run_eval_once(
     if write_pareto and dataset_role == "validation" and persist_validation_replay:
         from .validation import write_validation_evidence
 
-        assert cfg.validation_dataset is not None
         write_validation_evidence(
-            cfg.validation_dataset,
+            str(dataset_path),
             project_root=primary_project_root,
             run_id=f"{active_run_id}:eval:{eval_id}",
             identity={"candidate_id": candidate.id, "eval_id": eval_id},
@@ -1008,7 +1018,11 @@ def _format_output_lines(outcome: EvalOutcome) -> str:
     return "\n".join(output_lines)
 
 
+@harness_environment()
 def eval_(
+    dataset_role: str = typer.Option(
+        "training", "--dataset-role", help="training or validation (harness only)."
+    ),
     max_token_cost: float | None = typer.Option(
         None,
         "--max-token-cost",
@@ -1075,7 +1089,10 @@ def eval_(
     if candidate_source not in {None, "components", "git"}:
         typer.echo("--candidate-source must be 'components' or 'git'.", err=True)
         raise typer.Exit(code=2)
+    if dataset_role not in {"training", "validation"}:
+        raise typer.BadParameter("--dataset-role must be training or validation.")
     outcome = run_eval_once(
+        dataset_role=cast(Literal["training", "validation"], dataset_role),
         max_token_cost=max_token_cost,
         candidate_file=candidate_file,
         minibatch_id=minibatch_id,

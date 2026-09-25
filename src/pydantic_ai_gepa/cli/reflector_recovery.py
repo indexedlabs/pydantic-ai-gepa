@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Any, Callable
 
 import typer
 
+from .validation import public_echo, private_evaluation
+
 from ..evaluation import EvaluationRecord
 from ..types import RolloutOutput
 from .eval import EvalOutcome, _trace_file_path
@@ -40,7 +42,7 @@ class CandidateChanged(typer.Exit):
     """A paid sample belongs to a different tree than this continuation."""
 
     def __init__(self) -> None:
-        typer.echo(
+        public_echo(
             "Candidate changed during continuation; abandoning its checkpoint. "
             "Paid evaluations remain charged. Run continue again for the current tree.",
             err=True,
@@ -91,6 +93,10 @@ def _row_outcome(
     state: RunState, row: ParetoRow, iteration: int, threshold: float
 ) -> EvalOutcome:
     validation = row.extra.get("dataset_role") == "validation"
+    if validation:
+        from .validation import check_heldout_pin
+
+        check_heldout_pin(repo_root(), state.run_id)
     eval_id = row.extra.get("eval_id", "")
     stem = f"{iteration:04d}-{eval_id}-{row.candidate_id}"
     report = run_dir(state.run_id) / "reports" / f"{stem}.md"
@@ -174,6 +180,7 @@ def _row_outcome(
     return EvalOutcome(records, summary, report_path, trace_path)
 
 
+@private_evaluation
 def durable_eval(evaluate: Callable[..., EvalOutcome], **kwargs: Any) -> EvalOutcome:
     replay = _replay.get()
     if replay is None:
@@ -322,7 +329,7 @@ def cleanup_continuation(state: RunState, root: Path | None = None) -> None:
             )
             path.unlink(missing_ok=True)
     except (OSError, ValueError, typer.BadParameter) as exc:
-        typer.echo(
+        public_echo(
             f"Warning: private replay evidence cleanup failed ({type(exc).__name__}).",
             err=True,
         )
@@ -337,6 +344,8 @@ def after_state_save(root: Path | None = None) -> None:
 def abandon_continuation(state: RunState, *, reason: str) -> RunState:
     if state.continuation is None:
         return state
+    if state.heldout_required:
+        state = state.restore_validation_evidence()
     from .lanes import _append_journal
     from .runs import utc_now_iso
 
@@ -353,9 +362,12 @@ def abandon_continuation(state: RunState, *, reason: str) -> RunState:
         },
     )
     abandoned = replace(state, continuation=None, iterations=used)
+    from .harness import abandoning_scoring_tree
+
     token = _replay.set(None)
     try:
-        abandoned.save()
+        with abandoning_scoring_tree():
+            abandoned.save()
     finally:
         _replay.reset(token)
     cleanup_continuation(state)
@@ -404,6 +416,8 @@ def continue_run(
     gate_case: list[str],
     reflector_epoch: int | None,
     execute: Callable[..., None],
+    *,
+    locked: bool = False,
 ) -> None:
     from .reflector import already_scored, run_lock
     from .run import (
@@ -415,11 +429,13 @@ def continue_run(
     )
 
     initial = _load_state(run_id)
-    with run_lock(initial.run_id):
-        state = _load_state(initial.run_id)
+    from contextlib import nullcontext
+
+    with nullcontext() if locked else run_lock(initial.run_id):
+        state = _load_state(initial.run_id).restore_validation_evidence()
         epoch = state.reflector["epoch"]
         if reflector_epoch is not None and reflector_epoch != epoch:
-            typer.echo(
+            public_echo(
                 f"Stale reflector epoch {reflector_epoch}; current epoch is {epoch}. "
                 f"Use `gepa run resume --run-id {state.run_id}` for a fresh packet.",
                 err=True,
@@ -428,7 +444,7 @@ def continue_run(
         if state.lanes > 0 or state.status == "done":
             execute(state.run_id, gate_case)
             return
-        if state.validation_dataset_path is not None:
+        if state.heldout_required:
             _assert_validation_dataset_unchanged(state)
         if gate_case and state.reflection_minibatch_id is not None:
             _validate_gate_cases(state, gate_case)
@@ -436,7 +452,7 @@ def continue_run(
             state.candidate_source, active_run_id=state.run_id
         )
         if already_scored(state, candidate):
-            typer.echo("Candidate already scored; re-issuing the recorded result.")
+            public_echo("Candidate already scored; re-issuing the recorded result.")
             _emit_status(state, outcomes=[])
             return
         ledger = ParetoLog(state.run_id)
@@ -480,12 +496,27 @@ def continue_run(
         token = _replay.set(Replay(state, pending, budget_adjustment=adjustment))
         try:
             execute(state.run_id, gate_case)
-        except (typer.Exit, typer.BadParameter) as exc:
+        except Exception as exc:
+            if not locked and not isinstance(exc, (typer.Exit, typer.BadParameter)):
+                raise
+            from .harness import StaleNomination
+
             saved = _load_state(state.run_id)
-            changed = isinstance(exc, CandidateChanged) or any(
+            changed = isinstance(exc, (CandidateChanged, StaleNomination)) or any(
                 row.candidate_id != checkpoint["candidate_id"]
                 for row in ledger.iter_rows()[checkpoint["ledger_offset"] :]
             )
+            try:
+                changed = (
+                    changed
+                    or _current_baseline_candidate_id(
+                        state.candidate_source, active_run_id=state.run_id
+                    )
+                    != checkpoint["candidate_id"]
+                )
+            except Exception:
+                # A broken import must not prevent retiring an unpaid checkpoint.
+                pass
             if saved.continuation is not None and (
                 changed
                 or (

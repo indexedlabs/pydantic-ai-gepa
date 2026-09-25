@@ -723,7 +723,7 @@ def _phase_promote(
     #    or vectors, so its evidence never enters a reflection packet.
     accepted = [lane_state for lane_state in valid if lane_state.verdict == "accepted"]
     config = GepaConfig.load(config_path(workspace_root))
-    validation_enabled = config.validation_dataset is not None
+    validation_enabled = state.heldout_required
     vector_validation = validation_enabled and config.acceptance.mode == "vector"
     validation_results = dict(ctx.get("validation_results") or {})
     state = replace(
@@ -1285,7 +1285,7 @@ def _phase_journal(
     ctx["budget_rows"] = rows
     ctx["overshoot"] = max(0, rows - state.max_iterations)
     config = GepaConfig.load(config_path(workspace_root))
-    if config.validation_dataset is not None and config.acceptance.mode == "vector":
+    if state.heldout_required and config.acceptance.mode == "vector":
         validation_rounds = int(ctx.get("validation_rounds", 0))
         overshoot_bound = (
             state.lanes * state.acceptance_max_repetitions
@@ -2023,7 +2023,7 @@ def _run_select_locked(workspace_root: Path, run_state: Any) -> Any:
         )
         raise typer.Exit(code=1)
 
-    if run_state.validation_dataset_path is not None:
+    if run_state.heldout_required:
         from .run import _assert_validation_dataset_unchanged
 
         _assert_validation_dataset_unchanged(run_state, workspace_root=workspace_root)

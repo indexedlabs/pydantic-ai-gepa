@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 
 import pytest
+from tests.cli.harness_helpers import scored_continue
 import typer
 
 from pydantic_ai_gepa.cli import run as run_module
@@ -329,12 +330,9 @@ def test_validation_row_survives_death_without_leaking_evidence(
         )
         + "\n"
     )
-    config = validation_repo / ".gepa" / "gepa.toml"
-    config.write_text(
-        config.read_text() + f'validation_dataset = "{validation_path}"\n'
-    )
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(validation_path))
     _git(validation_repo, "add", ".gepa/gepa.toml")
-    _git(validation_repo, "commit", "-m", "Configure validation")
+    _git(validation_repo, "commit", "--allow-empty", "-m", "Configure validation")
     started = _start(size=3, budget=13)
     run_id = str(started["run_id"])
     (validation_repo / "out_case-2.txt").write_text("b\n")
@@ -351,7 +349,7 @@ def test_validation_row_survives_death_without_leaking_evidence(
         return outcome
 
     monkeypatch.setattr(run_module, "run_eval_once", die_after_validation)
-    interrupted = _run("run", "continue", "--run-id", run_id)
+    interrupted = scored_continue("run", "continue", "--run-id", run_id)
     assert interrupted.exit_code != 0
     assert calls == ["training"] * 3 + ["validation"] * 3
     assert ParetoLog(run_id).count_budget_rows() == 13
@@ -360,7 +358,7 @@ def test_validation_row_survives_death_without_leaking_evidence(
         "run_eval_once",
         lambda **_: pytest.fail("training and validation rows are already durable"),
     )
-    resumed = _run("run", "continue", "--run-id", run_id)
+    resumed = scored_continue("run", "continue", "--run-id", run_id)
     assert resumed.exit_code == 0, resumed.output
     packet = _resume(run_id)
     serialized = json.dumps(packet)
@@ -585,19 +583,18 @@ def test_validation_failure_packet_withholds_selection_minibatch_identity(
         )
         + "\n"
     )
-    config = validation_repo / ".gepa" / "gepa.toml"
-    config.write_text(
-        config.read_text() + f'validation_dataset = "{validation_path}"\n'
-    )
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(validation_path))
     _git(validation_repo, "add", ".gepa/gepa.toml")
-    _git(validation_repo, "commit", "-m", "Configure private validation")
+    _git(
+        validation_repo, "commit", "--allow-empty", "-m", "Configure private validation"
+    )
     started = _start(size=3, budget=14)
     run_id = str(started["run_id"])
     (validation_repo / "out_case-2.txt").write_text("b\n")
     _git(validation_repo, "add", "out_case-2.txt")
     _git(validation_repo, "commit", "-m", "Improve training candidate")
     monkeypatch.setenv("GEPA_TEST_FAIL_VALIDATION", "1")
-    failed = _run("run", "continue", "--run-id", run_id)
+    failed = scored_continue("run", "continue", "--run-id", run_id)
     assert failed.exit_code == 0, failed.output
     state = run_module._load_state(run_id)
     assert state.status == "paused_after_infrastructure_error"
@@ -614,7 +611,9 @@ def test_validation_failure_packet_withholds_selection_minibatch_identity(
     assert packet["last_comparison"]["outcome"] == "infrastructure_failure"
 
 
-def _configure_private_validation(project: Path) -> Path:
+def _configure_private_validation(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
     directory = project.parent / f"{project.name}-heldout"
     directory.mkdir()
     path = directory / "recovery-heldout.jsonl"
@@ -631,10 +630,11 @@ def _configure_private_validation(project: Path) -> Path:
             for i in range(2)
         )
     )
-    config = project / ".gepa" / "gepa.toml"
-    config.write_text(config.read_text() + f'validation_dataset = "{path}"\n')
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(path))
     _git(project, "add", ".gepa/gepa.toml")
-    _git(project, "commit", "-m", "Configure withheld recovery evidence")
+    _git(
+        project, "commit", "--allow-empty", "-m", "Configure withheld recovery evidence"
+    )
     return path
 
 
@@ -696,7 +696,7 @@ def test_validation_confirmation_replays_initial_and_extra_samples(
     from pydantic_ai_gepa.cli import eval as eval_module
     from pydantic_ai_gepa.evaluation import EvaluationRecord
 
-    validation_path = _configure_private_validation(git_repo)
+    validation_path = _configure_private_validation(git_repo, monkeypatch)
     candidate_samples = [0.2, 0.8, 0.5, 0.2, 0.8]
     calls = {"training": [], "validation": []}
     proposed = False
@@ -734,11 +734,11 @@ def test_validation_confirmation_replays_initial_and_extra_samples(
         return outcome
 
     monkeypatch.setattr(run_module, "run_eval_once", die_during_confirmation)
-    interrupted = _run("run", "continue", "--run-id", run_id)
-    assert isinstance(interrupted.exception, RuntimeError)
+    interrupted = scored_continue("run", "continue", "--run-id", run_id)
+    assert interrupted.exit_code == 1
     before = ParetoLog(run_id).iter_rows()
     packet = _resume(run_id)
-    resumed = _run(*packet["next_command"]["argv"][1:])
+    resumed = scored_continue(*packet["next_command"]["argv"][1:])
     assert resumed.exit_code == 0, resumed.output
     comparison = _run_payload(resumed.output)["last_comparison"]
     assert comparison["training_verdict"] == "accepted"
@@ -766,7 +766,7 @@ def test_paired_validation_recovers_private_evidence_and_incumbent(
     from pydantic_ai_gepa.cli import eval as eval_module
     from pydantic_ai_gepa.evaluation import EvaluationRecord
 
-    validation_path = _configure_private_validation(validation_repo)
+    validation_path = _configure_private_validation(validation_repo, monkeypatch)
     proposed = False
     calls = []
 
@@ -784,7 +784,11 @@ def test_paired_validation_recovers_private_evidence_and_incumbent(
     started = _start("--acceptance-paired-min-cases", "2", size=3, budget=5)
     run_id = str(started["run_id"])
     assert calls == ["validation", "training", "training"]
-    incumbent = dict(run_module._load_state(run_id).best_validation_per_case_scores)
+    incumbent = dict(
+        run_module._load_state(run_id)
+        .restore_validation_evidence()
+        .best_validation_per_case_scores
+    )
     assert len(incumbent) == 2
     candidate = _commit_score(validation_repo, "paired-proposal")
     proposed = True
@@ -814,12 +818,17 @@ def test_paired_validation_recovers_private_evidence_and_incumbent(
 
     monkeypatch.setattr(run_module, "run_eval_once", die_after_row)
     monkeypatch.setattr(os, "replace", die_before_final_state)
-    interrupted = _run("run", "continue", "--run-id", run_id)
-    assert isinstance(interrupted.exception, RuntimeError), interrupted.output
-    assert run_module._load_state(run_id).best_validation_per_case_scores == incumbent
+    interrupted = scored_continue("run", "continue", "--run-id", run_id)
+    assert interrupted.exit_code == 1, interrupted.output
+    assert (
+        run_module._load_state(run_id)
+        .restore_validation_evidence()
+        .best_validation_per_case_scores
+        == incumbent
+    )
     before = ParetoLog(run_id).iter_rows()
     packet = _resume(run_id)
-    resumed = _run(*packet["next_command"]["argv"][1:])
+    resumed = scored_continue(*packet["next_command"]["argv"][1:])
     assert resumed.exit_code == 0, resumed.output
     payload = _run_payload(resumed.output)
     assert payload["last_comparison"]["validation_comparison"]["method"] == "paired_t"
@@ -829,7 +838,7 @@ def test_paired_validation_recovers_private_evidence_and_incumbent(
     after = ParetoLog(run_id).iter_rows()
     assert after[: len(before)] == before
     assert len(after) == 5
-    state = run_module._load_state(run_id)
+    state = run_module._load_state(run_id).restore_validation_evidence()
     assert state.best_validation_samples == (pytest.approx(0.75),)
     assert state.best_validation_per_case_scores == {
         "secret-paired-0": pytest.approx(0.7),
@@ -849,7 +858,7 @@ def test_paired_validation_recovers_private_evidence_and_incumbent(
 def test_interrupted_validation_seed_retry_reuses_paid_incumbent_samples(
     validation_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _configure_private_validation(validation_repo)
+    _configure_private_validation(validation_repo, monkeypatch)
     monkeypatch.setenv("GEPA_TEST_FAIL_VALIDATION", "1")
     started = _start(size=3, budget=14)
     run_id = str(started["run_id"])
@@ -868,11 +877,11 @@ def test_interrupted_validation_seed_retry_reuses_paid_incumbent_samples(
         return outcome
 
     monkeypatch.setattr(run_module, "run_eval_once", die_during_incumbent_sampling)
-    interrupted = _run("run", "continue", "--run-id", run_id)
-    assert isinstance(interrupted.exception, RuntimeError)
+    interrupted = scored_continue("run", "continue", "--run-id", run_id)
+    assert interrupted.exit_code == 1
     before = ParetoLog(run_id).iter_rows()
     assert len(before) == 3
-    resumed = _run("run", "continue", "--run-id", run_id)
+    resumed = scored_continue("run", "continue", "--run-id", run_id)
     assert resumed.exit_code == 0, resumed.output
     payload = _run_payload(resumed.output)
     assert payload["status"] == "paused_for_reflection"
@@ -1033,7 +1042,7 @@ def test_nonpaired_validation_never_writes_private_replay_evidence(
     from pydantic_ai_gepa.cli import eval as eval_module
     from pydantic_ai_gepa.evaluation import EvaluationRecord
 
-    validation_path = _configure_private_validation(git_repo)
+    validation_path = _configure_private_validation(git_repo, monkeypatch)
     proposed = False
 
     async def evaluate(**kwargs):
@@ -1057,7 +1066,7 @@ def test_nonpaired_validation_never_writes_private_replay_evidence(
     run_id = str(started["run_id"])
     _commit_score(git_repo, "good")
     proposed = True
-    continued = _run("run", "continue", "--run-id", run_id)
+    continued = scored_continue("run", "continue", "--run-id", run_id)
     assert continued.exit_code == 0, continued.output
     assert len(ParetoLog(run_id).validation_rows()) == 6
     assert not (validation_path.parent / ".gepa-validation-evidence").exists()
@@ -1068,7 +1077,7 @@ def test_lane_validation_does_not_create_continuation_snapshots(
 ) -> None:
     from pydantic_ai_gepa.cli import validation
 
-    validation_path = _configure_private_validation(validation_repo)
+    validation_path = _configure_private_validation(validation_repo, monkeypatch)
     started = _start("--acceptance-paired-min-cases", "2", size=3, budget=5)
     run_id = str(started["run_id"])
     state = run_module._load_state(run_id)
@@ -1093,7 +1102,7 @@ def test_private_replay_snapshots_removed_after_completion_or_abandonment(
     from pydantic_ai_gepa.cli import eval as eval_module
     from pydantic_ai_gepa.evaluation import EvaluationRecord
 
-    validation_path = _configure_private_validation(validation_repo)
+    validation_path = _configure_private_validation(validation_repo, monkeypatch)
     proposed = False
 
     async def paired_evaluator(**kwargs):
@@ -1119,9 +1128,7 @@ def test_private_replay_snapshots_removed_after_completion_or_abandonment(
         return outcome
 
     monkeypatch.setattr(run_module, "run_eval_once", die_after_validation)
-    assert isinstance(
-        _run("run", "continue", "--run-id", run_id).exception, RuntimeError
-    )
+    assert scored_continue("run", "continue", "--run-id", run_id).exit_code == 1
     assert (
         len(list(directory.glob("*.json"))) == 3
     )  # Incumbent, backup, candidate eval.
@@ -1134,7 +1141,7 @@ def test_private_replay_snapshots_removed_after_completion_or_abandonment(
         assert packet["budget"]["used"] == 5
         assert _git(validation_repo, "rev-parse", "HEAD") == candidate
     else:
-        completed = _run("run", "continue", "--run-id", run_id)
+        completed = scored_continue("run", "continue", "--run-id", run_id)
         assert completed.exit_code == 0, completed.output
         assert (
             _run_payload(completed.output)["last_comparison"]["verdict"] == "accepted"
