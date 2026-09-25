@@ -18,6 +18,7 @@ from .inspection import (
     InspectionSnapshot,
 )
 from .exceptions import UsageBudgetExceeded
+from .provider_errors import ProviderStopError, is_provider_stop_error
 from .runner import GepaOptimizationResult, optimize_agent
 from .components import AppliedCandidateAgent
 from .compose import (
@@ -127,6 +128,8 @@ __all__ = [
     "InMemorySkillsSearchProvider",
     "InspectingModel",
     "InspectionAborted",
+    "ProviderStopError",
+    "is_provider_stop_error",
     "InspectionSnapshot",
     "UsageBudgetExceeded",
     "OptimizationTask",

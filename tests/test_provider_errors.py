@@ -12,7 +12,11 @@ from pydantic_evals import Case
 
 from pydantic_ai_gepa.adapters.agent_adapter import AgentAdapter
 from pydantic_ai_gepa.evaluation import evaluate_callable_dataset
-from pydantic_ai_gepa.provider_errors import is_provider_stop_error
+from pydantic_ai_gepa.provider_errors import (
+    ProviderStopError,
+    is_provider_stop_error,
+    mentions_provider_stop_code,
+)
 from pydantic_ai_gepa.types import MetricResult
 
 
@@ -24,6 +28,8 @@ from pydantic_ai_gepa.types import MetricResult
             "message": "You have no credits remaining.",
             "code": "credit_balance_exhausted",
         },
+        {"code": "project_spend_limit_exceeded"},
+        {"code": "organization_spend_limit_exceeded"},
     ],
 )
 def test_billing_quota_errors_require_operator(body: object) -> None:
@@ -75,6 +81,39 @@ async def test_plain_callable_evaluation_propagates_billing_quota_error() -> Non
         raise error
 
     with pytest.raises(ModelHTTPError, match="insufficient_quota"):
+        await evaluate_callable_dataset(
+            evaluate=evaluate,
+            metric=lambda case, output: 0.0,
+            dataset=[Case(name="case-1", inputs="x")],
+        )
+
+
+def test_provider_stop_error_stops_directly_and_through_a_cause() -> None:
+    stop = ProviderStopError("child process: insufficient_quota")
+    try:
+        raise RuntimeError("case failed") from stop
+    except RuntimeError as wrapped:
+        chained = wrapped
+
+    assert is_provider_stop_error(stop)
+    assert is_provider_stop_error(chained)
+    assert not is_provider_stop_error(RuntimeError("case failed"))
+
+
+def test_stop_codes_are_found_in_error_text() -> None:
+    assert mentions_provider_stop_code(
+        "status_code: 429, model_name: gpt-6-sol, body: {'code': 'insufficient_quota'}"
+    )
+    assert mentions_provider_stop_code("Error code: 429 - PROJECT_SPEND_LIMIT_EXCEEDED")
+    assert not mentions_provider_stop_code("status_code: 429, rate_limit_exceeded")
+
+
+@pytest.mark.asyncio
+async def test_plain_callable_evaluation_propagates_provider_stop_error() -> None:
+    async def evaluate(case: object) -> object:
+        raise ProviderStopError("child process: project_spend_limit_exceeded")
+
+    with pytest.raises(ProviderStopError, match="project_spend_limit_exceeded"):
         await evaluate_callable_dataset(
             evaluate=evaluate,
             metric=lambda case, output: 0.0,
