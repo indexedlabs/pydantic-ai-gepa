@@ -8,6 +8,7 @@ from pydantic_ai import usage as _usage
 
 from ..adapters.agent_adapter import create_adapter
 from ..exceptions import UsageBudgetExceeded
+from ..provider_errors import PROVIDER_STOP_REASON, is_provider_stop_error
 from ..gepa_graph import create_deps, create_gepa_graph
 from ..gepa_graph.models import CandidateMap, GepaConfig, GepaResult, GepaState
 from ..runner import _resolve_candidate_selector, _resolve_component_selector
@@ -106,6 +107,11 @@ class GepaEngine:
             gepa_result = run_output
         except UsageBudgetExceeded:
             state.mark_stopped(reason="Usage budget exceeded")
+            gepa_result = GepaResult.from_state(state)
+        except Exception as error:
+            if not is_provider_stop_error(error):
+                raise
+            state.mark_stopped(reason=PROVIDER_STOP_REASON)
             gepa_result = GepaResult.from_state(state)
         finally:
             adapter.close()

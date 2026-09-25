@@ -56,7 +56,7 @@ from ..evaluation_models import EvaluationBatch
 from ..gepa_graph.models import CandidateMap, candidate_texts
 from ..inspection import InspectionAborted
 from ..input_type import BoundInputSpec, InputSpec, build_input_spec
-from .._concurrency import gather_cancelling_siblings
+from .._concurrency import gather_cancelling_on_provider_stop
 from ..provider_errors import is_provider_stop_error
 from ..signature_agent import SignatureAgent
 from ..skill_components import apply_candidate_to_skills
@@ -764,7 +764,7 @@ class _BaseAgentAdapter(
         )
 
         with self.apply_candidate(candidate):
-            results = await gather_cancelling_siblings(
+            results = await gather_cancelling_on_provider_stop(
                 *(
                     self.process_case(
                         case,

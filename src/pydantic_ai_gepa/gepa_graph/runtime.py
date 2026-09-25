@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from ..adapter import Adapter
 
 from ..exceptions import UsageBudgetExceeded
+from ..provider_errors import PROVIDER_STOP_REASON, is_provider_stop_error
 from .deps import GepaDeps
 from .datasets import DatasetInput, resolve_dataset
 from .graph import create_gepa_graph
@@ -105,6 +106,21 @@ async def optimize(
 
         logfire.info(
             "GEPA run stopped early due to usage budget limit",
+            best_score=state.best_score,
+            total_evaluations=state.total_evaluations,
+        )
+        return GepaResult.from_state(state)
+    except Exception as error:
+        if not is_provider_stop_error(error):
+            raise
+        # Billing or credentials: every later request fails the same way, so keep
+        # the progress made so far, as a usage-budget stop does.
+        state.mark_stopped(reason=PROVIDER_STOP_REASON)
+        import logfire
+
+        logfire.warning(
+            "GEPA run stopped by a provider billing or credential failure",
+            error_type=type(error).__name__,
             best_score=state.best_score,
             total_evaluations=state.total_evaluations,
         )

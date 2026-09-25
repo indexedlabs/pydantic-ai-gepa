@@ -9,6 +9,7 @@ from ...evaluation_models import EvaluationBatch
 from ...types import RolloutOutput, Trajectory
 from pydantic_evals import Case
 from ..models import CandidateMap, CandidateProgram
+from ..._concurrency import gather_cancelling_on_provider_stop
 
 if TYPE_CHECKING:
     from ...adapter import Adapter
@@ -84,7 +85,7 @@ class ParallelEvaluator:
 
         tasks = [run_one(idx, instance) for idx, instance in enumerate(batch)]
 
-        results = await asyncio.gather(*tasks)
+        results = await gather_cancelling_on_provider_stop(*tasks)
         return self._merge_results(results, capture_traces=capture_traces)
 
     async def _call_adapter(

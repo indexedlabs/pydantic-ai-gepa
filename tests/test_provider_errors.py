@@ -5,6 +5,11 @@ from __future__ import annotations
 from unittest.mock import AsyncMock
 
 import pytest
+
+try:
+    from builtins import ExceptionGroup
+except ImportError:  # Python 3.10
+    from exceptiongroup import ExceptionGroup
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.models.test import TestModel
@@ -154,3 +159,56 @@ async def test_a_stop_cancels_cases_already_in_flight() -> None:
         )
     # The slow case was cancelled and drained before the stop propagated.
     assert cancelled == ["slow"]
+
+
+def test_openai_sdk_credential_text_is_a_stop() -> None:
+    assert is_provider_stop_message(
+        "Error code: 401 - {'error': {'code': 'invalid_api_key'}}"
+    )
+    assert is_provider_stop_message("Error code: 403 - {'error': {}}")
+    assert not is_provider_stop_message("Error code: 429 - rate_limit_exceeded")
+
+
+def test_exception_group_stops_only_when_every_child_stops() -> None:
+    quota = ModelHTTPError(
+        status_code=429, model_name="a", body={"code": "insufficient_quota"}
+    )
+    auth = ModelHTTPError(status_code=401, model_name="b", body=None)
+    rate = ModelHTTPError(
+        status_code=429, model_name="c", body={"code": "rate_limit_exceeded"}
+    )
+
+    assert is_provider_stop_error(ExceptionGroup("fallback", [quota, auth]))
+    assert not is_provider_stop_error(ExceptionGroup("fallback", [quota, rate]))
+
+
+def test_exception_group_whose_child_points_back_at_it_terminates() -> None:
+    child = RuntimeError("boom")
+    group = ExceptionGroup("wrapped", [child])
+    child.__context__ = group
+
+    assert not is_provider_stop_error(group)
+
+
+@pytest.mark.asyncio
+async def test_other_failures_leave_in_flight_cases_running() -> None:
+    import asyncio
+
+    from pydantic_ai_gepa._concurrency import gather_cancelling_on_provider_stop
+
+    finished: list[str] = []
+
+    async def slow() -> str:
+        await asyncio.sleep(0.05)
+        finished.append("slow")
+        return "slow"
+
+    async def fails() -> str:
+        raise RuntimeError("usage budget")
+
+    slow_task = asyncio.ensure_future(slow())
+    with pytest.raises(RuntimeError):
+        await gather_cancelling_on_provider_stop(slow_task, fails())
+    # Like plain gather: the paid rollout still completes and records its result.
+    await slow_task
+    assert finished == ["slow"]

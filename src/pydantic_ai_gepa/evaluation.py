@@ -17,7 +17,7 @@ from pydantic_evals import Case, Dataset
 from .adapters.agent_adapter import CaseFactory, create_adapter
 from .gepa_graph.models import CandidateMap, candidate_texts
 from .input_type import InputSpec
-from ._concurrency import gather_cancelling_siblings
+from ._concurrency import gather_cancelling_on_provider_stop
 from .provider_errors import is_provider_stop_error
 from .skills import SkillsFS
 from .skills.models import SkillCapability
@@ -115,7 +115,7 @@ async def evaluate_candidate_dataset(
             **extra_attributes,
         ) as eval_span:
             with adapter.apply_candidate(candidate_map):
-                await gather_cancelling_siblings(
+                await gather_cancelling_on_provider_stop(
                     *(run_case(idx, case) for idx, case in enumerate(cases))
                 )
 
@@ -212,7 +212,7 @@ async def evaluate_callable_dataset(
                 )
             )
 
-    await gather_cancelling_siblings(
+    await gather_cancelling_on_provider_stop(
         *(run_case(index, case) for index, case in enumerate(cases))
     )
     return records
