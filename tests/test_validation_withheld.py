@@ -34,7 +34,11 @@ async def test_optimize_withholds_validation_from_traces_cache_and_reflection(
     reflected = []
 
     class Proposer:
-        async def propose_texts(self, *, reflective_data, component_toolsets, **kwargs):
+        async def propose_texts(
+            self, *, candidate, reflective_data, component_toolsets, **kwargs
+        ):
+            assert candidate.validation_scores == {}
+            assert candidate.validation_outputs == {}
             reflected.append(reflective_data)
             for toolset in component_toolsets:
                 if "run_python_repl" in toolset.tools:

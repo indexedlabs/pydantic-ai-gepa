@@ -138,6 +138,42 @@ def test_run_start_defaults_match_minibatch_evaluation(repo: Path) -> None:
     assert len(baseline_samples) == 3
 
 
+def test_continue_rejects_external_validation_tampered_after_start(repo: Path) -> None:
+    validation_path = repo.parent / "validation.jsonl"
+    validation_path.write_text(
+        json.dumps(
+            {"name": "secret-holdout", "inputs": "x", "expected_output": "Paris"}
+        )
+        + "\n"
+    )
+    config = repo / ".gepa" / "gepa.toml"
+    config.write_text(
+        config.read_text() + f'validation_dataset = "{validation_path}"\n'
+    )
+    started = _run(
+        "run",
+        "start",
+        "--lanes",
+        "0",
+        "--size",
+        "2",
+        "--max-iterations",
+        "10",
+        "--acceptance-repetitions",
+        "1",
+    )
+    assert started.exit_code == 0, started.output
+    payload = _run_payload(started.output)
+    assert payload["status"] == "paused_for_reflection"
+    validation_path.write_text(
+        json.dumps({"name": "tampered", "inputs": "x", "expected_output": "Berlin"})
+        + "\n"
+    )
+    result = _run("run", "continue", "--run-id", str(payload["run_id"]))
+    assert result.exit_code == 2, result.output
+    assert "changed after run start" in result.output
+
+
 def test_held_out_validation_selects_without_exposing_reflection_evidence(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

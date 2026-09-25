@@ -1909,16 +1909,17 @@ def run_select(run_id: str | None) -> Any:
 
 
 def _run_select_locked(workspace_root: Path, run_state: Any) -> Any:
-    if run_state.validation_dataset_path is not None:
-        from .run import _assert_validation_dataset_unchanged
-
-        _assert_validation_dataset_unchanged(run_state, workspace_root=workspace_root)
     if run_state.status == "done":
         typer.echo(
             f"Run {run_state.run_id} is done; there is nothing to select.",
             err=True,
         )
         raise typer.Exit(code=1)
+
+    if run_state.validation_dataset_path is not None:
+        from .run import _assert_validation_dataset_unchanged
+
+        _assert_validation_dataset_unchanged(run_state, workspace_root=workspace_root)
 
     state = run_state
     if state.select_phase is None:

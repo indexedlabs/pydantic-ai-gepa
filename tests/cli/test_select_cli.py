@@ -369,6 +369,43 @@ def test_select_uses_held_out_validation_instead_of_training_delta(
     ).read_text(encoding="utf-8")
 
 
+def test_select_rejects_external_validation_tampered_after_start(
+    git_repo: Path,
+) -> None:
+    validation_path = git_repo.parent / "validation.jsonl"
+    validation_path.write_text(
+        json.dumps({"name": "secret-holdout", "inputs": "x", "expected_output": "v"})
+        + "\n"
+    )
+    config = git_repo / ".gepa" / "gepa.toml"
+    config.write_text(
+        config.read_text() + f'validation_dataset = "{validation_path}"\n'
+    )
+    _git(git_repo, "add", ".gepa/gepa.toml")
+    _git(git_repo, "commit", "-m", "Configure external validation")
+    run_id = _run_id(_start_lane_run(git_repo, lanes=1))
+    _drive_lane(git_repo, run_id, "lane-1", {"out_case-2.txt": "b\n"})
+    validation_path.write_text(
+        json.dumps({"name": "tampered", "inputs": "x", "expected_output": "b"}) + "\n"
+    )
+    result = _select(git_repo, run_id)
+    assert result.exit_code == 2, result.output
+    assert "changed after run start" in result.output
+
+
+def test_select_done_run_does_not_require_validation_file(git_repo: Path) -> None:
+    from types import SimpleNamespace
+    import typer
+    from pydantic_ai_gepa.cli.select import _run_select_locked
+
+    state = SimpleNamespace(
+        status="done", run_id="finished", validation_dataset_path="missing.jsonl"
+    )
+    with pytest.raises(typer.Exit) as error:
+        _run_select_locked(git_repo, state)
+    assert error.value.exit_code == 1
+
+
 def test_select_rejects_candidate_that_changes_pinned_validation_data(
     git_repo: Path,
 ) -> None:

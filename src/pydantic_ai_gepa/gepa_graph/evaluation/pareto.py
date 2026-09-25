@@ -17,16 +17,16 @@ class ParetoFrontManager:
         candidate_idx: int,
         eval_results: EvaluationResults,
     ) -> None:
-        """Merge evaluation results into the state's Pareto fronts."""
-        for data_id, score, output in eval_results:
+        """Merge validation scores into the fronts without retaining outputs."""
+        for data_id, score, _output in eval_results:
             entry = state.pareto_front.get(data_id)
             if entry is None:
                 entry = ParetoFrontEntry(data_id=data_id)
                 state.pareto_front[data_id] = entry
+            entry.best_outputs.clear()
             entry.update(
                 candidate_idx=candidate_idx,
                 score=score,
-                output=output,
             )
 
     def find_dominators(self, state: GepaState) -> list[int]:

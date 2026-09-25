@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import subprocess
+from typing import Any
 
 import typer
 
@@ -25,10 +26,19 @@ def validation_dataset_path(
         "(or init --validation-dataset) at its absolute path. "
         "Start the workspace from Git history that never contained the validation dataset."
     )
+
+    def run_git(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[Any]:
+        try:
+            return subprocess.run(command, env={**os.environ, "LC_ALL": "C"}, **kwargs)
+        except OSError as exc:
+            raise typer.BadParameter(
+                "Cannot verify validation dataset isolation. " + fix
+            ) from exc
+
     roots = {project_root.resolve(), (candidate_root or project_root).resolve()}
     repositories: set[Path] = set()
     for root in tuple(roots):
-        result = subprocess.run(
+        result = run_git(
             ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
             capture_output=True,
             text=True,
@@ -58,7 +68,7 @@ def validation_dataset_path(
     for repository in repositories:
         # Checking the object database also catches staged files, deleted files,
         # renamed files, other branches and reflogs. Moving a file is not enough.
-        hashed = subprocess.run(
+        hashed = run_git(
             ["git", "-C", str(repository), "hash-object", "--stdin"],
             input=contents,
             capture_output=True,
@@ -67,7 +77,7 @@ def validation_dataset_path(
             raise typer.BadParameter(
                 "Cannot verify validation dataset Git history. " + fix
             )
-        found = subprocess.run(
+        found = run_git(
             [
                 "git",
                 "-C",
