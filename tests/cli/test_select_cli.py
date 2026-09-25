@@ -287,15 +287,15 @@ def test_select_promotes_winner_journals_losers_and_refans(git_repo: Path) -> No
 
     # Loser branches deleted; every lane re-branched off the new best.
     assert _lane_branches(git_repo) == [
-        f"gepa/lane/{run_id}/lane-1/2",
-        f"gepa/lane/{run_id}/lane-2/2",
-        f"gepa/lane/{run_id}/lane-3/2",
+        f"gepa/lane/{run_id}/lane-1/5",
+        f"gepa/lane/{run_id}/lane-2/5",
+        f"gepa/lane/{run_id}/lane-3/5",
     ]
     for lane in ("lane-1", "lane-2", "lane-3"):
         lane_state = load_lane_state(git_repo, run_id, lane)
         assert lane_state.status == "paused_for_reflection"
-        assert lane_state.iteration == 2
-        assert lane_state.branch == f"gepa/lane/{run_id}/{lane}/2"
+        assert lane_state.iteration == 5
+        assert lane_state.branch == f"gepa/lane/{run_id}/{lane}/5"
         # Fresh lease epoch after re-fan (the detached handoff bumps the
         # epoch once; direct foreground drives start unleased).
         assert lane_state.lease_epoch >= 1
@@ -305,13 +305,13 @@ def test_select_promotes_winner_journals_losers_and_refans(git_repo: Path) -> No
         assert _git(worktree, "rev-parse", "HEAD") == lane_2.candidate_sha
         assert Path(str(lane_state.packet_path)).exists()
         packet = json.loads(Path(str(lane_state.packet_path)).read_text())
-        assert packet["baseline"]["samples"] == [pytest.approx(1.0)]
+        assert packet["baseline"]["samples"] == [pytest.approx(1.0)] * 3
 
     # Fresh frozen baseline at the new best, paid once for the iteration.
     assert state.reflection_baseline_commit_sha == lane_2.candidate_sha
-    assert list(state.reflection_baseline_samples) == [pytest.approx(1.0)]
+    assert list(state.reflection_baseline_samples) == [pytest.approx(1.0)] * 3
     rows_after = ParetoLog(run_id, git_repo).count_rows()
-    assert rows_after - rows_before == 1
+    assert rows_after - rows_before == 3
 
     # lane_ready re-emitted per lane; overlapping accepted diffs -> no merge
     # opportunity.
@@ -360,9 +360,11 @@ def test_select_uses_held_out_validation_instead_of_training_delta(
     assert state.best_commit_sha == lane_1.candidate_sha
     assert state.best_commit_sha != lane_2.candidate_sha
     assert state.best_mean_score == pytest.approx(1.0)
-    assert state.validation_evaluations == 3  # seed plus two lane candidates
+    assert (
+        state.validation_evaluations == 8
+    )  # three seed, two screening, three confirmation
     validation_rows = ParetoLog(run_id, git_repo).validation_rows()
-    assert len(validation_rows) == 3
+    assert len(validation_rows) == 8
     assert all(row.per_case_scores == {} for row in validation_rows)
     assert "secret-holdout" not in (
         git_repo / ".gepa" / "runs" / run_id / "pareto.jsonl"
@@ -406,7 +408,7 @@ def test_select_rejects_candidate_that_changes_pinned_validation_data(
     assert result.exit_code == 2
     assert "Candidate changed the held-out validation dataset" in result.output
     assert _state(git_repo, run_id).best_commit_sha != lane.candidate_sha
-    assert len(ParetoLog(run_id, git_repo).validation_rows()) == 1  # seed only
+    assert len(ParetoLog(run_id, git_repo).validation_rows()) == 3  # repeated seed only
 
 
 def test_lane_validation_infrastructure_failure_retries_without_leaking(
@@ -506,14 +508,14 @@ def test_lane_validation_recovers_after_crash_before_checkpoint(
     assert first.exit_code == 1
     assert isinstance(first.exception, RuntimeError)
     rows_after_crash = ParetoLog(run_id, git_repo).validation_rows()
-    assert len(rows_after_crash) == 2  # seed plus lane candidate
+    assert len(rows_after_crash) == 4  # repeated seed plus lane screening
 
     monkeypatch.setattr(select_module, "_checkpoint", original_checkpoint)
     second = _select(git_repo, run_id)
 
     assert second.exit_code == 0, second.output
     assert _state(git_repo, run_id).best_commit_sha == lane.candidate_sha
-    assert len(ParetoLog(run_id, git_repo).validation_rows()) == 2
+    assert len(ParetoLog(run_id, git_repo).validation_rows()) == 7
 
 
 def test_validation_seed_failure_is_redacted_and_has_no_bogus_report_path(
@@ -732,7 +734,7 @@ def test_straggler_terminated_journaled_and_refanned(git_repo: Path) -> None:
     # Lane reset in the re-fan: paused on the fresh branch, partial work gone.
     lane_state = load_lane_state(git_repo, run_id, "lane-2")
     assert lane_state.status == "paused_for_reflection"
-    assert lane_state.iteration == 2
+    assert lane_state.iteration == 5
     assert lane_state.candidate_sha is None
     assert lane_state.eval_pid is None
     assert not (worktree / "notes.txt").exists()
@@ -785,7 +787,7 @@ def test_cross_branch_point_lane_invalidated(git_repo: Path) -> None:
     assert state.best_commit_sha == winner.candidate_sha
     lane_state = load_lane_state(git_repo, run_id, "lane-2")
     assert lane_state.status == "paused_for_reflection"
-    assert lane_state.iteration == 2
+    assert lane_state.iteration == 5
 
 
 def test_concurrent_select_rejected(git_repo: Path) -> None:
@@ -870,9 +872,9 @@ def test_select_killed_after_promotion_resumes_exactly_once(
     assert sorted(str(row["lane"]) for row in losers) == ["lane-1", "lane-3"]
     assert len(_events(git_repo, run_id, "lane_ready")) == 6
     assert _lane_branches(git_repo) == [
-        f"gepa/lane/{run_id}/lane-1/2",
-        f"gepa/lane/{run_id}/lane-2/2",
-        f"gepa/lane/{run_id}/lane-3/2",
+        f"gepa/lane/{run_id}/lane-1/5",
+        f"gepa/lane/{run_id}/lane-2/5",
+        f"gepa/lane/{run_id}/lane-3/5",
     ]
     state = _state(git_repo, run_id)
     assert state.select_phase is None
@@ -898,8 +900,8 @@ def test_merge_opportunity_for_disjoint_accepted_lanes(git_repo: Path) -> None:
     payload = opportunities[0]["payload"]
     assert payload["lane_a"] == "lane-1"
     assert payload["lane_b"] == "lane-2"
-    assert payload["branch_a"] == f"gepa/lane/{run_id}/lane-1/1"
-    assert payload["branch_b"] == f"gepa/lane/{run_id}/lane-2/1"
+    assert payload["branch_a"] == f"gepa/lane/{run_id}/lane-1/4"
+    assert payload["branch_b"] == f"gepa/lane/{run_id}/lane-2/4"
     stat_path = Path(str(payload["diff_stat_path"]))
     assert stat_path.exists()
     stat = stat_path.read_text(encoding="utf-8")
@@ -918,19 +920,19 @@ def test_merge_opportunity_for_disjoint_accepted_lanes(git_repo: Path) -> None:
 def test_budget_exhausted_marks_done_with_overshoot(git_repo: Path) -> None:
     """spec-er3 + dec-msy: the budget stop is enforced at select; overshoot is
     recorded in the final report and run_done is emitted."""
-    run = _start_lane_run(git_repo, 2, "--max-iterations", "2")
+    run = _start_lane_run(git_repo, 2, "--max-iterations", "9")
     run_id = _run_id(run)
-    assert ParetoLog(run_id, git_repo).count_rows() == 1
+    assert ParetoLog(run_id, git_repo).count_rows() == 4
     lane_1 = _drive_lane(git_repo, run_id, "lane-1", {"out_case-2.txt": "b\n"})
     _drive_lane(git_repo, run_id, "lane-2", {"out_case-3.txt": "c\n"})
-    assert ParetoLog(run_id, git_repo).count_rows() == 3  # 1 over budget
+    assert ParetoLog(run_id, git_repo).count_rows() == 10  # 1 over budget
 
     result = _select(git_repo, run_id)
     assert result.exit_code == 0, result.output
 
     state = _state(git_repo, run_id)
     assert state.status == "done"
-    assert state.iterations == 3
+    assert state.iterations == 10
     assert state.select_phase is None
     assert state.best_commit_sha == lane_1.candidate_sha
 
@@ -949,8 +951,8 @@ def test_budget_exhausted_marks_done_with_overshoot(git_repo: Path) -> None:
     # branches for the orchestrator to merge, so deleting them in the same
     # select would make the event unactionable.
     assert _lane_branches(git_repo) == [
-        f"gepa/lane/{run_id}/lane-1/1",
-        f"gepa/lane/{run_id}/lane-2/1",
+        f"gepa/lane/{run_id}/lane-1/4",
+        f"gepa/lane/{run_id}/lane-2/4",
     ]
     assert len(_events(git_repo, run_id, "lane_ready")) == 2  # fan-out only
 
@@ -1003,12 +1005,12 @@ def test_select_dirty_primary_promotes_in_run_state_only(git_repo: Path) -> None
     # Winner branch kept so the promoted commit stays reachable; the fresh
     # re-fan branch exists alongside it.
     assert _lane_branches(git_repo) == [
-        f"gepa/lane/{run_id}/lane-1/1",
-        f"gepa/lane/{run_id}/lane-1/2",
+        f"gepa/lane/{run_id}/lane-1/4",
+        f"gepa/lane/{run_id}/lane-1/5",
     ]
     # The shared baseline was still re-measured at the new best (via the
     # re-fanned lane worktree, which carries the same commit).
-    assert list(state.reflection_baseline_samples) == [pytest.approx(2.0 / 3.0)]
+    assert list(state.reflection_baseline_samples) == [pytest.approx(2.0 / 3.0)] * 3
     assert state.reflection_baseline_commit_sha == lane_1.candidate_sha
 
 
@@ -1108,10 +1110,10 @@ def test_no_accepted_lane_means_no_promotion(git_repo: Path) -> None:
     assert {str(row["verdict"]) for row in losers} == {"rejected", "equivalent"}
     # Lanes still re-fan (onto the same best) with fresh branches + baseline.
     assert _lane_branches(git_repo) == [
-        f"gepa/lane/{run_id}/lane-1/2",
-        f"gepa/lane/{run_id}/lane-2/2",
+        f"gepa/lane/{run_id}/lane-1/5",
+        f"gepa/lane/{run_id}/lane-2/5",
     ]
-    assert list(state.reflection_baseline_samples) == [pytest.approx(BASELINE_MEAN)]
+    assert list(state.reflection_baseline_samples) == [pytest.approx(BASELINE_MEAN)] * 3
     assert len(_events(git_repo, run_id, "lane_ready")) == 4
 
 
@@ -1223,14 +1225,40 @@ def test_select_lock_serializes_concurrent_selects(git_repo: Path) -> None:
 def test_budget_low_emitted_near_budget_floor(git_repo: Path) -> None:
     """dec-d0d: select emits budget_low when remaining evals fall below
     lanes x acceptance max-repetitions."""
-    run = _start_lane_run(git_repo, 2, "--max-iterations", "4")
+    run = _start_lane_run(git_repo, 2, "--max-iterations", "11")
     run_id = _run_id(run)
     _drive_lane(git_repo, run_id, "lane-1", {"out_case-2.txt": "b\n"})
     _drive_lane(git_repo, run_id, "lane-2", {"out_case-3.txt": "c\n"})
-    # rows: 1 baseline + 2 lane evals = 3; remaining = 1 < lanes(2) x reps(1) = 2
+    # rows: one screening + three baseline + six lane = ten; remaining = one
     result = _select(git_repo, run_id)
     assert result.exit_code == 0, result.output
 
     low_events = _events(git_repo, run_id, "budget_low")
     assert len(low_events) == 1
     assert low_events[0]["payload"]["remaining_evals"] == 1
+
+
+def test_old_two_sample_baseline_cannot_promote_deterministic_lane(
+    git_repo: Path,
+) -> None:
+    run = _start_lane_run(git_repo, lanes=1)
+    run_id = _run_id(run)
+    incumbent = _state(git_repo, run_id)
+    _write_state(
+        git_repo,
+        RunState(
+            **{
+                **incumbent.to_dict(),
+                "reflection_baseline_samples": (BASELINE_MEAN, BASELINE_MEAN),
+            }
+        ),
+    )
+    lane = _drive_lane(git_repo, run_id, "lane-1", {"out_case-2.txt": "b\n"})
+    assert lane.eval_samples == (2 / 3, 2 / 3)
+    assert lane.verdict == "inconclusive"
+    comparison = json.loads(Path(str(lane.comparison_path)).read_text())
+    assert comparison["reason_code"] == "baseline_evidence_insufficient"
+    assert comparison["selectable"] is False
+    result = _select(git_repo, run_id)
+    assert result.exit_code == 0, result.output
+    assert _state(git_repo, run_id).best_commit_sha == incumbent.best_commit_sha

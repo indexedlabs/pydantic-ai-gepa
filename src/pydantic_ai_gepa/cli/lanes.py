@@ -76,7 +76,7 @@ from .layout import (
     vector_records_path,
 )
 from .notes import notes_index
-from .runs import MinibatchStore, utc_now_iso
+from .runs import MinibatchStore, ParetoLog, utc_now_iso
 
 LaneStatus = Literal[
     "created",
@@ -1152,10 +1152,39 @@ def _run_lane_eval_loop(
     cfg = GepaConfig.load(config_path(workspace_root))
     vector_mode = cfg.acceptance.mode == "vector"
     baseline_samples = tuple(float(v) for v in run_state.reflection_baseline_samples)
+    baseline_per_case = None
+    paired_min_cases = getattr(run_state, "acceptance_paired_min_cases", None)
+    if not vector_mode and paired_min_cases is not None:
+        baseline_ids = set(run_state.reflection_baseline_eval_ids)
+        baseline_row = next(
+            (
+                row
+                for row in ParetoLog(run_id, workspace_root).iter_rows()
+                if row.extra.get("eval_id") in baseline_ids
+                and row.extra.get("selectable") is not False
+            ),
+            None,
+        )
+        if (
+            baseline_row is not None
+            and len(baseline_row.per_case_scores) >= paired_min_cases
+        ):
+            baseline_per_case = baseline_row.per_case_scores
     max_candidate_samples = (
-        run_state.acceptance_repetitions + 1 if vector_mode else len(baseline_samples)
+        run_state.acceptance_repetitions + 1
+        if vector_mode
+        else 1
+        if baseline_per_case is not None
+        else len(baseline_samples)
     )
-    initial_samples = min(run_state.acceptance_repetitions, max_candidate_samples)
+    initial_samples = (
+        run_state.acceptance_repetitions
+        if vector_mode
+        else 1
+        if baseline_per_case is not None
+        else max(3, run_state.acceptance_repetitions)
+    )
+    initial_samples = min(initial_samples, max_candidate_samples)
 
     # The candidate tree is the cwd for evaluation: `evaluate` callables and
     # user metric code routinely read files by relative path, and those reads
@@ -1183,12 +1212,16 @@ def _run_lane_eval_loop(
                 candidate_root=candidate_project,
                 lane=lane,
             )
-            if str(gate_outcomes[0].summary["candidate_id"]) != git_state.candidate_id:
+            if (
+                gate_outcomes
+                and str(gate_outcomes[0].summary["candidate_id"])
+                != git_state.candidate_id
+            ):
                 raise typer.BadParameter(
                     "The lane candidate changed during gate evaluation; "
                     "refusing to compare mixed candidates."
                 )
-            if gate_comparison.get("outcome") != "valid":
+            if gate_comparison.get("outcome") == "infrastructure_failure":
                 return _stall_for_infrastructure_failure(
                     workspace_root=workspace_root,
                     run_state=run_state,
@@ -1200,7 +1233,11 @@ def _run_lane_eval_loop(
                     ),
                     valid_samples=[],
                 )
-            if gate_comparison.get("rejection_reason") == "gate":
+            if (
+                gate_comparison.get("rejection_reason") == "gate"
+                or gate_comparison.get("verdict") == "inconclusive"
+            ):
+                gate_verdict = str(gate_comparison["verdict"])
                 comparison = {
                     "run_id": run_id,
                     "lane": lane,
@@ -1218,8 +1255,8 @@ def _run_lane_eval_loop(
                     **{
                         **lane_state.to_dict(),
                         "status": "awaiting_selection",
-                        "verdict": "rejected",
-                        "verdict_delta": gate_comparison["delta"],
+                        "verdict": gate_verdict,
+                        "verdict_delta": gate_comparison.get("delta", 0.0),
                         "comparison_path": str(comparison_path),
                         "eval_pid": None,
                         "updated_at": utc_now_iso(),
@@ -1233,8 +1270,8 @@ def _run_lane_eval_loop(
                         type="verdict",
                         lane=lane,
                         payload={
-                            "verdict": "rejected",
-                            "delta": gate_comparison["delta"],
+                            "verdict": gate_verdict,
+                            "delta": gate_comparison.get("delta", 0.0),
                             "comparison_path": str(comparison_path),
                         },
                     ),
@@ -1370,6 +1407,19 @@ def _run_lane_eval_loop(
                     tuple(samples),
                     confidence=run_state.acceptance_confidence,
                     min_delta=run_state.acceptance_min_delta,
+                    max_looks=(
+                        1
+                        if baseline_per_case is not None
+                        else max(3, run_state.acceptance_max_repetitions)
+                        - max(3, run_state.acceptance_repetitions)
+                        + 1
+                    ),
+                    paired_baseline_scores=baseline_per_case,
+                    paired_candidate_scores=(
+                        {record.case_id: record.score for record in outcome.records}
+                        if baseline_per_case is not None
+                        else None
+                    ),
                 )
                 if comparison_result.verdict != "inconclusive":
                     break
@@ -1385,6 +1435,16 @@ def _run_lane_eval_loop(
         result_data = comparison_result.to_dict()
         verdict = comparison_result.verdict
         display = comparison_result.delta
+        if baseline_per_case is None and len(baseline_samples) < max(
+            3, run_state.acceptance_repetitions
+        ):
+            verdict = "inconclusive"
+            result_data.update(
+                verdict=verdict,
+                improved=False,
+                selectable=False,
+                reason_code="baseline_evidence_insufficient",
+            )
     comparison = {
         "run_id": run_id,
         "lane": lane,

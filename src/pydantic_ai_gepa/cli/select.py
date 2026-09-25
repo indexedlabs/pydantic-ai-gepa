@@ -663,6 +663,29 @@ def _phase_promote(
     workspace_root: Path, state: Any, ctx: dict[str, Any]
 ) -> tuple[Any, dict[str, Any], str]:
     """Invalidate stragglers/cross-baseline lanes, pick + promote the winner."""
+    if "accepted_promotion_count" in ctx:
+        # The promotion checkpoint includes the new incumbent evidence. Do
+        # not compare the winner with itself when resuming that checkpoint.
+        if "merge_pairs" not in ctx:
+            results = ctx.get("validation_results", {})
+            accepted = [
+                lane
+                for lane in load_all_lane_states(workspace_root, state.run_id)
+                if lane.verdict == "accepted"
+                and lane.lane not in ctx.get("invalidated", [])
+                and (
+                    not results
+                    or (
+                        results.get(lane.lane, {}).get("selectable")
+                        and results[lane.lane]
+                        .get("comparison", {})
+                        .get("verdict", "accepted")
+                        == "accepted"
+                    )
+                )
+            ]
+            _emit_merge_opportunities(workspace_root, state, ctx, accepted)
+        return state, ctx, "journal"
     run_id = state.run_id
     baseline_sha = state.reflection_baseline_commit_sha
     if not baseline_sha:
@@ -717,7 +740,31 @@ def _phase_promote(
     validation_enabled = config.validation_dataset is not None
     vector_validation = validation_enabled and config.acceptance.mode == "vector"
     validation_results = dict(ctx.get("validation_results") or {})
+    state = replace(
+        state,
+        iterations=max(
+            state.iterations, ParetoLog(run_id, workspace_root).count_budget_rows()
+        ),
+    )
     from .run import _evaluate_validation_candidate
+
+    if (
+        validation_enabled
+        and not vector_validation
+        and not state.best_validation_samples
+    ):
+        from .run import _ensure_validation_seed
+
+        with _chdir(workspace_root):
+            state, _ = _ensure_validation_seed(state)
+        state = _checkpoint(state, workspace_root, "promote", ctx)
+        if state.status == "paused_after_infrastructure_error":
+            typer.echo(
+                "Incumbent validation failed; no promotion. Recover the evaluator "
+                "and retry `gepa run select`.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
 
     incumbent_vectors: tuple[VectorRecord, ...] = ()
     missing_validation = [
@@ -845,6 +892,14 @@ def _phase_promote(
         )
         validation_outcomes = []
         repetitions = state.acceptance_max_repetitions if vector_validation else 1
+        if not vector_validation and state.iterations >= state.max_iterations:
+            validation_results[lane_state.lane] = {
+                "selectable": False,
+                "reason_code": "validation_budget_exhausted",
+            }
+            ctx["validation_results"] = validation_results
+            state = _checkpoint(state, workspace_root, "promote", ctx)
+            continue
         for repetition in range(1, repetitions + 1):
             with _chdir(candidate_root):
                 state, validation_outcome = _evaluate_validation_candidate(
@@ -965,16 +1020,10 @@ def _phase_promote(
             == "accepted"
         ]
     elif validation_enabled:
-        prior_best = state.best_mean_score
         selectable_candidates = [
             lane_state
             for lane_state in accepted
             if validation_results[lane_state.lane]["selectable"]
-            and (
-                prior_best is None
-                or float(validation_results[lane_state.lane]["mean_score"])
-                > prior_best + state.acceptance_min_delta
-            )
         ]
     else:
         selectable_candidates = accepted
@@ -1018,6 +1067,51 @@ def _phase_promote(
                 return tuple(-float(item) for item in raw) + (lane_state.lane,)
 
             winner = sorted(selectable_candidates, key=training_rank)[0]
+    confirmation_outcomes = []
+    if winner is not None and validation_enabled and not vector_validation:
+        from .run import _confirm_validation_candidate
+
+        candidate_root = (
+            Path(winner.candidate_project_path)
+            if winner.candidate_project_path
+            else candidate_project_root(workspace_root, Path(str(winner.worktree_path)))
+        )
+        with _chdir(candidate_root):
+            state, confirmation_outcomes, confirmation = _confirm_validation_candidate(
+                state,
+                candidate_root=candidate_root,
+                workspace_root=workspace_root,
+                lane=f"{winner.lane}:confirmation",
+            )
+        ctx["validation_confirmation"] = confirmation
+        state = replace(state, last_comparison=confirmation)
+        if confirmation.get("outcome") == "infrastructure_failure":
+            state = replace(state, status="paused_after_infrastructure_error")
+            state = _checkpoint(state, workspace_root, "promote", ctx)
+            typer.echo(
+                "Held-out finalist confirmation failed; incumbent preserved. "
+                "Recover the evaluator and retry `gepa run select`.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        if (
+            confirmation_outcomes
+            and confirmation_outcomes[0].summary["candidate_id"]
+            != validation_results[winner.lane]["candidate_id"]
+        ):
+            raise typer.BadParameter(
+                "The lane finalist changed between validation screening and confirmation; "
+                "refusing to promote mixed candidate evidence."
+            )
+        if confirmation.get("verdict") != "accepted":
+            if confirmation.get("reason_code"):
+                typer.echo(f"Finalist not promoted: {confirmation['reason_code']}.")
+            winner = None
+        else:
+            validation_results[winner.lane]["mean_score"] = confirmation[
+                "candidate_mean"
+            ]
+
     losers = [lane_state.lane for lane_state in valid if lane_state is not winner]
 
     ctx.update(
@@ -1041,6 +1135,7 @@ def _phase_promote(
 
         counts_as_failed_hypothesis = (
             bool(accepted)
+            and ctx.get("validation_confirmation", {}).get("verdict") != "inconclusive"
             if validation_enabled
             else any(
                 lane_state.verdict in {"rejected", "equivalent"} for lane_state in valid
@@ -1131,6 +1226,10 @@ def _phase_promote(
         best_mean_score=resolved_winner_mean,
         accepted_promotion_count=promotion_count,
     )
+    if confirmation_outcomes:
+        from .run import _mark_best_validation_samples
+
+        state = _mark_best_validation_samples(state, confirmation_outcomes)
     from .run import _consume_candidate_verdict
 
     state = _consume_candidate_verdict(state, accepted=True)
@@ -1631,6 +1730,9 @@ def _phase_rebaseline(
     remaining = state.max_iterations - ledger.count_budget_rows()
     affordable_repetitions = max(1, (remaining + 1) // 2)
     target_repetitions = min(state.acceptance_max_repetitions, affordable_repetitions)
+    scalar_mode = (
+        GepaConfig.load(config_path(workspace_root)).acceptance.mode != "vector"
+    )
 
     outcomes: list[Any] = []
 
@@ -1683,6 +1785,20 @@ def _phase_rebaseline(
         state = _with_last_outcome(state, first)
         outcomes.append(first)
         fail_on_infrastructure_error(first)
+        if scalar_mode:
+            from .run import _acceptance_schedule, _inconclusive_comparison
+
+            initial, maximum = _acceptance_schedule(state, len(first.records))
+            affordable_repetitions = remaining // (state.lanes + 1)
+            if affordable_repetitions < initial:
+                state = replace(
+                    state,
+                    last_comparison=_inconclusive_comparison(
+                        "baseline_budget_exhausted"
+                    ),
+                )
+                return state, ctx, "finalize"
+            target_repetitions = min(maximum, affordable_repetitions)
         expected_candidate_id = str(first.summary["candidate_id"])
         minibatch_id = str(first.summary["minibatch_id"])
         while len(outcomes) < target_repetitions:

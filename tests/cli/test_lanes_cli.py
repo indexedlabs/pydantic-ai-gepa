@@ -121,10 +121,14 @@ def _start_lane_run(repo: Path, lanes: int = 2) -> dict[str, object]:
         "start",
         "--lanes",
         str(lanes),
+        "--max-iterations",
+        "40",
         "--size",
         "1",
         "--acceptance-repetitions",
-        "1",
+        "3",
+        "--acceptance-max-repetitions",
+        "3",
     )
     assert result.exit_code == 0, result.output
     return _run_payload(result.output)
@@ -195,7 +199,7 @@ def test_run_continue_errors_in_lane_run(git_repo: Path) -> None:
 
 def test_single_path_run_untouched(git_repo: Path) -> None:
     """--lanes absent -> existing synchronous path: no worktrees, no events."""
-    result = _run("run", "start", "--size", "1", "--acceptance-repetitions", "1")
+    result = _run("run", "start", "--size", "1", "--acceptance-repetitions", "3")
     assert result.exit_code == 0, result.output
     run = _run_payload(result.output)
     assert run["lanes"] == 0
@@ -207,7 +211,7 @@ def test_single_path_run_untouched(git_repo: Path) -> None:
 
 
 def test_pre_lane_state_loads_with_lane_defaults(git_repo: Path) -> None:
-    result = _run("run", "start", "--size", "1", "--acceptance-repetitions", "1")
+    result = _run("run", "start", "--size", "1", "--acceptance-repetitions", "3")
     assert result.exit_code == 0, result.output
     run = _run_payload(result.output)
     state_path = Path(str(run["state_path"]))
@@ -241,7 +245,7 @@ def test_packet_is_self_contained(git_repo: Path) -> None:
     assert Path(packet["candidate_project_root"]).is_dir()
     assert packet["project_prefix"] == "."
     baseline = packet["baseline"]
-    assert baseline["samples"] == [0.0]
+    assert baseline["samples"] == [0.0, 0.0, 0.0]
     assert baseline["minibatch_id"]
     assert all(Path(p).exists() for p in baseline["report_paths"])
     assert packet["journal_tail"][0]["content"] == "seed entry"
@@ -413,7 +417,11 @@ def test_nested_monorepo_lane_uses_candidate_project_and_src_imports(
             "--size",
             "1",
             "--acceptance-repetitions",
-            "1",
+            "3",
+            "--acceptance-max-repetitions",
+            "3",
+            "--max-iterations",
+            "40",
         )
         assert start.exit_code == 0, start.output
         run = _run_payload(start.output)
@@ -635,7 +643,7 @@ def test_lane_continue_evaluates_and_emits_verdict(git_repo: Path) -> None:
     assert state.verdict == "accepted"
     assert state.verdict_delta == pytest.approx(1.0)
     assert state.candidate_sha == lane_head
-    assert state.eval_samples == (1.0,)
+    assert state.eval_samples == (1.0, 1.0, 1.0)
     assert state.eval_pid is None
     assert Path(str(state.comparison_path)).exists()
 
@@ -655,7 +663,7 @@ def test_lane_continue_evaluates_and_emits_verdict(git_repo: Path) -> None:
 
     rows = ParetoLog(run_id, git_repo).iter_rows()
     lane_rows = [row for row in rows if row.lane == "lane-1"]
-    assert len(lane_rows) == 1
+    assert len(lane_rows) == 3
     assert lane_rows[0].mean_score == pytest.approx(1.0)
 
 
@@ -932,7 +940,7 @@ def test_lane_verbs_reject_done_runs(git_repo: Path) -> None:
         "--size",
         "1",
         "--acceptance-repetitions",
-        "1",
+        "3",
         "--max-iterations",
         "1",
     )
