@@ -78,6 +78,7 @@ from .layout import (
     vector_records_path,
 )
 from .metrics import default_substring_metric
+from .validation import validation_dataset_path
 from .runs import (
     Minibatch,
     MinibatchStore,
@@ -418,8 +419,34 @@ def run_eval_once(
         configured_dataset = cfg.validation_dataset
     else:
         configured_dataset = cfg.dataset
-    dataset_path = primary_project_root / configured_dataset
-    cases = load_dataset(dataset_path)
+    dataset_path = (primary_project_root / configured_dataset).resolve()
+    if dataset_role == "validation":
+        dataset_path = validation_dataset_path(
+            configured_dataset,
+            project_root=primary_project_root,
+            candidate_root=active_candidate_project,
+        )
+        try:
+            cases = load_dataset(dataset_path)
+        except (OSError, ValueError, TypeError) as exc:
+            raise typer.BadParameter(
+                "Could not load held-out validation dataset."
+            ) from exc
+    else:
+        if cfg.validation_dataset is not None:
+            held_out_path = (primary_project_root / cfg.validation_dataset).resolve()
+            if dataset_path == held_out_path or (
+                dataset_path.is_file()
+                and held_out_path.is_file()
+                and (
+                    dataset_path.samefile(held_out_path)
+                    or dataset_path.read_bytes() == held_out_path.read_bytes()
+                )
+            ):
+                raise typer.BadParameter(
+                    "Training dataset aliases held-out validation; use a separate training dataset."
+                )
+        cases = load_dataset(dataset_path)
     if not cases:
         typer.echo(f"Dataset {dataset_path} is empty.", err=True)
         raise typer.Exit(code=1)
@@ -521,7 +548,12 @@ def run_eval_once(
     run_dir(active_run_id, workspace_root).mkdir(parents=True, exist_ok=True)
     minibatch_store = MinibatchStore(active_run_id, workspace_root)
     if dataset_role == "validation":
-        if minibatch_id is not None or case_id is not None:
+        if (
+            minibatch_id is not None
+            or case_id is not None
+            or selected_case_ids is not None
+            or supplemental_records
+        ):
             raise typer.BadParameter(
                 "Held-out validation always evaluates its complete dataset."
             )
@@ -720,7 +752,7 @@ def run_eval_once(
     selectable = not infrastructure_failures and metric_selectable
     pareto_status = "infrastructure_failure" if infrastructure_failures else status
     persisted_errors = (
-        [{"error_kind": failure.error_kind} for failure in infrastructure_failures]
+        ([{"error_kind": "infrastructure_failure"}] if infrastructure_failures else [])
         if redact_selection_evidence
         else [failure.to_dict() for failure in infrastructure_failures]
     )
@@ -886,7 +918,10 @@ def run_eval_once(
 
 def _format_output_lines(outcome: EvalOutcome) -> str:
     output_lines = []
-    for record in outcome.records:
+    records = (
+        [] if outcome.summary.get("dataset_role") == "validation" else outcome.records
+    )
+    for record in records:
         output_lines.append(
             json.dumps(
                 {

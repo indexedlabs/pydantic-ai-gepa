@@ -63,7 +63,7 @@ test, provider, credential, or worker failures.
 gepa init \
   --agent mypkg.agents:my_agent \
   --metric mypkg.metrics:my_metric \
-  --validation-dataset .gepa/validation.jsonl \
+  --validation-dataset /srv/gepa-heldout/my-project/validation.jsonl \
   --install-skill
 ```
 
@@ -76,17 +76,29 @@ What each flag does:
 - `--evaluate MODULE:ATTR` — git-mode alternative to `--agent`; points at a
   plain task callable.
 - `--metric MODULE:ATTR` — optional. An async (or sync) callable `(case, output) -> MetricResult | float`. Omit it to use the default substring/equality scorer, which is only useful for trivial expected-output strings.
-- `--validation-dataset PATH` — optional held-out selection set. Configure it
-  for validation-guided GEPA; never inspect its cases, reports, or traces while
-  acting as the reflector.
+- `--validation-dataset PATH` — optional held-out selection set, provisioned by
+  the harness outside the repository. Use an absolute path such as the example
+  above, replacing it with the harness's actual location. Never inspect its
+  cases while acting as the reflector.
 - `--install-skill` — drops this SKILL.md into `<repo>/.agents/skills/gepa-optimize/` so coding agents auto-discover it. Pass it the first time.
 
-Write reflection-training cases at `.gepa/dataset.jsonl` and held-out selection
-cases at `.gepa/validation.jsonl`, one JSON object per line:
+Write reflection-training cases at `.gepa/dataset.jsonl`, one JSON object per
+line. The harness provisions held-out selection cases in the same format at
+the external `validation_dataset` path:
 
 ```json
 {"name": "case-1", "inputs": "...", "expected_output": "...", "metadata": {}}
 ```
+
+Keep validation data outside the primary checkout and every candidate worktree
+in both component and git modes. Never commit it to the candidate repository.
+Managed runs refuse a validation path inside a checkout or tracked by that
+repository, including paths that resolve there through symlinks. `start`,
+`continue`, and lane selection recheck the boundary and pinned dataset identity.
+Move an existing dataset outside the repository and update `validation_dataset`
+in `.gepa/gepa.toml` before starting a new run. If Git already contains the
+dataset, use a fresh candidate repository without those objects; deleting or
+moving the file does not remove access through history.
 
 In component mode, `gepa init` introspects the agent, writes
 `.gepa/gepa.toml`, and pre-seeds `.gepa/components/<slot>.md` from each slot's
@@ -108,6 +120,7 @@ gepa init \
   --candidate-source git \
   --evaluate mypkg.eval:evaluate \
   --metric mypkg.eval:metric \
+  --validation-dataset /srv/gepa-heldout/my-project/validation.jsonl \
   --install-skill
 ```
 
@@ -117,7 +130,7 @@ This writes the following top-level configuration:
 candidate_source = "git"
 evaluate = "mypkg.eval:evaluate"
 dataset = ".gepa/dataset.jsonl"
-validation_dataset = ".gepa/validation.jsonl"
+validation_dataset = "/srv/gepa-heldout/my-project/validation.jsonl"
 metric = "mypkg.eval:metric"
 ```
 
@@ -168,6 +181,10 @@ the reflection baseline. Only a training improvement spends a full held-out
 validation evaluation. Validation—not the training minibatch—decides whether
 `best_candidate_id` and `best_commit_sha` advance. The CLI persists no
 validation report, trace, per-case score, or minibatch manifest for reflection.
+Status/start/continue summaries, lane packets and events, Pareto history, and
+the final report expose only aggregate validation scores and outcomes. Training
+reports and traces retain their full feedback. Validation evaluations write no
+report or trace file.
 When either gate rejects the candidate, the CLI pauses with:
 
 ```text
@@ -185,7 +202,7 @@ git checkout <best_commit_sha>
 
 ### Per-stage trace file contract
 
-Before each trace-enabled evaluation, the CLI exports `GEPA_TRACE_FILE` with
+Before each trace-enabled training evaluation, the CLI exports `GEPA_TRACE_FILE` with
 the absolute path:
 
 ```text
@@ -665,9 +682,13 @@ gepa run status --run-id <run_id>
     ├── final_report.md        # written when managed run reaches done
     ├── pareto.jsonl           # append-only ParetoRow history (one row per eval)
     ├── minibatches/<mb_id>.json
-    ├── reports/<iteration>-<eval_id>-<candidate_id>.md
-    └── traces/minibatches/<mb_id>/<iteration>-<eval_id>-<candidate_id>.jsonl
+    ├── reports/<iteration>-<eval_id>-<candidate_id>.md  # training only
+    └── traces/minibatches/<mb_id>/<iteration>-<eval_id>-<candidate_id>.jsonl  # training only
 ```
+
+The held-out validation dataset lives outside this repository; no validation
+case files, reports, or traces belong in this layout. Validation rows in
+`pareto.jsonl` contain only aggregate scores and outcomes.
 
 In the default component mode, slot identity comes from live-agent
 introspection and slot values come from `.gepa/components/<slot>.md` (or the

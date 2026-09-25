@@ -6,6 +6,32 @@ GEPA (Genetic Evolution with Prompt Adaptation) is an evolutionary optimization 
 
 **Core Innovation**: Reflection on execution trajectories - using detailed execution traces to generate targeted improvements via LLM-based feedback.
 
+## Validation boundary in this library
+
+The algorithm's per-case validation scores and Pareto bookkeeping described
+below belong to the harness. Reflection receives training cases, outputs,
+feedback, and traces; it never receives validation cases, outputs, feedback,
+side information, reports, traces, or per-case scores. Validation rollouts write
+no trace file and discard captured spans before training trace collection
+resumes. Aggregate validation scores and candidate adoption outcomes may be
+returned to the reflector.
+
+For managed CLI runs, the harness must load validation from outside the primary
+repository and every candidate worktree, in component and git modes alike:
+
+```bash
+gepa init --agent mypkg.agents:my_agent \
+  --validation-dataset /srv/gepa-heldout/my-project/validation.jsonl
+```
+
+Replace this absolute example path with the harness-owned dataset location;
+never add validation data to the candidate repository. Managed runs refuse
+paths inside the checkout or tracked by git, pin the external dataset identity,
+and recheck it on resume and lane selection. No validation report or trace file
+is written. Reflection-visible status, packets, events, final reports, and
+Pareto rows contain only aggregate validation scores and outcomes. Training
+reports and traces remain unredacted.
+
 ---
 
 ## 1. System Model

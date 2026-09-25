@@ -336,6 +336,7 @@ def test_default_workspace_unchanged_when_flag_omitted(empty_repo: Path) -> None
 
 
 def test_init_writes_held_out_validation_dataset(empty_repo: Path) -> None:
+    validation_path = empty_repo.parent / "validation.jsonl"
     result = _run(
         "init",
         "--agent",
@@ -343,14 +344,14 @@ def test_init_writes_held_out_validation_dataset(empty_repo: Path) -> None:
         "--dataset",
         "data/train.jsonl",
         "--validation-dataset",
-        "data/validation.jsonl",
+        str(validation_path),
     )
 
     assert result.exit_code == 0, result.output
     body = (empty_repo / ".gepa" / "gepa.toml").read_text(encoding="utf-8")
     assert 'dataset = "data/train.jsonl"' in body
-    assert 'validation_dataset = "data/validation.jsonl"' in body
-    assert "held-out validation cases at data/validation.jsonl" in result.output
+    assert f'validation_dataset = "{validation_path}"' in body
+    assert f"held-out validation cases at {validation_path}" in result.output
 
 
 def test_parallel_workspaces_isolated(empty_repo: Path) -> None:
@@ -382,3 +383,16 @@ def test_parallel_workspaces_isolated(empty_repo: Path) -> None:
     assert ".gepa.support/dataset.jsonl" in (
         empty_repo / ".gepa.support" / "gepa.toml"
     ).read_text(encoding="utf-8")
+
+
+def test_init_refuses_validation_inside_checkout(empty_repo: Path) -> None:
+    result = _run(
+        "init",
+        "--agent",
+        "agent_pkg.agents:agent",
+        "--validation-dataset",
+        ".gepa/validation.jsonl",
+    )
+    assert result.exit_code == 2, result.output
+    assert "outside the repository" in result.output
+    assert not (empty_repo / ".gepa" / "validation.jsonl").exists()

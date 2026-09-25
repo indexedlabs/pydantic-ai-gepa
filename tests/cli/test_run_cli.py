@@ -147,7 +147,7 @@ def test_held_out_validation_selects_without_exposing_reflection_evidence(
         {"name": "secret-validation-alpha", "inputs": "?", "expected_output": "Paris"},
         {"name": "secret-validation-beta", "inputs": "?", "expected_output": "Berlin"},
     ]
-    validation_path = repo / ".gepa" / "validation.jsonl"
+    validation_path = repo.parent / "validation.jsonl"
     validation_path.write_text(
         "\n".join(json.dumps(row) for row in validation_cases) + "\n",
         encoding="utf-8",
@@ -155,7 +155,7 @@ def test_held_out_validation_selects_without_exposing_reflection_evidence(
     config = repo / ".gepa" / "gepa.toml"
     config.write_text(
         config.read_text(encoding="utf-8")
-        + 'validation_dataset = ".gepa/validation.jsonl"\n',
+        + f'validation_dataset = "{validation_path}"\n',
         encoding="utf-8",
     )
 
@@ -206,6 +206,10 @@ def test_held_out_validation_selects_without_exposing_reflection_evidence(
     assert calls[-1]["capture_traces"] is False
     assert calls[-1]["persist_report"] is False
     assert calls[-1]["redact_selection_evidence"] is True
+    status = _run("run", "status", "--run-id", str(start_payload["run_id"]))
+    assert status.exit_code == 0, status.output
+    for secret in ("secret-validation-alpha", "secret-validation-beta"):
+        assert secret not in started.output + result.output + status.output
 
     run_root = repo / ".gepa" / "runs" / str(start_payload["run_id"])
     persisted = "\n".join(
@@ -219,6 +223,36 @@ def test_held_out_validation_selects_without_exposing_reflection_evidence(
     assert len(validation_rows) == 2
     assert all(not row.per_case_scores for row in validation_rows)
     assert ParetoLog(str(start_payload["run_id"])).count_budget_rows() == 4
+
+
+def test_held_out_final_report_is_aggregate_only(repo: Path) -> None:
+    validation_path = repo.parent / "validation.jsonl"
+    validation_path.write_text(
+        json.dumps(
+            {
+                "name": "WITHHELD_CASE",
+                "inputs": "WITHHELD_INPUT",
+                "expected_output": "Paris",
+            }
+        )
+        + "\n"
+    )
+    config = repo / ".gepa" / "gepa.toml"
+    config.write_text(
+        config.read_text() + f'validation_dataset = "{validation_path}"\n'
+    )
+    started = _run("run", "start", "--size", "2", "--max-iterations", "2")
+    assert started.exit_code == 0, started.output
+    payload = _run_payload(started.output)
+    run_id = str(payload["run_id"])
+    if payload["status"] != "done":
+        done = _run("run", "continue", "--run-id", run_id)
+        assert done.exit_code == 0, done.output
+        payload = _run_payload(done.output)
+    assert payload["status"] == "done"
+    report = Path(str(payload["final_report_path"])).read_text()
+    assert "validation_evaluations: 1" in report
+    assert "WITHHELD" not in report
 
 
 def test_stall_block_appears_after_five_non_promoting_verdicts_and_clears(

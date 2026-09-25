@@ -7,6 +7,7 @@ from collections.abc import Awaitable
 from typing import TypeVar
 
 from .provider_errors import is_provider_stop_error
+from ._validation import validation_active
 
 T = TypeVar("T")
 
@@ -18,7 +19,8 @@ async def gather_cancelling_on_provider_stop(*awaitables: Awaitable[T]) -> list[
     cases still in flight are cancelled rather than calling the provider again,
     possibly after their caller has left the candidate context. Other failures
     keep ``gather``'s behavior: the remaining cases run to completion, so paid
-    rollouts still record usage and cache their results. Cancellation reaches
+    rollouts still record usage and cache their results. Validation always
+    drains pending tasks before its evidence context closes. Cancellation reaches
     coroutines only; work already handed to a thread keeps running.
     """
 
@@ -26,7 +28,7 @@ async def gather_cancelling_on_provider_stop(*awaitables: Awaitable[T]) -> list[
     try:
         return list(await asyncio.gather(*tasks))
     except BaseException as error:
-        if is_provider_stop_error(error):
+        if is_provider_stop_error(error) or validation_active():
             unfinished = [task for task in tasks if not task.done()]
             for task in unfinished:
                 task.cancel()

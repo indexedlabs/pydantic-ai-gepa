@@ -8,6 +8,7 @@ import logfire
 from pydantic_graph import StepContext
 
 from pydantic_evals import Case
+from ..._validation import validation_evaluation
 from ..deps import GepaDeps
 from ..models import CandidateProgram, GepaState
 from .continue_step import IterationAction
@@ -66,10 +67,13 @@ async def merge_step(ctx: StepContext[GepaState, GepaDeps, None]) -> IterationAc
 
     state.record_merge_attempt()
 
-    with logfire.span(
-        "evaluate merged candidate",
-        candidate_idx=merged_candidate.idx,
-        subsample_size=len(subsample),
+    with (
+        validation_evaluation(deps.memory_exporter),
+        logfire.span(
+            "evaluate merged candidate",
+            candidate_idx=merged_candidate.idx,
+            subsample_size=len(subsample),
+        ),
     ):
         merged_results = await deps.evaluator.evaluate_batch(
             candidate=merged_candidate,

@@ -767,9 +767,7 @@ def _phase_promote(
             failure_history = dict(ctx.get("validation_infrastructure_failures") or {})
             failure_history["incumbent"] = {
                 "evaluation_error_count": len(incumbent_failures),
-                "error_kinds": sorted(
-                    {failure.error_kind or "unknown" for failure in incumbent_failures}
-                ),
+                "error_kinds": ["infrastructure_failure"],
             }
             ctx["validation_infrastructure_failures"] = failure_history
             state = _checkpoint(state, workspace_root, "promote", ctx)
@@ -869,9 +867,7 @@ def _phase_promote(
             failure_history = dict(ctx.get("validation_infrastructure_failures") or {})
             failure_history[lane_state.lane] = {
                 "evaluation_error_count": len(failures),
-                "error_kinds": sorted(
-                    {failure.error_kind or "unknown" for failure in failures}
-                ),
+                "error_kinds": ["infrastructure_failure"],
             }
             ctx["validation_infrastructure_failures"] = failure_history
             state = _checkpoint(state, workspace_root, "promote", ctx)
@@ -1913,6 +1909,10 @@ def run_select(run_id: str | None) -> Any:
 
 
 def _run_select_locked(workspace_root: Path, run_state: Any) -> Any:
+    if run_state.validation_dataset_path is not None:
+        from .run import _assert_validation_dataset_unchanged
+
+        _assert_validation_dataset_unchanged(run_state, workspace_root=workspace_root)
     if run_state.status == "done":
         typer.echo(
             f"Run {run_state.run_id} is done; there is nothing to select.",

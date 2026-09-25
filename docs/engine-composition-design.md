@@ -136,6 +136,14 @@ compatibility reporting score. CLI Pareto views support `--frontier instance`,
 rows cannot enter a front. An `OptimizationTask(test_set=...)` evaluates that
 set only after final selection, never exposes it to engines or reflection.
 
+Validation evidence stays inside the harness: reflection sees only aggregate
+validation scores and outcomes, while training feedback remains available in
+full. Validation evaluations write no reports or traces. CLI validation rows
+do not expose per-case or objective coordinates. Configure `validation_dataset`
+as an absolute path outside the repository and candidate worktrees, for example
+`/srv/gepa-heldout/my-project/validation.jsonl`; managed runs refuse an in-tree
+or git-tracked validation path and recheck the pinned external file on resume.
+
 Candidate/case evaluation caching is opt-in and in-memory only (`cache=True`), and requires
 `evaluation_cache_identity` containing the deterministic evaluator version and
 any seed/control identity. It is intentionally unavailable for uncontrolled
