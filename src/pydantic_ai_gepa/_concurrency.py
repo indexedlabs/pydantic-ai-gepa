@@ -8,6 +8,7 @@ from typing import TypeVar
 
 from .exceptions import UsageBudgetExceeded
 from .provider_errors import is_provider_stop_error
+from ._validation import validation_active
 
 T = TypeVar("T")
 
@@ -25,8 +26,10 @@ async def gather_cancelling_on_provider_stop(*awaitables: Awaitable[T]) -> list[
     further model rounds after a cost stop.
 
     Other failures keep ``gather``'s behavior: the remaining cases run to
-    completion, so paid rollouts still record usage and cache their results. Cancellation reaches
-    coroutines only; work already handed to a thread keeps running.
+    completion, so paid rollouts still record usage and cache their results.
+    Validation always drains pending tasks before its evidence context closes.
+    Cancellation reaches coroutines only; work already handed to a thread keeps
+    running.
     """
 
     tasks = [asyncio.ensure_future(awaitable) for awaitable in awaitables]
@@ -37,7 +40,7 @@ async def gather_cancelling_on_provider_stop(*awaitables: Awaitable[T]) -> list[
             # Drain already-paid requests before snapshotting spend; each meter
             # blocks queued runs and additional model rounds after a cost stop.
             await asyncio.gather(*tasks, return_exceptions=True)
-        elif is_provider_stop_error(error):
+        elif is_provider_stop_error(error) or validation_active():
             unfinished = [task for task in tasks if not task.done()]
             for task in unfinished:
                 task.cancel()

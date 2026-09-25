@@ -40,6 +40,8 @@ from pydantic_ai_gepa.gepa_graph.selectors import (
 )
 from pydantic_ai_gepa.types import RolloutOutput
 from pydantic_ai_gepa.adapter import Adapter, SharedReflectiveDataset
+from pydantic_ai_gepa._validation import validation_active
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 
 def _make_data_inst(case_id: str) -> Case[str, str, dict[str, str]]:
@@ -175,6 +177,7 @@ class _StubEvaluator(ParallelEvaluator):
         self.calls = 0
 
     async def evaluate_batch(self, **kwargs):
+        assert validation_active()
         self.calls += 1
         return self._result
 
@@ -347,9 +350,21 @@ async def test_merge_step_accepts_when_scores_non_strictly_better() -> None:
         subsample=subsample,
     )
     deps = _make_deps(merge_builder=builder, evaluator=evaluator)
+
+    class Exporter(InMemorySpanExporter):
+        cleared = False
+
+        def clear(self):
+            self.cleared = True
+            super().clear()
+
+    exporter = Exporter()
+    deps.memory_exporter = exporter
     ctx = _ctx(state, deps)
 
     next_node = await merge_step(ctx)
+    assert exporter.cleared
+    assert not validation_active()
 
     assert next_node == "evaluate"
     assert evaluator.calls == 1

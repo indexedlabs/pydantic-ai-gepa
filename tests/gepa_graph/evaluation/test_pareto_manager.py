@@ -55,6 +55,7 @@ def test_pareto_manager_updates_fronts() -> None:
     assert state.pareto_front["0"].best_score == pytest.approx(0.5)
     assert state.pareto_front["0"].candidate_indices == {0}
     assert state.pareto_front["1"].best_score == pytest.approx(0.7)
+    assert all(not entry.best_outputs for entry in state.pareto_front.values())
 
 
 def test_pareto_manager_handles_ties() -> None:
@@ -82,6 +83,7 @@ def test_pareto_manager_handles_ties() -> None:
     entry = state.pareto_front["0"]
     assert entry.best_score == pytest.approx(0.6)
     assert entry.candidate_indices == {0, 1}
+    assert entry.best_outputs == []
 
 
 def test_find_dominators_filters_dominated_candidates() -> None:

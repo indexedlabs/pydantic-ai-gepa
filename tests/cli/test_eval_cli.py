@@ -533,3 +533,76 @@ def test_eval_lane_budget_cap_is_advisory(repo: Path, tmp_path: Path) -> None:
     assert rows[0].lane is None
     assert rows[1].lane == "lane-a"
     assert rows[1].extra["eval_id"] == outcome.summary["eval_id"]
+
+
+@pytest.mark.parametrize("alias", ["path", "symlink", "hardlink", "copy"])
+def test_eval_refuses_validation_as_training(repo: Path, alias: str) -> None:
+    validation_path = repo.parent / "validation.jsonl"
+    validation_path.write_text(
+        json.dumps({"name": "withheld-eval-case", "inputs": "private"}) + "\n"
+    )
+    training_path = repo / "alias.jsonl"
+    if alias == "path":
+        training_path = validation_path
+    elif alias == "symlink":
+        training_path.symlink_to(validation_path)
+    elif alias == "hardlink":
+        training_path.hardlink_to(validation_path)
+    else:
+        training_path.write_bytes(validation_path.read_bytes())
+    config = repo / ".gepa" / "gepa.toml"
+    config.write_text(
+        config.read_text().replace(".gepa/dataset.jsonl", str(training_path))
+        + f'validation_dataset = "{validation_path}"\n'
+    )
+
+    result = _run("eval", "--capture-traces", "--output-file", "-")
+
+    assert result.exit_code == 2, result.output
+    assert "aliases held-out validation" in result.output
+    assert "withheld-eval-case" not in result.output
+    assert not list((repo / ".gepa" / "runs").glob("*/reports/*.md"))
+
+
+def test_validation_eval_never_emits_per_case_output(repo: Path) -> None:
+    from pydantic_ai_gepa.cli.eval import _format_output_lines
+
+    validation_path = repo.parent / "validation.jsonl"
+    validation_path.write_text(
+        json.dumps(
+            {
+                "name": "withheld-eval-case",
+                "inputs": "private",
+                "expected_output": "Paris",
+            }
+        )
+        + "\n"
+    )
+    config = repo / ".gepa" / "gepa.toml"
+    config.write_text(
+        config.read_text() + f'validation_dataset = "{validation_path}"\n'
+    )
+    outcome = run_eval_once(
+        candidate_file=_candidate_file(
+            repo, {"instructions": "You are a geography expert."}
+        ),
+        minibatch_id=None,
+        size=1,
+        seed=0,
+        epoch=0,
+        run_id=None,
+        concurrency=1,
+        max_iterations=2,
+        threshold=0.999,
+        dataset_role="validation",
+        capture_traces=True,
+        persist_report=True,
+    )
+
+    assert outcome.summary["mean_score"] == 1.0
+    assert outcome.report_path is outcome.trace_path is None
+    assert "withheld-eval-case" not in _format_output_lines(outcome)
+    run_path = repo / ".gepa" / "runs" / outcome.summary["run_id"]
+    assert not list(run_path.rglob("*.md"))
+    assert not list((run_path / "traces").rglob("*"))
+    assert not list((run_path / "minibatches").rglob("*"))

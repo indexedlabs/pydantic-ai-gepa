@@ -143,6 +143,13 @@ async def test_coding_agent_engine_keeps_validation_evidence_out_of_reflection()
             feedback=(
                 "VALIDATION SECRET" if case.name == "validation-secret" else "train fix"
             ),
+            side_info={
+                "evidence": (
+                    "VALIDATION SIDE INFO"
+                    if case.name == "validation-secret"
+                    else "training side info"
+                )
+            },
         )
 
     task = OptimizationTask(
@@ -171,8 +178,18 @@ async def test_coding_agent_engine_keeps_validation_evidence_out_of_reflection()
     assert [record.case_id for record in contexts[0].minibatch_records] == [
         "train-visible"
     ]
-    assert "VALIDATION SECRET" not in contexts[0].report
-    assert "VALIDATION SECRET" not in repr(result.history)
+    for secret in ("validation-secret", "VALIDATION SECRET", "VALIDATION SIDE INFO"):
+        assert secret not in repr(contexts)
+        assert secret not in repr(result.history)
+    assert "train fix" in contexts[0].report
+    assert "training side info" in repr(contexts[0].minibatch_records)
+    validation_events = [
+        event for event in result.history if "validation_score" in event.data
+    ]
+    assert [event.data["validation_score"] for event in validation_events] == [0.0, 1.0]
+    assert all(
+        "validation_case_scores" not in event.data for event in validation_events
+    )
     assert result.history[-1].data["validation_evaluations"] == 2
 
 

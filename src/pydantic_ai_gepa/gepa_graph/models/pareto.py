@@ -31,19 +31,20 @@ class ParetoFrontEntry(BaseModel):
         *,
         candidate_idx: int,
         score: float,
-        output: RolloutOutput[Any],
+        output: RolloutOutput[Any] | None = None,
     ) -> None:
         """Update the Pareto entry with a new candidate result."""
         if score > self.best_score:
             self.best_score = score
             self.candidate_indices = {candidate_idx}
-            self.best_outputs = [(candidate_idx, output)]
+            self.best_outputs = [(candidate_idx, output)] if output is not None else []
             return
 
         if score == self.best_score:
             if candidate_idx not in self.candidate_indices:
                 self.candidate_indices.add(candidate_idx)
-            self.best_outputs.append((candidate_idx, output))
+            if output is not None:
+                self.best_outputs.append((candidate_idx, output))
 
     def is_empty(self) -> bool:
         """Return True if no candidates have been recorded."""

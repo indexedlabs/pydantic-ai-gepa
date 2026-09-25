@@ -45,6 +45,7 @@ from .layout import (
 )
 from .runs import MinibatchStore, ParetoLog, utc_now_iso
 from .store import ComponentStore
+from .validation import validation_dataset_path
 
 
 app = typer.Typer(
@@ -614,7 +615,7 @@ def _validation_dataset_identity(root: Path | None = None) -> tuple[str, str]:
         raise typer.BadParameter(
             "Held-out validation requires validation_dataset in gepa.toml."
         )
-    path = project_root / cfg.validation_dataset
+    path = validation_dataset_path(cfg.validation_dataset, project_root=project_root)
     try:
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
     except OSError as exc:
@@ -659,18 +660,9 @@ def _assert_validation_dataset_unchanged(
                     "Candidate changed validation_dataset in gepa.toml; held-out "
                     "selection configuration is immutable during a run."
                 )
-    validation_path = Path(configured_path)
-    if not validation_path.is_absolute():
-        candidate_validation = candidate_root / validation_path
-        if (
-            candidate_validation.is_file()
-            and hashlib.sha256(candidate_validation.read_bytes()).hexdigest()
-            != state.validation_dataset_digest
-        ):
-            raise typer.BadParameter(
-                "Candidate changed the held-out validation dataset; restore the "
-                "pinned data before selection."
-            )
+    validation_dataset_path(
+        configured_path, project_root=primary_root, candidate_root=candidate_root
+    )
 
 
 def _evaluate_validation_candidate(
@@ -1699,6 +1691,8 @@ def start(
         typer.echo("--candidate-source must be 'components' or 'git'.", err=True)
         raise typer.Exit(code=2)
     cfg = GepaConfig.load(config_path())
+    if cfg.validation_dataset is not None:
+        _validation_dataset_identity()
     vector_validation = (
         cfg.validation_dataset is not None and cfg.acceptance.mode == "vector"
     )
@@ -1853,6 +1847,8 @@ def continue_(
 ) -> None:
     """Resume after reflection edits and advance to the next pause or completion."""
     state = _load_state(run_id)
+    if state.validation_dataset_path is not None:
+        _assert_validation_dataset_unchanged(state)
     if state.lanes > 0 and not (
         state.status == "paused_after_infrastructure_error"
         and state.reflection_minibatch_id is None

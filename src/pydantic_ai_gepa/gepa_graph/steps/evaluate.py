@@ -8,6 +8,7 @@ import logfire
 from pydantic_graph import StepContext
 
 from pydantic_evals import Case
+from ..._validation import validation_evaluation
 from ..deps import GepaDeps
 from ..evaluation import EvaluationResults
 from ..models import CandidateProgram, GepaState
@@ -32,10 +33,13 @@ async def evaluate_step(ctx: StepContext[GepaState, GepaDeps, None]) -> None:
             state.best_candidate_idx = candidate.idx
         return None
 
-    with logfire.span(
-        "evaluate candidate",
-        candidate_idx=candidate.idx,
-        validation_batch_size=len(validation_batch),
+    with (
+        validation_evaluation(ctx.deps.memory_exporter),
+        logfire.span(
+            "evaluate candidate",
+            candidate_idx=candidate.idx,
+            validation_batch_size=len(validation_batch),
+        ),
     ):
         results = await ctx.deps.evaluator.evaluate_batch(
             candidate=candidate,
@@ -43,31 +47,6 @@ async def evaluate_step(ctx: StepContext[GepaState, GepaDeps, None]) -> None:
             adapter=ctx.deps.adapter,
             max_concurrent=state.config.max_concurrent_evaluations,
         )
-
-    # Serialize traces to disk if memory_exporter is available
-    if ctx.deps.memory_exporter is not None:
-        from pathlib import Path
-
-        from ...trace_capabilities import drain_spans_by_trace_id
-
-        trace_ids = {
-            trace_id
-            for output in results.outputs
-            if (trace_id := output.trace_id) is not None
-        }
-        spans = drain_spans_by_trace_id(ctx.deps.memory_exporter, trace_ids)
-        if spans:
-            from ..proposal.trace_store import span_to_jsonl_line
-
-            traces_dir = Path(
-                f".gepa_cache/runs/{state.run_id}/candidates/{candidate.idx}/traces"
-            )
-            traces_dir.mkdir(parents=True, exist_ok=True)
-            traces_file = traces_dir / "traces.jsonl"
-
-            with open(traces_file, "a", encoding="utf-8") as f:
-                for span in spans:
-                    f.write(span_to_jsonl_line(span))
 
     state.record_evaluation_errors(
         candidate_idx=candidate.idx,

@@ -219,11 +219,11 @@ def _configure_validation(repo: Path, *, pinned_scorer: bool) -> None:
         _config(pinned_scorer=pinned_scorer).replace(
             'dataset = ".gepa/dataset.jsonl"\n',
             'dataset = ".gepa/dataset.jsonl"\n'
-            'validation_dataset = ".gepa/validation.jsonl"\n',
+            f'validation_dataset = "{repo.parent / "validation.jsonl"}"\n',
         ),
         encoding="utf-8",
     )
-    (repo / ".gepa" / "validation.jsonl").write_text(
+    (repo.parent / "validation.jsonl").write_text(
         json.dumps(
             {
                 "name": "secret-vector-validation",
@@ -234,7 +234,7 @@ def _configure_validation(repo: Path, *, pinned_scorer: bool) -> None:
         + "\n",
         encoding="utf-8",
     )
-    _git(repo, "add", ".gepa/gepa.toml", ".gepa/validation.jsonl")
+    _git(repo, "add", ".gepa/gepa.toml")
     _git(repo, "commit", "-m", "Configure vector validation")
 
 
@@ -269,11 +269,11 @@ def test_vector_mode_never_persists_validation_assertions(
         _config().replace(
             'dataset = ".gepa/dataset.jsonl"\n',
             'dataset = ".gepa/dataset.jsonl"\n'
-            'validation_dataset = ".gepa/validation.jsonl"\n',
+            f'validation_dataset = "{vector_repo.parent / "validation.jsonl"}"\n',
         ),
         encoding="utf-8",
     )
-    (vector_repo / ".gepa" / "validation.jsonl").write_text(
+    (vector_repo.parent / "validation.jsonl").write_text(
         json.dumps(
             {
                 "name": "secret-vector-validation",
@@ -284,7 +284,7 @@ def test_vector_mode_never_persists_validation_assertions(
         + "\n",
         encoding="utf-8",
     )
-    _git(vector_repo, "add", ".gepa/gepa.toml", ".gepa/validation.jsonl")
+    _git(vector_repo, "add", ".gepa/gepa.toml")
     _git(vector_repo, "commit", "-m", "Configure held-out validation")
 
     payload, state = _start(vector_repo)
