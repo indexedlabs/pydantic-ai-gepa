@@ -54,6 +54,8 @@ from .reflector_recovery import (
 from .runs import MinibatchStore, ParetoLog, utc_now_iso
 from .store import ComponentStore
 from .validation import (
+    public_echo,
+    harness_environment,
     heldout_dataset,
     private_evaluation,
     heldout_identity,
@@ -461,7 +463,7 @@ class RunState:
             try:
                 write_packet(self.run_id, root)
             except Exception as exc:
-                typer.echo(
+                public_echo(
                     f"Warning: state saved but reflector packet could not be refreshed "
                     f"({type(exc).__name__}). Regenerate it with `gepa run resume --run-id {self.run_id}`.",
                     err=True,
@@ -472,18 +474,18 @@ class RunState:
 def _load_state(run_id: str | None) -> RunState:
     active_run_id = run_id or _latest_managed_run_id()
     if active_run_id is None:
-        typer.echo("No run found. Start one with `gepa run start`.", err=True)
+        public_echo("No run found. Start one with `gepa run start`.", err=True)
         raise typer.Exit(code=1)
     path = run_state_path(active_run_id)
     if not path.exists():
-        typer.echo(
+        public_echo(
             f"No managed run state at {path}. Start one with `gepa run start`.",
             err=True,
         )
         raise typer.Exit(code=1)
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
-        typer.echo(f"Run state at {path} is not a JSON object.", err=True)
+        public_echo(f"Run state at {path} is not a JSON object.", err=True)
         raise typer.Exit(code=1)
     return RunState.from_dict(raw)
 
@@ -1095,7 +1097,7 @@ def _capture_reflection_baseline(
             candidate_source=state.candidate_source,
         )
         if str(outcome.summary["candidate_id"]) != expected_candidate_id:
-            typer.echo(
+            public_echo(
                 "The baseline candidate changed while collecting repeated "
                 "evaluations; refusing to compare mixed candidates.",
                 err=True,
@@ -1197,13 +1199,13 @@ def _evaluate_reflected_candidate(
     gate_case_ids: Sequence[str] = (),
 ) -> tuple[RunState, list[EvalOutcome], dict[str, Any]]:
     if state.reflection_minibatch_id is None:
-        typer.echo(
+        public_echo(
             "Run is not waiting on a reflection minibatch; use `gepa run status`.",
             err=True,
         )
         raise typer.Exit(code=1)
     if not state.reflection_baseline_samples:
-        typer.echo("Run state is missing reflection baseline samples.", err=True)
+        public_echo("Run state is missing reflection baseline samples.", err=True)
         raise typer.Exit(code=1)
 
     validation_reserve = _validation_schedule(state)[0] if state.heldout_required else 0
@@ -1256,7 +1258,7 @@ def _evaluate_reflected_candidate(
         if candidate_id is None:
             candidate_id = current_candidate_id
         elif current_candidate_id != candidate_id:
-            typer.echo(
+            public_echo(
                 "The reflected candidate changed while collecting repeated "
                 "evaluations; refusing to compare mixed candidates.",
                 err=True,
@@ -1556,7 +1558,7 @@ def _current_baseline_candidate_id(
         try:
             state = git_candidate_state(exclude_paths=candidate_identity_exempt_paths())
         except GitCandidateError as exc:
-            typer.echo(str(exc), err=True)
+            public_echo(str(exc), err=True)
             raise typer.Exit(code=1) from exc
         return state.candidate_id
 
@@ -1718,84 +1720,84 @@ def _emit_status(
             if state.candidate_source == "git"
             else "components or source"
         )
-        typer.echo(
+        public_echo(
             "Paused for reflection. Inspect the report and trace file, edit "
             f"{editable_surface}, then run:"
         )
-        typer.echo(f"  gepa run continue --run-id {state.run_id}")
-        typer.echo(f"Report: {state.reflection_baseline_report_path}")
-        typer.echo(f"Trace: {state.reflection_baseline_trace_path}")
+        public_echo(f"  gepa run continue --run-id {state.run_id}")
+        public_echo(f"Report: {state.reflection_baseline_report_path}")
+        public_echo(f"Trace: {state.reflection_baseline_trace_path}")
     elif state.status == "paused_after_candidate_eval":
         comparison = state.last_comparison or {}
         verdict = comparison.get("verdict", "rejected")
         if verdict == "inconclusive":
-            typer.echo(
+            public_echo(
                 "Candidate comparison remains inconclusive after the configured "
                 "repetitions. Revise the candidate or restore the baseline, then run:"
             )
         elif verdict == "equivalent":
-            typer.echo(
+            public_echo(
                 "Candidate is equivalent within the configured practical delta. "
                 "Restore the baseline or revise the candidate, then run:"
             )
         else:
             if comparison.get("rejection_reason") == "validation":
-                typer.echo(
+                public_echo(
                     "Candidate improved the training minibatch but did not improve "
                     "held-out validation. Discard or revise the edits, then run:"
                 )
             else:
-                typer.echo(
+                public_echo(
                     "Candidate did not beat the reflection baseline. Recommendation: "
                     "discard or revise the edits, then run:"
                 )
-        typer.echo(f"  gepa run continue --run-id {state.run_id}")
+        public_echo(f"  gepa run continue --run-id {state.run_id}")
         if comparison and "delta" in comparison:
-            typer.echo(
+            public_echo(
                 f"Baseline {comparison['baseline_mean_score']:.6f}; "
                 f"candidate {comparison['candidate_mean_score']:.6f}; "
                 f"delta {comparison['delta']:.6f}."
             )
             if "lower_bound" in comparison and "upper_bound" in comparison:
-                typer.echo(
+                public_echo(
                     f"{comparison['confidence']:.0%} interval "
                     f"[{comparison['lower_bound']:.6f}, "
                     f"{comparison['upper_bound']:.6f}]; "
                     f"verdict {verdict}."
                 )
-            typer.echo(f"Candidate report: {comparison['candidate_report_path']}")
-            typer.echo(f"Candidate trace: {comparison['candidate_trace_path']}")
+            public_echo(f"Candidate report: {comparison['candidate_report_path']}")
+            public_echo(f"Candidate trace: {comparison['candidate_trace_path']}")
             if comparison.get("validation_evaluated"):
-                typer.echo(
+                public_echo(
                     "Held-out validation was used for selection; no validation "
                     "report or trace was exposed to reflection."
                 )
             if comparison.get("discard_command"):
-                typer.echo(
+                public_echo(
                     "To discard the git candidate and restore the reflection "
                     "baseline, run:"
                 )
-                typer.echo(f"  {comparison['discard_command']}")
+                public_echo(f"  {comparison['discard_command']}")
     elif state.status == "paused_after_infrastructure_error":
         comparison = state.last_comparison or {}
-        typer.echo(
+        public_echo(
             "A required evaluation rollout failed outside the quality "
             "comparison. The incumbent was preserved. Recover the service "
             "or configuration, then retry:"
         )
-        typer.echo(f"  gepa run continue --run-id {state.run_id}")
+        public_echo(f"  gepa run continue --run-id {state.run_id}")
         if comparison.get("candidate_report_path"):
-            typer.echo(f"Failure report: {comparison['candidate_report_path']}")
+            public_echo(f"Failure report: {comparison['candidate_report_path']}")
         if comparison.get("candidate_trace_path"):
-            typer.echo(f"Failure trace: {comparison['candidate_trace_path']}")
+            public_echo(f"Failure trace: {comparison['candidate_trace_path']}")
     elif state.status == "done":
-        typer.echo("Run complete.")
+        public_echo("Run complete.")
         if final_report_text:
-            typer.echo(final_report_text.rstrip())
+            public_echo(final_report_text.rstrip())
     else:
-        typer.echo(f"Run status: {state.status}")
+        public_echo(f"Run status: {state.status}")
 
-    typer.echo(
+    public_echo(
         json.dumps(
             {"run": _public_state(state, outcomes=outcomes, final_report=final_report)}
         )
@@ -1804,7 +1806,7 @@ def _emit_status(
 
 def _validate_max_iterations(max_iterations: int) -> None:
     if max_iterations < 1:
-        typer.echo("--max-iterations must be >= 1.", err=True)
+        public_echo("--max-iterations must be >= 1.", err=True)
         raise typer.Exit(code=2)
 
 
@@ -1816,19 +1818,19 @@ def _validate_acceptance_options(
     min_delta: float,
 ) -> None:
     if repetitions < 1:
-        typer.echo("--acceptance-repetitions must be >= 1.", err=True)
+        public_echo("--acceptance-repetitions must be >= 1.", err=True)
         raise typer.Exit(code=2)
     if max_repetitions < repetitions:
-        typer.echo(
+        public_echo(
             "--acceptance-max-repetitions must be >= --acceptance-repetitions.",
             err=True,
         )
         raise typer.Exit(code=2)
     if not 0.0 < confidence < 1.0:
-        typer.echo("--acceptance-confidence must be between 0 and 1.", err=True)
+        public_echo("--acceptance-confidence must be between 0 and 1.", err=True)
         raise typer.Exit(code=2)
     if min_delta < 0.0:
-        typer.echo("--acceptance-min-delta must be >= 0.", err=True)
+        public_echo("--acceptance-min-delta must be >= 0.", err=True)
         raise typer.Exit(code=2)
 
 
@@ -1867,6 +1869,7 @@ def _fan_out_lane_run_if_ready(
 
 
 @app.command("start")
+@harness_environment()
 def start(
     heldout_required: bool = typer.Option(
         False,
@@ -1976,7 +1979,7 @@ def start(
     validate_cap(max_token_cost)
     _validate_max_iterations(max_iterations)
     if lanes < 0:
-        typer.echo("--lanes must be >= 0.", err=True)
+        public_echo("--lanes must be >= 0.", err=True)
         raise typer.Exit(code=2)
     resolved_max_repetitions = (
         acceptance_repetitions
@@ -1991,7 +1994,7 @@ def start(
         min_delta=acceptance_min_delta,
     )
     if candidate_source not in {None, "components", "git"}:
-        typer.echo("--candidate-source must be 'components' or 'git'.", err=True)
+        public_echo("--candidate-source must be 'components' or 'git'.", err=True)
         raise typer.Exit(code=2)
     cfg = GepaConfig.load(config_path())
     if acceptance_paired_min_cases is None:
@@ -2003,14 +2006,14 @@ def start(
         _validation_dataset_identity()
     vector_validation = heldout_required and cfg.acceptance.mode == "vector"
     if vector_validation and lanes == 0:
-        typer.echo(
+        public_echo(
             "Vector held-out validation requires --lanes greater than zero; "
             "the synchronous loop supports scalar validation only.",
             err=True,
         )
         raise typer.Exit(code=2)
     if vector_validation and resolved_max_repetitions < 2:
-        typer.echo(
+        public_echo(
             "Vector held-out validation requires at least two maximum "
             "acceptance repetitions.",
             err=True,
@@ -2020,7 +2023,7 @@ def start(
         cfg.stall_threshold if stall_threshold is None else stall_threshold
     )
     if resolved_stall_threshold < 1:
-        typer.echo("--stall-threshold must be >= 1.", err=True)
+        public_echo("--stall-threshold must be >= 1.", err=True)
         raise typer.Exit(code=2)
     active_candidate_source = cast(
         CandidateSource, candidate_source or cfg.candidate_source
@@ -2030,7 +2033,7 @@ def start(
 
     if lanes > 0:
         if active_candidate_source != "git":
-            typer.echo(
+            public_echo(
                 "--lanes requires git candidate mode (component-mode lanes share "
                 "one process-global agent and are out of scope, spec-1do).",
                 err=True,
@@ -2047,10 +2050,10 @@ def start(
                 exclude_paths=candidate_identity_exempt_paths(workspace_root),
             )
         except GitCandidateError as exc:
-            typer.echo(str(exc), err=True)
+            public_echo(str(exc), err=True)
             raise typer.Exit(code=1) from exc
         if primary_state.dirty:
-            typer.echo(
+            public_echo(
                 "`gepa run start --lanes` requires a clean primary tree; "
                 "commit or stash your changes first (lane branches are cut "
                 "from a clean commit).",
@@ -2074,7 +2077,7 @@ def start(
             except (json.JSONDecodeError, KeyError, ValueError):
                 continue
             if prior.lanes > 0 and prior.status != "done":
-                typer.echo(
+                public_echo(
                     f"Lane run {prior.run_id} is still active "
                     f"(status {prior.status}); finish it (`gepa run select`) "
                     "or abandon it before starting another lane run.",
@@ -2181,7 +2184,7 @@ def _continue_impl(run_id: str | None, gate_case: list[str]) -> None:
         state.status == "paused_after_infrastructure_error"
         and state.reflection_minibatch_id is None
     ):
-        typer.echo(
+        public_echo(
             "`gepa run continue` does not drive lane runs. Evaluate a lane with "
             "`gepa lane continue <lane>` and commit the iteration with "
             "`gepa run select`.",
@@ -2220,7 +2223,7 @@ def _continue_impl(run_id: str | None, gate_case: list[str]) -> None:
         )
         == state.reflection_baseline_candidate_id
     ):
-        typer.echo(
+        public_echo(
             "Current components match the reflection baseline; discarding the "
             "losing candidate and advancing."
         )
@@ -2370,6 +2373,7 @@ def resume(
 
 
 @app.command("select")
+@harness_environment()
 def select(
     run_id: str | None = typer.Option(
         None,
@@ -2425,7 +2429,7 @@ def status(
             lane_state.to_dict()
             for lane_state in load_all_lane_states(workspace_root, state.run_id)
         ]
-    typer.echo(json.dumps(payload))
+    public_echo(json.dumps(payload))
 
 
 __all__ = ["app"]

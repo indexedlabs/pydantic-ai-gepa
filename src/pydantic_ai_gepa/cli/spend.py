@@ -25,7 +25,7 @@ from ..spend import (
     SpendCategory,
     rollout_spend,
 )
-from .layout import run_dir, run_state_path
+from .layout import repo_root, run_dir, run_state_path
 from .validation import public_echo
 
 if TYPE_CHECKING:
@@ -220,7 +220,7 @@ def _private_spend_path(run_id: str, root: Path | None) -> Path | None:
     if dataset is None:
         return None
     return validation_spend_path(
-        dataset, project_root=root or Path.cwd(), run_id=run_id
+        dataset, project_root=root or repo_root(), run_id=run_id
     )
 
 
@@ -603,7 +603,7 @@ def evaluation_spend(
 
         validation_spend_path = validation_dataset_path(
             str(validation_spend_path),
-            project_root=root or Path.cwd(),
+            project_root=root or repo_root(),
             allow_missing=True,
         )
     meter = EvalSpendMeter(
@@ -621,7 +621,7 @@ def evaluation_spend(
     admitted = False
 
     def refuse(reason: str) -> NoReturn:
-        typer.echo(reason, err=True)
+        public_echo(reason, err=True)
         raise typer.Exit(code=2)
 
     def register_private_path() -> None:

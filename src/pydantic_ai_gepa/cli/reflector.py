@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shlex
 import tempfile
+import time
 from typing import Any, Iterator
 
 import typer
@@ -53,22 +54,39 @@ def default_reflector() -> dict[str, Any]:
 
 @contextmanager
 def run_lock(
-    run_id: str, root: Path | None = None, *, wait: bool = False
+    run_id: str,
+    root: Path | None = None,
+    *,
+    wait: bool = False,
+    timeout: float | None = None,
 ) -> Iterator[None]:
     """Serialize continuation and handoff; kernel releases the lock on death."""
     path = run_dir(run_id, root) / "run.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+", encoding="utf-8") as handle:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
-        except BlockingIOError as exc:
-            handle.seek(0)
-            pid = handle.read().strip() or "unknown"
-            typer.echo(
-                f"Run {run_id} is locked by live process {pid}; retry after it finishes.",
-                err=True,
-            )
-            raise typer.Exit(code=1) from exc
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        while True:
+            try:
+                nonblocking = not wait or deadline is not None
+                fcntl.flock(
+                    handle.fileno(),
+                    fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0),
+                )
+                break
+            except BlockingIOError as exc:
+                if wait and deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("Run lock acquisition timed out") from exc
+                    time.sleep(min(0.05, remaining))
+                    continue
+                handle.seek(0)
+                pid = handle.read().strip() or "unknown"
+                typer.echo(
+                    f"Run {run_id} is locked by live process {pid}; retry after it finishes.",
+                    err=True,
+                )
+                raise typer.Exit(code=1) from exc
         try:
             handle.seek(0)
             handle.truncate()

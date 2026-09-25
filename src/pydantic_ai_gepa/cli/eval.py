@@ -80,6 +80,8 @@ from .layout import (
 )
 from .metrics import default_substring_metric
 from .validation import (
+    public_echo,
+    harness_environment,
     heldout_dataset,
     validation_dataset_path,
     private_evaluation,
@@ -548,7 +550,7 @@ def run_eval_once(
     prior_count = _count_evals_in_run(active_run_id, root=workspace_root)
     if prior_count >= max_iterations:
         if not lane:  # None (single path) or empty: hard cap; lane str: advisory
-            typer.echo(
+            public_echo(
                 f"Max iterations reached ({prior_count}/{max_iterations}). "
                 "Start a new run (omit --run-id) or raise --max-iterations.",
                 err=True,
@@ -1016,6 +1018,7 @@ def _format_output_lines(outcome: EvalOutcome) -> str:
     return "\n".join(output_lines)
 
 
+@harness_environment()
 def eval_(
     dataset_role: str = typer.Option(
         "training", "--dataset-role", help="training or validation (harness only)."

@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Any, Callable
 
 import typer
 
+from .validation import public_echo, private_evaluation
+
 from ..evaluation import EvaluationRecord
 from ..types import RolloutOutput
 from .eval import EvalOutcome, _trace_file_path
@@ -40,7 +42,7 @@ class CandidateChanged(typer.Exit):
     """A paid sample belongs to a different tree than this continuation."""
 
     def __init__(self) -> None:
-        typer.echo(
+        public_echo(
             "Candidate changed during continuation; abandoning its checkpoint. "
             "Paid evaluations remain charged. Run continue again for the current tree.",
             err=True,
@@ -178,6 +180,7 @@ def _row_outcome(
     return EvalOutcome(records, summary, report_path, trace_path)
 
 
+@private_evaluation
 def durable_eval(evaluate: Callable[..., EvalOutcome], **kwargs: Any) -> EvalOutcome:
     replay = _replay.get()
     if replay is None:
@@ -326,7 +329,7 @@ def cleanup_continuation(state: RunState, root: Path | None = None) -> None:
             )
             path.unlink(missing_ok=True)
     except (OSError, ValueError, typer.BadParameter) as exc:
-        typer.echo(
+        public_echo(
             f"Warning: private replay evidence cleanup failed ({type(exc).__name__}).",
             err=True,
         )
@@ -359,9 +362,12 @@ def abandon_continuation(state: RunState, *, reason: str) -> RunState:
         },
     )
     abandoned = replace(state, continuation=None, iterations=used)
+    from .harness import abandoning_scoring_tree
+
     token = _replay.set(None)
     try:
-        abandoned.save()
+        with abandoning_scoring_tree():
+            abandoned.save()
     finally:
         _replay.reset(token)
     cleanup_continuation(state)
@@ -429,7 +435,7 @@ def continue_run(
         state = _load_state(initial.run_id).restore_validation_evidence()
         epoch = state.reflector["epoch"]
         if reflector_epoch is not None and reflector_epoch != epoch:
-            typer.echo(
+            public_echo(
                 f"Stale reflector epoch {reflector_epoch}; current epoch is {epoch}. "
                 f"Use `gepa run resume --run-id {state.run_id}` for a fresh packet.",
                 err=True,
@@ -446,7 +452,7 @@ def continue_run(
             state.candidate_source, active_run_id=state.run_id
         )
         if already_scored(state, candidate):
-            typer.echo("Candidate already scored; re-issuing the recorded result.")
+            public_echo("Candidate already scored; re-issuing the recorded result.")
             _emit_status(state, outcomes=[])
             return
         ledger = ParetoLog(state.run_id)
@@ -490,12 +496,27 @@ def continue_run(
         token = _replay.set(Replay(state, pending, budget_adjustment=adjustment))
         try:
             execute(state.run_id, gate_case)
-        except (typer.Exit, typer.BadParameter) as exc:
+        except Exception as exc:
+            if not locked and not isinstance(exc, (typer.Exit, typer.BadParameter)):
+                raise
+            from .harness import StaleNomination
+
             saved = _load_state(state.run_id)
-            changed = isinstance(exc, CandidateChanged) or any(
+            changed = isinstance(exc, (CandidateChanged, StaleNomination)) or any(
                 row.candidate_id != checkpoint["candidate_id"]
                 for row in ledger.iter_rows()[checkpoint["ledger_offset"] :]
             )
+            try:
+                changed = (
+                    changed
+                    or _current_baseline_candidate_id(
+                        state.candidate_source, active_run_id=state.run_id
+                    )
+                    != checkpoint["candidate_id"]
+                )
+            except Exception:
+                # A broken import must not prevent retiring an unpaid checkpoint.
+                pass
             if saved.continuation is not None and (
                 changed
                 or (

@@ -293,9 +293,24 @@ def test_scoring_tree_change_cannot_publish_a_promotion(git_repo, heldout, monke
             (git_repo / ".gepa" / "runs" / run_id / "results").glob("*.json")
         ).read_text()
     )
-    assert saved["exit_code"] == 2
+    assert saved["exit_code"] == 2, saved["stderr"]
     assert saved["stale"]
-    _sweep(git_repo, path)
+    assert state.continuation is None
+    from pydantic_ai_gepa.cli.runs import ParetoLog
+
+    paid = [row.extra["eval_id"] for row in ParetoLog(run_id).iter_rows()]
+    assert state.iterations == ParetoLog(run_id).count_budget_rows()
+    monkeypatch.setattr(run_module, "run_eval_once", original)
+    _commit(git_repo, "fixed candidate")
+    assert _continue(run_id).exit_code == 0
+    assert _serve(run_id, path, monkeypatch).exit_code == 0
+    delivered = _continue(run_id)
+    assert delivered.exit_code in (0, 70), delivered.output
+    rows = ParetoLog(run_id).iter_rows()
+    assert [row.extra["eval_id"] for row in rows[: len(paid)]] == paid
+    assert len({row.extra["eval_id"] for row in rows}) == len(rows)
+    assert run_module._load_state(run_id).continuation is None
+    _sweep(git_repo, path, delivered.output)
 
 
 def test_private_helpers_require_harness_environment_even_with_cached_evidence(heldout):

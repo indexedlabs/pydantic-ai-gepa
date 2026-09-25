@@ -394,6 +394,9 @@ it can be collected from the incumbent tree.
 For held-out runs, the **harness process started by the orchestrator** holds
 `GEPA_HELDOUT_DATASET` (an absolute path). Never give that variable, its value,
 or the held-out directory to the reflector or any process it launches.
+Scoring commands (`run start`, `harness serve`, `run select`, and `eval`) remove
+the variable from `os.environ` before importing or running candidate code and
+keep the path in controller memory during the command.
 `gepa.toml` must contain only the training `dataset`; the old
 `validation_dataset` setting and `init --validation-dataset` are refused with
 exit 2. Held-out entries in the repository's `.env` are also refused. Legacy
@@ -415,17 +418,30 @@ It never evaluates a held-out run, even if the variable was accidentally set
 in its environment. The harness takes the run lock, checks the epoch and clean
 candidate identity, evaluates the training gate, then confirms training winners
 on validation. It rechecks the tree before saving state and after scoring.
-Keep the nominated tree unchanged until the result arrives. This version uses
-checks around scoring in the existing checkout, rather than a detached checkout.
+Held-out runs require a **committed, clean candidate in both git and component
+mode**: commit component-file edits too. A dirty-tree refusal asks you to commit
+before nominating. Keep the nominated tree unchanged until the result arrives.
+This version checks the existing checkout before and after scoring.
 
 The reflector receives the usual training reports, trace paths, aggregate
 validation verdict and exit code. `--wait-secs` defaults to 300; `0` enqueues
-and returns immediately. A timeout exits **75**: run the same command again to
-reattach without duplicating the nomination. A different pending candidate or
+and returns immediately. Nomination waits up to five seconds for a busy run
+lock; either a lock timeout or a result timeout exits **75**. Run the same command
+again to reattach without duplicating the nomination. A different pending candidate or
 gate selection is refused. `harness serve --once` processes one current
 nomination (and retires old epochs), then returns. Interrupted scoring resumes
 from the existing paid evaluation ledger. Normal `run resume` still issues a
 new epoch and packet without reading validation.
+
+Results contain explicit controller messages only; candidate/evaluator stdout,
+stderr, and logging streams are never relayed to the reflector. Unexpected
+scoring exceptions produce a retryable exit **1** result naming only the exception
+type and the training/held-out phase. The harness keeps serving. Unpaid or
+changed-candidate continuations are retired while paid evaluations remain charged,
+so a fixed commit can be nominated without operator cleanup. After a run finishes,
+`continue` returns its public final status; any undelivered terminal result keeps
+its original output and exit code. Lane runs immediately direct callers to
+`lane continue` and `run select` without queuing a nomination.
 
 Harness commands are held-out `run start`, `harness serve`, lane `run select`,
 `eval --dataset-role validation`, and held-out `run resume --abandon-continuation`
@@ -481,6 +497,12 @@ file failed with `Operation not permitted`, sandboxed `continue` enqueued,
 the external harness scored, and sandboxed `continue` returned the accepted
 verdict. Repeat this read-denial and scoring probe for the actual deployment's
 paths and grants; system-temp placement does not protect held-out data.
+
+Candidate code executed by the harness still runs with scorer privileges and
+can read files the harness can read. **In git mode, a reflector-written candidate
+is not isolated from the held-out file.** Removing the environment variable is
+partial hardening, not a filesystem boundary for that code. A separate held-out
+scoring subprocess with its own sandbox is a follow-up.
 
 Process isolation is the barrier, not secrecy of the path: `ps` can expose
 another process's arguments and environment. Run files are shared coordination

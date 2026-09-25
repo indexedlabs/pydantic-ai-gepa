@@ -8,8 +8,10 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
-from typing import Any, Callable, ParamSpec, TypeVar, TextIO
+from typing import Any, Callable, Iterator, ParamSpec, TypeVar, TextIO
 from contextvars import ContextVar
+from contextlib import contextmanager
+import io
 import sys
 
 import typer
@@ -183,9 +185,12 @@ def refuse_legacy_validation() -> None:
     )
 
 
+_harness_dataset: ContextVar[str | None] = ContextVar("harness_dataset", default=None)
+
+
 def heldout_dataset(*, required: bool = True) -> str | None:
     """The sole environment lookup for the harness's private dataset path."""
-    value = os.environ.get("GEPA_HELDOUT_DATASET")
+    value = _harness_dataset.get() or os.environ.get("GEPA_HELDOUT_DATASET")
     if not value:
         if required:
             raise typer.BadParameter(
@@ -195,6 +200,24 @@ def heldout_dataset(*, required: bool = True) -> str | None:
     if not Path(value).is_absolute():
         raise typer.BadParameter("GEPA_HELDOUT_DATASET must be an absolute path.")
     return value
+
+
+@contextmanager
+def harness_environment() -> Iterator[None]:
+    """Keep the path in controller memory while a harness command runs.
+
+    Restore the caller's environment only when the command returns, so embedded
+    CLI invocations do not change their caller's configuration.
+    """
+    dataset = heldout_dataset(required=False)
+    original = os.environ.pop("GEPA_HELDOUT_DATASET", None)
+    token = _harness_dataset.set(dataset)
+    try:
+        yield
+    finally:
+        _harness_dataset.reset(token)
+        if original is not None:
+            os.environ["GEPA_HELDOUT_DATASET"] = original
 
 
 def heldout_identity(root: Path) -> tuple[str, str]:
@@ -249,9 +272,36 @@ _public_stdout: ContextVar[TextIO | None] = ContextVar(
 )
 
 
-def public_echo(message: str) -> None:
-    """Emit only trusted controller output through private evaluator suppression."""
-    typer.echo(message, file=_public_stdout.get())
+_controller_output: ContextVar[tuple[TextIO, TextIO] | None] = ContextVar(
+    "controller_output", default=None
+)
+_evaluation_phase: ContextVar[str] = ContextVar("evaluation_phase", default="training")
+
+
+@contextmanager
+def controller_output() -> Iterator[tuple[io.StringIO, io.StringIO]]:
+    """Capture explicit controller messages, never redirect process streams."""
+    streams = (io.StringIO(), io.StringIO())
+    token = _controller_output.set(streams)
+    phase = _evaluation_phase.set("training")
+    try:
+        yield streams
+    finally:
+        _controller_output.reset(token)
+        _evaluation_phase.reset(phase)
+
+
+def evaluation_phase() -> str:
+    return _evaluation_phase.get()
+
+
+def public_echo(message: str, *, err: bool = False, nl: bool = True) -> None:
+    """Publish trusted controller output separately from evaluator stdio."""
+    streams = _controller_output.get()
+    target = (
+        streams[1 if err else 0] if streams else (None if err else _public_stdout.get())
+    )
+    typer.echo(message, file=target, err=err, nl=nl)
 
 
 def private_evaluation(evaluate: Callable[_P, _T]) -> Callable[_P, _T]:
@@ -262,7 +312,9 @@ def private_evaluation(evaluate: Callable[_P, _T]) -> Callable[_P, _T]:
 
     @wraps(evaluate)
     def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _T:
-        if kwargs.get("dataset_role") != "validation":
+        private = kwargs.get("dataset_role") == "validation"
+        _evaluation_phase.set("held-out" if private else "training")
+        if not private:
             return evaluate(*args, **kwargs)
         heldout_dataset()
         token = _public_stdout.set(_public_stdout.get() or sys.stdout)
