@@ -787,6 +787,20 @@ def run_eval_once(
         else None
     )
 
+    # Paired validation must be replayable without placing case scores in the
+    # reflector ledger. Publish private evidence before its paid row, too.
+    if write_pareto and dataset_role == "validation":
+        from .validation import write_validation_evidence
+
+        assert cfg.validation_dataset is not None
+        write_validation_evidence(
+            cfg.validation_dataset,
+            project_root=primary_project_root,
+            run_id=f"{active_run_id}:eval:{eval_id}",
+            identity={"candidate_id": candidate.id, "eval_id": eval_id},
+            scores=per_case,
+        )
+
     # A paid row must only become visible after its training evidence is saved.
     if write_pareto:
         pareto = ParetoLog(active_run_id, workspace_root)

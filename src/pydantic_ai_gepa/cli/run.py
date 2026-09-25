@@ -387,6 +387,13 @@ class RunState:
             run_id=self.run_id,
             identity=self._validation_evidence_identity(),
         )
+        if not scores and self.continuation:
+            scores = read_validation_evidence(
+                self.validation_dataset_path,
+                project_root=root or repo_root(),
+                run_id=f"{self.run_id}:continuation:{self.continuation['candidate_id']}",
+                identity=self._validation_evidence_identity(),
+            )
         return replace(self, best_validation_per_case_scores=scores)
 
     def save(self, root: Path | None = None) -> Path:
@@ -2221,6 +2228,7 @@ def _continue_impl(run_id: str | None, gate_case: list[str]) -> None:
             and comparison.get("outcome") == "valid"
             and comparison["improved"]
         ):
+            training_comparison = dict(comparison)
             training_verdict = str(comparison["verdict"])
             training_mean = float(comparison["candidate_mean_score"])
             state, validation_outcomes, validation_comparison = (
@@ -2230,6 +2238,7 @@ def _continue_impl(run_id: str | None, gate_case: list[str]) -> None:
             comparison.update(
                 {
                     **validation_comparison,
+                    "training_comparison": training_comparison,
                     "training_verdict": training_verdict,
                     "training_mean_score": training_mean,
                     "validation_evaluated": bool(validation_outcomes),

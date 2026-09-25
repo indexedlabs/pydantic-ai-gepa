@@ -121,15 +121,15 @@ def test_resume_preserves_unscored_commit_and_issues_complete_packet(
     monkeypatch.chdir(command["cwd"])
     continued = _run(*command["argv"][1:])
     assert continued.exit_code == 0, continued.output
-    assert len(calls) == 1
+    assert len(calls) == 3
     assert _run_payload(continued.output)["reflector_packet_path"]
 
 
 @pytest.mark.parametrize(
     "score,budget,verdict",
     [
-        ("good", 2, "accepted"),
-        ("good", 8, "accepted"),
+        ("good", 7, "accepted"),
+        ("good", 14, "accepted"),
         ("still-bad", 8, "equivalent"),
         ("still-bad", 8, "rejected"),
     ],
@@ -141,7 +141,7 @@ def test_resume_after_finished_continue_never_rescores(
     budget: int,
     verdict: str,
 ) -> None:
-    if (score == "good" and budget == 8) or verdict == "rejected":
+    if (score == "good" and budget == 14) or verdict == "rejected":
         dataset = git_repo / ".gepa" / "dataset.jsonl"
         dataset.write_text(
             dataset.read_text()
@@ -160,7 +160,7 @@ def test_resume_after_finished_continue_never_rescores(
     continued = _run("run", "continue", "--run-id", run_id)
     assert continued.exit_code == 0, continued.output
     assert _packet(git_repo, run_id)["last_comparison"]["verdict"] == verdict
-    if score == "good" and budget == 8:
+    if score == "good" and budget == 14:
         assert _run_payload(continued.output)["status"] == "paused_for_reflection"
     before = ParetoLog(run_id).count_budget_rows()
     monkeypatch.setattr(
@@ -183,7 +183,7 @@ def test_resume_after_finished_continue_never_rescores(
 def test_interrupted_continue_reuses_persisted_training_samples(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, completed_before_death: int
 ) -> None:
-    started = _start(repetitions=3, budget=6)
+    started = _start(repetitions=3, budget=7)
     run_id = str(started["run_id"])
     _commit_score(git_repo, "still-bad")
     original = run_module.run_eval_once
@@ -200,14 +200,14 @@ def test_interrupted_continue_reuses_persisted_training_samples(
     monkeypatch.setattr(run_module, "run_eval_once", die_after_durable_sample)
     interrupted = _run("run", "continue", "--run-id", run_id)
     assert interrupted.exit_code != 0
-    assert ParetoLog(run_id).count_budget_rows() == 3 + completed_before_death
+    assert ParetoLog(run_id).count_budget_rows() == 4 + completed_before_death
     resumed = _run("run", "continue", "--run-id", run_id)
     assert resumed.exit_code == 0, resumed.output
     comparison = _run_payload(resumed.output)["last_comparison"]
     assert comparison["candidate_sample_count"] == 3
     assert len(comparison["candidate_report_paths"]) == 3
     assert calls == 3
-    assert ParetoLog(run_id).count_budget_rows() == 6
+    assert ParetoLog(run_id).count_budget_rows() == 7
 
 
 def test_resume_fences_stale_epoch_and_keeps_legacy_continue(git_repo: Path) -> None:
@@ -228,7 +228,7 @@ def test_resume_fences_stale_epoch_and_keeps_legacy_continue(git_repo: Path) -> 
     assert ParetoLog(run_id).count_budget_rows() == before
     legacy = _run("run", "continue", "--run-id", run_id)
     assert legacy.exit_code == 0, legacy.output
-    assert ParetoLog(run_id).count_budget_rows() == before + 1
+    assert ParetoLog(run_id).count_budget_rows() == before + 3
 
 
 @pytest.mark.parametrize("command", ["resume", "continue"])
@@ -335,7 +335,7 @@ def test_validation_row_survives_death_without_leaking_evidence(
     )
     _git(validation_repo, "add", ".gepa/gepa.toml")
     _git(validation_repo, "commit", "-m", "Configure validation")
-    started = _start(size=3, budget=4)
+    started = _start(size=3, budget=13)
     run_id = str(started["run_id"])
     (validation_repo / "out_case-2.txt").write_text("b\n")
     _git(validation_repo, "add", "out_case-2.txt")
@@ -346,15 +346,15 @@ def test_validation_row_survives_death_without_leaking_evidence(
     def die_after_validation(**kwargs):
         calls.append(kwargs.get("dataset_role", "training"))
         outcome = original(**kwargs)
-        if kwargs.get("dataset_role") == "validation":
+        if calls.count("validation") == 3:
             raise RuntimeError("died after the validation row was persisted")
         return outcome
 
     monkeypatch.setattr(run_module, "run_eval_once", die_after_validation)
     interrupted = _run("run", "continue", "--run-id", run_id)
     assert interrupted.exit_code != 0
-    assert calls == ["training", "validation"]
-    assert ParetoLog(run_id).count_budget_rows() == 4
+    assert calls == ["training"] * 3 + ["validation"] * 3
+    assert ParetoLog(run_id).count_budget_rows() == 13
     monkeypatch.setattr(
         run_module,
         "run_eval_once",
@@ -374,17 +374,17 @@ def test_validation_row_survives_death_without_leaking_evidence(
         assert secret not in serialized
     assert packet["last_comparison"]["validation"]["evaluated"] is True
     assert packet["last_comparison"]["validation"]["improved"] is False
-    assert len(ParetoLog(run_id).validation_rows()) == 2
-    assert ParetoLog(run_id).count_budget_rows() == 4
+    assert len(ParetoLog(run_id).validation_rows()) == 6
+    assert ParetoLog(run_id).count_budget_rows() == 13
 
 
-@pytest.mark.parametrize("baseline_samples_before_death", [1, 2])
+@pytest.mark.parametrize("baseline_samples_before_death", [0, 1, 2, 3])
 def test_post_acceptance_baseline_reuses_partial_paid_samples(
     validation_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
     baseline_samples_before_death: int,
 ) -> None:
-    started = _start(size=3, repetitions=3, budget=12)
+    started = _start(size=3, repetitions=3, budget=14)
     run_id = str(started["run_id"])
     (validation_repo / "out_case-2.txt").write_text("b\n")
     _git(validation_repo, "add", "out_case-2.txt")
@@ -395,14 +395,14 @@ def test_post_acceptance_baseline_reuses_partial_paid_samples(
     def die_during_next_baseline(**kwargs):
         calls.append(kwargs)
         outcome = original(**kwargs)
-        if len(calls) == 3 + baseline_samples_before_death:
+        if len(calls) == 4 + baseline_samples_before_death:
             raise RuntimeError("died while advancing the accepted baseline")
         return outcome
 
     monkeypatch.setattr(run_module, "run_eval_once", die_during_next_baseline)
     interrupted = _run("run", "continue", "--run-id", run_id)
     assert interrupted.exit_code != 0
-    assert ParetoLog(run_id).count_budget_rows() == 6 + baseline_samples_before_death
+    assert ParetoLog(run_id).count_budget_rows() == 8 + baseline_samples_before_death
     resumed = _run("run", "continue", "--run-id", run_id)
     assert resumed.exit_code == 0, resumed.output
     payload = _run_payload(resumed.output)
@@ -410,8 +410,8 @@ def test_post_acceptance_baseline_reuses_partial_paid_samples(
     assert payload["reflection_minibatch_id"] != started["reflection_minibatch_id"]
     assert payload["reflection_baseline_samples"] == [pytest.approx(2 / 3)] * 3
     assert _packet(validation_repo, run_id)["last_comparison"]["verdict"] == "accepted"
-    assert len(calls) == 6
-    assert ParetoLog(run_id).count_budget_rows() == 9
+    assert len(calls) == 7
+    assert ParetoLog(run_id).count_budget_rows() == 11
 
 
 def test_interrupted_infrastructure_result_remains_failure_on_recovery(
@@ -432,7 +432,7 @@ def test_interrupted_infrastructure_result_remains_failure_on_recovery(
     monkeypatch.setattr(run_module, "run_eval_once", die_after_failure_row)
     interrupted = _run("run", "continue", "--run-id", run_id)
     assert interrupted.exit_code != 0
-    assert ParetoLog(run_id).count_budget_rows() == 2
+    assert ParetoLog(run_id).count_budget_rows() == 5
     monkeypatch.delenv("GEPA_TEST_REBASELINE_FAILURE")
     monkeypatch.setattr(
         run_module,
@@ -446,13 +446,13 @@ def test_interrupted_infrastructure_result_remains_failure_on_recovery(
     assert payload["last_comparison"]["outcome"] == "infrastructure_failure"
     assert payload["last_comparison"]["verdict"] is None
     assert payload["best_candidate_id"] == started["best_candidate_id"]
-    assert ParetoLog(run_id).count_budget_rows() == 2
+    assert ParetoLog(run_id).count_budget_rows() == 5
 
     monkeypatch.setattr(run_module, "run_eval_once", original)
     retried = _run("run", "continue", "--run-id", run_id)
     assert retried.exit_code == 0, retried.output
     assert _run_payload(retried.output)["last_comparison"]["verdict"] == "equivalent"
-    assert ParetoLog(run_id).count_budget_rows() == 3
+    assert ParetoLog(run_id).count_budget_rows() == 8
 
 
 def test_interrupted_gate_continue_reuses_gate_checkpoint(
@@ -469,7 +469,7 @@ def test_interrupted_gate_continue_reuses_gate_checkpoint(
     def die_after_paid_sample(**kwargs):
         calls.append(kwargs)
         outcome = original(**kwargs)
-        if kwargs.get("write_pareto", True):
+        if sum(call.get("write_pareto", True) for call in calls) == 3:
             raise RuntimeError("died after the full training sample")
         return outcome
 
@@ -477,9 +477,9 @@ def test_interrupted_gate_continue_reuses_gate_checkpoint(
     args = ("run", "continue", "--run-id", run_id, "--gate-case", "case-1")
     interrupted = _run(*args)
     assert interrupted.exit_code != 0
-    assert len(calls) == 2
+    assert len(calls) == 6
     assert calls[0]["write_pareto"] is False
-    assert ParetoLog(run_id).count_budget_rows() == 2
+    assert ParetoLog(run_id).count_budget_rows() == 7
     monkeypatch.setattr(
         run_module,
         "run_eval_once",
@@ -490,7 +490,7 @@ def test_interrupted_gate_continue_reuses_gate_checkpoint(
     comparison = _run_payload(resumed.output)["last_comparison"]
     assert comparison["verdict"] == "equivalent"
     assert comparison["gate"]["cases"] == ["case-1"]
-    assert ParetoLog(run_id).count_budget_rows() == 2
+    assert ParetoLog(run_id).count_budget_rows() == 7
 
 
 @pytest.mark.parametrize("refusal", ["invalid_gate", "unpaid_eval_exit"])
@@ -513,14 +513,14 @@ def test_unpaid_refusal_does_not_block_corrected_candidate(
     refused = _run("run", "continue", "--run-id", run_id, *args)
     assert refused.exit_code == 2, refused.output
     assert run_module._load_state(run_id).continuation is None
-    assert ParetoLog(run_id).count_budget_rows() == 1
+    assert ParetoLog(run_id).count_budget_rows() == 4
 
     monkeypatch.setattr(run_module, "run_eval_once", original)
     _commit_score(git_repo, "corrected-attempt")
     corrected = _run("run", "continue", "--run-id", run_id)
     assert corrected.exit_code == 0, corrected.output
     assert _run_payload(corrected.output)["last_comparison"]["verdict"] == "equivalent"
-    assert ParetoLog(run_id).count_budget_rows() == 2
+    assert ParetoLog(run_id).count_budget_rows() == 7
 
 
 def test_paid_row_is_published_only_after_training_artifacts_exist(
@@ -531,6 +531,7 @@ def test_paid_row_is_published_only_after_training_artifacts_exist(
     _commit_score(git_repo, "still-bad")
     original_append = ParetoLog.append
     published_artifacts = []
+    original_evaluate = run_module.run_eval_once
 
     def die_after_publish(ledger: ParetoLog, row: ParetoRow):
         assert row.extra["dataset_role"] == "training"
@@ -551,19 +552,23 @@ def test_paid_row_is_published_only_after_training_artifacts_exist(
     interrupted = _run("run", "continue", "--run-id", run_id)
     assert isinstance(interrupted.exception, RuntimeError), interrupted.output
     assert "after publishing" in str(interrupted.exception)
-    assert ParetoLog(run_id).count_budget_rows() == 2
+    assert ParetoLog(run_id).count_budget_rows() == 5
     monkeypatch.setattr(ParetoLog, "append", original_append)
-    monkeypatch.setattr(
-        run_module,
-        "run_eval_once",
-        lambda **_: pytest.fail("the paid row and training artifacts already exist"),
-    )
+    remaining_calls = []
+
+    def evaluate_remaining(**kwargs):
+        remaining_calls.append(kwargs)
+        return original_evaluate(**kwargs)
+
+    monkeypatch.setattr(run_module, "run_eval_once", evaluate_remaining)
     resumed = _run("run", "continue", "--run-id", run_id)
     assert resumed.exit_code == 0, resumed.output
     comparison = _run_payload(resumed.output)["last_comparison"]
-    assert comparison["candidate_report_paths"] == [str(published_artifacts[0])]
-    assert comparison["candidate_trace_paths"] == [str(published_artifacts[1])]
-    assert ParetoLog(run_id).count_budget_rows() == 2
+    assert comparison["candidate_report_paths"][0] == str(published_artifacts[0])
+    assert comparison["candidate_trace_paths"][0] == str(published_artifacts[1])
+    assert len(remaining_calls) == 2
+    assert len(comparison["candidate_report_paths"]) == 3
+    assert ParetoLog(run_id).count_budget_rows() == 7
 
 
 def test_validation_failure_packet_withholds_selection_minibatch_identity(
@@ -586,7 +591,7 @@ def test_validation_failure_packet_withholds_selection_minibatch_identity(
     )
     _git(validation_repo, "add", ".gepa/gepa.toml")
     _git(validation_repo, "commit", "-m", "Configure private validation")
-    started = _start(size=3)
+    started = _start(size=3, budget=14)
     run_id = str(started["run_id"])
     (validation_repo / "out_case-2.txt").write_text("b\n")
     _git(validation_repo, "add", "out_case-2.txt")
@@ -607,3 +612,273 @@ def test_validation_failure_packet_withholds_selection_minibatch_identity(
     assert str(validation_path) not in serialized
     assert "secret-validation-failure" not in serialized
     assert packet["last_comparison"]["outcome"] == "infrastructure_failure"
+
+
+def _configure_private_validation(project: Path) -> Path:
+    path = project.parent / "recovery-heldout.jsonl"
+    path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "name": f"secret-paired-{i}",
+                    "inputs": "PRIVATE",
+                    "expected_output": "v",
+                }
+            )
+            + "\n"
+            for i in range(2)
+        )
+    )
+    config = project / ".gepa" / "gepa.toml"
+    config.write_text(config.read_text() + f'validation_dataset = "{path}"\n')
+    _git(project, "add", ".gepa/gepa.toml")
+    _git(project, "commit", "-m", "Configure withheld recovery evidence")
+    return path
+
+
+@pytest.mark.parametrize("death_sample", [4, 5])
+def test_extra_noise_training_samples_replay_without_new_paid_rows(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, death_sample: int
+) -> None:
+    from pydantic_ai_gepa.cli import eval as eval_module
+    from pydantic_ai_gepa.evaluation import EvaluationRecord
+
+    calls = []
+    baseline_samples = [0.4, 0.6, 0.5, 0.4, 0.6]
+    samples = iter([0.5, *baseline_samples, *baseline_samples])
+
+    async def noisy_training(**kwargs):
+        score = next(samples)
+        calls.append(score)
+        return [
+            EvaluationRecord(case.name, score, None, {}) for case in kwargs["dataset"]
+        ]
+
+    monkeypatch.setattr(eval_module, "evaluate_callable_dataset", noisy_training)
+    started = _start("--acceptance-max-repetitions", "5", repetitions=3, budget=11)
+    run_id = str(started["run_id"])
+    assert started["reflection_baseline_samples"] == baseline_samples
+    assert len(calls) == 6  # Selected failure plus five fresh baselines.
+    _commit_score(git_repo, "noisy-proposal")
+    original = run_module.run_eval_once
+    candidate_calls = []
+
+    def die_in_extra_look(**kwargs):
+        outcome = original(**kwargs)
+        candidate_calls.append(outcome.summary["eval_id"])
+        if len(candidate_calls) == death_sample:
+            raise RuntimeError("died in an extra noise acceptance look")
+        return outcome
+
+    monkeypatch.setattr(run_module, "run_eval_once", die_in_extra_look)
+    interrupted = _run("run", "continue", "--run-id", run_id)
+    assert isinstance(interrupted.exception, RuntimeError)
+    before = list(ParetoLog(run_id).iter_rows())
+    resumed = _run("run", "continue", "--run-id", run_id)
+    assert resumed.exit_code == 0, resumed.output
+    comparison = _run_payload(resumed.output)["last_comparison"]
+    assert comparison["verdict"] == "inconclusive"
+    assert comparison["candidate_samples"] == baseline_samples
+    assert comparison["max_looks"] == 3
+    assert len(candidate_calls) == 5
+    assert len(calls) == 11
+    after = ParetoLog(run_id).iter_rows()
+    assert after[: len(before)] == before
+    assert len(after) == 11
+
+
+@pytest.mark.parametrize("death_sample", [1, 3, 4, 5])
+def test_validation_confirmation_replays_initial_and_extra_samples(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, death_sample: int
+) -> None:
+    from pydantic_ai_gepa.cli import eval as eval_module
+    from pydantic_ai_gepa.evaluation import EvaluationRecord
+
+    validation_path = _configure_private_validation(git_repo)
+    candidate_samples = [0.2, 0.8, 0.5, 0.2, 0.8]
+    calls = {"training": [], "validation": []}
+    proposed = False
+
+    async def noisy_evaluator(**kwargs):
+        role = (
+            "validation"
+            if kwargs["dataset"][0].name.startswith("secret-")
+            else "training"
+        )
+        if role == "training":
+            score = 0.8 if proposed else 0.1
+        else:
+            score = candidate_samples[len(calls[role]) - 3] if proposed else 0.5
+        calls[role].append(score)
+        return [
+            EvaluationRecord(case.name, score, None, {}) for case in kwargs["dataset"]
+        ]
+
+    monkeypatch.setattr(eval_module, "evaluate_callable_dataset", noisy_evaluator)
+    started = _start("--acceptance-max-repetitions", "5", repetitions=3, budget=17)
+    run_id = str(started["run_id"])
+    assert started["iterations"] == 9
+    _commit_score(git_repo, "noisy-validation-proposal")
+    proposed = True
+    original = run_module.run_eval_once
+    validation_calls = []
+
+    def die_during_confirmation(**kwargs):
+        outcome = original(**kwargs)
+        if kwargs.get("dataset_role") == "validation":
+            validation_calls.append(outcome.summary["eval_id"])
+            if len(validation_calls) == death_sample:
+                raise RuntimeError("died during validation confirmation")
+        return outcome
+
+    monkeypatch.setattr(run_module, "run_eval_once", die_during_confirmation)
+    interrupted = _run("run", "continue", "--run-id", run_id)
+    assert isinstance(interrupted.exception, RuntimeError)
+    before = ParetoLog(run_id).iter_rows()
+    packet = _resume(run_id)
+    resumed = _run(*packet["next_command"]["argv"][1:])
+    assert resumed.exit_code == 0, resumed.output
+    comparison = _run_payload(resumed.output)["last_comparison"]
+    assert comparison["training_verdict"] == "accepted"
+    assert comparison["validation_comparison"]["verdict"] == "inconclusive"
+    assert comparison["validation_comparison"]["candidate_samples"] == candidate_samples
+    assert comparison["validation_comparison"]["max_looks"] == 3
+    assert len(validation_calls) == 5
+    assert calls["validation"] == [0.5] * 3 + candidate_samples
+    assert calls["training"] == [0.1] * 6 + [0.8] * 3
+    after = ParetoLog(run_id).iter_rows()
+    assert after[: len(before)] == before
+    assert len(after) == 17
+    packet = _packet(git_repo, run_id)
+    assert packet["last_comparison"]["candidate_samples"] == [0.8] * 3
+    assert packet["last_comparison"]["baseline_samples"] == [0.1] * 3
+    assert packet["last_comparison"]["validation"]["mean"] == pytest.approx(0.5)
+    assert str(validation_path) not in json.dumps(packet)
+    assert "secret-paired" not in json.dumps(packet)
+
+
+@pytest.mark.parametrize("death_phase", ["training", "validation", "final_save"])
+def test_paired_validation_recovers_private_evidence_and_incumbent(
+    validation_repo: Path, monkeypatch: pytest.MonkeyPatch, death_phase: str
+) -> None:
+    from pydantic_ai_gepa.cli import eval as eval_module
+    from pydantic_ai_gepa.evaluation import EvaluationRecord
+
+    validation_path = _configure_private_validation(validation_repo)
+    proposed = False
+    calls = []
+
+    async def paired_evaluator(**kwargs):
+        private = kwargs["dataset"][0].name.startswith("secret-")
+        calls.append("validation" if private else "training")
+        return [
+            EvaluationRecord(
+                case.name, (0.7 if proposed else 0.2) + index * 0.1, None, {}
+            )
+            for index, case in enumerate(kwargs["dataset"])
+        ]
+
+    monkeypatch.setattr(eval_module, "evaluate_callable_dataset", paired_evaluator)
+    started = _start("--acceptance-paired-min-cases", "2", size=3, budget=5)
+    run_id = str(started["run_id"])
+    assert calls == ["validation", "training", "training"]
+    incumbent = dict(run_module._load_state(run_id).best_validation_per_case_scores)
+    assert len(incumbent) == 2
+    candidate = _commit_score(validation_repo, "paired-proposal")
+    proposed = True
+    original = run_module.run_eval_once
+    original_replace = os.replace
+    killed = False
+
+    def die_after_row(**kwargs):
+        nonlocal killed
+        outcome = original(**kwargs)
+        if not killed and kwargs.get("dataset_role", "training") == death_phase:
+            killed = True
+            raise RuntimeError("died after paid paired evaluation")
+        return outcome
+
+    def die_before_final_state(source, destination):
+        nonlocal killed
+        if (
+            not killed
+            and death_phase == "final_save"
+            and Path(destination).name == "state.json"
+            and json.loads(Path(source).read_text())["status"] == "done"
+        ):
+            killed = True
+            raise RuntimeError("died after replacing private incumbent evidence")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(run_module, "run_eval_once", die_after_row)
+    monkeypatch.setattr(os, "replace", die_before_final_state)
+    interrupted = _run("run", "continue", "--run-id", run_id)
+    assert isinstance(interrupted.exception, RuntimeError), interrupted.output
+    assert run_module._load_state(run_id).best_validation_per_case_scores == incumbent
+    before = ParetoLog(run_id).iter_rows()
+    packet = _resume(run_id)
+    resumed = _run(*packet["next_command"]["argv"][1:])
+    assert resumed.exit_code == 0, resumed.output
+    payload = _run_payload(resumed.output)
+    assert payload["last_comparison"]["validation_comparison"]["method"] == "paired_t"
+    assert payload["last_comparison"]["verdict"] == "accepted"
+    assert payload["best_candidate_id"] == candidate[:12]
+    assert calls == ["validation", "training", "training", "training", "validation"]
+    after = ParetoLog(run_id).iter_rows()
+    assert after[: len(before)] == before
+    assert len(after) == 5
+    state = run_module._load_state(run_id)
+    assert state.best_validation_samples == (pytest.approx(0.75),)
+    assert state.best_validation_per_case_scores == {
+        "secret-paired-0": pytest.approx(0.7),
+        "secret-paired-1": pytest.approx(0.8),
+    }
+    packet = _packet(validation_repo, run_id)
+    assert "secret-paired" not in json.dumps(packet)
+    assert str(validation_path) not in json.dumps(packet)
+    public_files = validation_repo / ".gepa" / "runs" / run_id
+    assert all(
+        "secret-paired" not in path.read_text()
+        for path in public_files.rglob("*")
+        if path.is_file()
+    )
+
+
+def test_interrupted_validation_seed_retry_reuses_paid_incumbent_samples(
+    validation_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_private_validation(validation_repo)
+    monkeypatch.setenv("GEPA_TEST_FAIL_VALIDATION", "1")
+    started = _start(size=3, budget=14)
+    run_id = str(started["run_id"])
+    assert started["status"] == "paused_after_infrastructure_error"
+    assert started["iterations"] == 1
+    monkeypatch.delenv("GEPA_TEST_FAIL_VALIDATION")
+    original = run_module.run_eval_once
+    validation_calls = []
+
+    def die_during_incumbent_sampling(**kwargs):
+        outcome = original(**kwargs)
+        if kwargs.get("dataset_role") == "validation":
+            validation_calls.append(outcome.summary["eval_id"])
+            if len(validation_calls) == 2:
+                raise RuntimeError("died while collecting the incumbent confirmation")
+        return outcome
+
+    monkeypatch.setattr(run_module, "run_eval_once", die_during_incumbent_sampling)
+    interrupted = _run("run", "continue", "--run-id", run_id)
+    assert isinstance(interrupted.exception, RuntimeError)
+    before = ParetoLog(run_id).iter_rows()
+    assert len(before) == 3
+    resumed = _run("run", "continue", "--run-id", run_id)
+    assert resumed.exit_code == 0, resumed.output
+    payload = _run_payload(resumed.output)
+    assert payload["status"] == "paused_for_reflection"
+    assert (
+        payload["validation_evaluations"] == 4
+    )  # Failed seed plus three fresh samples.
+    assert len(payload["best_validation_samples"]) == 3
+    assert len(validation_calls) == 3
+    after = ParetoLog(run_id).iter_rows()
+    assert after[: len(before)] == before
+    assert len(after) == 8  # Four validation rows, selected failure, three baselines.

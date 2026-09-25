@@ -17,7 +17,7 @@ import typer
 from ..evaluation import EvaluationRecord
 from ..types import RolloutOutput
 from .eval import EvalOutcome, _trace_file_path
-from .layout import run_dir
+from .layout import repo_root, run_dir
 from .runs import ParetoLog, ParetoRow
 
 if TYPE_CHECKING:
@@ -72,9 +72,25 @@ def _row_outcome(
     # Preserve existing artifacts and expose only paths which actually exist.
     report_path = report if not validation and report.exists() else None
     trace_path = trace if not validation and trace.exists() else None
+    scores = row.per_case_scores
+    if validation and state.acceptance_paired_min_cases is not None:
+        from .validation import read_validation_evidence
+        from .run import _validation_schedule
+
+        scores = read_validation_evidence(
+            state.validation_dataset_path,
+            project_root=repo_root(),
+            run_id=f"{state.run_id}:eval:{eval_id}",
+            identity={"candidate_id": row.candidate_id, "eval_id": eval_id},
+        )
+        if not scores and _validation_schedule(state)[0] == 1:
+            raise typer.BadParameter(
+                "Private paired validation evidence is missing for a paid "
+                "evaluation; restore the harness evidence before continuing."
+            )
     records = [
         EvaluationRecord(case_id=key, score=value, feedback=None, payload={})
-        for key, value in row.per_case_scores.items()
+        for key, value in scores.items()
     ]
     errors = row.extra.get("evaluation_errors") or []
     for error in errors:
@@ -270,6 +286,18 @@ def continue_run(
                 "ledger_offset": len(rows),
             }
             state = replace(state, continuation=checkpoint)
+            if state.best_validation_per_case_scores and state.validation_dataset_path:
+                from .validation import write_validation_evidence
+
+                # A final save writes incumbent evidence before state.json.
+                # Keep the original evidence until that state transition commits.
+                write_validation_evidence(
+                    state.validation_dataset_path,
+                    project_root=repo_root(),
+                    run_id=f"{state.run_id}:continuation:{candidate}",
+                    identity=state._validation_evidence_identity(),
+                    scores=state.best_validation_per_case_scores,
+                )
             state.save()
         elif (
             checkpoint["candidate_id"] != candidate

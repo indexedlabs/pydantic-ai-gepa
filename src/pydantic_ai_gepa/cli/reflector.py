@@ -116,7 +116,34 @@ def _comparison_packet(comparison: dict[str, Any] | None) -> dict[str, Any] | No
         "rejection_reason",
         "discard_command",
     )
-    packet = {key: comparison[key] for key in keys if key in comparison}
+    training = comparison.get("training_comparison", comparison)
+    packet = {key: training[key] for key in keys if key in training}
+    for key in (
+        "outcome",
+        "selectable",
+        "verdict",
+        "recommendation",
+        "rejection_reason",
+    ):
+        if key in comparison:
+            packet[key] = comparison[key]
+    if (
+        "validation_comparison" in comparison
+        and "training_comparison" not in comparison
+    ):
+        # Older noise-acceptance states overwrote training statistics with
+        # validation statistics. Do not present those as training evidence.
+        for key in (
+            "baseline_samples",
+            "candidate_samples",
+            "baseline_mean_score",
+            "candidate_mean_score",
+            "delta",
+            "lower_bound",
+            "upper_bound",
+            "minibatch_id",
+        ):
+            packet.pop(key, None)
     if (
         comparison.get("reason_code") == "validation_rollout_failed"
         or comparison.get("rejection_reason") == "validation_infrastructure_failure"
