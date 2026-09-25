@@ -299,6 +299,7 @@ class CodingAgentEngine:
                     proposal_samples,
                     confidence=acceptance_confidence,
                     min_delta=acceptance_min_delta,
+                    max_looks=acceptance_max_repetitions - acceptance_repetitions + 1,
                 )
                 if comparison_result.verdict != "inconclusive":
                     break

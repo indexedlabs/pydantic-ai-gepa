@@ -784,7 +784,12 @@ async def _select_fair_winner(
                 "The frozen fair-vote baseline must be selectable on every matched round."
             )
         acceptance = _acceptance_for_candidate(
-            votes, baseline_index, provisional, confidence, min_delta
+            votes,
+            baseline_index,
+            provisional,
+            confidence,
+            min_delta,
+            max_repetitions - repetitions + 1,
         )
         continue_rounds = (
             provisional != baseline_index and acceptance["verdict"] == "inconclusive"
@@ -805,7 +810,12 @@ async def _select_fair_winner(
                     "The frozen fair-vote baseline must be selectable on every matched round."
                 )
             acceptance = _acceptance_for_candidate(
-                votes, baseline_index, provisional, confidence, min_delta
+                votes,
+                baseline_index,
+                provisional,
+                confidence,
+                min_delta,
+                max_repetitions - repetitions + 1,
             )
             continue_rounds = (
                 provisional != baseline_index
@@ -854,6 +864,7 @@ def _acceptance_for_candidate(
     candidate_index: int,
     confidence: float,
     min_delta: float,
+    max_looks: int = 1,
 ) -> dict[str, Any]:
     """Run the one shared acceptance primitive against the durable baseline."""
     if candidate_index == baseline_index:
@@ -867,6 +878,7 @@ def _acceptance_for_candidate(
         votes[candidate_index].samples,
         confidence=confidence,
         min_delta=min_delta,
+        max_looks=max_looks,
     ).to_dict()
 
 

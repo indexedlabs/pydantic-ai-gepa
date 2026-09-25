@@ -102,20 +102,21 @@ async def test_coding_agent_engine_accepts_an_improving_proposal() -> None:
 
     config = EngineConfig(
         engine="coding_agent",
-        max_metric_calls=12,
+        max_metric_calls=24,
         engine_config={
             "propose": propose,
             "minibatch_size": 3,
             "max_proposals_per_run": 1,
+            "acceptance_repetitions": 3,
         },
     )
-    budget = BudgetTracker(12)
+    budget = BudgetTracker(24)
 
     result = await get_engine("coding_agent", config).run(_task(), config, budget)
 
     assert result.best_candidate["instructions"].text == "correct"
     assert result.best_score == 1.0
-    assert budget.spent == result.num_metric_calls == 12
+    assert budget.spent == result.num_metric_calls == 24
     assert [event.kind for event in result.history].count("accepted") == 1
     assert contexts[0].minibatch_records
     assert contexts[0].report.startswith("# Eval report")
@@ -156,15 +157,16 @@ async def test_coding_agent_engine_keeps_validation_evidence_out_of_reflection()
 
     config = EngineConfig(
         engine="coding_agent",
-        max_metric_calls=4,
+        max_metric_calls=8,
         engine_config={
             "propose": propose,
             "minibatch_size": 1,
             "max_proposals_per_run": 1,
+            "acceptance_repetitions": 3,
         },
     )
     result = await get_engine("coding_agent", config).run(
-        task, config, BudgetTracker(4)
+        task, config, BudgetTracker(8)
     )
 
     assert result.best_candidate["instructions"].text == "correct"
@@ -208,15 +210,16 @@ async def test_coding_agent_engine_does_not_adopt_validation_regression() -> Non
 
     config = EngineConfig(
         engine="coding_agent",
-        max_metric_calls=4,
+        max_metric_calls=8,
         engine_config={
             "propose": propose,
             "minibatch_size": 1,
             "max_proposals_per_run": 1,
+            "acceptance_repetitions": 3,
         },
     )
     result = await get_engine("coding_agent", config).run(
-        task, config, BudgetTracker(4)
+        task, config, BudgetTracker(8)
     )
 
     assert result.best_candidate["instructions"].text == "seed"

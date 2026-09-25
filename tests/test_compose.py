@@ -327,7 +327,7 @@ async def test_composition_with_real_gepa_and_coding_agent_engines(
     configs = [
         EngineConfig(
             engine="gepa",
-            max_metric_calls=4,
+            max_metric_calls=8,
             max_iterations=1,
             stop_at_score=0.5,
             engine_config={
@@ -337,9 +337,13 @@ async def test_composition_with_real_gepa_and_coding_agent_engines(
         ),
         EngineConfig(
             engine="coding_agent",
-            max_metric_calls=4,
+            max_metric_calls=8,
             max_iterations=1,
-            engine_config={"propose": propose, "minibatch_size": 1},
+            engine_config={
+                "propose": propose,
+                "minibatch_size": 1,
+                "acceptance_repetitions": 3,
+            },
         ),
     ]
     if helper == "omni":
@@ -348,10 +352,10 @@ async def test_composition_with_real_gepa_and_coding_agent_engines(
             OmniPlan(
                 phase_one=configs,
                 phase_two=configs[1],
-                phase_one_metric_calls=8,
-                phase_two_metric_calls=4,
-                fair_vote_repetitions=1,
-                fair_vote_max_repetitions=1,
+                phase_one_metric_calls=16,
+                phase_two_metric_calls=8,
+                fair_vote_repetitions=3,
+                fair_vote_max_repetitions=3,
             ),
         )
         assert [item.engine for item in result.results] == [
@@ -366,7 +370,7 @@ async def test_composition_with_real_gepa_and_coding_agent_engines(
             "sequential": optimize_sequential,
             "adaptive_sequential": optimize_adaptive_sequential,
         }[helper]
-        result = await optimize(task, configs, max_metric_calls=8)
+        result = await optimize(task, configs, max_metric_calls=16)
         assert [item.engine for item in result.results] == ["gepa", "coding_agent"]
 
     assert len(contexts) == 1
@@ -379,4 +383,4 @@ async def test_composition_with_real_gepa_and_coding_agent_engines(
     assert result.total_metric_calls == sum(
         item.num_metric_calls for item in result.results
     )
-    assert result.total_metric_calls <= (12 if helper == "omni" else 8)
+    assert result.total_metric_calls <= (24 if helper == "omni" else 16)
