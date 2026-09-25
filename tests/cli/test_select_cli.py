@@ -1272,7 +1272,14 @@ def test_run_start_refuses_reflector_accessible_validation(
     result = _run("run", "start", "--lanes", str(lanes), "--size", "3")
 
     assert result.exit_code == 2, result.output
-    assert "outside the repository" in result.output
+    # Ignore Rich's borders and line wrapping when checking the full message.
+    message = "".join(result.output.replace("│", "").split())
+    for expected in (
+        str(validation_path.resolve()),
+        "Keep the validation dataset outside the GEPA workspace/repository",
+        "Start the workspace from Git history that never contained the validation dataset",
+    ):
+        assert "".join(expected.split()) in message
     assert "withheld-case" not in result.output
     assert not list((git_repo / ".gepa" / "runs").glob("*/pareto.jsonl"))
 

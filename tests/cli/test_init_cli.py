@@ -394,5 +394,12 @@ def test_init_refuses_validation_inside_checkout(empty_repo: Path) -> None:
         ".gepa/validation.jsonl",
     )
     assert result.exit_code == 2, result.output
-    assert "outside the repository" in result.output
+    # Ignore Rich's borders and line wrapping when checking the full message.
+    message = "".join(result.output.replace("│", "").split())
+    for expected in (
+        str((empty_repo / ".gepa" / "validation.jsonl").resolve()),
+        "Keep the validation dataset outside the GEPA workspace/repository",
+        "Start the workspace from Git history that never contained the validation dataset",
+    ):
+        assert "".join(expected.split()) in message
     assert not (empty_repo / ".gepa" / "validation.jsonl").exists()

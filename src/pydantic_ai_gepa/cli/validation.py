@@ -20,9 +20,10 @@ def validation_dataset_path(
     lexical_path = Path(os.path.abspath(project_root / configured_path))
     path = lexical_path.resolve()
     fix = (
-        "Move validation data outside the repository and point validation_dataset "
+        f"Validation dataset: {path}. "
+        "Keep the validation dataset outside the GEPA workspace/repository and point validation_dataset "
         "(or init --validation-dataset) at its absolute path. "
-        "Previously committed data requires a fresh repository without that history."
+        "Start the workspace from Git history that never contained the validation dataset."
     )
     roots = {project_root.resolve(), (candidate_root or project_root).resolve()}
     repositories: set[Path] = set()
