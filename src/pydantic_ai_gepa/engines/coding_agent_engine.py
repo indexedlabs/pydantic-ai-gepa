@@ -182,22 +182,37 @@ class CodingAgentEngine:
             )
             epoch += 1
             minibatch = await train_loader.fetch(minibatch_ids)
-            # A baseline is an indivisible provider-facing operation.  Do not
-            # let `_affordable_repetitions` turn an unaffordable first batch
-            # into one attempted evaluation: `_evaluate_minibatch` reserves
-            # before it invokes the provider, so stopping here is both clean
-            # and honest.
+            if not minibatch:
+                # An empty minibatch cannot fail or make progress; stop with an
+                # event instead of spinning on zero-spend iterations.
+                history.append(
+                    EngineEvent(
+                        kind="budget_exhausted",
+                        message="The training loader produced an empty minibatch.",
+                        data={
+                            "stage": "baseline_minibatch",
+                            "reason_code": "empty_minibatch",
+                        },
+                    )
+                )
+                stop_reason = "budget_exhausted"
+                break
+            # Spend a selection batch only when a comparison can follow it: the
+            # batch itself plus two paired baseline/proposal repetitions (5n
+            # calls). `_evaluate_minibatch` reserves before it invokes the
+            # provider, so stopping here is both clean and honest.
             if (
-                len(minibatch) > budget.remaining
-                or len(minibatch) > engine_budget.remaining
+                5 * len(minibatch) > budget.remaining
+                or 5 * len(minibatch) > engine_budget.remaining
             ):
                 history.append(
                     EngineEvent(
                         kind="budget_exhausted",
-                        message="No complete baseline minibatch is affordable.",
+                        message="At least two matched repetitions are required for acceptance.",
                         data={
                             "stage": "baseline_minibatch",
-                            "requested": len(minibatch),
+                            "reason_code": "insufficient_acceptance_repetitions",
+                            "minimum_repetitions": 2,
                             "budget_remaining": budget.remaining,
                             "engine_budget_remaining": engine_budget.remaining,
                         },
@@ -231,11 +246,6 @@ class CodingAgentEngine:
                 stop_reason = "budget_overshoot"
                 break
             iterations += 1
-            if not selection_records:
-                # An empty minibatch spends nothing and cannot fail; without
-                # this guard an empty trainset would loop forever.
-                stop_reason = "budget_exhausted"
-                break
             selection_score = _mean_score(selection_records)
 
             failures = [
