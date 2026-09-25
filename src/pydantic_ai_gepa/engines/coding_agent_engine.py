@@ -442,7 +442,7 @@ class CodingAgentEngine:
         raises after starting a rollout, the call remains accounted; a
         preflight failure makes no evaluator call.
         """
-        case_count = len(await task._validation_cases())
+        case_count = await task.validation_case_count()
         if case_count > engine_budget.remaining:
             history.append(
                 EngineEvent(
