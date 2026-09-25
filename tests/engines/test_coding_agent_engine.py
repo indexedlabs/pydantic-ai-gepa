@@ -27,9 +27,9 @@ from pydantic_ai_gepa.gepa_graph.models import CandidateMap, ComponentValue
 from pydantic_ai_gepa.types import MetricResult, RolloutOutput
 
 
-def _task(*, case_count: int = 3) -> OptimizationTask:
+def _task(*, case_count: int = 3, instructions: str = "seed") -> OptimizationTask:
     """Build a TestModel task whose metric observes the applied instructions."""
-    agent = Agent(TestModel(custom_output_text="response"), instructions="seed")
+    agent = Agent(TestModel(custom_output_text="response"), instructions=instructions)
     cases = [
         Case(name=f"case-{index}", inputs="input", expected_output="response")
         for index in range(case_count)
@@ -120,22 +120,24 @@ async def test_coding_agent_engine_accepts_an_improving_proposal() -> None:
         contexts.append(context)
         return _candidate("correct")
 
+    # Seed validation + selection batch + 3 baseline + 3 proposal repetitions
+    # of 3 cases + proposal validation: 3 + 3 + 9 + 9 + 3.
     config = EngineConfig(
         engine="coding_agent",
-        max_metric_calls=24,
+        max_metric_calls=27,
         engine_config={
             "propose": propose,
             "minibatch_size": 3,
             "max_proposals_per_run": 1,
         },
     )
-    budget = BudgetTracker(24)
+    budget = BudgetTracker(27)
 
     result = await get_engine("coding_agent", config).run(_task(), config, budget)
 
     assert result.best_candidate["instructions"].text == "correct"
     assert result.best_score == 1.0
-    assert budget.spent == result.num_metric_calls == 24
+    assert budget.spent == result.num_metric_calls == 27
     assert [event.kind for event in result.history].count("accepted") == 1
     assert contexts[0].minibatch_records
     assert contexts[0].report.startswith("# Eval report")
@@ -181,9 +183,11 @@ async def test_coding_agent_engine_keeps_validation_evidence_out_of_reflection()
         contexts.append(context)
         return _candidate("correct")
 
+    # Seed validation + selection batch + 3 matched repetitions + proposal
+    # validation, one case each: 1 + 1 + 3 + 3 + 1.
     config = EngineConfig(
         engine="coding_agent",
-        max_metric_calls=8,
+        max_metric_calls=9,
         engine_config={
             "propose": propose,
             "minibatch_size": 1,
@@ -191,7 +195,7 @@ async def test_coding_agent_engine_keeps_validation_evidence_out_of_reflection()
         },
     )
     result = await get_engine("coding_agent", config).run(
-        task, config, BudgetTracker(8)
+        task, config, BudgetTracker(9)
     )
 
     assert result.best_candidate["instructions"].text == "correct"
@@ -243,9 +247,11 @@ async def test_coding_agent_engine_does_not_adopt_validation_regression() -> Non
     async def propose(context: ReflectionContext) -> CandidateMap:
         return _candidate("proposal")
 
+    # Seed validation + selection batch + 3 matched repetitions + proposal
+    # validation, one case each: 1 + 1 + 3 + 3 + 1.
     config = EngineConfig(
         engine="coding_agent",
-        max_metric_calls=8,
+        max_metric_calls=9,
         engine_config={
             "propose": propose,
             "minibatch_size": 1,
@@ -253,7 +259,7 @@ async def test_coding_agent_engine_does_not_adopt_validation_regression() -> Non
         },
     )
     result = await get_engine("coding_agent", config).run(
-        task, config, BudgetTracker(8)
+        task, config, BudgetTracker(9)
     )
 
     assert result.best_candidate["instructions"].text == "seed"
@@ -270,7 +276,7 @@ async def test_coding_agent_engine_skips_validation_for_non_improvement() -> Non
 
     config = EngineConfig(
         engine="coding_agent",
-        max_metric_calls=21,
+        max_metric_calls=24,
         engine_config={
             "propose": propose,
             "minibatch_size": 3,
@@ -278,11 +284,12 @@ async def test_coding_agent_engine_skips_validation_for_non_improvement() -> Non
         },
     )
     result = await get_engine("coding_agent", config).run(
-        _task(), config, BudgetTracker(21)
+        _task(), config, BudgetTracker(24)
     )
 
     assert result.history[-1].data["validation_evaluations"] == 1
-    assert result.num_metric_calls == 21
+    # Seed validation + selection batch + 3 matched repetitions: 3+3+9+9.
+    assert result.num_metric_calls == 24
 
 
 @pytest.mark.asyncio
@@ -318,9 +325,11 @@ async def test_coding_agent_engine_repeats_matched_case_evaluations() -> None:
     async def propose(context: ReflectionContext) -> CandidateMap:
         return _candidate("correct")
 
+    # Seed validation + selection batch + 3 matched repetitions + proposal
+    # validation, one case each: 1 + 1 + 3 + 3 + 1.
     config = EngineConfig(
         engine="coding_agent",
-        max_metric_calls=8,
+        max_metric_calls=9,
         engine_config={
             "propose": propose,
             "minibatch_size": 1,
@@ -329,7 +338,7 @@ async def test_coding_agent_engine_repeats_matched_case_evaluations() -> None:
             "acceptance_max_repetitions": 3,
         },
     )
-    budget = BudgetTracker(8)
+    budget = BudgetTracker(9)
 
     result = await get_engine("coding_agent", config).run(
         _task(case_count=1), config, budget
@@ -339,7 +348,7 @@ async def test_coding_agent_engine_repeats_matched_case_evaluations() -> None:
     assert accepted.data["baseline_sample_count"] == 3
     assert accepted.data["candidate_sample_count"] == 3
     assert accepted.data["verdict"] == "accepted"
-    assert result.num_metric_calls == budget.spent == 8
+    assert result.num_metric_calls == budget.spent == 9
 
 
 @pytest.mark.asyncio
@@ -347,8 +356,10 @@ async def test_coding_agent_engine_preserves_noisy_overlap_as_inconclusive() -> 
     """A positive sample mean inside rollout variance is not accepted or rejected."""
     agent = Agent(TestModel(custom_output_text="response"), instructions="seed")
     case = Case(name="case-noisy", inputs="input", expected_output="response")
+    # Seed samples: validation, failure-selecting batch, three fresh baselines
+    # with mean 0.50 so the delta stays 0.05.
     samples = {
-        "seed": iter([0.50, 0.40, 0.60, 0.50]),
+        "seed": iter([0.50, 0.40, 0.60, 0.50, 0.40]),
         "proposal": iter([0.45, 0.65, 0.55]),
     }
 
@@ -370,7 +381,7 @@ async def test_coding_agent_engine_preserves_noisy_overlap_as_inconclusive() -> 
 
     config = EngineConfig(
         engine="coding_agent",
-        max_metric_calls=7,
+        max_metric_calls=8,
         engine_config={
             "propose": propose,
             "minibatch_size": 1,
@@ -381,7 +392,7 @@ async def test_coding_agent_engine_preserves_noisy_overlap_as_inconclusive() -> 
     )
 
     result = await get_engine("coding_agent", config).run(
-        task, config, BudgetTracker(7)
+        task, config, BudgetTracker(8)
     )
 
     inconclusive = next(
@@ -482,7 +493,7 @@ async def test_coding_agent_engine_minibatches_are_deterministic_for_a_seed(
 
     config = EngineConfig(
         engine="coding_agent",
-        max_metric_calls=23,
+        max_metric_calls=26,
         seed=17,
         engine_config={
             "propose": propose,
@@ -491,13 +502,14 @@ async def test_coding_agent_engine_minibatches_are_deterministic_for_a_seed(
         },
     )
     first = await get_engine("coding_agent", config).run(
-        _task(case_count=5), config, BudgetTracker(23)
+        _task(case_count=5), config, BudgetTracker(26)
     )
     second = await get_engine("coding_agent", config).run(
-        _task(case_count=5), config, BudgetTracker(23)
+        _task(case_count=5), config, BudgetTracker(26)
     )
 
-    assert first.num_metric_calls == second.num_metric_calls == 23
+    # Seed validation (5) + selection batch (3) + 3 matched repetitions (9+9).
+    assert first.num_metric_calls == second.num_metric_calls == 26
     assert [event.model_dump() for event in first.history] == [
         event.model_dump() for event in second.history
     ]
@@ -511,7 +523,11 @@ async def test_coding_agent_stops_before_under_sampled_comparison(
     engine_limit: int,
     shared_limit: int,
 ) -> None:
-    """A budget for fewer than two matched batches only spends seed validation."""
+    """A selection batch that cannot lead to a comparison is never spent.
+
+    Each of these budgets leaves fewer than 5n calls after seed validation,
+    so the engine stops before evaluating the selection batch at all.
+    """
     task = _task(case_count=2)
     original_metric = task.metric
     metric_calls = 0
@@ -543,8 +559,9 @@ async def test_coding_agent_stops_before_under_sampled_comparison(
     assert result.num_metric_calls == budget.spent == metric_calls == 2
     assert proposer_calls == 0
     event = next(event for event in result.history if event.kind == "budget_exhausted")
+    assert event.data["stage"] == "baseline_minibatch"
     assert event.data["reason_code"] == "insufficient_acceptance_repetitions"
-    assert event.data["affordable_repetitions"] < 2
+    assert event.data["minimum_repetitions"] == 2
     assert result.history[-1].data["stop_reason"] == "budget_exhausted"
     assert result.history[-1].data["iterations"] == 0
 
@@ -556,9 +573,11 @@ async def test_coding_agent_can_accept_two_affordable_matched_repetitions() -> N
     async def propose(context: ReflectionContext) -> CandidateMap:
         return _candidate("correct")
 
+    # Seed validation + selection batch + 2 matched repetitions + proposal
+    # validation, two cases each: 2 + 2 + 4 + 4 + 2.
     config = EngineConfig(
         engine="coding_agent",
-        max_metric_calls=12,
+        max_metric_calls=14,
         engine_config={
             "propose": propose,
             "minibatch_size": 2,
@@ -566,10 +585,190 @@ async def test_coding_agent_can_accept_two_affordable_matched_repetitions() -> N
         },
     )
     result = await get_engine("coding_agent", config).run(
-        _task(case_count=2), config, BudgetTracker(12)
+        _task(case_count=2), config, BudgetTracker(14)
     )
     assert result.best_candidate == _candidate("correct")
     accepted = next(event for event in result.history if event.kind == "accepted")
     assert accepted.data["baseline_sample_count"] == 2
     assert accepted.data["candidate_sample_count"] == 2
-    assert result.num_metric_calls == 12
+    assert result.num_metric_calls == 14
+
+
+@pytest.mark.asyncio
+async def test_coding_agent_engine_excludes_the_failure_selected_batch() -> None:
+    """The batch that triggers reflection is charged but never used as evidence."""
+    agent = Agent(TestModel(custom_output_text="response"), instructions="seed")
+    train = Case(name="train-case", inputs="input", expected_output="response")
+    validation = Case(
+        name="validation-case", inputs="input", expected_output="response"
+    )
+    # Seed draws on the training case, in call order: the low
+    # failure-selecting batch, then the fresh baseline repetitions.
+    # The proposal matches the fresh baseline mean.
+    samples = {
+        "seed": iter([0.0, 0.7, 0.7]),
+        "proposal": iter([0.7, 0.7]),
+    }
+
+    def metric(case: Case[str, str, Any], output: RolloutOutput[Any]) -> MetricResult:
+        del output
+        if case.name == "validation-case":
+            return MetricResult(score=0.5, feedback="validation")
+        override = agent._override_instructions.get()
+        instructions = override.value if override is not None else agent._instructions
+        key = (
+            "proposal"
+            if "proposal" in "\n".join(str(item) for item in instructions)
+            else "seed"
+        )
+        return MetricResult(score=next(samples[key]), feedback=f"{key} feedback")
+
+    task = OptimizationTask(
+        agent=agent, trainset=[train], valset=[validation], metric=metric
+    )
+    contexts: list[ReflectionContext] = []
+
+    async def propose(context: ReflectionContext) -> CandidateMap:
+        contexts.append(context)
+        return _candidate("proposal")
+
+    config = EngineConfig(
+        engine="coding_agent",
+        max_metric_calls=6,
+        engine_config={
+            "propose": propose,
+            "minibatch_size": 1,
+            "max_proposals_per_run": 1,
+            "acceptance_repetitions": 2,
+            "acceptance_max_repetitions": 2,
+        },
+    )
+    result = await get_engine("coding_agent", config).run(
+        task, config, BudgetTracker(6)
+    )
+
+    comparison = next(
+        event for event in result.history if "selection_score" in event.data
+    )
+    assert comparison.data["selection_score"] == 0.0
+    assert comparison.data["baseline_samples"] == [0.7, 0.7]
+    assert comparison.data["baseline_score"] == pytest.approx(0.7)
+    # The selected batch still drives the reflection context.
+    assert [record.score for record in contexts[0].minibatch_records] == [0.0]
+    assert "train-case" in contexts[0].report
+    assert result.num_metric_calls == 6
+
+
+@pytest.mark.asyncio
+async def test_coding_agent_engine_reserves_paired_repetitions_before_proposing() -> (
+    None
+):
+    """The paired-repetition reserve is checked before the selection batch.
+
+    Seed validation (2) leaves 8 calls: the two-case selection batch would
+    fit, but the batch plus two paired baseline/proposal repetitions (10)
+    does not, so the run stops without spending the batch or proposing.
+    """
+    proposer_calls = 0
+
+    async def propose(context: ReflectionContext) -> CandidateMap:
+        del context
+        nonlocal proposer_calls
+        proposer_calls += 1
+        return _candidate("correct")
+
+    config = EngineConfig(
+        engine="coding_agent",
+        max_metric_calls=10,
+        engine_config={
+            "propose": propose,
+            "minibatch_size": 2,
+            "max_proposals_per_run": 1,
+        },
+    )
+    budget = BudgetTracker(10)
+
+    result = await get_engine("coding_agent", config).run(
+        _task(case_count=2), config, budget
+    )
+
+    assert proposer_calls == 0
+    assert result.num_metric_calls == budget.spent == 2
+    event = next(event for event in result.history if event.kind == "budget_exhausted")
+    assert event.data["stage"] == "baseline_minibatch"
+    assert event.data["reason_code"] == "insufficient_acceptance_repetitions"
+    assert event.data["minimum_repetitions"] == 2
+    assert result.history[-1].data["stop_reason"] == "budget_exhausted"
+    assert result.history[-1].data["iterations"] == 0
+    assert result.history[-1].data["proposals"] == 0
+
+
+@pytest.mark.asyncio
+async def test_coding_agent_engine_spends_one_batch_per_clean_minibatch() -> None:
+    """A minibatch without failures costs its selection batch and nothing more."""
+
+    async def propose(context: ReflectionContext) -> CandidateMap:
+        pytest.fail("A clean minibatch must not trigger a proposal")
+
+    # Headroom for the 5n pre-check (10) before each of the 3 iterations.
+    config = EngineConfig(
+        engine="coding_agent",
+        max_metric_calls=16,
+        max_iterations=3,
+        engine_config={"propose": propose, "minibatch_size": 2},
+    )
+    task = _task(case_count=2, instructions="correct seed")
+    result = await get_engine("coding_agent", config).run(
+        task, config, BudgetTracker(16)
+    )
+
+    clean = [event for event in result.history if event.kind == "clean_minibatch"]
+    assert [event.data["iteration"] for event in clean] == [1, 2, 3]
+    assert [event.data["mean_score"] for event in clean] == [1.0, 1.0, 1.0]
+    # Seed validation (2) plus exactly one two-case selection batch per clean
+    # iteration: 2 + 3 * 2.
+    assert result.num_metric_calls == 8
+    assert result.history[-1].data["proposals"] == 0
+    assert result.history[-1].data["stop_reason"] == "max_iterations"
+
+
+@pytest.mark.asyncio
+async def test_coding_agent_engine_stops_with_an_event_on_an_empty_minibatch() -> None:
+    """A training loader without ids terminates the run with an explicit event."""
+
+    class _EmptyIdsLoader:
+        def __len__(self) -> int:
+            # resolve_dataset rejects loaders that report zero length.
+            return 1
+
+        async def all_ids(self) -> list[str]:
+            return []
+
+        async def fetch(self, ids: Any) -> list[Any]:
+            return []
+
+    async def propose(context: ReflectionContext) -> CandidateMap:
+        pytest.fail("An empty minibatch must not trigger a proposal")
+
+    agent = Agent(TestModel(custom_output_text="response"), instructions="seed")
+    task = OptimizationTask(
+        agent=agent,
+        trainset=_EmptyIdsLoader(),
+        valset=[Case(name="val", inputs="x", expected_output="response")],
+        metric=lambda case, output: MetricResult(score=1.0),
+    )
+    config = EngineConfig(
+        engine="coding_agent",
+        max_metric_calls=10,
+        engine_config={"propose": propose, "minibatch_size": 1},
+    )
+    result = await get_engine("coding_agent", config).run(
+        task, config, BudgetTracker(10)
+    )
+
+    assert result.num_metric_calls == 1  # seed validation only
+    event = next(event for event in result.history if event.kind == "budget_exhausted")
+    assert event.data["stage"] == "baseline_minibatch"
+    assert event.data["reason_code"] == "empty_minibatch"
+    assert result.history[-1].data["stop_reason"] == "budget_exhausted"
+    assert result.history[-1].data["iterations"] == 0
