@@ -486,21 +486,35 @@ def custom_metric(input_data, output) -> MetricResult:
 ### Result Caching
 
 ```python
-from pydantic_ai_gepa import CacheManager
-
-cache = CacheManager(
-    cache_dir=".gepa_cache",
-    enabled=True,
-)
+from pydantic_ai_gepa import metric_code_identity
 
 result = await optimize_agent(
     agent=agent,
     trainset=trainset,
     metric=metric,
-    cache_manager=cache,
+    enable_cache=True,
+    cache_dir=".gepa_cache",
+    # Caching fails closed: nothing is stored unless you opt in explicitly.
+    cache_metric_results=True,  # cache metric scores (requires an identity)
+    cache_metric_identity=metric_code_identity(metric),  # or a version string
+    cache_rollouts=True,  # cache agent runs (freezes each rollout's first sample)
 )
-# Second run reuses cached LLM results
+# Second run reuses cached metric results and agent runs
 ```
+
+Rollouts and judge-based metrics call sampled models, so caching freezes the
+first sample. The cache therefore fails closed: `enable_cache=True` without an
+explicit opt-in raises `ValueError` before any model call, and
+`cache_metric_results=True` requires `cache_metric_identity` — a string that
+must change whenever the metric, its grader, or judge prompts change (a version
+string, a freeze-manifest hash, or `metric_code_identity(metric)`; the helper
+covers only the function's own source, not helpers it calls or prompt files it
+reads).
+
+A cached entry is invalidated (a cache miss) whenever any of these change:
+the metric identity, the case's expected output (gold) or case-level
+evaluators, the candidate text, the case inputs/name/metadata, the rollout
+output (for metric results), or the model identifier.
 
 ## Development
 

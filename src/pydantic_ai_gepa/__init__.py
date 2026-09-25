@@ -11,7 +11,7 @@ from .adapters.agent_adapter import (
     create_adapter,
 )
 from .reflection import ReflectionSampler
-from .cache import CacheManager, create_cached_metric
+from .cache import CacheManager, create_cached_metric, metric_code_identity
 from .inspection import (
     InspectingModel,
     InspectionAborted,
@@ -109,6 +109,7 @@ __all__ = [
     "ReflectionSampler",
     "CacheManager",
     "create_cached_metric",
+    "metric_code_identity",
     "Case",
     "create_adapter",
     "AgentAdapterTrajectory",

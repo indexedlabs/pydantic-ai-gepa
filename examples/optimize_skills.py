@@ -16,6 +16,7 @@ from pydantic_ai_gepa import (
     MetricResult,
     ReflectionConfig,
     RolloutOutput,
+    metric_code_identity,
     optimize_agent,
 )
 from pydantic_ai_gepa.types import Case
@@ -142,6 +143,12 @@ async def main(
             enable_cache=True,
             cache_dir=".gepa_cache",
             cache_verbose=False,
+            # The metric is deterministic (regex integer comparison), so
+            # caching its results is sound; the code-identity hash invalidates
+            # them whenever the metric body changes.
+            cache_metric_identity=metric_code_identity(metric),
+            cache_metric_results=True,
+            cache_rollouts=True,
             show_progress=True,
             seed=seed,
         )

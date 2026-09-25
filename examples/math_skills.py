@@ -19,7 +19,7 @@ from utils import run_python_tool
 from pydantic_ai_gepa import InspectionAborted
 from pydantic_ai_gepa.gepa_graph.models import CandidateMap
 from pydantic_ai_gepa.adapters import SignatureAgentAdapter
-from pydantic_ai_gepa.cache import CacheManager
+from pydantic_ai_gepa.cache import CacheManager, metric_code_identity
 from pydantic_ai_gepa.evaluation import EvaluationRecord, evaluate_candidate_dataset
 from pydantic_ai_gepa.gepa_graph import (
     CandidateSelectorStrategy,
@@ -663,10 +663,17 @@ async def run_math_tools_optimization(
     *,
     max_evaluations: int = 300,
 ) -> GepaResult:
+    # The metric is deterministic (numeric comparison against the gold), so
+    # caching its results is sound; the code-identity hash invalidates them
+    # whenever the metric body changes. cache_rollouts=True freezes each
+    # rollout's first sampled agent run.
     cache_manager = CacheManager(
         cache_dir=".gepa_cache",
         enabled=True,
         verbose=True,
+        metric_identity=metric_code_identity(metric),
+        cache_metric_results=True,
+        cache_rollouts=True,
     )
 
     adapter = SignatureAgentAdapter(

@@ -73,6 +73,9 @@ async def test_optimize_withholds_validation_from_traces_cache_and_reflection(
         reflection_minibatch_size=1,
         show_progress=False,
         enable_cache=True,
+        cache_metric_identity="validation-withheld-test-v1",
+        cache_metric_results=True,
+        cache_rollouts=True,
     )
     assert result.original_score == 0.25
     assert seen_validation
@@ -101,7 +104,12 @@ async def test_validation_discards_spans_and_metric_details_even_if_capture_requ
     adapter = create_adapter(
         agent=Agent(TestModel(custom_output_text="WITHHELD"), instructions="seed"),
         metric=lambda *args: metric,
-        cache_manager=CacheManager(cache_dir=tmp_path),
+        cache_manager=CacheManager(
+            cache_dir=tmp_path,
+            metric_identity="validation-withheld-test-v1",
+            cache_metric_results=True,
+            cache_rollouts=True,
+        ),
     )
     try:
         with validation_evaluation(adapter.trace_collector.exporter):
