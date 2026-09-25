@@ -8,7 +8,7 @@ minibatch, then uses held-out validation to decide whether to adopt it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import os
@@ -135,6 +135,9 @@ class RunState:
     select_phase: str | None = None
     select_context: dict[str, Any] | None = None
     infrastructure_retry_minibatch_id: str | None = None
+    acceptance_paired_min_cases: int | None = None
+    best_validation_samples: tuple[float, ...] = ()
+    best_validation_per_case_scores: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -150,6 +153,8 @@ class RunState:
             "acceptance_max_repetitions": self.acceptance_max_repetitions,
             "acceptance_confidence": self.acceptance_confidence,
             "acceptance_min_delta": self.acceptance_min_delta,
+            "acceptance_paired_min_cases": self.acceptance_paired_min_cases,
+            "best_validation_samples": list(self.best_validation_samples),
             "candidate_source": self.candidate_source,
             "iterations": self.iterations,
             "created_at": self.created_at,
@@ -219,6 +224,14 @@ class RunState:
             ),
             acceptance_confidence=float(data.get("acceptance_confidence", 0.9)),
             acceptance_min_delta=float(data.get("acceptance_min_delta", 0.0)),
+            acceptance_paired_min_cases=data.get("acceptance_paired_min_cases"),
+            best_validation_samples=tuple(
+                float(x) for x in data.get("best_validation_samples", ())
+            ),
+            best_validation_per_case_scores={
+                str(k): float(v)
+                for k, v in data.get("best_validation_per_case_scores", {}).items()
+            },
             candidate_source=cast(
                 CandidateSource, data.get("candidate_source", "components")
             ),
@@ -336,7 +349,37 @@ class RunState:
             ),
         )
 
+    def _validation_evidence_identity(self) -> dict[str, Any]:
+        return {
+            "candidate_id": self.best_candidate_id,
+            "dataset_digest": self.validation_dataset_digest,
+            "samples": list(self.best_validation_samples),
+        }
+
+    def restore_validation_evidence(self, root: Path | None = None) -> RunState:
+        from .validation import read_validation_evidence
+
+        if self.acceptance_paired_min_cases is None:
+            return replace(self, best_validation_per_case_scores={})
+        scores = read_validation_evidence(
+            self.validation_dataset_path,
+            project_root=root or repo_root(),
+            run_id=self.run_id,
+            identity=self._validation_evidence_identity(),
+        )
+        return replace(self, best_validation_per_case_scores=scores)
+
     def save(self, root: Path | None = None) -> Path:
+        from .validation import write_validation_evidence
+
+        if self.best_validation_per_case_scores and self.validation_dataset_path:
+            write_validation_evidence(
+                self.validation_dataset_path,
+                project_root=root or repo_root(),
+                run_id=self.run_id,
+                identity=self._validation_evidence_identity(),
+                scores=self.best_validation_per_case_scores,
+            )
         path = run_state_path(self.run_id, root)
         path.parent.mkdir(parents=True, exist_ok=True)
         # Atomic (tmpfile + os.replace): lane evals, select checkpoints, and
@@ -374,7 +417,7 @@ def _load_state(run_id: str | None) -> RunState:
     if not isinstance(raw, dict):
         typer.echo(f"Run state at {path} is not a JSON object.", err=True)
         raise typer.Exit(code=1)
-    return RunState.from_dict(raw)
+    return RunState.from_dict(raw).restore_validation_evidence()
 
 
 def _latest_managed_run_id() -> str | None:
@@ -722,52 +765,174 @@ def _mark_best_from_validation(state: RunState, outcome: EvalOutcome) -> RunStat
     )
 
 
-def _validation_improved(state: RunState, outcome: EvalOutcome) -> bool:
-    if outcome.summary.get("selectable") is False:
-        return False
-    if state.best_mean_score is None:
-        return True
-    return (
-        float(outcome.summary["mean_score"])
-        > state.best_mean_score + state.acceptance_min_delta
+def _acceptance_schedule(state: RunState, case_count: int) -> tuple[int, int]:
+    """Use one paired repetition only for an explicitly configured large set."""
+    if (
+        state.acceptance_paired_min_cases is not None
+        and case_count >= state.acceptance_paired_min_cases
+    ):
+        return 1, 1
+    initial = max(3, state.acceptance_repetitions)
+    return initial, max(initial, state.acceptance_max_repetitions)
+
+
+def _validation_schedule(state: RunState, root: Path | None = None) -> tuple[int, int]:
+    from .dataset import load_dataset
+
+    root = root or repo_root()
+    cfg = GepaConfig.load(config_path(root))
+    assert cfg.validation_dataset is not None
+    return _acceptance_schedule(state, len(load_dataset(root / cfg.validation_dataset)))
+
+
+def _case_scores(outcome: EvalOutcome) -> dict[str, float]:
+    return {record.case_id: record.score for record in outcome.records}
+
+
+def _mark_best_validation_samples(
+    state: RunState, outcomes: Sequence[EvalOutcome]
+) -> RunState:
+    samples = tuple(float(outcome.summary["mean_score"]) for outcome in outcomes)
+    return _with_timestamp(
+        _mark_best_from_validation(state, outcomes[-1]),
+        best_validation_samples=samples,
+        best_validation_per_case_scores=_case_scores(outcomes[0])
+        if len(outcomes) == 1
+        else {},
+        best_mean_score=sum(samples) / len(samples),
     )
 
 
-def _ensure_validation_seed(
-    state: RunState,
-) -> tuple[RunState, list[EvalOutcome]]:
-    """Evaluate the seed once so every later adoption is validation-guided."""
+def _inconclusive_comparison(reason: str) -> dict[str, Any]:
+    return {
+        "outcome": "valid",
+        "selectable": False,
+        "verdict": "inconclusive",
+        "improved": False,
+        "reason_code": reason,
+    }
 
-    if (
-        not _held_out_validation_enabled()
-        or state.validation_seeded
-        or state.iterations >= state.max_iterations
+
+def _validation_improved(
+    state: RunState, outcomes: Sequence[EvalOutcome], *, initial: int, maximum: int
+) -> dict[str, Any]:
+    if not state.best_validation_samples or (
+        initial == 1 and not state.best_validation_per_case_scores
     ):
+        return _inconclusive_comparison("incumbent_evidence_missing")
+    if any(outcome.summary.get("selectable") is False for outcome in outcomes):
+        return _inconclusive_comparison("validation_not_selectable")
+    result = compare_candidate_samples(
+        state.best_validation_samples,
+        [float(outcome.summary["mean_score"]) for outcome in outcomes],
+        confidence=state.acceptance_confidence,
+        min_delta=state.acceptance_min_delta,
+        max_looks=maximum - initial + 1,
+        paired_baseline_scores=state.best_validation_per_case_scores
+        if initial == 1
+        else None,
+        paired_candidate_scores=_case_scores(outcomes[0]) if initial == 1 else None,
+    )
+    return {"outcome": "valid", "selectable": True, **result.to_dict()}
+
+
+def _confirm_validation_candidate(
+    state: RunState,
+    *,
+    candidate_root: Path | None = None,
+    workspace_root: Path | None = None,
+    lane: str | None = None,
+) -> tuple[RunState, list[EvalOutcome], dict[str, Any]]:
+    initial, maximum = _validation_schedule(state, workspace_root)
+    if not state.best_validation_samples or (
+        initial == 1 and not state.best_validation_per_case_scores
+    ):
+        return state, [], _inconclusive_comparison("incumbent_evidence_missing")
+    if state.max_iterations - state.iterations < initial:
+        return state, [], _inconclusive_comparison("validation_budget_exhausted")
+    outcomes: list[EvalOutcome] = []
+    for _ in range(min(maximum, state.max_iterations - state.iterations)):
+        state, outcome = _evaluate_validation_candidate(
+            state,
+            candidate_root=candidate_root,
+            workspace_root=workspace_root,
+            lane=lane,
+        )
+        outcomes.append(outcome)
+        if outcome.summary["candidate_id"] != outcomes[0].summary["candidate_id"]:
+            raise typer.BadParameter("Candidate changed during validation sampling.")
+        failures = _outcome_infrastructure_failures(outcome)
+        if failures:
+            state, comparison = _pause_after_infrastructure_failure(
+                state, outcomes, phase="candidate", failures=failures
+            )
+            return state, outcomes, comparison
+        if len(outcomes) >= initial:
+            comparison = _validation_improved(
+                state, outcomes, initial=initial, maximum=maximum
+            )
+            if comparison["verdict"] != "inconclusive":
+                break
+    return state, outcomes, comparison
+
+
+def _ensure_validation_seed(state: RunState) -> tuple[RunState, list[EvalOutcome]]:
+    """Collect incumbent evidence while its tree is still available."""
+    if not _held_out_validation_enabled():
         return state, []
+    initial = None
+    if state.best_validation_samples:
+        initial, _ = _validation_schedule(state)
+        if initial != 1 or state.best_validation_per_case_scores:
+            return state, []
+    if (
+        state.best_candidate_id is not None
+        and _current_baseline_candidate_id(
+            state.candidate_source, active_run_id=state.run_id
+        )
+        != state.best_candidate_id
+    ):
+        return _with_timestamp(
+            state,
+            last_comparison=_inconclusive_comparison("incumbent_evidence_missing"),
+        ), []
+    if initial is None:
+        initial, _ = _validation_schedule(state)
+    if state.max_iterations - state.iterations < initial:
+        return _with_timestamp(
+            state,
+            status="done",
+            last_comparison=_inconclusive_comparison("validation_budget_exhausted"),
+        ), []
+    if (
+        state.validation_dataset_path is not None
+        or state.validation_dataset_digest is not None
+    ):
+        _assert_validation_dataset_unchanged(state)
     validation_path, validation_digest = _validation_dataset_identity()
     state = _with_timestamp(
         state,
         validation_dataset_path=validation_path,
         validation_dataset_digest=validation_digest,
     )
-    state, outcome = _evaluate_validation_candidate(state)
-    failures = _outcome_infrastructure_failures(outcome)
-    if failures:
-        comparison = _infrastructure_failure_comparison(
-            state, [outcome], phase="baseline", failures=failures
-        )
-        comparison["reason_code"] = "validation_rollout_failed"
-        state = _with_timestamp(
-            state,
-            status=(
-                "paused_after_infrastructure_error"
-                if state.iterations < state.max_iterations
-                else "done"
-            ),
-            last_comparison=comparison,
-        )
-        return state, [outcome]
-    return _mark_best_from_validation(state, outcome), [outcome]
+    outcomes: list[EvalOutcome] = []
+    for _ in range(initial):
+        state, outcome = _evaluate_validation_candidate(state)
+        outcomes.append(outcome)
+        if outcome.summary["candidate_id"] != outcomes[0].summary["candidate_id"]:
+            raise typer.BadParameter("Candidate changed during validation sampling.")
+        failures = _outcome_infrastructure_failures(outcome)
+        if failures:
+            state, comparison = _pause_after_infrastructure_failure(
+                state, outcomes, phase="baseline", failures=failures
+            )
+            comparison["reason_code"] = "validation_rollout_failed"
+            return _with_timestamp(
+                state,
+                last_comparison=comparison,
+                infrastructure_retry_minibatch_id=None,
+            ), outcomes
+    return _mark_best_validation_samples(state, outcomes), outcomes
 
 
 def _consume_candidate_verdict(state: RunState, *, accepted: bool) -> RunState:
@@ -848,20 +1013,25 @@ def _capture_reflection_baseline(
     """Measure the stochastic baseline before yielding the tree for edits."""
 
     remaining_iterations = state.max_iterations - state.iterations
-    # Reserve one evaluation for held-out validation after a training-improved
-    # proposal. With r baseline samples total, the remaining spend is
-    # (r - 1) additional baselines + r candidate samples + 1 validation.
-    if _held_out_validation_enabled():
-        affordable_repetitions = max(1, remaining_iterations // 2)
-    else:
-        affordable_repetitions = max(1, (remaining_iterations + 1) // 2)
-    target_repetitions = min(state.acceptance_max_repetitions, affordable_repetitions)
-    outcomes = [first_outcome]
+    initial, maximum = _acceptance_schedule(state, len(first_outcome.records))
+    validation_reserve = (
+        _validation_schedule(state)[0] if _held_out_validation_enabled() else 0
+    )
+    # The failure-selected outcome is already charged and is never evidence.
+    affordable_repetitions = (remaining_iterations - validation_reserve) // 2
+    if affordable_repetitions < initial:
+        return _with_timestamp(
+            state,
+            status="done",
+            last_comparison=_inconclusive_comparison("baseline_budget_exhausted"),
+        ), []
+    target_repetitions = min(maximum, affordable_repetitions)
+    outcomes: list[EvalOutcome] = []
     first_failures = _outcome_infrastructure_failures(first_outcome)
     if first_failures:
         paused, _ = _pause_after_infrastructure_failure(
             state,
-            outcomes,
+            [first_outcome],
             phase="baseline",
             failures=first_failures,
         )
@@ -905,7 +1075,30 @@ def _capture_reflection_baseline(
             )
             return paused, outcomes
 
-    return _mark_reflection_pause(state, outcomes), outcomes
+    state = _mark_reflection_pause(state, outcomes)
+    # Keep the failure that triggered reflection visible, but never use its
+    # selected score as statistical evidence.
+    selected_report = first_outcome.summary.get("report_path")
+    selected_trace = first_outcome.summary.get("trace_path")
+    if selected_report:
+        state = replace(
+            state,
+            reflection_baseline_report_path=str(selected_report),
+            reflection_baseline_report_paths=(
+                str(selected_report),
+                *state.reflection_baseline_report_paths,
+            ),
+        )
+    if selected_trace:
+        state = replace(
+            state,
+            reflection_baseline_trace_path=str(selected_trace),
+            reflection_baseline_trace_paths=(
+                str(selected_trace),
+                *state.reflection_baseline_trace_paths,
+            ),
+        )
+    return state, outcomes
 
 
 def _advance_to_reflection_or_done(
@@ -915,7 +1108,7 @@ def _advance_to_reflection_or_done(
     state = _with_timestamp(_clear_reflection_baseline(state), status="running")
     state, validation_outcomes = _ensure_validation_seed(state)
     outcomes.extend(validation_outcomes)
-    if state.status == "paused_after_infrastructure_error":
+    if state.status in {"paused_after_infrastructure_error", "done"}:
         return state, outcomes
     while state.iterations < state.max_iterations:
         state, outcome = _fresh_baseline_outcome(state)
@@ -949,11 +1142,8 @@ def _advance_to_reflection_or_done(
             return _mark_done(state), outcomes
 
         if outcome.n_failures > 0:
-            validation_reserve = 1 if _held_out_validation_enabled() else 0
-            if state.max_iterations - state.iterations < 1 + validation_reserve:
-                return _mark_done(state), outcomes
             state, baseline_outcomes = _capture_reflection_baseline(state, outcome)
-            outcomes.extend(baseline_outcomes[1:])
+            outcomes.extend(baseline_outcomes)
             return state, outcomes
 
     return _mark_done(state), outcomes
@@ -975,17 +1165,18 @@ def _evaluate_reflected_candidate(
         typer.echo("Run state is missing reflection baseline samples.", err=True)
         raise typer.Exit(code=1)
 
-    validation_reserve = 1 if _held_out_validation_enabled() else 0
+    validation_reserve = (
+        _validation_schedule(state)[0] if _held_out_validation_enabled() else 0
+    )
+    minibatch = MinibatchStore(state.run_id).load(state.reflection_minibatch_id)
+    initial, maximum = _acceptance_schedule(state, len(minibatch.case_ids))
     max_candidate_samples = min(
         len(state.reflection_baseline_samples),
         state.max_iterations - state.iterations - validation_reserve,
     )
-    if max_candidate_samples < 1:
-        typer.echo(
-            "No evaluation budget remains for the reflected candidate.", err=True
-        )
-        raise typer.Exit(code=70)
-    initial_candidate_samples = min(state.acceptance_repetitions, max_candidate_samples)
+    if max_candidate_samples < initial:
+        return state, [], _inconclusive_comparison("candidate_budget_exhausted")
+    initial_candidate_samples = initial
 
     outcomes: list[EvalOutcome] = []
     candidate_samples: list[float] = []
@@ -1049,6 +1240,11 @@ def _evaluate_reflected_candidate(
             candidate_samples,
             confidence=state.acceptance_confidence,
             min_delta=state.acceptance_min_delta,
+            max_looks=maximum - initial + 1,
+            paired_baseline_scores=_reflection_case_scores(state)
+            if initial == 1
+            else None,
+            paired_candidate_scores=_case_scores(outcomes[0]) if initial == 1 else None,
         )
         if comparison_result.verdict != "inconclusive":
             break
@@ -1112,6 +1308,18 @@ def _evaluate_reflected_candidate(
         )
     state = _with_timestamp(state, last_comparison=comparison)
     return state, outcomes, comparison
+
+
+def _reflection_case_scores(
+    state: RunState, *, root: Path | None = None
+) -> dict[str, float]:
+    for row in ParetoLog(state.run_id, root).iter_rows():
+        if (
+            state.reflection_baseline_eval_ids
+            and row.extra.get("eval_id") == state.reflection_baseline_eval_ids[0]
+        ):
+            return dict(row.per_case_scores)
+    return {}
 
 
 def _gate_baseline_samples(
@@ -1194,7 +1402,9 @@ def _evaluate_gate_cases(
     max_candidate_samples = min(len(baseline_samples), remaining)
     if max_candidate_samples < 1:
         raise typer.BadParameter("No evaluation budget remains for gate comparison.")
-    initial_samples = min(state.acceptance_repetitions, max_candidate_samples)
+    initial_samples, maximum = _acceptance_schedule(state, len(gate_case_ids))
+    if max_candidate_samples < initial_samples:
+        return state, [], _inconclusive_comparison("gate_baseline_evidence_missing")
     outcomes: list[EvalOutcome] = []
     candidate_samples: list[float] = []
     comparison_result: AcceptanceComparison | None = None
@@ -1246,6 +1456,17 @@ def _evaluate_gate_cases(
             candidate_samples,
             confidence=state.acceptance_confidence,
             min_delta=state.acceptance_min_delta,
+            max_looks=maximum - initial_samples + 1,
+            paired_baseline_scores={
+                k: v
+                for k, v in _reflection_case_scores(state, root=workspace_root).items()
+                if k in gate_case_ids
+            }
+            if initial_samples == 1
+            else None,
+            paired_candidate_scores=_case_scores(outcomes[0])
+            if initial_samples == 1
+            else None,
         )
         if comparison_result.verdict != "inconclusive":
             break
@@ -1353,13 +1574,13 @@ def _write_final_report(
                 "",
                 "## Last Candidate Comparison",
                 "",
-                f"- minibatch_id: {comparison['minibatch_id']}",
+                f"- minibatch_id: {comparison.get('minibatch_id')}",
                 f"- outcome: {comparison.get('outcome', 'valid')}",
                 f"- verdict: {comparison.get('verdict', 'unknown')}",
-                f"- recommendation: {comparison['recommendation']}",
+                f"- recommendation: {comparison.get('recommendation', comparison.get('reason_code'))}",
             ]
         )
-        if comparison.get("outcome", "valid") == "valid":
+        if comparison.get("outcome", "valid") == "valid" and "delta" in comparison:
             lines.extend(
                 [
                     f"- baseline_mean_score: {comparison['baseline_mean_score']:.6f}",
@@ -1401,6 +1622,7 @@ def _public_state(
     final_report: Path | None = None,
 ) -> dict[str, Any]:
     payload = state.to_dict()
+    payload.pop("best_validation_per_case_scores", None)
     payload["state_path"] = str(run_state_path(state.run_id))
     payload["final_report_path"] = str(final_report) if final_report else None
     if state.status == "done":
@@ -1465,7 +1687,7 @@ def _emit_status(
                     "discard or revise the edits, then run:"
                 )
         typer.echo(f"  gepa run continue --run-id {state.run_id}")
-        if comparison:
+        if comparison and "delta" in comparison:
             typer.echo(
                 f"Baseline {comparison['baseline_mean_score']:.6f}; "
                 f"candidate {comparison['candidate_mean_score']:.6f}; "
@@ -1629,6 +1851,11 @@ def start(
         "--acceptance-min-delta",
         help="Smallest practical score improvement required for acceptance.",
     ),
+    acceptance_paired_min_cases: int | None = typer.Option(
+        None,
+        "--acceptance-paired-min-cases",
+        help="Use one paired repetition at or above this case count; disabled by default.",
+    ),
     candidate_source: str | None = typer.Option(
         None,
         "--candidate-source",
@@ -1691,6 +1918,10 @@ def start(
         typer.echo("--candidate-source must be 'components' or 'git'.", err=True)
         raise typer.Exit(code=2)
     cfg = GepaConfig.load(config_path())
+    if acceptance_paired_min_cases is None:
+        acceptance_paired_min_cases = cfg.acceptance.paired_min_cases
+    if acceptance_paired_min_cases is not None and acceptance_paired_min_cases < 2:
+        raise typer.BadParameter("--acceptance-paired-min-cases must be >= 2.")
     if cfg.validation_dataset is not None:
         _validation_dataset_identity()
     vector_validation = (
@@ -1791,6 +2022,7 @@ def start(
         acceptance_max_repetitions=resolved_max_repetitions,
         acceptance_confidence=acceptance_confidence,
         acceptance_min_delta=acceptance_min_delta,
+        acceptance_paired_min_cases=acceptance_paired_min_cases,
         candidate_source=active_candidate_source,
         iterations=0,
         created_at=now,
@@ -1945,7 +2177,8 @@ def continue_(
             )
             outcomes.extend(comparison_outcomes)
 
-        validation_outcome: EvalOutcome | None = None
+        state = _with_timestamp(state, last_comparison=comparison)
+        validation_outcomes: list[EvalOutcome] = []
         if (
             _held_out_validation_enabled()
             and comparison.get("outcome") == "valid"
@@ -1953,57 +2186,43 @@ def continue_(
         ):
             training_verdict = str(comparison["verdict"])
             training_mean = float(comparison["candidate_mean_score"])
-            state, validation_outcome = _evaluate_validation_candidate(state)
-            outcomes.append(validation_outcome)
-            failures = _outcome_infrastructure_failures(validation_outcome)
-            if failures:
-                state, validation_failure = _pause_after_infrastructure_failure(
-                    state,
-                    [validation_outcome],
-                    phase="candidate",
-                    failures=failures,
-                )
-                validation_failure.update(
-                    {
-                        "training_verdict": training_verdict,
-                        "training_mean_score": training_mean,
-                        "validation_evaluated": True,
-                        "validation_improved": False,
-                        "rejection_reason": "validation_infrastructure_failure",
-                    }
-                )
-                comparison = validation_failure
-                state = _with_timestamp(state, last_comparison=comparison)
-            else:
-                validation_improved = _validation_improved(state, validation_outcome)
-                comparison.update(
-                    {
-                        "training_verdict": training_verdict,
-                        "training_mean_score": training_mean,
-                        "validation_evaluated": True,
-                        "validation_improved": validation_improved,
-                        "validation_mean_score": float(
-                            validation_outcome.summary["mean_score"]
-                        ),
-                        "prior_best_validation_mean_score": state.best_mean_score,
-                        "improved": validation_improved,
-                        "verdict": "accepted" if validation_improved else "rejected",
-                        "rejection_reason": (
-                            None if validation_improved else "validation"
-                        ),
-                        "recommendation": (
-                            "keep_and_advance"
-                            if validation_improved
-                            else "discard_or_revise"
-                        ),
-                    }
-                )
-                state = _with_timestamp(state, last_comparison=comparison)
+            state, validation_outcomes, validation_comparison = (
+                _confirm_validation_candidate(state)
+            )
+            outcomes.extend(validation_outcomes)
+            comparison.update(
+                {
+                    **validation_comparison,
+                    "training_verdict": training_verdict,
+                    "training_mean_score": training_mean,
+                    "validation_evaluated": bool(validation_outcomes),
+                    "validation_improved": validation_comparison["improved"],
+                    "validation_comparison": validation_comparison,
+                    "validation_mean_score": validation_comparison.get(
+                        "candidate_mean"
+                    ),
+                    "prior_best_validation_mean_score": state.best_mean_score,
+                    "rejection_reason": None
+                    if validation_comparison["improved"]
+                    else "validation",
+                    "recommendation": "keep_and_advance"
+                    if validation_comparison["improved"]
+                    else "discard_or_revise",
+                }
+            )
+            if "baseline_mean" in validation_comparison:
+                comparison["baseline_mean_score"] = validation_comparison[
+                    "baseline_mean"
+                ]
+                comparison["candidate_mean_score"] = validation_comparison[
+                    "candidate_mean"
+                ]
+            state = _with_timestamp(state, last_comparison=comparison)
 
         if comparison["improved"]:
             state = _consume_candidate_verdict(state, accepted=True)
-            if validation_outcome is not None:
-                state = _mark_best_from_validation(state, validation_outcome)
+            if validation_outcomes:
+                state = _mark_best_validation_samples(state, validation_outcomes)
             else:
                 state = _mark_best_candidate(
                     state,
@@ -2031,6 +2250,11 @@ def continue_(
     _emit_status(
         state, outcomes=outcomes, final_report=final_path, final_report_text=final_text
     )
+    if (
+        state.last_comparison is not None
+        and state.last_comparison.get("reason_code") == "candidate_budget_exhausted"
+    ):
+        raise typer.Exit(code=70)
 
 
 @app.command("select")

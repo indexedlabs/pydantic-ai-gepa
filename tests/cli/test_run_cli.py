@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import sys
 import textwrap
@@ -113,12 +114,12 @@ def _fail_rollout_calls(
 
 
 def test_managed_run_pauses_for_reflection_and_writes_trace_paths(repo: Path) -> None:
-    result = _run("run", "start", "--size", "2", "--max-iterations", "3")
+    result = _run("run", "start", "--size", "2", "--max-iterations", "8")
 
     assert result.exit_code == 0, result.output
     payload = _run_payload(result.output)
     assert payload["status"] == "paused_for_reflection"
-    assert payload["iterations"] == 1
+    assert payload["iterations"] == 4
     assert payload["next_command"] == f"gepa run continue --run-id {payload['run_id']}"
     assert Path(str(payload["reflection_baseline_report_path"])).exists()
     assert Path(str(payload["reflection_baseline_trace_path"])).exists()
@@ -158,7 +159,7 @@ def test_continue_rejects_external_validation_tampered_after_start(repo: Path) -
         "--size",
         "2",
         "--max-iterations",
-        "10",
+        "20",
         "--acceptance-repetitions",
         "1",
     )
@@ -201,7 +202,7 @@ def test_held_out_validation_selects_without_exposing_reflection_evidence(
         "--size",
         "2",
         "--max-iterations",
-        "6",
+        "16",
         "--acceptance-repetitions",
         "1",
     )
@@ -209,7 +210,7 @@ def test_held_out_validation_selects_without_exposing_reflection_evidence(
     start_payload = _run_payload(started.output)
     assert start_payload["status"] == "paused_for_reflection"
     assert start_payload["validation_seeded"] is True
-    assert start_payload["validation_evaluations"] == 1
+    assert start_payload["validation_evaluations"] == 3
 
     original = run_module.run_eval_once
     calls: list[dict[str, object]] = []
@@ -234,9 +235,13 @@ def test_held_out_validation_selects_without_exposing_reflection_evidence(
     assert comparison["validation_improved"] is False
     assert comparison["rejection_reason"] == "validation"
     assert payload["status"] == "paused_after_candidate_eval"
-    assert payload["validation_evaluations"] == 2
+    assert payload["validation_evaluations"] == 6
     assert [call.get("dataset_role", "training") for call in calls] == [
         "training",
+        "training",
+        "training",
+        "validation",
+        "validation",
         "validation",
     ]
     assert calls[-1]["capture_traces"] is False
@@ -256,9 +261,9 @@ def test_held_out_validation_selects_without_exposing_reflection_evidence(
     assert "secret-validation-alpha" not in persisted
     assert "secret-validation-beta" not in persisted
     validation_rows = ParetoLog(str(start_payload["run_id"])).validation_rows()
-    assert len(validation_rows) == 2
+    assert len(validation_rows) == 6
     assert all(not row.per_case_scores for row in validation_rows)
-    assert ParetoLog(str(start_payload["run_id"])).count_budget_rows() == 4
+    assert ParetoLog(str(start_payload["run_id"])).count_budget_rows() == 13
 
 
 def test_held_out_final_report_is_aggregate_only(repo: Path) -> None:
@@ -277,7 +282,7 @@ def test_held_out_final_report_is_aggregate_only(repo: Path) -> None:
     config.write_text(
         config.read_text() + f'validation_dataset = "{validation_path}"\n'
     )
-    started = _run("run", "start", "--size", "2", "--max-iterations", "2")
+    started = _run("run", "start", "--size", "2", "--max-iterations", "3")
     assert started.exit_code == 0, started.output
     payload = _run_payload(started.output)
     run_id = str(payload["run_id"])
@@ -287,7 +292,7 @@ def test_held_out_final_report_is_aggregate_only(repo: Path) -> None:
         payload = _run_payload(done.output)
     assert payload["status"] == "done"
     report = Path(str(payload["final_report_path"])).read_text()
-    assert "validation_evaluations: 1" in report
+    assert "validation_evaluations: 3" in report
     assert "WITHHELD" not in report
 
 
@@ -353,7 +358,7 @@ def test_gate_rejection_skips_full_minibatch_and_pareto(
     result = _run("run", "continue", "--run-id", run_id, "--gate-case", "case-paris")
 
     assert result.exit_code == 0, result.output
-    assert len(calls) == 1
+    assert len(calls) == 3
     assert calls[0]["selected_case_ids"] == ("case-paris",)
     payload = _run_payload(result.output)
     comparison = payload["last_comparison"]
@@ -374,7 +379,7 @@ def test_gate_rejection_consumes_managed_run_budget(
         "--size",
         "2",
         "--max-iterations",
-        "2",
+        "7",
         "--acceptance-repetitions",
         "1",
     )
@@ -392,8 +397,8 @@ def test_gate_rejection_consumes_managed_run_budget(
 
     assert result.exit_code == 0, result.output
     payload = _run_payload(result.output)
-    assert payload["status"] == "done"
-    assert payload["iterations"] == 2
+    assert payload["status"] == "paused_after_candidate_eval"
+    assert payload["iterations"] == 5
     assert _load_state(run_id).gate_consumed_iterations == 1
 
 
@@ -429,7 +434,11 @@ def test_gate_passes_then_full_minibatch_verdict_governs(
     assert result.exit_code == 0, result.output
     assert [call.get("selected_case_ids") for call in calls] == [
         ("case-paris",),
+        ("case-paris",),
+        ("case-paris",),
         ["case-berlin"],
+        None,
+        None,
     ]
     comparison = _run_payload(result.output)["last_comparison"]
     assert isinstance(comparison, dict)
@@ -467,7 +476,7 @@ def test_unknown_gate_case_errors_before_evaluation(
     assert "case-berlin" in result.output
 
 
-def test_no_gate_keeps_the_existing_single_full_evaluation(
+def test_no_gate_repeats_the_full_minibatch(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from pydantic_ai_gepa.cli import run as run_module
@@ -495,15 +504,15 @@ def test_no_gate_keeps_the_existing_single_full_evaluation(
     result = _run("run", "continue", "--run-id", run_id)
 
     assert result.exit_code == 0, result.output
-    assert len(calls) == 1
+    assert len(calls) == 3
     assert calls[0].get("selected_case_ids") is None
-    assert ParetoLog(run_id).count_rows() == before + 1
+    assert ParetoLog(run_id).count_rows() == before + 3
 
 
 def test_continue_reports_equivalent_when_candidate_does_not_change(
     repo: Path,
 ) -> None:
-    start = _run("run", "start", "--size", "2", "--max-iterations", "3")
+    start = _run("run", "start", "--size", "2", "--max-iterations", "8")
     run_id = str(_run_payload(start.output)["run_id"])
 
     result = _run("run", "continue", "--run-id", run_id)
@@ -512,7 +521,7 @@ def test_continue_reports_equivalent_when_candidate_does_not_change(
     assert "equivalent" in result.output
     payload = _run_payload(result.output)
     assert payload["status"] == "paused_after_candidate_eval"
-    assert payload["iterations"] == 2
+    assert payload["iterations"] == 7
     comparison = payload["last_comparison"]
     assert isinstance(comparison, dict)
     assert comparison["verdict"] == "equivalent"
@@ -530,7 +539,7 @@ def test_managed_run_repeats_baseline_and_candidate_on_saved_minibatch(
         "--size",
         "2",
         "--max-iterations",
-        "10",
+        "11",
         "--acceptance-repetitions",
         "3",
         "--acceptance-max-repetitions",
@@ -540,13 +549,13 @@ def test_managed_run_repeats_baseline_and_candidate_on_saved_minibatch(
     assert start.exit_code == 0, start.output
     start_payload = _run_payload(start.output)
     assert start_payload["status"] == "paused_for_reflection"
-    assert start_payload["iterations"] == 5
+    assert start_payload["iterations"] == 6
     baseline_samples = start_payload["reflection_baseline_samples"]
     baseline_report_paths = start_payload["reflection_baseline_report_paths"]
     assert isinstance(baseline_samples, list)
     assert isinstance(baseline_report_paths, list)
     assert len(baseline_samples) == 5
-    assert len(set(baseline_report_paths)) == 5
+    assert len(set(baseline_report_paths)) == 6
 
     result = _run("run", "continue", "--run-id", str(start_payload["run_id"]))
 
@@ -560,7 +569,7 @@ def test_managed_run_repeats_baseline_and_candidate_on_saved_minibatch(
     candidate_report_paths = comparison["candidate_report_paths"]
     assert isinstance(candidate_report_paths, list)
     assert len(set(candidate_report_paths)) == 3
-    assert payload["iterations"] == 8
+    assert payload["iterations"] == 9
 
 
 def test_baseline_rollout_failure_pauses_without_installing_baseline(
@@ -568,7 +577,7 @@ def test_baseline_rollout_failure_pauses_without_installing_baseline(
 ) -> None:
     _fail_rollout_calls(monkeypatch, {1})
 
-    result = _run("run", "start", "--size", "2", "--max-iterations", "4")
+    result = _run("run", "start", "--size", "2", "--max-iterations", "8")
 
     assert result.exit_code == 0, result.output
     payload = _run_payload(result.output)
@@ -590,7 +599,7 @@ def test_baseline_rollout_failure_pauses_without_installing_baseline(
     assert retry_payload["best_candidate_id"] is not None
     retry_samples = retry_payload["reflection_baseline_samples"]
     assert isinstance(retry_samples, list)
-    assert len(retry_samples) == 1
+    assert len(retry_samples) == 3
     assert retry_payload["reflection_minibatch_id"] == failed_minibatch_id
     assert retry_payload["last_comparison"] is None
 
@@ -618,8 +627,8 @@ def test_budget_edge_baseline_failure_is_terminal_without_a_quality_best(
 def test_budget_edge_candidate_failure_finishes_without_promoting_candidate(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _fail_rollout_calls(monkeypatch, {2})
-    start = _run("run", "start", "--size", "2", "--max-iterations", "2")
+    _fail_rollout_calls(monkeypatch, {7})
+    start = _run("run", "start", "--size", "2", "--max-iterations", "7")
     start_payload = _run_payload(start.output)
     incumbent = start_payload["best_candidate_id"]
 
@@ -638,7 +647,7 @@ def test_budget_edge_candidate_failure_finishes_without_promoting_candidate(
 def test_mixed_baseline_repetitions_discard_partial_samples(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _fail_rollout_calls(monkeypatch, {2})
+    _fail_rollout_calls(monkeypatch, {3})
 
     result = _run(
         "run",
@@ -656,7 +665,7 @@ def test_mixed_baseline_repetitions_discard_partial_samples(
     assert result.exit_code == 0, result.output
     payload = _run_payload(result.output)
     assert payload["status"] == "paused_after_infrastructure_error"
-    assert payload["iterations"] == 2
+    assert payload["iterations"] == 3
     assert payload["best_candidate_id"] is None
     assert payload["reflection_baseline_samples"] == []
     comparison = payload["last_comparison"]
@@ -708,8 +717,8 @@ def test_healthy_baseline_before_later_failure_remains_the_incumbent(
 def test_candidate_rollout_failure_preserves_incumbent_and_can_retry(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _fail_rollout_calls(monkeypatch, {4})
-    start = _run("run", "start", "--size", "2", "--max-iterations", "7")
+    _fail_rollout_calls(monkeypatch, {5})
+    start = _run("run", "start", "--size", "2", "--max-iterations", "10")
     start_payload = _run_payload(start.output)
     incumbent = start_payload["best_candidate_id"]
 
@@ -736,7 +745,7 @@ def test_candidate_rollout_failure_preserves_incumbent_and_can_retry(
 def test_mixed_candidate_repetitions_never_compare_partial_samples(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _fail_rollout_calls(monkeypatch, {5})
+    _fail_rollout_calls(monkeypatch, {6})
     start = _run(
         "run",
         "start",
@@ -767,7 +776,7 @@ def test_mixed_candidate_repetitions_never_compare_partial_samples(
 
 
 def test_continue_after_revert_discards_candidate_and_advances(repo: Path) -> None:
-    start = _run("run", "start", "--size", "2", "--max-iterations", "3")
+    start = _run("run", "start", "--size", "2", "--max-iterations", "8")
     run_id = str(_run_payload(start.output)["run_id"])
 
     first_continue = _run("run", "continue", "--run-id", run_id)
@@ -782,7 +791,7 @@ def test_continue_after_revert_discards_candidate_and_advances(repo: Path) -> No
     assert "discarding the losing candidate and advancing" in second_continue.output
     payload = _run_payload(second_continue.output)
     assert payload["status"] == "done"
-    assert payload["iterations"] == 3
+    assert payload["iterations"] == 8
 
 
 def test_current_baseline_candidate_id_includes_configured_skills(repo: Path) -> None:
@@ -835,3 +844,102 @@ def test_managed_run_prints_final_report_at_max_iterations(repo: Path) -> None:
     assert payload["final_report_path"] == str(final_report_path(run_id, repo))
     assert Path(str(payload["final_report_path"])).exists()
     assert "GEPA Run Final Report" in done.output
+
+
+def test_paired_config_drives_single_repetition_promotion(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pydantic_ai_gepa.cli import eval as eval_module
+    from pydantic_ai_gepa.cli.store import ComponentStore
+
+    validation = [
+        {"name": "held-out-a", "inputs": "?", "expected_output": "a"},
+        {"name": "held-out-b", "inputs": "?", "expected_output": "b"},
+    ]
+    validation_path = repo.parent / "validation.jsonl"
+    validation_path.write_text("\n".join(json.dumps(row) for row in validation) + "\n")
+    config = repo / ".gepa" / "gepa.toml"
+    config.write_text(
+        config.read_text()
+        + f'validation_dataset = "{validation_path}"\n'
+        + "[acceptance]\npaired_min_cases = 2\n"
+    )
+
+    async def evaluate(**kwargs):
+        improved = kwargs["candidate"]["instructions"].text == "Improved prompt"
+        return [
+            EvaluationRecord(
+                case_id=case.name,
+                score=0.6 if improved else 0.4,
+                feedback="Synthetic feedback",
+                payload={},
+            )
+            for case in kwargs["dataset"]
+        ]
+
+    def assert_validation_ids_withheld() -> None:
+        for artifact in (repo / ".gepa").rglob("*"):
+            if artifact.is_file():
+                contents = artifact.read_bytes()
+                for case in validation:
+                    assert case["name"].encode() not in contents, artifact
+
+    monkeypatch.setattr(eval_module, "evaluate_candidate_dataset", evaluate)
+    started = _run("run", "start", "--size", "2", "--max-iterations", "6")
+    assert started.exit_code == 0, (started.output, started.exception)
+    start_payload = _run_payload(started.output)
+    assert start_payload["acceptance_paired_min_cases"] == 2
+    assert start_payload["reflection_baseline_samples"] == [0.4]
+    assert start_payload["best_validation_samples"] == [0.4]
+    assert "best_validation_per_case_scores" not in start_payload
+    for case in validation:
+        assert case["name"] not in started.output
+    run_id = str(start_payload["run_id"])
+    seed_state = _load_state(run_id)
+    assert seed_state.best_validation_per_case_scores == {
+        "held-out-a": 0.4,
+        "held-out-b": 0.4,
+    }
+    assert_validation_ids_withheld()
+    ComponentStore().write("instructions", "Improved prompt")
+    result = _run("run", "continue", "--run-id", str(start_payload["run_id"]))
+    assert result.exit_code == 0, (result.output, result.exception)
+    state = _load_state(str(start_payload["run_id"]))
+    assert state.best_validation_samples == (0.6,)
+    assert state.best_validation_per_case_scores == {
+        "held-out-a": 0.6,
+        "held-out-b": 0.6,
+    }
+    assert state.validation_evaluations == 2
+    for case in validation:
+        assert case["name"] not in result.output
+    assert_validation_ids_withheld()
+
+
+@pytest.mark.parametrize("remaining", [0, 2])
+def test_reflected_candidate_budget_refusal_records_comparison_and_exits_70(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, remaining: int
+) -> None:
+    from pydantic_ai_gepa.cli import run as run_module
+
+    started = _run("run", "start", "--size", "2", "--max-iterations", "7")
+    assert started.exit_code == 0, (started.output, started.exception)
+    run_id = str(_run_payload(started.output)["run_id"])
+    before = _load_state(run_id)
+    replace(before, max_iterations=before.iterations + remaining).save()
+    rows_before = ParetoLog(run_id).count_rows()
+
+    def no_evaluation(**kwargs):
+        pytest.fail("Insufficient candidate budget must not start an evaluation")
+
+    monkeypatch.setattr(run_module, "run_eval_once", no_evaluation)
+    result = _run("run", "continue", "--run-id", run_id)
+    assert result.exit_code == 70, (result.output, result.exception)
+    after = _load_state(run_id)
+    assert after.last_comparison["verdict"] == "inconclusive"
+    assert after.last_comparison["reason_code"] == "candidate_budget_exhausted"
+    assert after.last_comparison["improved"] is False
+    assert after.best_candidate_id == before.best_candidate_id
+    assert after.iterations == before.iterations
+    assert ParetoLog(run_id).count_rows() == rows_before
+    assert _run_payload(result.output)["last_comparison"] == after.last_comparison

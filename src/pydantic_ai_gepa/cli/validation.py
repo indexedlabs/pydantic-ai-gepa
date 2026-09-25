@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 from pathlib import Path
 import subprocess
+import tempfile
 from typing import Any
 
 import typer
@@ -97,3 +100,56 @@ def validation_dataset_path(
                 "Held-out validation is recoverable from Git objects. " + fix
             )
     return path
+
+
+def validation_evidence_path(dataset: str, *, project_root: Path, run_id: str) -> Path:
+    """Keep paired evidence beside the harness-owned dataset, outside checkouts."""
+    dataset_path = validation_dataset_path(dataset, project_root=project_root)
+    key = hashlib.sha256(
+        f"{project_root.resolve()}\0{run_id}\0{dataset_path}".encode()
+    ).hexdigest()
+    return validation_dataset_path(
+        str(dataset_path.parent / ".gepa-validation-evidence" / f"{key}.json"),
+        project_root=project_root,
+        allow_missing=True,
+    )
+
+
+def write_validation_evidence(
+    dataset: str,
+    *,
+    project_root: Path,
+    run_id: str,
+    identity: dict[str, Any],
+    scores: dict[str, float],
+) -> None:
+    path = validation_evidence_path(dataset, project_root=project_root, run_id=run_id)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"identity": identity, "scores": scores}, handle)
+        os.replace(temporary, path)
+    except BaseException:
+        os.unlink(temporary)
+        raise
+
+
+def read_validation_evidence(
+    dataset: str | None,
+    *,
+    project_root: Path,
+    run_id: str,
+    identity: dict[str, Any],
+) -> dict[str, float]:
+    if dataset is None:
+        return {}
+    path = validation_evidence_path(dataset, project_root=project_root, run_id=run_id)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or raw.get("identity") != identity:
+            return {}
+        return {str(key): float(value) for key, value in raw["scores"].items()}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        # A missing or interrupted private write can never authorize promotion.
+        return {}

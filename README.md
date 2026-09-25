@@ -343,6 +343,35 @@ tests/                # Test suite
 
 In addition to the Python `optimize_agent()` entry point, `pydantic-ai-gepa` ships a `gepa` CLI that lets coding agents (Claude Code, Codex, etc.) drive the optimization loop directly. The CLI exposes `init`, `run`, `eval`, `apply`, `components`, `pareto`, `journal`, `next`, `ack`, and `lane`. For agent-driven optimization, prefer `gepa init --validation-dataset PATH` followed by `gepa run start --max-iterations N`: it evaluates training minibatches until reflection is useful, writes report and trace paths, pauses for the coding agent to edit components or source, then `gepa run continue` requires a training-minibatch improvement before scoring the proposal on held-out validation. Validation decides promotion, while its cases, reports, traces, and per-case scores remain outside reflection artifacts. Each validation row evaluates the complete validation dataset, so the row budget is a lifecycle bound rather than a direct model-call or cost bound. Stochastic pipelines can use `--acceptance-repetitions`, `--acceptance-max-repetitions`, `--acceptance-confidence`, and `--acceptance-min-delta` so training-gate decisions carry repeated samples, variance, confidence bounds, and an accepted/rejected/equivalent/inconclusive verdict instead of comparing two single rollout means. In git candidate mode, `gepa run start --lanes N` additionally fans the run out into N worktree-backed reflection lanes evaluated in the background and coordinated by an event stream (`gepa next` / `gepa ack` / `gepa run select`), so a coding agent can orchestrate several isolated reflector subagents in parallel — see the "Parallel reflection lanes" section of the bundled skill at [`src/pydantic_ai_gepa/skills/gepa_optimize/SKILL.md`](src/pydantic_ai_gepa/skills/gepa_optimize/SKILL.md) for the orchestrator loop, the subagent dispatch contract, and the content-file convention.
 
+Scalar acceptance uses Welch's Student-t confidence interval with a Bonferroni
+alpha split across the configured maximum number of looks. Use
+`--acceptance-repetitions 3 --acceptance-max-repetitions 5` for three repetitions,
+up to five while inconclusive, at the default confidence 0.9. When omitted, the
+maximum equals the configured initial repetitions. Small sets
+require at least three repetitions per side. The failure-selected training
+sample is excluded from the baseline; fresh samples supply the comparison.
+Validation compares fresh candidate samples against repeated incumbent evidence,
+and lane finalists receive a fresh confirmation before promotion. Each additional
+evaluation consumes one budget row; insufficient budget cannot promote a candidate.
+
+For larger sets, `gepa run start --acceptance-paired-min-cases 100` switches to one
+repetition per side when there are at least 100 cases, using a paired Student-t
+interval over matching per-case score differences. The threshold is configurable
+(integer ≥2), and paired mode is disabled by default. It can also be set in
+`.gepa/gepa.toml`; an explicit CLI value takes precedence:
+
+```toml
+[acceptance]
+paired_min_cases = 100
+```
+
+Omit `paired_min_cases` to retain repeated evaluation for every dataset size.
+The incumbent's aggregate validation samples are retained in `state.json` and
+replaced only after an accepted promotion. Paired per-case evidence stays in the
+harness-owned `.gepa-validation-evidence` directory beside the external dataset,
+never in public run artifacts. Missing incumbent evidence prevents promotion until
+it can be collected from the incumbent tree.
+
 Keep the validation dataset outside the repository and all candidate worktrees,
 in both git and component modes. For example:
 

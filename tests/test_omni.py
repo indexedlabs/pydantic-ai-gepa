@@ -199,8 +199,8 @@ async def test_omni_keeps_seed_when_phase_two_regresses_and_reports_held_out_tes
         ),
         phase_one_metric_calls=1,
         phase_two_metric_calls=1,
-        fair_vote_repetitions=1,
-        fair_vote_max_repetitions=1,
+        fair_vote_repetitions=3,
+        fair_vote_max_repetitions=3,
     )
     result = await optimize_omni(_task(test_set=True), plan)
     assert result.best.best_candidate["instructions"].text == "good"
@@ -275,8 +275,8 @@ async def test_omni_phase_two_obeys_objective_frontier_not_scalar_only(
         ),
         phase_one_metric_calls=1,
         phase_two_metric_calls=1,
-        fair_vote_repetitions=1,
-        fair_vote_max_repetitions=1,
+        fair_vote_repetitions=3,
+        fair_vote_max_repetitions=3,
         selection_mode="objective",
     )
     result = await optimize_omni(_objective_task(), plan)

@@ -94,7 +94,7 @@ class CodingAgentEngine:
         concurrency = self._positive_int_option("concurrency", 5)
         max_proposals = self._positive_int_option("max_proposals_per_run", 10)
         failure_threshold = float(self._option("failure_threshold", 0.999))
-        acceptance_repetitions = self._positive_int_option("acceptance_repetitions", 1)
+        acceptance_repetitions = self._positive_int_option("acceptance_repetitions", 3)
         acceptance_max_repetitions = self._positive_int_option(
             "acceptance_max_repetitions", acceptance_repetitions
         )
@@ -211,6 +211,23 @@ class CodingAgentEngine:
                 shared_remaining=budget.remaining,
                 engine_remaining=engine_budget.remaining,
             )
+            if effective_max_repetitions < 2:
+                history.append(
+                    EngineEvent(
+                        kind="budget_exhausted",
+                        message="At least two matched repetitions are required for acceptance.",
+                        data={
+                            "stage": "baseline_minibatch",
+                            "reason_code": "insufficient_acceptance_repetitions",
+                            "minimum_repetitions": 2,
+                            "affordable_repetitions": effective_max_repetitions,
+                            "budget_remaining": budget.remaining,
+                            "engine_budget_remaining": engine_budget.remaining,
+                        },
+                    )
+                )
+                stop_reason = "budget_exhausted"
+                break
             baseline_batches: list[list[EvaluationRecord]] = []
             baseline_budget_exhausted = False
             for _ in range(effective_max_repetitions):
@@ -320,6 +337,7 @@ class CodingAgentEngine:
                     proposal_samples,
                     confidence=acceptance_confidence,
                     min_delta=acceptance_min_delta,
+                    max_looks=acceptance_max_repetitions - acceptance_repetitions + 1,
                 )
                 if comparison_result.verdict != "inconclusive":
                     break
@@ -566,7 +584,7 @@ def _affordable_repetitions(
         return 1
     available = min(shared_remaining, engine_remaining)
     paired_repetitions = available // (2 * case_count)
-    return min(requested, max(1, paired_repetitions))
+    return min(requested, max(0, paired_repetitions))
 
 
 def _mean_score(records: Sequence[EvaluationRecord]) -> float:

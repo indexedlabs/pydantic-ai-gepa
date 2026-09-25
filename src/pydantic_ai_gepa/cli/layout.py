@@ -49,14 +49,15 @@ CandidateSource = Literal["components", "git"]
 
 @dataclass(frozen=True)
 class AcceptanceConfig:
-    """Optional generic assertion-vector acceptance configuration.
+    """Scalar sampling and optional assertion-vector acceptance configuration.
 
-    ``mode = "scalar"`` preserves the historical acceptance loop. Vector
+    ``mode = "scalar"`` selects scalar score comparisons. Vector
     mode is deliberately explicit because old scalar traces are not a safe
     baseline for a keyed-vector comparator.
     """
 
     mode: Literal["scalar", "vector"] = "scalar"
+    paired_min_cases: int | None = None
     comparator: str | None = None
     vector_schema_version: str = "1"
     telemetry_schema_version: str = "1"
@@ -80,6 +81,15 @@ class AcceptanceConfig:
         mode = data.get("mode", "scalar")
         if mode not in {"scalar", "vector"}:
             raise GepaConfigError("acceptance.mode must be 'scalar' or 'vector'.")
+        paired_min_cases = data.get("paired_min_cases")
+        if paired_min_cases is not None and (
+            isinstance(paired_min_cases, bool)
+            or not isinstance(paired_min_cases, int)
+            or paired_min_cases < 2
+        ):
+            raise GepaConfigError(
+                "acceptance.paired_min_cases must be an integer >= 2 or omitted."
+            )
         comparator = data.get("comparator")
         if mode == "vector" and (
             not isinstance(comparator, str) or ":" not in comparator
@@ -164,6 +174,7 @@ class AcceptanceConfig:
             raise GepaConfigError("acceptance.review_context must be a TOML table.")
         return AcceptanceConfig(
             mode=mode,
+            paired_min_cases=paired_min_cases,
             comparator=comparator,
             vector_schema_version=str(data.get("vector_schema_version", "1")),
             telemetry_schema_version=str(data.get("telemetry_schema_version", "1")),
@@ -274,7 +285,7 @@ class GepaConfig:
     """Optional path (relative to repo root) to an Agent Skills directory."""
 
     acceptance: AcceptanceConfig = field(default_factory=AcceptanceConfig)
-    """Opt-in generic vector acceptance and scorer-integrity settings."""
+    """Scalar sampling, opt-in vector acceptance, and scorer-integrity settings."""
 
     stall_threshold: int = 5
     """Candidate verdicts without an acceptance before a run is reported stalled."""
