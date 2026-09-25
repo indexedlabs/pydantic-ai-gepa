@@ -12,8 +12,10 @@ from pydantic_ai.models.test import TestModel
 from pydantic_evals import Case
 
 from pydantic_ai_gepa.compose import (
+    OmniPlan,
     optimize_adaptive_sequential,
     optimize_best_of,
+    optimize_omni,
     optimize_parallel,
     optimize_sequential,
     optimize_vote,
@@ -23,11 +25,12 @@ from pydantic_ai_gepa.engines import (
     EngineConfig,
     EngineResult,
     OptimizationTask,
+    ReflectionContext,
     register_engine,
     unregister_engine,
 )
 from pydantic_ai_gepa.gepa_graph.models import CandidateMap, ComponentValue
-from pydantic_ai_gepa.types import MetricResult, RolloutOutput
+from pydantic_ai_gepa.types import MetricResult, ReflectionConfig, RolloutOutput
 
 _ENGINE_NAME = "compose_test_engine"
 
@@ -294,3 +297,86 @@ async def test_optimize_vote_selects_the_highest_valset_score() -> None:
     assert result.best_index == 1
     assert result.best.best_candidate["instructions"].text == "correct"
     assert result.fair_scores == [0.0, 1.0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "helper", ["best_of", "sequential", "adaptive_sequential", "omni"]
+)
+async def test_composition_with_real_gepa_and_coding_agent_engines(
+    helper: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("pydantic_ai.models.ALLOW_MODEL_REQUESTS", False)
+    task = _task()
+
+    def metric(case: Case[str, str, Any], output: RolloutOutput[Any]) -> MetricResult:
+        override = task.agent._override_instructions.get()
+        active = override.value if override is not None else task.agent._instructions
+        return MetricResult(score=1.0 if "correct" in str(active) else 0.5)
+
+    task.metric = metric
+    task.valset = [
+        Case(name="validation", inputs="held out", expected_output="response")
+    ]
+    contexts: list[ReflectionContext] = []
+
+    async def propose(context: ReflectionContext) -> CandidateMap:
+        contexts.append(context)
+        return _candidate("correct")
+
+    configs = [
+        EngineConfig(
+            engine="gepa",
+            max_metric_calls=4,
+            max_iterations=1,
+            stop_at_score=0.5,
+            engine_config={
+                "reflection_minibatch_size": 1,
+                "reflection_config": ReflectionConfig(model=TestModel()),
+            },
+        ),
+        EngineConfig(
+            engine="coding_agent",
+            max_metric_calls=4,
+            max_iterations=1,
+            engine_config={"propose": propose, "minibatch_size": 1},
+        ),
+    ]
+    if helper == "omni":
+        result = await optimize_omni(
+            task,
+            OmniPlan(
+                phase_one=configs,
+                phase_two=configs[1],
+                phase_one_metric_calls=8,
+                phase_two_metric_calls=4,
+                fair_vote_repetitions=1,
+                fair_vote_max_repetitions=1,
+            ),
+        )
+        assert [item.engine for item in result.results] == [
+            "seed",
+            "gepa",
+            "coding_agent",
+            "coding_agent",
+        ]
+    else:
+        optimize = {
+            "best_of": optimize_best_of,
+            "sequential": optimize_sequential,
+            "adaptive_sequential": optimize_adaptive_sequential,
+        }[helper]
+        result = await optimize(task, configs, max_metric_calls=8)
+        assert [item.engine for item in result.results] == ["gepa", "coding_agent"]
+
+    assert len(contexts) == 1
+    assert [record.case_id for record in contexts[0].minibatch_records] == ["case"]
+    assert result.best.best_candidate == _candidate("correct")
+    assert result.best.best_score == 1.0
+    assert all(
+        item.num_metric_calls > 0 for item in result.results if item.engine != "seed"
+    )
+    assert result.total_metric_calls == sum(
+        item.num_metric_calls for item in result.results
+    )
+    assert result.total_metric_calls <= (12 if helper == "omni" else 8)

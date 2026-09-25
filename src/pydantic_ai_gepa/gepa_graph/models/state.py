@@ -88,6 +88,11 @@ class GepaConfig(BaseModel):
         description="Optional cap on graph iterations; None disables the iteration limit.",
     )
 
+    stop_at_score: float | None = Field(
+        default=None,
+        description="Stop once the best full validation score reaches this target.",
+    )
+
     # Reflection
     minibatch_size: int = Field(
         default=3,

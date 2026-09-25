@@ -45,6 +45,14 @@ def _should_stop(state: GepaState) -> bool:
     if state.stopped:
         return True
 
+    if (
+        state.config.stop_at_score is not None
+        and state.best_score is not None
+        and state.best_score >= state.config.stop_at_score
+    ):
+        state.stop_reason = "Target score reached"
+        return True
+
     if state.total_evaluations >= state.config.max_evaluations:
         state.stop_reason = "Max evaluations reached"
         return True

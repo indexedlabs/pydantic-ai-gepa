@@ -23,7 +23,12 @@ from pydantic_ai_gepa.gepa_graph.models import (
     GepaConfig,
     GepaState,
 )
-from pydantic_ai_gepa.gepa_graph.steps import merge_step
+from pydantic_ai_gepa.gepa_graph.steps import (
+    StopSignal,
+    continue_step,
+    evaluate_step,
+    merge_step,
+)
 from pydantic_ai_gepa.gepa_graph.proposal import (
     InstructionProposalGenerator,
     MergeProposalBuilder,
@@ -262,6 +267,57 @@ def _evaluation_results(
         outputs=[RolloutOutput.from_success("merged")] * len(subsample),
         trajectories=None,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remaining", [2, 4])
+async def test_merge_budget_stop_preserves_fully_validated_best(remaining: int) -> None:
+    state = _make_state()
+    state.config = state.config.model_copy(update={"max_evaluations": 10 + remaining})
+    state.total_evaluations = 10
+    ancestor_idx, parent1_idx, parent2_idx = _build_lineage(state)
+    state.recompute_best_candidate()
+    best_idx = state.best_candidate_idx
+    best_score = state.best_score
+    validation_items = await _validation_instances(state)
+    subsample = validation_items[:3]
+    merged_candidate = CandidateProgram(
+        idx=len(state.candidates),
+        components={
+            "instructions": ComponentValue(
+                name="instructions", text="Parent1 instructions"
+            ),
+            "tools": ComponentValue(name="tools", text="Parent2 tools"),
+        },
+        creation_type="merge",
+        parent_indices=[parent1_idx, parent2_idx],
+        discovered_at_iteration=3,
+        discovered_at_evaluation=10,
+    )
+    evaluator = _StubEvaluator(_evaluation_results(subsample, [1.0] * 3))
+    builder = _StubMergeBuilder(
+        pair=(parent1_idx, parent2_idx),
+        ancestor_idx=ancestor_idx,
+        merged_candidate=merged_candidate,
+        subsample=subsample,
+    )
+    ctx = _ctx(state, _make_deps(merge_builder=builder, evaluator=evaluator))
+
+    action = await merge_step(ctx)
+    if remaining == 4:
+        assert action == "evaluate"
+        await evaluate_step(ctx)
+        assert merged_candidate.avg_validation_score > best_score
+    else:
+        assert action == "continue"
+    stop = await continue_step(ctx)
+
+    assert isinstance(stop, StopSignal)
+    assert stop.result.stop_reason.startswith("Max evaluations reached")
+    assert stop.result.best_candidate_idx == best_idx
+    assert stop.result.best_score == best_score
+    assert evaluator.calls == (1 if remaining == 4 else 0)
+    assert state.total_evaluations == 10 + evaluator.calls * 3
 
 
 @pytest.mark.asyncio

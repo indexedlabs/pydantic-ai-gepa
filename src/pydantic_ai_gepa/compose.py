@@ -143,6 +143,9 @@ class _EngineTaskView:
     async def val_loader(self) -> Any:
         return await self.__task.val_loader()
 
+    async def validation_case_count(self) -> int:
+        return await self.__task.validation_case_count()
+
     @property
     def agent(self) -> Any:
         return self.__task.agent

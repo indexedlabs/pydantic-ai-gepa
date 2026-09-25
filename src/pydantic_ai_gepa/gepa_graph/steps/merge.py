@@ -12,6 +12,7 @@ from ..._validation import validation_evaluation
 from ..deps import GepaDeps
 from ..models import CandidateProgram, GepaState
 from .continue_step import IterationAction
+from .budget import can_evaluate
 
 
 async def merge_step(ctx: StepContext[GepaState, GepaDeps, None]) -> IterationAction:
@@ -64,6 +65,9 @@ async def merge_step(ctx: StepContext[GepaState, GepaDeps, None]) -> IterationAc
     if not subsample:
         return reject()
     subsample_batch = [instance for _, instance in subsample]
+
+    if not can_evaluate(state, len(subsample_batch)):
+        return "continue"
 
     state.record_merge_attempt()
 

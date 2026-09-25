@@ -12,6 +12,7 @@ from ..._validation import validation_evaluation
 from ..deps import GepaDeps
 from ..evaluation import EvaluationResults
 from ..models import CandidateProgram, GepaState
+from .budget import can_evaluate
 
 
 async def evaluate_step(ctx: StepContext[GepaState, GepaDeps, None]) -> None:
@@ -22,6 +23,15 @@ async def evaluate_step(ctx: StepContext[GepaState, GepaDeps, None]) -> None:
     previous_best_score = state.best_score
     candidate = _current_candidate(state)
     validation_batch = await _get_validation_batch(state)
+    if not can_evaluate(
+        state,
+        len(validation_batch),
+        reason="Max evaluations reached: budget cannot cover the validation set",
+    ):
+        if state.best_candidate_idx is None and candidate.creation_type == "seed":
+            # Return the unscored seed without inventing a partial validation score.
+            state.best_candidate_idx = candidate.idx
+        return None
 
     with (
         validation_evaluation(ctx.deps.memory_exporter),

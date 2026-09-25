@@ -32,9 +32,10 @@ class GepaEngine:
     constructed Python objects; registry-based configuration is therefore
     limited to the scalar knobs.
 
-    When ``EngineConfig.stop_at_score`` is set, it overrides ``perfect_score``
-    and enables ``skip_perfect_score``.  This maps the engine-level threshold
-    to the graph's existing early-stop behavior.
+    When ``EngineConfig.stop_at_score`` is set, the run ends once the best
+    validation score reaches the target. It also overrides ``perfect_score``
+    and enables ``skip_perfect_score`` to preserve minibatch skipping behavior.
+    Budget stops return the best candidate so far and refund unused capacity.
     """
 
     name = "gepa"
@@ -119,6 +120,8 @@ class GepaEngine:
         num_metric_calls = state.total_evaluations
         history: list[EngineEvent] = []
         if num_metric_calls > reserved:
+            # Unreachable while every graph evaluation checks batch affordability;
+            # keep this invariant visible rather than hiding an accounting bug.
             raise RuntimeError(
                 f"GEPA exceeded its pre-reserved slice ({num_metric_calls}>{reserved})."
             )
@@ -166,6 +169,7 @@ class GepaEngine:
         return GepaConfig(
             max_evaluations=max_evaluations,
             max_iterations=config.max_iterations,
+            stop_at_score=config.stop_at_score,
             minibatch_size=self._option("reflection_minibatch_size", 3),
             perfect_score=float(perfect_score),
             skip_perfect_score=skip_perfect_score,
