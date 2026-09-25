@@ -275,6 +275,7 @@ class OptimizationTask:
             {
                 "identity": self.evaluation_cache_identity,
                 "dataset": dataset,
+                "withheld": validation_active(),
                 "cases": [
                     {
                         "id": case.name,
@@ -360,6 +361,10 @@ def _objective_scores(
                 or not isinstance(raw, (int, float))
                 or not math.isfinite(float(raw))
             ):
+                if validation_active():
+                    raise ValueError(
+                        "Validation objective scores must be finite numeric."
+                    )
                 raise ValueError(
                     f"Objective score {name!r} for case {record.case_id!r} must be finite numeric."
                 )

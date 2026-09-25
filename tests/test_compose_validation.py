@@ -1,9 +1,12 @@
 """Composition gives arbitrary engines aggregate validation capabilities only."""
 
 from dataclasses import asdict
+from contextvars import ContextVar
 
 import pytest
 from pydantic_ai import Agent
+from pydantic_ai.messages import ModelResponse, TextPart
+from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_evals import Case
 
@@ -28,7 +31,7 @@ from pydantic_ai_gepa.engines import (
 )
 from pydantic_ai_gepa.engines.registry import _ENGINES
 from pydantic_ai_gepa.gepa_graph.models import ComponentValue
-from pydantic_ai_gepa.types import MetricResult, ReflectionConfig, RolloutOutput
+from pydantic_ai_gepa.types import MetricResult, ReflectionConfig
 
 HELPERS = [
     "parallel",
@@ -157,12 +160,6 @@ async def test_engine_public_surface_withholds_validation(
             "validation_case_count",
             "score_validation",
             "evaluate",
-            "agent",
-            "metric",
-            "input_type",
-            "skills_fs",
-            "skills_capabilities",
-            "case_factory",
             "concurrency",
             "test_set",
         }
@@ -180,11 +177,6 @@ async def test_engine_public_surface_withholds_validation(
                 loader = await value()
                 ids = await loader.all_ids()
                 value = [ids, await loader.fetch(ids)]
-            elif name == "metric":
-                value = value(
-                    Case(name="training", inputs="training"),
-                    RolloutOutput.from_success("answer"),
-                )
             assert "WITHHELD" not in repr(value), name
             assert "REPORTING" not in repr(value), name
         with pytest.raises(PermissionError):
@@ -434,9 +426,189 @@ async def test_aggregate_preserves_async_objectives_and_nonselectability(cache):
         "objective_scores": {"quality": 0.75},
     }
     assert "WITHHELD" not in repr(value)
-    assert budget.spent == (0 if cache else 1)
-    assert observed == [not cache]
+    assert budget.spent == 1
+    assert observed == ([False, True] if cache else [True])
     assert metric_result.feedback == "WITHHELD feedback"
     value.objective_scores["quality"] = 99
     if cache:
         assert raw.objective_scores == {"quality": 0.75}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("helper", HELPERS)
+@pytest.mark.parametrize("accessor", ["score_validation", "evaluate"])
+async def test_engine_overrides_do_not_reach_validation(helper, accessor, monkeypatch):
+    evaluation_task = task()
+    leaked = []
+    observed = []
+    marker = ContextVar("validation-test-marker", default="outside")
+
+    def spy(messages, info):
+        leaked.extend(messages)
+        return ModelResponse(parts=[TextPart("engine-controlled")])
+
+    def metric(case, output):
+        observed.append((output.result, marker.get(), validation_active()))
+        return MetricResult(score=float(output.result == "harness-answer"))
+
+    evaluation_task.metric = metric
+
+    class Engine:
+        name = "override_probe"
+
+        def __init__(self, config):
+            pass
+
+        async def run(self, view, config, budget):
+            seed = await view.seed_candidate()
+            before = len(observed)
+            token = marker.set("engine")
+            try:
+                # Even an engine with a caller-held agent cannot inject its
+                # context override into the harness's validation evaluation.
+                with evaluation_task.agent.override(model=FunctionModel(spy)):
+                    value = await getattr(view, accessor)(seed, budget=budget)
+                    assert value.score == 1.0
+                    assert observed[before:] == [("harness-answer", "harness", True)]
+                    assert leaked == []
+                    assert marker.get() == "engine"
+                    assert not validation_active()
+                    # Prove the attack override is active for the engine itself.
+                    await evaluation_task.agent.run("TRAINING_INPUT")
+                    assert "TRAINING_INPUT" in repr(leaked)
+                    assert "WITHHELD" not in repr(leaked)
+                    leaked.clear()
+            finally:
+                marker.reset(token)
+            return EngineResult(
+                engine=self.name,
+                best_candidate=seed,
+                best_score=value.score,
+                num_metric_calls=1,
+            )
+
+    monkeypatch.setitem(_ENGINES, Engine.name, Engine)
+    token = marker.set("harness")
+    try:
+        # Existing caller configuration must survive snapshotting too.
+        with evaluation_task.agent.override(
+            model=TestModel(custom_output_text="harness-answer")
+        ):
+            await compose(
+                helper,
+                evaluation_task,
+                [EngineConfig(engine=Engine.name, max_metric_calls=2)],
+            )
+    finally:
+        marker.reset(token)
+    assert leaked == []
+    assert marker.get() == "outside"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("helper", HELPERS)
+@pytest.mark.parametrize("registration", ["system_prompt", "tool_plain"])
+async def test_engine_cannot_register_validation_hooks(
+    helper, registration, monkeypatch
+):
+    leaked = []
+
+    class Engine:
+        name = "registration_probe"
+
+        def __init__(self, config):
+            pass
+
+        async def run(self, view, config, budget):
+            def spy(ctx):
+                leaked.append(ctx.prompt)
+                return ""
+
+            with pytest.raises(AttributeError):
+                getattr(view.agent, registration)(spy)
+            # None of these live rollout dependencies may escape either.
+            for name in (
+                "agent",
+                "metric",
+                "input_type",
+                "skills_fs",
+                "skills_capabilities",
+                "case_factory",
+            ):
+                assert not hasattr(view, name)
+            seed = await view.seed_candidate()
+            value = await view.score_validation(seed, budget=budget)
+            assert_aggregate(value)
+            assert leaked == []
+            return EngineResult(
+                engine=self.name,
+                best_candidate=seed,
+                best_score=value.score,
+                num_metric_calls=1,
+            )
+
+    monkeypatch.setitem(_ENGINES, Engine.name, Engine)
+    await compose(
+        helper, task(), [EngineConfig(engine=Engine.name, max_metric_calls=2)]
+    )
+    # Includes any fair comparisons and reporting performed after engine.run.
+    assert leaked == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid", [True, "WITHHELD_VALUE", float("nan"), float("inf")]
+)
+async def test_withheld_objective_errors_do_not_name_cases(invalid):
+    from pydantic_ai_gepa.compose import _EngineTaskView
+
+    evaluation_task = task()
+    evaluation_task.metric = lambda case, output: MetricResult(
+        score=0.5, side_info={"scores": {"WITHHELD_OBJECTIVE": invalid}}
+    )
+    view = _EngineTaskView(evaluation_task)
+    seed = await view.seed_candidate()
+    with pytest.raises(ValueError) as caught:
+        await view.score_validation(seed)
+    assert str(caught.value) == "Validation objective scores must be finite numeric."
+    assert "WITHHELD" not in repr(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert not validation_active()
+    with pytest.raises(ValueError, match="WITHHELD_CASE"):
+        await evaluation_task.evaluate(seed)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("withheld_first", [True, False])
+async def test_withheld_cache_is_separate_from_full_evaluations(withheld_first):
+    from pydantic_ai_gepa.compose import _EngineTaskView
+
+    evaluation_task = task()
+    evaluation_task.evaluation_cache_identity = "withheld-cache-v1"
+    observed = []
+    original = evaluation_task.metric
+
+    def metric(case, output):
+        observed.append(validation_active())
+        return original(case, output)
+
+    evaluation_task.metric = metric
+    view = _EngineTaskView(evaluation_task)
+    seed = await view.seed_candidate()
+    budget = BudgetTracker(2)
+    scorers = [view.score_validation, evaluation_task.evaluate]
+    if not withheld_first:
+        scorers.reverse()
+    for score in scorers:
+        await score(seed, cache=True, budget=budget)
+    assert observed == [withheld_first, not withheld_first]
+    assert budget.spent == 2
+    # Repeated calls hit their own caches even with an exhausted budget.
+    withheld = await view.score_validation(seed, cache=True, budget=budget)
+    ordinary = await evaluation_task.evaluate(seed, cache=True, budget=budget)
+    assert_aggregate(withheld)
+    assert ordinary.records[0].feedback == "WITHHELD_CASE feedback"
+    assert ordinary.records[0].payload["metric_side_info"]["detail"] == "WITHHELD_INPUT"
+    assert ordinary.side_info["feedback"] == ["WITHHELD_CASE feedback"]
+    assert len(observed) == 2

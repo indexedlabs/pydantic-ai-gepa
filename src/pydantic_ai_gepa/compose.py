@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 from collections.abc import Callable, Sequence
+from contextvars import copy_context
 from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -137,6 +138,7 @@ class _EngineTaskView:
 
     def __init__(self, task: OptimizationTask) -> None:
         self.__task = task
+        self.__validation_context = copy_context()
 
     async def seed_candidate(self) -> CandidateMap:
         return await self.__task.seed_candidate()
@@ -146,6 +148,57 @@ class _EngineTaskView:
 
     async def validation_case_count(self) -> int:
         return await self.__task.validation_case_count()
+
+    @property
+    def concurrency(self) -> int:
+        return self.__task.concurrency
+
+    async def evaluate(
+        self, candidate: CandidateMap, **kwargs: Any
+    ) -> ValidationScore | CandidateEvaluation:
+        """Compatibility alias returning aggregates only to untrusted engines."""
+        if kwargs.pop("dataset", "validation") != "validation":
+            raise PermissionError("Engines cannot access the reporting-only test_set.")
+        # Retain the old keyword without allowing engines to request evidence.
+        kwargs.pop("capture_traces", False)
+        return await self.score_validation(candidate, **kwargs)
+
+    async def score_validation(
+        self,
+        candidate: CandidateMap,
+        *,
+        budget: BudgetTracker | None = None,
+        cache: bool = False,
+    ) -> ValidationScore:
+        """Score inside the harness and expose only aggregate selection data."""
+
+        async def score() -> ValidationScore:
+            with validation_evaluation():
+                evaluation = await self.__task.evaluate(
+                    candidate, budget=budget, capture_traces=False, cache=cache
+                )
+            return ValidationScore(
+                score=evaluation.score,
+                num_cases=evaluation.num_cases,
+                selectable=evaluation.selectable,
+                objective_scores=dict(evaluation.objective_scores),
+            )
+
+        # Creating the task in a fresh snapshot also supports Python 3.10,
+        # which has no create_task(context=...). Awaiting propagates cancellation.
+        return await self.__validation_context.copy().run(asyncio.create_task, score())
+
+    @property
+    def test_set(self) -> None:
+        return None
+
+
+class _TrustedEngineTaskView(_EngineTaskView):
+    """Internal selection channel for the library's audited Pareto engines."""
+
+    def __init__(self, task: OptimizationTask) -> None:
+        super().__init__(task)
+        self.__task = task
 
     @property
     def agent(self) -> Any:
@@ -170,51 +223,6 @@ class _EngineTaskView:
     @property
     def case_factory(self) -> Any:
         return self.__task.case_factory
-
-    @property
-    def concurrency(self) -> int:
-        return self.__task.concurrency
-
-    async def evaluate(
-        self, candidate: CandidateMap, **kwargs: Any
-    ) -> ValidationScore | CandidateEvaluation:
-        """Compatibility alias returning aggregates only to untrusted engines."""
-        if kwargs.pop("dataset", "validation") != "validation":
-            raise PermissionError("Engines cannot access the reporting-only test_set.")
-        # Retain the old keyword without allowing engines to request evidence.
-        kwargs.pop("capture_traces", False)
-        return await self.score_validation(candidate, **kwargs)
-
-    async def score_validation(
-        self,
-        candidate: CandidateMap,
-        *,
-        budget: BudgetTracker | None = None,
-        cache: bool = False,
-    ) -> ValidationScore:
-        """Score inside the harness and expose only aggregate selection data."""
-        with validation_evaluation():
-            evaluation = await self.__task.evaluate(
-                candidate, budget=budget, capture_traces=False, cache=cache
-            )
-        return ValidationScore(
-            score=evaluation.score,
-            num_cases=evaluation.num_cases,
-            selectable=evaluation.selectable,
-            objective_scores=dict(evaluation.objective_scores),
-        )
-
-    @property
-    def test_set(self) -> None:
-        return None
-
-
-class _TrustedEngineTaskView(_EngineTaskView):
-    """Internal selection channel for the library's audited Pareto engines."""
-
-    def __init__(self, task: OptimizationTask) -> None:
-        super().__init__(task)
-        self.__task = task
 
     async def val_loader(self) -> Any:
         return await self.__task.val_loader()
