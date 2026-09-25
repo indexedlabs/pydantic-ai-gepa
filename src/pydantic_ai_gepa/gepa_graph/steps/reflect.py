@@ -46,6 +46,7 @@ from ...skills.models import (
 from ...skills.search import LocalSkillsSearchProvider
 from ...types import DEFAULT_MAX_SPAWNED_AGENTS
 from .continue_step import IterationAction
+from .budget import can_evaluate
 
 _IMPROVEMENT_EPSILON = 1e-9
 _TOKEN_RE = re.compile(r"[a-zA-Z0-9_/-]{3,}")
@@ -80,6 +81,9 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
             batch=minibatch,
             capture_traces=True,
         )
+
+    if parent_results is None:
+        return "continue"
 
     state.record_evaluation_errors(
         candidate_idx=parent_idx,
@@ -350,6 +354,9 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
             capture_traces=False,
         )
 
+    if new_results is None:
+        return "continue"
+
     state.record_evaluation_errors(
         candidate_idx=new_candidate.idx,
         stage="reflection_candidate",
@@ -437,7 +444,9 @@ async def _evaluate_minibatch(
     candidate: CandidateProgram,
     batch: Sequence[Case[Any, Any, Any]],
     capture_traces: bool,
-) -> EvaluationResults[str]:
+) -> EvaluationResults[str] | None:
+    if not can_evaluate(state, len(batch)):
+        return None
     results = await deps.evaluator.evaluate_batch(
         candidate=candidate,
         batch=batch,
