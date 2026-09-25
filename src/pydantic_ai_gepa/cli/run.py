@@ -45,7 +45,9 @@ from .layout import (
 )
 from .reflector import default_reflector, write_packet
 from .reflector_recovery import (
+    after_state_save,
     continue_run,
+    state_for_replay,
     durable_eval,
     remember_comparison,
     state_for_save,
@@ -425,8 +427,16 @@ class RunState:
         except BaseException:
             os.unlink(tmp_name)
             raise
+        after_state_save(root)
         if self.lanes == 0 and self.status != "running":
-            write_packet(self.run_id, root)
+            try:
+                write_packet(self.run_id, root)
+            except Exception as exc:
+                typer.echo(
+                    f"Warning: state saved but reflector packet could not be refreshed "
+                    f"({type(exc).__name__}). Regenerate it with `gepa run resume --run-id {self.run_id}`.",
+                    err=True,
+                )
         return path
 
 
@@ -1655,7 +1665,7 @@ def _public_state(
     outcomes: list[EvalOutcome],
     final_report: Path | None = None,
 ) -> dict[str, Any]:
-    payload = state.to_dict()
+    payload = state_for_save(state).to_dict()
     payload.pop("best_validation_per_case_scores", None)
     payload["state_path"] = str(run_state_path(state.run_id))
     if state.lanes == 0:
@@ -2122,7 +2132,7 @@ def continue_(
 
 
 def _continue_impl(run_id: str | None, gate_case: list[str]) -> None:
-    state = _load_state(run_id)
+    state = state_for_replay(_load_state(run_id))
     if state.validation_dataset_path is not None:
         _assert_validation_dataset_unchanged(state)
     if state.lanes > 0 and not (
@@ -2309,11 +2319,12 @@ def resume(
     run_id: str | None = typer.Option(None, "--run-id"),
     reason: str | None = typer.Option(None, "--reason"),
     reflector: str | None = typer.Option(None, "--reflector"),
+    abandon_continuation: bool = typer.Option(False, "--abandon-continuation"),
 ) -> None:
     """Re-issue a durable packet after losing the previous reflector."""
     from .reflector import resume as resume_reflector
 
-    resume_reflector(run_id, reason, reflector)
+    resume_reflector(run_id, reason, reflector, abandon_continuation)
 
 
 @app.command("select")

@@ -170,6 +170,31 @@ def _comparison_packet(comparison: dict[str, Any] | None) -> dict[str, Any] | No
     return packet
 
 
+def already_scored(state: Any, candidate_id: str | None) -> bool:
+    """Whether continue will reissue this candidate's terminal comparison."""
+    comparison = state.last_comparison or state.last_reflector_comparison or {}
+    return bool(
+        state.continuation is None
+        and candidate_id is not None
+        and candidate_id == comparison.get("candidate_id")
+        and comparison.get("verdict")
+        in {"accepted", "rejected", "equivalent", "inconclusive"}
+        and (
+            state.status == "done"
+            or (
+                (
+                    comparison.get("minibatch_id") == state.reflection_minibatch_id
+                    or comparison.get("improved")
+                )
+                and (
+                    candidate_id != state.reflection_baseline_candidate_id
+                    or comparison.get("improved")
+                )
+            )
+        )
+    )
+
+
 def _current_tree(state: Any, project: Path) -> dict[str, Any]:
     candidate_id = None
     commit_sha = current_commit_sha(project)
@@ -197,12 +222,7 @@ def _current_tree(state: Any, project: Path) -> dict[str, Any]:
         # is temporarily unavailable, without claiming an invented identity.
         identity_error = type(exc).__name__
     comparison = state.last_comparison or state.last_reflector_comparison or {}
-    scored = (
-        candidate_id is not None
-        and candidate_id == comparison.get("candidate_id")
-        and comparison.get("verdict")
-        in {"accepted", "rejected", "equivalent", "inconclusive"}
-    )
+    scored = already_scored(state, candidate_id)
     result = {
         "candidate_id": candidate_id,
         "commit_sha": commit_sha,
@@ -231,7 +251,10 @@ def _instructions(state: Any, tree: dict[str, Any]) -> str:
             f"Continuation of candidate {candidate} was interrupted. {restore}"
             "Run next_command with its saved gate options to recover completed "
             "evaluations and finish the comparison. Preserve this candidate "
-            "until its pending continuation finishes."
+            "until its pending continuation finishes. To drop the checkpoint "
+            "(for example, when overwritten components cannot be restored), run "
+            f"gepa run resume --run-id {state.run_id} --abandon-continuation. "
+            "Paid evaluations remain charged to the budget."
         )
     if state.status == "paused_after_infrastructure_error":
         return "A required evaluation rollout failed outside the quality comparison. The incumbent was preserved. Recover the service or configuration, then run next_command to retry."
@@ -376,6 +399,7 @@ def resume(
     run_id: str | None = None,
     reason: str | None = None,
     reflector: str | None = None,
+    abandon_continuation: bool = False,
 ) -> None:
     """Declare the previous reflector lost and issue a fresh reflection packet."""
     from .lanes import _append_journal
@@ -390,6 +414,10 @@ def resume(
         raise typer.Exit(code=2)
     with run_lock(state.run_id):
         state = _load_state(state.run_id)
+        if abandon_continuation:
+            from .reflector_recovery import abandon_continuation as abandon
+
+            state = abandon(state, reason=reason or "explicit_resume")
         now = utc_now_iso()
         old = state.reflector or default_reflector()
         lost = {key: value for key, value in old.items() if key != "history"}

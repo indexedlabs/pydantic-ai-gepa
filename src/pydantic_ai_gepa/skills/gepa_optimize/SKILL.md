@@ -328,6 +328,9 @@ expiry; the operator decides when a reflector has been lost.
 - **Death after continue completed:** the packet retains the recorded verdict,
   including an accepted proposal after the loop advances. Repeating continue on
   the recorded candidate returns the result with exit 0 and no evaluations.
+  In particular, after acceptance advances to `paused_for_reflection`, calling
+  `continue` on the unchanged tree returns "already scored" without evaluating;
+  edit the tree to move on.
   For a rejected proposal, restore the baseline to advance or revise the tree
   to compare a new proposal.
 - **Death during continue:** durable training samples and any completed
@@ -335,6 +338,13 @@ expiry; the operator decides when a reflector has been lost.
   paid evaluations are not duplicated. Gate samples use a separate checkpoint
   because they do not write Pareto rows. Keep the interrupted candidate unchanged
   until its comparison finishes; the packet preserves any `--gate-case` options.
+
+If a pending candidate cannot be restored (especially overwritten components),
+use `gepa run resume --run-id <run_id> --abandon-continuation`. This journals and
+drops the checkpoint, preserving all paid budget charges, so the next continue
+starts a new comparison. A candidate change detected during evaluation also
+drops the checkpoint. Paired validation replay snapshots are private and removed
+when the continuation completes or is abandoned.
 
 Continuation and resume share a run lock. A live holder causes exit 1; a process
 death releases the lock automatically. Lane runs refuse this command with exit

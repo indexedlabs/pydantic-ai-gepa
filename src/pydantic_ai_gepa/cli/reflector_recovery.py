@@ -30,21 +30,53 @@ class Replay:
     rows: list[tuple[int, ParetoRow]]
     cursor: int = 0
     gate_cursor: int = 0
+    budget_adjustment: int = 0
 
 
 _replay: ContextVar[Replay | None] = ContextVar("reflector_replay", default=None)
+
+
+class CandidateChanged(typer.Exit):
+    """A paid sample belongs to a different tree than this continuation."""
+
+    def __init__(self) -> None:
+        typer.echo(
+            "Candidate changed during continuation; abandoning its checkpoint. "
+            "Paid evaluations remain charged. Run continue again for the current tree.",
+            err=True,
+        )
+        super().__init__(code=1)
+
+
+def state_for_replay(state: RunState) -> RunState:
+    replay = _replay.get()
+    return (
+        replace(state, iterations=state.iterations + replay.budget_adjustment)
+        if replay
+        else state
+    )
 
 
 def state_for_save(state: RunState) -> RunState:
     """The controller saves only at terminal pauses during a continuation."""
     replay = _replay.get()
     if replay is not None:
-        if replay.cursor < len(replay.rows):
+        budget_exhausted = (state.last_comparison or {}).get("reason_code") in {
+            "candidate_budget_exhausted",
+            "baseline_budget_exhausted",
+            "validation_budget_exhausted",
+        }
+        if replay.cursor < len(replay.rows) and not budget_exhausted:
             raise typer.BadParameter(
                 "Continuation ended before recovering all paid evaluations; "
                 "its checkpoint has been preserved."
             )
-        return replace(state, continuation=None)
+        return replace(
+            state,
+            continuation=None,
+            iterations=ParetoLog(state.run_id).count_budget_rows()
+            + state.gate_consumed_iterations,
+        )
     return state
 
 
@@ -68,14 +100,24 @@ def _row_outcome(
         candidate_id=row.candidate_id,
         minibatch_id=row.minibatch_id,
     )
+    # Discarded foreign rows shift replay's budget ordinal. The eval ID still
+    # identifies the original artifacts, regardless of their saved ordinal.
+    if eval_id and not validation:
+        if not report.exists():
+            report = next(
+                report.parent.glob(f"*-{eval_id}-{row.candidate_id}.md"), report
+            )
+        if not trace.exists():
+            trace = next(
+                trace.parent.glob(f"*-{eval_id}-{row.candidate_id}.jsonl"), trace
+            )
     # The paid row may precede artifact writes when the process is killed.
     # Preserve existing artifacts and expose only paths which actually exist.
     report_path = report if not validation and report.exists() else None
     trace_path = trace if not validation and trace.exists() else None
     scores = row.per_case_scores
-    if validation and state.acceptance_paired_min_cases is not None:
+    if validation and _paired_validation(state):
         from .validation import read_validation_evidence
-        from .run import _validation_schedule
 
         scores = read_validation_evidence(
             state.validation_dataset_path,
@@ -83,7 +125,7 @@ def _row_outcome(
             run_id=f"{state.run_id}:eval:{eval_id}",
             identity={"candidate_id": row.candidate_id, "eval_id": eval_id},
         )
-        if not scores and _validation_schedule(state)[0] == 1:
+        if not scores:
             raise typer.BadParameter(
                 "Private paired validation evidence is missing for a paid "
                 "evaluation; restore the harness evidence before continuing."
@@ -138,7 +180,13 @@ def durable_eval(evaluate: Callable[..., EvalOutcome], **kwargs: Any) -> EvalOut
     if not kwargs.get("write_pareto", True):
         return _durable_gate(replay, evaluate, kwargs)
     if replay.cursor >= len(replay.rows):
-        return evaluate(**kwargs)
+        if kwargs.get("dataset_role") == "validation" and _paired_validation(
+            replay.state
+        ):
+            kwargs["persist_validation_replay"] = True
+        outcome = evaluate(**kwargs)
+        _check_candidate(replay, outcome)
+        return outcome
     iteration, row = replay.rows[replay.cursor]
     role = kwargs.get("dataset_role", "training")
     minibatch = kwargs.get("minibatch_id")
@@ -180,6 +228,7 @@ def _durable_gate(
         )
     else:
         outcome = evaluate(**kwargs)
+        _check_candidate(replay, outcome)
         records = []
         for record in outcome.records:
             output = record.payload.get("output")
@@ -223,13 +272,139 @@ def _durable_gate(
     return outcome
 
 
+def _paired_validation(state: RunState) -> bool:
+    if (
+        state.lanes
+        or state.acceptance_paired_min_cases is None
+        or not state.validation_dataset_path
+    ):
+        return False
+    from .run import _validation_schedule
+
+    return _validation_schedule(state)[0] == 1
+
+
+def _check_candidate(replay: Replay, outcome: EvalOutcome) -> None:
+    assert replay.state.continuation is not None
+    if outcome.summary["candidate_id"] != replay.state.continuation["candidate_id"]:
+        raise CandidateChanged()
+
+
+def cleanup_continuation(state: RunState, root: Path | None = None) -> None:
+    """Retire private replay snapshots only after the state transition commits."""
+    if (
+        not state.continuation
+        or not state.validation_dataset_path
+        or state.acceptance_paired_min_cases is None
+    ):
+        return
+    from .validation import validation_evidence_path
+
+    try:
+        if not _paired_validation(state):
+            return
+        rows = ParetoLog(state.run_id, root).iter_rows()[
+            state.continuation["ledger_offset"] :
+        ]
+        keys = [
+            f"{state.run_id}:eval:{row.extra['eval_id']}"
+            for row in rows
+            if row.extra.get("dataset_role") == "validation"
+            and row.extra.get("eval_id")
+        ]
+        keys.append(f"{state.run_id}:continuation:{state.continuation['candidate_id']}")
+        for key in keys:
+            path = validation_evidence_path(
+                state.validation_dataset_path,
+                project_root=root or repo_root(),
+                run_id=key,
+            )
+            path.unlink(missing_ok=True)
+    except (OSError, ValueError, typer.BadParameter) as exc:
+        typer.echo(
+            f"Warning: private replay evidence cleanup failed ({type(exc).__name__}).",
+            err=True,
+        )
+
+
+def after_state_save(root: Path | None = None) -> None:
+    replay = _replay.get()
+    if replay is not None:
+        cleanup_continuation(replay.state, root)
+
+
+def abandon_continuation(state: RunState, *, reason: str) -> RunState:
+    if state.continuation is None:
+        return state
+    from .lanes import _append_journal
+    from .runs import utc_now_iso
+
+    used = ParetoLog(state.run_id).count_budget_rows() + state.gate_consumed_iterations
+    _append_journal(
+        repo_root(),
+        {
+            "kind": "continuation_abandoned",
+            "run_id": state.run_id,
+            "timestamp": utc_now_iso(),
+            "candidate_id": state.continuation["candidate_id"],
+            "reason": reason,
+            "budget_used": used,
+        },
+    )
+    abandoned = replace(state, continuation=None, iterations=used)
+    token = _replay.set(None)
+    try:
+        abandoned.save()
+    finally:
+        _replay.reset(token)
+    cleanup_continuation(state)
+    return abandoned
+
+
+def _paid_prefix(
+    state: RunState, rows: list[ParetoRow]
+) -> tuple[RunState, list[tuple[int, ParetoRow]], int]:
+    """Foreign candidates end the reusable prefix; later rows stay charged.
+
+    Remember discarded indices so samples newly paid after recovery remain
+    reusable if that recovery is interrupted again.
+    """
+    assert state.continuation is not None
+    checkpoint = dict(state.continuation)
+    discarded = set(checkpoint.get("discarded_rows", []))
+    matching = []
+    ended = False
+    for index, row in enumerate(rows):
+        if index < checkpoint["ledger_offset"] or row.extra.get(
+            "row_scope", "acceptance"
+        ) not in {"acceptance", "validation"}:
+            continue
+        if index in discarded:
+            continue
+        if row.candidate_id != checkpoint["candidate_id"]:
+            ended = True
+        if ended:
+            discarded.add(index)
+        else:
+            matching.append(row)
+    if discarded != set(checkpoint.get("discarded_rows", [])):
+        checkpoint["discarded_rows"] = sorted(discarded)
+        state = replace(state, continuation=checkpoint)
+        state.save()
+    adjustment = len(discarded)
+    pending = [
+        (state.iterations + adjustment + i + 1, row) for i, row in enumerate(matching)
+    ]
+    return state, pending, adjustment
+
+
 def continue_run(
     run_id: str | None,
     gate_case: list[str],
     reflector_epoch: int | None,
     execute: Callable[..., None],
 ) -> None:
-    from .reflector import run_lock
+    from .reflector import already_scored, run_lock
     from .run import (
         _current_baseline_candidate_id,
         _emit_status,
@@ -259,20 +434,7 @@ def continue_run(
         candidate = _current_baseline_candidate_id(
             state.candidate_source, active_run_id=state.run_id
         )
-        comparison = state.last_comparison or state.last_reflector_comparison or {}
-        if (
-            state.continuation is None
-            and comparison.get("candidate_id") == candidate
-            and comparison.get("verdict") is not None
-            and (
-                comparison.get("minibatch_id") == state.reflection_minibatch_id
-                or comparison.get("improved")
-            )
-            and (
-                candidate != state.reflection_baseline_candidate_id
-                or comparison.get("improved")
-            )
-        ):
+        if already_scored(state, candidate):
             typer.echo("Candidate already scored; re-issuing the recorded result.")
             _emit_status(state, outcomes=[])
             return
@@ -285,7 +447,11 @@ def continue_run(
                 "gate_case": gate_case,
                 "ledger_offset": len(rows),
             }
-            state = replace(state, continuation=checkpoint)
+            state = replace(
+                state,
+                continuation=checkpoint,
+                iterations=ledger.count_budget_rows() + state.gate_consumed_iterations,
+            )
             if state.best_validation_per_case_scores and state.validation_dataset_path:
                 from .validation import write_validation_evidence
 
@@ -306,39 +472,29 @@ def continue_run(
             raise typer.BadParameter(
                 "An interrupted continuation is pending. Restore candidate "
                 f"{checkpoint['candidate_id']} and reuse its --gate-case options "
-                "to finish the paid comparison."
+                "to finish the paid comparison, or use "
+                f"`gepa run resume --run-id {state.run_id} --abandon-continuation` to start over."
             )
-        budget = state.gate_consumed_iterations
-        pending: list[tuple[int, ParetoRow]] = []
-        for index, row in enumerate(rows):
-            if row.extra.get("row_scope", "acceptance") not in {
-                "acceptance",
-                "validation",
-            }:
-                continue
-            budget += 1
-            if index >= checkpoint["ledger_offset"]:
-                if row.candidate_id != candidate:
-                    raise typer.BadParameter(
-                        "Paid continuation rows contain another candidate."
-                    )
-                pending.append((budget, row))
-        token = _replay.set(Replay(state, pending))
+        state, pending, adjustment = _paid_prefix(state, rows)
+        token = _replay.set(Replay(state, pending, budget_adjustment=adjustment))
         try:
             execute(state.run_id, gate_case)
-        except (typer.Exit, typer.BadParameter):
+        except (typer.Exit, typer.BadParameter) as exc:
             saved = _load_state(state.run_id)
-            if (
-                saved.continuation is not None
-                and not saved.continuation.get("gates")
-                and len(ledger.iter_rows()) == checkpoint["ledger_offset"]
+            changed = isinstance(exc, CandidateChanged) or any(
+                row.candidate_id != checkpoint["candidate_id"]
+                for row in ledger.iter_rows()[checkpoint["ledger_offset"] :]
+            )
+            if saved.continuation is not None and (
+                changed
+                or (
+                    not saved.continuation.get("gates")
+                    and len(ledger.iter_rows()) == checkpoint["ledger_offset"]
+                )
             ):
-                # A refused, unpaid attempt must not fence off corrective edits.
-                cleanup_token = _replay.set(None)
-                try:
-                    replace(saved, continuation=None).save()
-                finally:
-                    _replay.reset(cleanup_token)
+                abandon_continuation(
+                    saved, reason="candidate_changed" if changed else "unpaid_refusal"
+                )
             raise
         finally:
             _replay.reset(token)

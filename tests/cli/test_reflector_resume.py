@@ -615,7 +615,9 @@ def test_validation_failure_packet_withholds_selection_minibatch_identity(
 
 
 def _configure_private_validation(project: Path) -> Path:
-    path = project.parent / "recovery-heldout.jsonl"
+    directory = project.parent / f"{project.name}-heldout"
+    directory.mkdir()
+    path = directory / "recovery-heldout.jsonl"
     path.write_text(
         "".join(
             json.dumps(
@@ -882,3 +884,340 @@ def test_interrupted_validation_seed_retry_reuses_paid_incumbent_samples(
     after = ParetoLog(run_id).iter_rows()
     assert after[: len(before)] == before
     assert len(after) == 8  # Four validation rows, selected failure, three baselines.
+
+
+@pytest.mark.parametrize("restore_original", [False, True])
+@pytest.mark.parametrize("budget", [7, 14])
+def test_candidate_change_releases_checkpoint_and_keeps_budget(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, restore_original: bool, budget: int
+) -> None:
+    started = _start(repetitions=3, budget=budget)
+    run_id = str(started["run_id"])
+    original_candidate = _commit_score(git_repo, "candidate-x")
+    original_eval = run_module.run_eval_once
+    calls = []
+
+    def change_candidate_after_first_sample(**kwargs):
+        outcome = original_eval(**kwargs)
+        calls.append(outcome.summary["candidate_id"])
+        if len(calls) == 1:
+            _commit_score(git_repo, "candidate-y")
+        return outcome
+
+    monkeypatch.setattr(
+        run_module, "run_eval_once", change_candidate_after_first_sample
+    )
+    failed = _run("run", "continue", "--run-id", run_id)
+    assert failed.exit_code == 1, failed.output
+    assert len(calls) == 2 and calls[0] != calls[1]
+    before = ParetoLog(run_id).iter_rows()
+    assert len(before) == 6
+    assert run_module._load_state(run_id).continuation is None
+    assert run_module._load_state(run_id).iterations == 6
+    if restore_original:
+        _git(git_repo, "reset", "--hard", original_candidate)
+    packet = _resume(run_id)
+    assert "pending_continuation" not in packet
+    assert packet["budget"]["used"] == 6
+    monkeypatch.setattr(run_module, "run_eval_once", original_eval)
+    retried = _run("run", "continue", "--run-id", run_id)
+    # The review's exact budget=7 leaves only one row, below the three-sample
+    # minimum. It must report the budget cap, not a wedged checkpoint.
+    assert retried.exit_code == (70 if budget == 7 else 0), retried.output
+    assert "Restore candidate" not in retried.output
+    assert "another candidate" not in retried.output
+    assert run_module._load_state(run_id).continuation is None
+    after = ParetoLog(run_id).iter_rows()
+    assert after[:6] == before
+    assert len(after) == (6 if budget == 7 else 9)
+
+
+def test_foreign_paid_row_ends_prefix_and_repeated_recovery_stays_reusable(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = _start(repetitions=3, budget=14)
+    run_id = str(started["run_id"])
+    candidate_x = _commit_score(git_repo, "candidate-x")
+    original_eval = run_module.run_eval_once
+    calls = []
+
+    def die_before_candidate_change_is_detected(**kwargs):
+        outcome = original_eval(**kwargs)
+        calls.append(outcome.summary["candidate_id"])
+        if len(calls) == 1:
+            _commit_score(git_repo, "candidate-y")
+        else:
+            raise RuntimeError("died before controller observed the foreign row")
+        return outcome
+
+    monkeypatch.setattr(
+        run_module, "run_eval_once", die_before_candidate_change_is_detected
+    )
+    failed = _run("run", "continue", "--run-id", run_id)
+    assert isinstance(failed.exception, RuntimeError)
+    assert ParetoLog(run_id).count_budget_rows() == 6
+    _git(git_repo, "reset", "--hard", candidate_x)
+    before = ParetoLog(run_id).iter_rows()
+    new_calls = []
+
+    def die_once_more(**kwargs):
+        outcome = original_eval(**kwargs)
+        new_calls.append(outcome.summary["eval_id"])
+        if len(new_calls) == 1:
+            raise RuntimeError("died after extending the reusable prefix")
+        return outcome
+
+    monkeypatch.setattr(run_module, "run_eval_once", die_once_more)
+    assert isinstance(
+        _run("run", "continue", "--run-id", run_id).exception, RuntimeError
+    )
+    resumed = _run("run", "continue", "--run-id", run_id)
+    assert resumed.exit_code == 0, resumed.output
+    comparison = _run_payload(resumed.output)["last_comparison"]
+    assert comparison["candidate_sample_count"] == 3
+    assert comparison["candidate_iteration"] == 6  # Includes the discarded row's cost.
+    assert len(comparison["candidate_report_paths"]) == 3
+    assert len(comparison["candidate_trace_paths"]) == 3
+    assert all(Path(path).exists() for path in comparison["candidate_report_paths"])
+    assert len(new_calls) == 2
+    assert ParetoLog(run_id).iter_rows()[:6] == before
+    assert ParetoLog(run_id).count_budget_rows() == 8
+    assert run_module._load_state(run_id).iterations == 8
+
+
+def test_components_can_abandon_an_unrestorable_continuation(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = _start(size=2, budget=11)
+    run_id = str(started["run_id"])
+    component = next((repo / ".gepa" / "components").glob("*.md"))
+    component.write_text("Candidate X instructions")
+    original_eval = run_module.run_eval_once
+
+    def die_after_sample(**kwargs):
+        original_eval(**kwargs)
+        raise RuntimeError("lost reflector")
+
+    monkeypatch.setattr(run_module, "run_eval_once", die_after_sample)
+    assert isinstance(
+        _run("run", "continue", "--run-id", run_id).exception, RuntimeError
+    )
+    component.write_text("Candidate Y overwrote X without a backup")
+    packet = _resume(run_id)
+    assert "--abandon-continuation" in packet["instructions"]
+    assert _run("run", "continue", "--run-id", run_id).exit_code == 2
+    before = ParetoLog(run_id).iter_rows()
+    packet = _resume(
+        run_id, "--abandon-continuation", "--reason", "components overwritten"
+    )
+    assert "pending_continuation" not in packet
+    assert packet["budget"]["used"] == 5
+    assert any(
+        row.get("kind") == "continuation_abandoned"
+        and row["reason"] == "components overwritten"
+        for row in packet["journal_tail"]
+    )
+    assert component.read_text() == "Candidate Y overwrote X without a backup"
+    assert ParetoLog(run_id).iter_rows() == before
+    monkeypatch.setattr(run_module, "run_eval_once", original_eval)
+    continued = _run("run", "continue", "--run-id", run_id)
+    assert continued.exit_code == 0, continued.output
+    assert ParetoLog(run_id).count_budget_rows() == 8
+
+
+@pytest.mark.parametrize("paired_threshold", [None, 100])
+def test_nonpaired_validation_never_writes_private_replay_evidence(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, paired_threshold: int | None
+) -> None:
+    from pydantic_ai_gepa.cli import validation
+    from pydantic_ai_gepa.cli import eval as eval_module
+    from pydantic_ai_gepa.evaluation import EvaluationRecord
+
+    validation_path = _configure_private_validation(git_repo)
+    proposed = False
+
+    async def evaluate(**kwargs):
+        return [
+            EvaluationRecord(case.name, 0.7 if proposed else 0.2, None, {})
+            for case in kwargs["dataset"]
+        ]
+
+    monkeypatch.setattr(eval_module, "evaluate_callable_dataset", evaluate)
+
+    def readonly_evidence(*args, **kwargs):
+        raise PermissionError("validation directory is read-only")
+
+    monkeypatch.setattr(validation, "write_validation_evidence", readonly_evidence)
+    options = (
+        ()
+        if paired_threshold is None
+        else ("--acceptance-paired-min-cases", str(paired_threshold))
+    )
+    started = _start(*options, budget=13)
+    run_id = str(started["run_id"])
+    _commit_score(git_repo, "good")
+    proposed = True
+    continued = _run("run", "continue", "--run-id", run_id)
+    assert continued.exit_code == 0, continued.output
+    assert len(ParetoLog(run_id).validation_rows()) == 6
+    assert not (validation_path.parent / ".gepa-validation-evidence").exists()
+
+
+def test_lane_validation_does_not_create_continuation_snapshots(
+    validation_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pydantic_ai_gepa.cli import validation
+
+    validation_path = _configure_private_validation(validation_repo)
+    started = _start("--acceptance-paired-min-cases", "2", size=3, budget=5)
+    run_id = str(started["run_id"])
+    state = run_module._load_state(run_id)
+    directory = validation_path.parent / ".gepa-validation-evidence"
+    before = list(directory.glob("*.json"))
+    monkeypatch.setattr(
+        validation,
+        "write_validation_evidence",
+        lambda *args, **kwargs: pytest.fail(
+            "lane evals do not use continuation replay"
+        ),
+    )
+    _, outcome = run_module._evaluate_validation_candidate(state, lane="lane-1")
+    assert outcome.summary["lane"] == "lane-1"
+    assert list(directory.glob("*.json")) == before
+
+
+@pytest.mark.parametrize("abandon", [False, True])
+def test_private_replay_snapshots_removed_after_completion_or_abandonment(
+    validation_repo: Path, monkeypatch: pytest.MonkeyPatch, abandon: bool
+) -> None:
+    from pydantic_ai_gepa.cli import eval as eval_module
+    from pydantic_ai_gepa.evaluation import EvaluationRecord
+
+    validation_path = _configure_private_validation(validation_repo)
+    proposed = False
+
+    async def paired_evaluator(**kwargs):
+        return [
+            EvaluationRecord(case.name, 0.7 if proposed else 0.2, None, {})
+            for case in kwargs["dataset"]
+        ]
+
+    monkeypatch.setattr(eval_module, "evaluate_callable_dataset", paired_evaluator)
+    started = _start("--acceptance-paired-min-cases", "2", size=3, budget=5)
+    run_id = str(started["run_id"])
+    directory = validation_path.parent / ".gepa-validation-evidence"
+    incumbent_files = set(directory.glob("*.json"))
+    assert len(incumbent_files) == 1
+    proposed = True
+    candidate = _commit_score(validation_repo, "paired proposal")
+    original_eval = run_module.run_eval_once
+
+    def die_after_validation(**kwargs):
+        outcome = original_eval(**kwargs)
+        if kwargs.get("dataset_role") == "validation":
+            raise RuntimeError("died after saving paired evidence")
+        return outcome
+
+    monkeypatch.setattr(run_module, "run_eval_once", die_after_validation)
+    assert isinstance(
+        _run("run", "continue", "--run-id", run_id).exception, RuntimeError
+    )
+    assert (
+        len(list(directory.glob("*.json"))) == 3
+    )  # Incumbent, backup, candidate eval.
+    before = ParetoLog(run_id).iter_rows()
+    monkeypatch.setattr(
+        run_module, "run_eval_once", lambda **kwargs: pytest.fail("all samples paid")
+    )
+    if abandon:
+        packet = _resume(run_id, "--abandon-continuation")
+        assert packet["budget"]["used"] == 5
+        assert _git(validation_repo, "rev-parse", "HEAD") == candidate
+    else:
+        completed = _run("run", "continue", "--run-id", run_id)
+        assert completed.exit_code == 0, completed.output
+        assert (
+            _run_payload(completed.output)["last_comparison"]["verdict"] == "accepted"
+        )
+    assert ParetoLog(run_id).iter_rows() == before
+    assert set(directory.glob("*.json")) == incumbent_files
+    assert run_module._load_state(run_id).continuation is None
+
+
+def test_packet_and_continue_agree_when_rejected_candidate_returns_on_new_batch(
+    validation_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = _start(size=3, budget=17)
+    run_id = str(started["run_id"])
+    baseline = _git(validation_repo, "rev-parse", "HEAD")
+    (validation_repo / "out_case-1.txt").write_text("wrong")
+    _git(validation_repo, "add", "out_case-1.txt")
+    _git(validation_repo, "commit", "-m", "Rejected candidate B")
+    candidate = _git(validation_repo, "rev-parse", "HEAD")
+    rejected = _run("run", "continue", "--run-id", run_id)
+    assert _run_payload(rejected.output)["last_comparison"]["verdict"] == "rejected"
+    _git(validation_repo, "reset", "--hard", baseline)
+    advanced = _run("run", "continue", "--run-id", run_id)
+    assert advanced.exit_code == 0, advanced.output
+    minibatch = _run_payload(advanced.output)["reflection_minibatch_id"]
+    assert minibatch != started["reflection_minibatch_id"]
+    _git(validation_repo, "reset", "--hard", candidate)
+    packet = _resume(run_id)
+    assert packet["current_tree"]["already_scored"] is False
+    assert "not scored" in packet["instructions"]
+    assert packet["journal_tail"][-1]["unscored_candidate_commit"] == candidate
+    before = ParetoLog(run_id).count_budget_rows()
+    continued = _run("run", "continue", "--run-id", run_id)
+    assert continued.exit_code == 0, continued.output
+    assert (
+        _run_payload(continued.output)["last_comparison"]["minibatch_id"] == minibatch
+    )
+    assert ParetoLog(run_id).count_budget_rows() == before + 3
+
+
+def test_torn_journal_does_not_break_pause_or_resume(git_repo: Path) -> None:
+    started = _start(budget=7)
+    run_id = str(started["run_id"])
+    _commit_score(git_repo, "good")
+    journal = git_repo / ".gepa" / "journal.jsonl"
+    journal.write_text('{"content": "valid note"}\nnot-json\n42\n{"torn":')
+    continued = _run("run", "continue", "--run-id", run_id)
+    assert continued.exit_code == 0, continued.output
+    assert _packet(git_repo, run_id)["journal_tail"] == [{"content": "valid note"}]
+    packet = _resume(run_id)
+    assert packet["status"] == "done"
+    assert packet["journal_tail"][0] == {"content": "valid note"}
+    assert packet["journal_tail"][-1]["kind"] == "reflector_lost"
+
+
+@pytest.mark.parametrize("failure", ["write", "notes"])
+def test_packet_failure_warns_after_committed_state_and_resume_regenerates(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    from pydantic_ai_gepa.cli import reflector
+
+    started = _start(budget=7)
+    run_id = str(started["run_id"])
+    _commit_score(git_repo, "good")
+    owner, name = (
+        (run_module, "write_packet")
+        if failure == "write"
+        else (reflector, "notes_index")
+    )
+    original = getattr(owner, name)
+
+    def broken_packet(*args, **kwargs):
+        raise OSError("packet unavailable")
+
+    monkeypatch.setattr(owner, name, broken_packet)
+    continued = _run("run", "continue", "--run-id", run_id)
+    assert continued.exit_code == 0, continued.output
+    assert "Warning: state saved" in continued.output
+    state = run_module._load_state(run_id)
+    assert state.status == "done" and state.continuation is None
+    monkeypatch.setattr(owner, name, original)
+    before = ParetoLog(run_id).iter_rows()
+    packet = _resume(run_id)
+    assert packet["status"] == "done"
+    assert packet["last_comparison"]["verdict"] == "accepted"
+    assert ParetoLog(run_id).iter_rows() == before

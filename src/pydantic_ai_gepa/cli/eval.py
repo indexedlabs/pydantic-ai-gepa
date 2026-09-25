@@ -373,6 +373,7 @@ def run_eval_once(
     dataset_role: Literal["training", "validation"] = "training",
     persist_report: bool = True,
     redact_selection_evidence: bool = False,
+    persist_validation_replay: bool = False,
 ) -> EvalOutcome:
     """Evaluate one baseline/candidate and append the standard run artifacts.
 
@@ -789,7 +790,7 @@ def run_eval_once(
 
     # Paired validation must be replayable without placing case scores in the
     # reflector ledger. Publish private evidence before its paid row, too.
-    if write_pareto and dataset_role == "validation":
+    if write_pareto and dataset_role == "validation" and persist_validation_replay:
         from .validation import write_validation_evidence
 
         assert cfg.validation_dataset is not None
