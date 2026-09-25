@@ -904,3 +904,54 @@ async def test_admission_keeps_full_concurrency_with_ample_headroom() -> None:
     assert started == 4
     assert meter.report().total_dollars == pytest.approx(0.5)
     assert not meter.report().stopped_by_cost
+
+
+@pytest.mark.asyncio
+async def test_admission_release_survives_a_second_cancellation() -> None:
+    """A rollout cancelled again while releasing must not leak its slot."""
+    meter = SpendMeter(
+        max_token_cost=10.0, price_fn=lambda response: 0.1, max_concurrent=2
+    )
+    capability = SpendCapability(meter, "rollout")
+
+    async def seed() -> None:
+        meter.record("rollout", _response())
+
+    await capability.wrap_run(cast(Any, None), handler=seed)
+
+    entered = asyncio.Event()
+    never = asyncio.Event()
+
+    async def rollout() -> None:
+        entered.set()
+        await never.wait()
+
+    task = asyncio.create_task(capability.wrap_run(cast(Any, None), handler=rollout))
+    await entered.wait()
+    assert meter._active["training"] == 1
+    assert meter._reserved == pytest.approx(0.1)
+
+    # Hold the condition lock so the release's notify acquire has to queue,
+    # then cancel the rollout a second time while it is queued there.
+    await meter._condition.acquire()
+    task.cancel()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert meter._active["training"] == 0
+    assert meter._reserved == pytest.approx(0.0)
+    task.cancel()
+    meter._condition.release()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The condition is not corrupted: a later rollout is admitted normally.
+    async def followup() -> None:
+        meter.record("rollout", _response())
+
+    await asyncio.wait_for(
+        capability.wrap_run(cast(Any, None), handler=followup), timeout=5
+    )
+    assert meter._active["training"] == 0
+    assert meter._reserved == pytest.approx(0.0)
+    assert meter.report().total_dollars == pytest.approx(0.2)
+    assert not meter.report().stopped_by_cost

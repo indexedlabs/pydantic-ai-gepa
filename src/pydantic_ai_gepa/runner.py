@@ -287,13 +287,17 @@ async def optimize_agent(
         max_token_cost: Optional positive run-level US dollar cap, including reflection
             and rollouts. A batch is projected at its own kind's observed mean
             (training vs validation rollouts), and each rollout is admitted
-            against the cap at its kind's highest observed cost, so a capped run
-            ends within one rollout of the cap (at the highest cost observed for
-            that rollout's kind). A rollout setting a new price high for its kind
-            can overshoot by its own excess, the first observed rollout of a kind
-            starts without a projection, and reflection overshoot stays bounded
-            by the reflection projection plus the response backstop. Overshoot is
-            reported honestly in the spend report.
+            against the cap with in-flight rollouts reserved at their kind's
+            highest observed cost. The margin is one rollout per in-flight slot
+            at that high. The first rollout of a kind runs alone and can
+            overshoot by its own cost. Up to ``max_concurrent_evaluations``
+            in-flight rollouts can each set a new price high for their kind;
+            the run then overshoots by the sum of their excesses. Reflection
+            overshoot stays bounded by the reflection projection plus the
+            response backstop. Near the cap the gate is conservative: with
+            nothing in flight it stops once the kind's highest observed rollout
+            no longer fits, so one outlier rollout can end a run with headroom
+            left. Overshoot is reported honestly in the spend report.
         price_fn: Optional response-to-dollars override; None falls back to the
             bundled price catalog. Unknown prices stop capped runs gracefully.
         gepa_usage_limits: Optional UsageLimits applied cumulatively across the entire

@@ -100,12 +100,21 @@ class SpendMeter:
     tracked separately for training and validation rollouts so a batch is
     projected at its own kind's mean instead of a blended one. With both
     ``max_token_cost`` and ``max_concurrent`` set, ``admit_rollout`` gates
-    every rollout start: a capped run ends within one rollout of the cap, at
-    the highest cost observed for that rollout's kind. A rollout costing more
-    than any earlier rollout of its kind (a new price high) can overshoot by
-    its own excess, and the first observed rollout of a kind starts without a
-    projection. Reflection overshoot stays bounded by the reflection
-    projection plus the response backstop.
+    every rollout start. The bound on a capped run, stated plainly:
+
+    - Each in-flight rollout is reserved at its kind's highest observed cost,
+      so the margin is one rollout per in-flight slot at that high.
+    - The first rollout of a kind runs alone with no projection and can
+      overshoot by its own cost.
+    - Up to ``max_concurrent`` in-flight rollouts can each set a new price
+      high for their kind; the run then overshoots by the sum of their
+      excesses over the previous high.
+    - Reflection overshoot stays bounded by the reflection projection plus
+      the response backstop.
+
+    Near the cap the gate is conservative: with nothing in flight it stops
+    once the kind's highest observed rollout no longer fits, so one outlier
+    rollout can end a run with headroom left.
     """
 
     def __init__(
@@ -344,9 +353,14 @@ class SpendMeter:
             yield
         finally:
             self._in_admission.reset(token)
-            async with self._condition:
+            # Release the slot synchronously: a second cancellation queued on
+            # the condition lock must not leak the reservation.
+            with self._lock:
                 self._active[kind] -= 1
                 self._reserved -= reservation
+            # If this notify acquire is itself cancelled, the run is already
+            # being torn down; the slot above is released either way.
+            async with self._condition:
                 self._condition.notify_all()
 
     def report(self) -> SpendReport:
