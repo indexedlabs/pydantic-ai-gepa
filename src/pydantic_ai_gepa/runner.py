@@ -23,6 +23,7 @@ from .components import (
     extract_seed_candidate_with_input_type,
 )
 from .exceptions import UsageBudgetExceeded
+from .spend import PriceFn, SpendReport
 from .provider_errors import PROVIDER_STOP_REASON, is_provider_stop_error
 from .gepa_graph import create_deps, create_gepa_graph
 from .gepa_graph.datasets import DatasetInput, resolve_dataset
@@ -83,6 +84,9 @@ class GepaOptimizationResult(BaseModel):
 
     raw_result: GepaResult | None = Field(default=None, exclude=True, repr=False)
     """Underlying GEPA graph result (for advanced users)."""
+    spend_report: SpendReport = Field(default_factory=SpendReport)
+    """Aggregate reflection and rollout cost, including unpriced usage."""
+
     evaluation_errors: list[EvaluationErrorEvent] = Field(default_factory=list)
     """Structured records of evaluation failures captured during the run."""
 
@@ -187,6 +191,8 @@ async def optimize_agent(
     optimize_output_type: bool = False,
     agent_usage_limits: _usage.UsageLimits | None = None,
     gepa_usage_limits: _usage.UsageLimits | None = None,
+    max_token_cost: float | None = None,
+    price_fn: PriceFn | None = None,
 ) -> GepaOptimizationResult:
     """Optimizes a pydantic-ai agent (and optional signature inputs) using the GEPA graph backend.
 
@@ -255,6 +261,11 @@ async def optimize_agent(
         agent_usage_limits: Optional UsageLimits applied to each individual agent run
             (e.g., cap tool calls per evaluation to prevent runaway tool loops). When None,
             no per-run usage limits are enforced.
+        max_token_cost: Optional positive run-level US dollar cap, including reflection
+            and rollouts. Uses observed mean costs to project the next step; the
+            first step and in-flight requests can overshoot, reported honestly.
+        price_fn: Optional response-to-dollars override; None falls back to the
+            bundled price catalog. Unknown prices stop capped runs gracefully.
         gepa_usage_limits: Optional UsageLimits applied cumulatively across the entire
             GEPA optimization run. When provided, GEPA stops once the aggregated usage
             exceeds this budget.
@@ -357,6 +368,8 @@ async def optimize_agent(
 
     config = _build_gepa_config(
         max_metric_calls=max_metric_calls,
+        max_token_cost=max_token_cost,
+        price_fn=price_fn,
         max_iterations=max_iterations,
         reflection_minibatch_size=reflection_minibatch_size,
         skip_perfect_score=skip_perfect_score,
@@ -420,7 +433,7 @@ async def optimize_agent(
             raise RuntimeError("GEPA graph run did not produce a result.")
         gepa_result = run_output
     except UsageBudgetExceeded as exc:
-        state.mark_stopped(reason="Usage budget exceeded")
+        state.mark_stopped(reason=getattr(exc, "stop_reason", "Usage budget exceeded"))
         logfire.info(
             "Optimization stopped due to usage budget",
             exception=exc,
@@ -443,7 +456,10 @@ async def optimize_agent(
                 "Optimization failed while returning fallback result",
                 exception=exc,
             )
-            return _fallback_result(normalized_seed_candidate)
+            fallback = _fallback_result(normalized_seed_candidate)
+            if state.spend_meter is not None:
+                fallback.spend_report = state.spend_meter.report()
+            return fallback
         # Billing or credentials: keep the best-so-far candidate, as a usage-budget
         # stop does, instead of discarding the run's progress.
         state.mark_stopped(reason=PROVIDER_STOP_REASON)
@@ -492,6 +508,7 @@ async def optimize_agent(
         num_metric_calls=gepa_result.total_evaluations,
         raw_result=gepa_result,
         evaluation_errors=gepa_result.evaluation_errors,
+        spend_report=gepa_result.spend_report,
     )
 
     if cache_manager and cache_verbose:
@@ -504,6 +521,8 @@ async def optimize_agent(
 def _build_gepa_config(
     *,
     max_metric_calls: int,
+    max_token_cost: float | None = None,
+    price_fn: PriceFn | None = None,
     max_iterations: int | None,
     reflection_minibatch_size: int,
     skip_perfect_score: bool,
@@ -527,6 +546,8 @@ def _build_gepa_config(
 
     return GepaConfig(
         max_evaluations=max_metric_calls,
+        max_token_cost=max_token_cost,
+        price_fn=price_fn,
         max_iterations=max_iterations,
         minibatch_size=reflection_minibatch_size,
         perfect_score=float(perfect_score),

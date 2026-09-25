@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ...spend import SpendReport
 from .candidate import CandidateProgram
 from .state import EvaluationErrorEvent
 
@@ -30,6 +31,7 @@ class GepaResult(BaseModel):
 
     stop_reason: str | None = None
     stopped: bool = False
+    spend_report: SpendReport = Field(default_factory=SpendReport)
 
     candidates: list[CandidateProgram] = Field(default_factory=list)
     evaluation_errors: list["EvaluationErrorEvent"] = Field(default_factory=list)
@@ -58,6 +60,11 @@ class GepaResult(BaseModel):
             iterations=max(state.iteration, 0),
             stop_reason=state.stop_reason,
             stopped=state.stopped,
+            spend_report=(
+                state.spend_meter.report()
+                if state.spend_meter
+                else SpendReport(max_token_cost=state.config.max_token_cost)
+            ),
             candidates=list(state.candidates),
             evaluation_errors=list(state.evaluation_errors),
         )

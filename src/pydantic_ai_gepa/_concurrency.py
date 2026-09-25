@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Awaitable
 from typing import TypeVar
 
+from .exceptions import UsageBudgetExceeded
 from .provider_errors import is_provider_stop_error
 
 T = TypeVar("T")
@@ -26,7 +27,11 @@ async def gather_cancelling_on_provider_stop(*awaitables: Awaitable[T]) -> list[
     try:
         return list(await asyncio.gather(*tasks))
     except BaseException as error:
-        if is_provider_stop_error(error):
+        if isinstance(error, UsageBudgetExceeded):
+            # Drain already-paid requests before snapshotting spend; each meter
+            # blocks queued runs and additional model rounds after a cost stop.
+            await asyncio.gather(*tasks, return_exceptions=True)
+        elif is_provider_stop_error(error):
             unfinished = [task for task in tasks if not task.done()]
             for task in unfinished:
                 task.cancel()

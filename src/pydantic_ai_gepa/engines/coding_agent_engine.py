@@ -5,6 +5,7 @@ from __future__ import annotations
 import random
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any, TypeAlias, cast
 
 from pydantic_evals import Case
@@ -21,6 +22,7 @@ from .base import (
     EngineResult,
     OptimizationTask,
     _aggregate_side_info,
+    check_cost_budget_support,
 )
 from .registry import register_engine
 
@@ -76,6 +78,7 @@ class CodingAgentEngine:
         budget: BudgetTracker,
     ) -> EngineResult:
         """Run managed baseline/reflection rounds and return the best candidate."""
+        check_cost_budget_support(self, config)
         budget.check()
 
         minibatch_size = self._positive_int_option("minibatch_size", 5)
@@ -99,6 +102,7 @@ class CodingAgentEngine:
         starting_spend = budget.spent
         engine_budget = BudgetTracker(config.max_metric_calls)
         history: list[EngineEvent] = []
+        proposal_wall_times: list[float] = []
         seed = _copy_candidate(await task.seed_candidate())
         seed_evaluation = await self._evaluate_validation(
             task=task,
@@ -115,6 +119,8 @@ class CodingAgentEngine:
                     data={
                         "iterations": 0,
                         "proposals": 0,
+                        "proposal_wall_time_seconds": 0.0,
+                        "proposal_wall_times_seconds": [],
                         "stop_reason": "budget_exhausted",
                         "validation_evaluations": 0,
                     },
@@ -258,7 +264,9 @@ class CodingAgentEngine:
                 iteration=iterations,
                 side_info=_aggregate_side_info(baseline_records),
             )
+            proposal_started = perf_counter()
             proposal = await self._propose(context)
+            proposal_wall_times.append(perf_counter() - proposal_started)
             proposals += 1
 
             proposal_samples: list[float] = []
@@ -371,6 +379,8 @@ class CodingAgentEngine:
                 data={
                     "iterations": iterations,
                     "proposals": proposals,
+                    "proposal_wall_time_seconds": sum(proposal_wall_times),
+                    "proposal_wall_times_seconds": proposal_wall_times,
                     "stop_reason": stop_reason,
                     "validation_evaluations": len(pool),
                     "pareto_candidates": sorted(_pareto_indices(pool)),

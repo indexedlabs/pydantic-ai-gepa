@@ -100,8 +100,8 @@ async def optimize(
                 state.total_evaluations,
                 best_score=state.best_score,
             )
-    except UsageBudgetExceeded:
-        state.mark_stopped(reason="Usage budget exceeded")
+    except UsageBudgetExceeded as exc:
+        state.mark_stopped(reason=getattr(exc, "stop_reason", "Usage budget exceeded"))
         import logfire
 
         logfire.info(

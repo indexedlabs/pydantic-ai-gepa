@@ -340,6 +340,7 @@ class EngineConfig(BaseModel):
     engine: str
     max_metric_calls: int = Field(default=200, gt=0)
     max_iterations: int | None = Field(default=None, gt=0)
+    max_token_cost: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     stop_at_score: float | None = None
     seed: int = 0
     engine_config: dict[str, Any] = Field(default_factory=dict)
@@ -458,6 +459,16 @@ class OptimizationEngine(Protocol):
     ) -> EngineResult:
         """Run optimization against ``task`` under the shared ``budget``."""
         ...
+
+
+def check_cost_budget_support(engine: OptimizationEngine, config: EngineConfig) -> None:
+    """Reject dollar limits on engines that cannot account for model spend."""
+    if config.max_token_cost is not None and not getattr(
+        engine, "supports_token_cost", False
+    ):
+        raise ValueError(
+            f"Engine {engine.name!r} cannot meter dollars and does not support max_token_cost."
+        )
 
 
 __all__ = [

@@ -44,9 +44,10 @@ from ...skills.models import (
     SkillSummary,
 )
 from ...skills.search import LocalSkillsSearchProvider
+from ...spend import SpendCapability
 from ...types import DEFAULT_MAX_SPAWNED_AGENTS
 from .continue_step import IterationAction
-from .budget import can_evaluate
+from .budget import can_evaluate, can_reflect_or_evaluate
 
 _IMPROVEMENT_EPSILON = 1e-9
 _TOKEN_RE = re.compile(r"[a-zA-Z0-9_/-]{3,}")
@@ -61,6 +62,15 @@ def _hash_text(text: str) -> str:
 
 
 async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> IterationAction:
+    """Run a reflection iteration with one grouped spend observation."""
+    meter = ctx.state.spend_meter
+    if meter is None:
+        return await _reflect_step(ctx)
+    with meter.step("reflection"):
+        return await _reflect_step(ctx)
+
+
+async def _reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> IterationAction:
     """Generate and evaluate reflective mutations for the current candidate."""
 
     state = ctx.state
@@ -124,6 +134,9 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
     if not can_evaluate(state, len(minibatch)):
         return "continue"
 
+    if not can_reflect_or_evaluate(state, "reflection"):
+        return "continue"
+
     reflection_model = _resolve_model(deps)
     components_to_update: Sequence[str] | None
     # The reflector's tool catalog is built here: journal tools (when a
@@ -182,6 +195,11 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
                 parent_idx,
                 reflection_model,
                 max_spawned_agents=max_spawned_agents,
+                **(
+                    {"spend_meter": state.spend_meter}
+                    if state.spend_meter is not None
+                    else {}
+                ),
             )
         )
 
@@ -238,6 +256,9 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
             Sequence[AgentCapability[object]],
             deps.trace_collector.capabilities(reflector_trace_context),
         )
+    reflector_capabilities = list(reflector_capabilities or ())
+    if state.spend_meter is not None:
+        reflector_capabilities.append(SpendCapability(state.spend_meter, "reflection"))
     with logfire.span(
         "propose new texts",
         parent_idx=parent_idx,
