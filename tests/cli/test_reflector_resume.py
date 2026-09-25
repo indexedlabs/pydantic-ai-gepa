@@ -1038,35 +1038,33 @@ def test_components_can_abandon_an_unrestorable_continuation(
 def test_nonpaired_validation_requires_writable_private_front(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, paired_threshold: int | None
 ) -> None:
-    from pydantic_ai_gepa.cli import validation
     from pydantic_ai_gepa.cli import front
     from pydantic_ai_gepa.cli import eval as eval_module
-    from pydantic_ai_gepa.evaluation import EvaluationRecord
 
     validation_path = _configure_private_validation(git_repo, monkeypatch)
-    proposed = False
+    calls = []
 
     async def evaluate(**kwargs):
-        return [
-            EvaluationRecord(case.name, 0.7 if proposed else 0.2, None, {})
-            for case in kwargs["dataset"]
-        ]
+        calls.append(kwargs)
+        pytest.fail("Storage must be checked before any rollout is paid")
 
     monkeypatch.setattr(eval_module, "evaluate_callable_dataset", evaluate)
 
     def readonly_evidence(*args, **kwargs):
-        raise PermissionError("validation directory is read-only")
+        raise PermissionError(f"{validation_path} is read-only")
 
-    monkeypatch.setattr(validation, "write_validation_evidence", readonly_evidence)
-    monkeypatch.setattr(front, "write_validation_evidence", readonly_evidence)
+    monkeypatch.setattr(front, "_write_front", readonly_evidence)
     options = (
         ()
         if paired_threshold is None
         else ("--acceptance-paired-min-cases", str(paired_threshold))
     )
     started = _run("run", "start", *options, "--max-iterations", "13")
-    assert started.exit_code == 1
-    assert isinstance(started.exception, PermissionError)
+    assert started.exit_code == 2, started.output
+    assert "Private parent front storage must be writable" in started.output
+    assert str(validation_path) not in started.output
+    assert not calls
+    assert not list((git_repo / ".gepa/runs").glob("*/pareto.jsonl"))
     assert not (validation_path.parent / ".gepa-validation-evidence").exists()
 
 

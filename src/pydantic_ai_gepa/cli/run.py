@@ -772,6 +772,12 @@ def _evaluate_validation_candidate(
         workspace_root=workspace_root,
         candidate_root=candidate_root,
     )
+    front = None
+    if lane is None and state.lanes == 0:
+        from .front import ValidationFront
+
+        front = ValidationFront(workspace_root or repo_root(), state.run_id)
+        front.preflight()
     outcome = private_evaluation(durable_eval)(
         run_eval_once,
         spend_state=state,
@@ -799,11 +805,10 @@ def _evaluate_validation_candidate(
         and lane is None
         and state.lanes == 0,
     )
-    if lane is None and state.lanes == 0:
-        from .front import ValidationFront, snapshot_components
+    if front is not None:
+        from .front import snapshot_components
 
         snapshot_components(outcome, workspace_root or repo_root())
-        front = ValidationFront(workspace_root or repo_root(), state.run_id)
         front.record(outcome)
         if (
             state.acceptance_paired_min_cases is None
@@ -1663,7 +1668,7 @@ def _write_final_report(
         lines.append(f"- accepted_best_commit_sha: {state.best_commit_sha}")
         if state.candidate_source == "git":
             lines.append(
-                f"- best_restore_command: git checkout {state.best_commit_sha}"
+                f"- best_restore_command: git reset --hard {state.best_commit_sha}"
             )
     if state.last_comparison:
         comparison = state.last_comparison
@@ -1752,7 +1757,7 @@ def _public_state(
     else:
         payload["next_command"] = f"gepa run continue --run-id {state.run_id}"
     payload["evaluations_this_call"] = [outcome.summary for outcome in outcomes]
-    if state.next_parent_candidate_id and state.status != "done":
+    if state.next_parent_candidate_id and state.status == "paused_after_candidate_eval":
         from .front import parent_restore_command
 
         payload["parent_restore_command"] = parent_restore_command(
@@ -1773,7 +1778,7 @@ def _emit_status(
     final_report: Path | None = None,
     final_report_text: str | None = None,
 ) -> None:
-    if state.next_parent_candidate_id and state.status != "done":
+    if state.next_parent_candidate_id and state.status == "paused_after_candidate_eval":
         public_echo(
             f"Next parent: {state.next_parent_candidate_id}. Restore it, then continue the run."
         )
@@ -2408,6 +2413,18 @@ def _continue_impl(run_id: str | None, gate_case: list[str]) -> None:
                 ]
             state = _with_timestamp(state, last_comparison=comparison)
 
+        if (
+            validation_outcomes
+            and not comparison["improved"]
+            and comparison.get("outcome") == "valid"
+        ):
+            if state.iterations >= state.max_iterations:
+                comparison["recommendation"] = "review_best"
+            elif (
+                comparison.get("candidate_id") != state.reflection_baseline_candidate_id
+            ):
+                comparison["recommendation"] = "select_next_parent"
+            state = _with_timestamp(state, last_comparison=comparison)
         state = remember_comparison(state, comparison)
         if comparison["improved"]:
             state = _consume_candidate_verdict(state, accepted=True)
