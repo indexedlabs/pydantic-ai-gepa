@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from threading import RLock
@@ -20,8 +21,28 @@ from pydantic_ai.run import AgentRunResult
 from .exceptions import UsageBudgetExceeded
 
 SpendCategory = Literal["reflection", "rollout"]
+RolloutKind = Literal["training", "validation"]
 PriceFn = Callable[[ModelResponse], float | None]
 COST_STOP_REASON = "Cost budget reached"
+
+_rollout_kind: ContextVar[RolloutKind] = ContextVar(
+    "gepa_rollout_kind", default="training"
+)
+
+
+@contextmanager
+def use_rollout_kind(kind: RolloutKind) -> Iterator[None]:
+    """Tag rollouts started in this context as ``kind`` for cost projections.
+
+    Merge subsamples run under ``validation_evaluation`` for evidence hygiene
+    but count as training rollouts, so the kind is declared explicitly by the
+    step instead of being derived from ``validation_active()``.
+    """
+    token = _rollout_kind.set(kind)
+    try:
+        yield
+    finally:
+        _rollout_kind.reset(token)
 
 
 class CostBudgetExceeded(UsageBudgetExceeded):
@@ -62,31 +83,68 @@ class SpendReport(BaseModel):
 class _StepUsage:
     category: SpendCategory
     requests: int = 0
+    dollars: float = 0.0
+    kind: RolloutKind = "training"
 
 
 class SpendMeter:
-    """Thread-safe response ledger and running-mean step projections.
+    """Thread-safe response ledger and per-kind running-mean step projections.
 
     ``price_fn`` can override a response's price in US dollars. Returning None
     falls back to the bundled genai-prices catalog via ``ModelResponse.cost``.
     No background catalog updates are enabled here.
+
+    Rollout observations, dollars, and the highest single-rollout cost are
+    tracked separately for training and validation rollouts so a batch is
+    projected at its own kind's mean instead of a blended one. With both
+    ``max_token_cost`` and ``max_concurrent`` set, ``admit_rollout`` gates
+    every rollout start: a capped run ends within one rollout of the cap, at
+    the highest cost observed for that rollout's kind. A rollout costing more
+    than any earlier rollout of its kind (a new price high) can overshoot by
+    its own excess, and the first observed rollout of a kind starts without a
+    projection. Reflection overshoot stays bounded by the reflection
+    projection plus the response backstop.
     """
 
     def __init__(
-        self, max_token_cost: float | None = None, price_fn: PriceFn | None = None
+        self,
+        max_token_cost: float | None = None,
+        price_fn: PriceFn | None = None,
+        max_concurrent: int | None = None,
     ) -> None:
         if max_token_cost is not None and (
             not math.isfinite(max_token_cost) or max_token_cost <= 0
         ):
             raise ValueError("max_token_cost must be finite and > 0")
+        if max_concurrent is not None and max_concurrent <= 0:
+            raise ValueError("max_concurrent must be > 0")
         self.max_token_cost = max_token_cost
         self.price_fn = price_fn
+        self.max_concurrent = max_concurrent
         self._lock = RLock()
         self._usage: dict[SpendCategory, dict[str, ModelSpend]] = {
             "reflection": {},
             "rollout": {},
         }
         self._observations: dict[SpendCategory, int] = {"reflection": 0, "rollout": 0}
+        self._kind_observations: dict[RolloutKind, int] = {
+            "training": 0,
+            "validation": 0,
+        }
+        self._kind_dollars: dict[RolloutKind, float] = {
+            "training": 0.0,
+            "validation": 0.0,
+        }
+        self._kind_highest: dict[RolloutKind, float] = {
+            "training": 0.0,
+            "validation": 0.0,
+        }
+        self._active: dict[RolloutKind, int] = {"training": 0, "validation": 0}
+        self._reserved = 0.0
+        self._condition = asyncio.Condition()
+        self._in_admission: ContextVar[bool] = ContextVar(
+            "gepa_in_admission", default=False
+        )
         self.stop_reason: str | None = None
         self._step_usage: ContextVar[_StepUsage | None] = ContextVar(
             "gepa_step_usage", default=None
@@ -123,6 +181,8 @@ class SpendMeter:
             observation = self._step_usage.get()
             if observation is not None and observation.category == category:
                 observation.requests += 1
+                if dollars is not None:
+                    observation.dollars += dollars
             usage.requests += 1
             usage.input_tokens += response.usage.input_tokens
             usage.output_tokens += response.usage.output_tokens
@@ -151,9 +211,20 @@ class SpendMeter:
         return sum(u.dollars for c in categories for u in self._usage[c].values())
 
     def can_start(
-        self, category: SpendCategory, count: int = 1, *, following_rollouts: int = 0
+        self,
+        category: SpendCategory,
+        count: int = 1,
+        *,
+        following_rollouts: int = 0,
+        rollout_kind: RolloutKind | None = None,
     ) -> bool:
-        """Allow the first observation; otherwise require the projected spend to fit."""
+        """Allow the first observation; otherwise require the projected spend to fit.
+
+        ``rollout_kind`` projects a rollout batch at that kind's own mean so an
+        expensive validation batch is not underestimated by cheap training
+        rollouts; an unobserved kind projects zero, as before. ``following_rollouts``
+        are training rollouts and project at the training mean.
+        """
         with self._lock:
             if self.stop_reason is not None:
                 return False
@@ -161,10 +232,19 @@ class SpendMeter:
             projection = (
                 self._total(category) / observations * count if observations else 0
             )
-            rollout_observations = self._observations["rollout"]
-            if following_rollouts and rollout_observations:
+            if category == "rollout" and rollout_kind is not None:
+                kind_observations = self._kind_observations[rollout_kind]
+                projection = (
+                    self._kind_dollars[rollout_kind] / kind_observations * count
+                    if kind_observations
+                    else 0
+                )
+            training_observations = self._kind_observations["training"]
+            if following_rollouts and training_observations:
                 projection += (
-                    self._total("rollout") / rollout_observations * following_rollouts
+                    self._kind_dollars["training"]
+                    / training_observations
+                    * following_rollouts
                 )
             if self.max_token_cost is not None and (
                 self._total() >= self.max_token_cost
@@ -175,9 +255,11 @@ class SpendMeter:
             return True
 
     @contextmanager
-    def step(self, category: SpendCategory) -> Iterator[None]:
+    def step(
+        self, category: SpendCategory, *, kind: RolloutKind = "training"
+    ) -> Iterator[None]:
         """Observe a complete rollout or reflection step, including failures."""
-        observation = _StepUsage(category)
+        observation = _StepUsage(category, kind=kind)
         token = self._step_usage.set(observation)
         try:
             yield
@@ -187,6 +269,83 @@ class SpendMeter:
                 # Concurrent runs must not count another run's responses.
                 if observation.requests:
                     self._observations[category] += 1
+                    if category == "rollout":
+                        # Steps with no response (cache hits, setup failures)
+                        # stay free and never dilute a kind's projections.
+                        self._kind_observations[observation.kind] += 1
+                        self._kind_dollars[observation.kind] += observation.dollars
+                        self._kind_highest[observation.kind] = max(
+                            self._kind_highest[observation.kind], observation.dollars
+                        )
+
+    def _try_admit(self, kind: RolloutKind) -> float | None:
+        """Return a rollout's reservation, None to wait, or raise on a cost stop."""
+        with self._lock:
+            if self.stop_reason is not None:
+                raise CostBudgetExceeded(self.stop_reason)
+            assert self.max_token_cost is not None and self.max_concurrent is not None
+            observations = self._kind_observations[kind]
+            highest = self._kind_highest[kind]
+            remaining = self.max_token_cost - self._total() - self._reserved
+            concurrency = max(1, self.max_concurrent)
+            # An unobserved kind, or headroom that cannot cover a full
+            # concurrent batch at the observed high, starts one at a time.
+            limit = (
+                concurrency
+                if observations and remaining >= concurrency * highest
+                else 1
+            )
+            if sum(self._active.values()) >= limit:
+                return None
+            # Reserve at the observed high so in-flight rollouts cannot each
+            # spend the same headroom on an underestimated mean.
+            projection = highest if observations else 0.0
+            if remaining <= 0 or projection > remaining:
+                if any(self._active.values()):
+                    # In-flight rollouts settle first; a failed or cheap one
+                    # can free enough headroom to admit this rollout.
+                    return None
+                self.stop_reason = COST_STOP_REASON
+                raise CostBudgetExceeded(self.stop_reason)
+            return projection
+
+    @asynccontextmanager
+    async def admit_rollout(self, kind: RolloutKind) -> AsyncIterator[None]:
+        """Gate a capped rollout start on the dollars it is projected to cost.
+
+        Uncapped meters (or meters without ``max_concurrent``) admit
+        immediately with no waiting or serialization, as before.
+        """
+        if (
+            self.max_token_cost is None
+            or self.max_concurrent is None
+            or self._in_admission.get()
+        ):
+            # A nested agent run shares the outer rollout's reservation.
+            yield
+            return
+        reservation: float | None = None
+        async with self._condition:
+            while reservation is None:
+                try:
+                    reservation = self._try_admit(kind)
+                except CostBudgetExceeded:
+                    # Wake waiting rollouts so they observe the stop and exit.
+                    self._condition.notify_all()
+                    raise
+                if reservation is None:
+                    await self._condition.wait()
+            self._active[kind] += 1
+            self._reserved += reservation
+            token = self._in_admission.set(True)
+        try:
+            yield
+        finally:
+            self._in_admission.reset(token)
+            async with self._condition:
+                self._active[kind] -= 1
+                self._reserved -= reservation
+                self._condition.notify_all()
 
     def report(self) -> SpendReport:
         with self._lock:
@@ -252,8 +411,10 @@ class SpendCapability(AbstractCapability[Any]):
     ) -> AgentRunResult[Any]:
         self.meter.check()
         if self.category == "rollout":
-            with self.meter.step("rollout"):
-                return await handler()
+            kind = _rollout_kind.get()
+            async with self.meter.admit_rollout(kind):
+                with self.meter.step("rollout", kind=kind):
+                    return await handler()
         return await handler()
 
 

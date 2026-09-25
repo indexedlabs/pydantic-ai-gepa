@@ -9,6 +9,7 @@ from pydantic_graph import StepContext
 
 from pydantic_evals import Case
 from ..._validation import validation_evaluation
+from ...spend import use_rollout_kind
 from ..deps import GepaDeps
 from ..evaluation import EvaluationResults
 from ..models import CandidateProgram, GepaState
@@ -27,6 +28,7 @@ async def evaluate_step(ctx: StepContext[GepaState, GepaDeps, None]) -> None:
         state,
         len(validation_batch),
         reason="Max evaluations reached: budget cannot cover the validation set",
+        rollout_kind="validation",
     ):
         if state.best_candidate_idx is None and candidate.creation_type == "seed":
             # Return the unscored seed without inventing a partial validation score.
@@ -35,6 +37,7 @@ async def evaluate_step(ctx: StepContext[GepaState, GepaDeps, None]) -> None:
 
     with (
         validation_evaluation(ctx.deps.memory_exporter),
+        use_rollout_kind("validation"),
         logfire.span(
             "evaluate candidate",
             candidate_idx=candidate.idx,
