@@ -292,6 +292,54 @@ repeat
 
 The eval summary you parse is **the last JSON line on stdout** — it carries `run_id`, `minibatch_id`, `mean_score`, `report_path`, and `iterations`.
 
+### Resuming with another reflector
+
+When the coding agent loses its session, hits quota, or must hand off, issue:
+
+```bash
+gepa run resume --run-id <run_id> --reason "session lost" --reflector <label>
+```
+
+Omit `--run-id` to resume the latest managed run. The command never evaluates,
+changes the candidate tree, or consumes budget. It works at every single-path
+pause and re-issues the final packet for a completed run. Its last JSON line is
+`{"packet": ...}`; `start`, `continue`, and `status` also expose
+`reflector_packet_path`. Hand the new agent that file at
+`runs/<run_id>/reflector_packet.json`. It contains the scored baseline, current
+tree identity, training reports and traces, last comparison, journal tail,
+notes index, best candidate, budget, and instructions. Validation remains
+aggregate-only. Local agents and Mighty threads receive the same packet.
+
+Run `next_command.argv` in `next_command.cwd`, or use `next_command.shell` from
+any directory. Both select the absolute workspace and carry
+`--reflector-epoch N`. `continue` refuses a stale epoch with exit 2 and names the
+current epoch. Omitting the flag preserves existing CLI behavior.
+
+The loop phase remains in `status`. The separate `reflector` block has an epoch,
+label, issue timestamp, and `active` or `lost` state. Resume records the previous
+epoch as `lost`, with its reason and timestamp in a bounded history, then issues
+an `active` epoch and appends a `reflector_lost` journal row. Repeating resume
+simply issues another packet and epoch. There is no heartbeat or automatic
+expiry; the operator decides when a reflector has been lost.
+
+- **Death after commit, before continue:** the packet identifies the committed,
+  unscored proposal. Review it and run `next_command`, or explicitly restore the
+  reported baseline. The CLI never discards the commit.
+- **Death after continue completed:** the packet retains the recorded verdict,
+  including an accepted proposal after the loop advances. Repeating continue on
+  the recorded candidate returns the result with exit 0 and no evaluations.
+  For a rejected proposal, restore the baseline to advance or revise the tree
+  to compare a new proposal.
+- **Death during continue:** durable training samples and any completed
+  validation evaluation are recovered before evaluating remaining samples, so
+  paid evaluations are not duplicated. Gate samples use a separate checkpoint
+  because they do not write Pareto rows. Keep the interrupted candidate unchanged
+  until its comparison finishes; the packet preserves any `--gate-case` options.
+
+Continuation and resume share a run lock. A live holder causes exit 1; a process
+death releases the lock automatically. Lane runs refuse this command with exit
+2: use `gepa lane reset` and `gepa lane lease` instead.
+
 ### Concrete commands
 
 ```bash
@@ -639,11 +687,12 @@ Look at the per-case `feedback` field in the report:
 | Code | Meaning | Where |
 |---|---|---|
 | 0 | Success | All verbs |
-| 1 | Recoverable error (missing file, invalid agent ref, dataset empty, orphan slots on `apply`) | All verbs |
-| 2 | Refusal — input wrong shape OR baseline blocked by stage-and-confirm | `gepa eval` / `gepa run` (unconfirmed slots), every verb on argparse errors |
+| 1 | Recoverable error (missing file, invalid agent ref, dataset empty, orphan slots on `apply`, live run lock holder) | All verbs |
+| 2 | Refusal — wrong input shape, unconfirmed slots, stale reflector epoch, or single-path resume of a lane run | `gepa eval` / `gepa run`, every verb on argparse errors |
 | 70 | Hard cap — `--max-iterations` exceeded | `gepa eval` |
 
-When you see exit 2 from `gepa eval` or `gepa run`, the stderr block tells you exactly which `gepa components confirm <slot>` calls to make.
+When you see exit 2, read stderr for the recovery command: component confirmation,
+a fresh reflector packet, or the lane workflow.
 
 ## Inspection
 
@@ -679,6 +728,8 @@ gepa run status --run-id <run_id>
 ├── staged/<slot>.md           # stubs awaiting `gepa components confirm`
 └── runs/<run_id>/
     ├── state.json             # managed `gepa run` controller state
+    ├── reflector_packet.json  # versioned single-path handoff; training + validation aggregates
+    ├── run.lock               # continuation/resume flock and holder PID
     ├── final_report.md        # written when managed run reaches done
     ├── pareto.jsonl           # append-only ParetoRow history (one row per eval)
     ├── minibatches/<mb_id>.json

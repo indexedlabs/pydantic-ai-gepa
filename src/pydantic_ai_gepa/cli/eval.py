@@ -757,6 +757,37 @@ def run_eval_once(
         else [failure.to_dict() for failure in infrastructure_failures]
     )
 
+    # Validation evidence is selection-only. Do not persist a report or trace
+    # that an external reflection agent could inspect.
+    report_path: Path | None = None
+    if persist_report:
+        reports_dir = run_dir(active_run_id, workspace_root) / "reports"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        report_path = reports_dir / f"{iteration:04d}-{eval_id}-{candidate.id}.md"
+        report_path.write_text(
+            _format_failures(
+                records,
+                threshold=threshold,
+                candidate_source=source,
+                redact_scores=cfg.acceptance.mode == "vector",
+            ),
+            encoding="utf-8",
+        )
+        if infrastructure_failures:
+            append_infrastructure_failures_to_report(
+                report_path, infrastructure_failures
+            )
+    trace_path = (
+        _write_trace_file(
+            path=planned_trace_path,
+            records=records,
+            redact_scores=cfg.acceptance.mode == "vector",
+        )
+        if planned_trace_path is not None
+        else None
+    )
+
+    # A paid row must only become visible after its training evidence is saved.
     if write_pareto:
         pareto = ParetoLog(active_run_id, workspace_root)
         pareto.append(
@@ -789,36 +820,6 @@ def run_eval_once(
                 },
             )
         )
-
-    # Validation evidence is selection-only. Do not persist a report or trace
-    # that an external reflection agent could inspect.
-    report_path: Path | None = None
-    if persist_report:
-        reports_dir = run_dir(active_run_id, workspace_root) / "reports"
-        reports_dir.mkdir(parents=True, exist_ok=True)
-        report_path = reports_dir / f"{iteration:04d}-{eval_id}-{candidate.id}.md"
-        report_path.write_text(
-            _format_failures(
-                records,
-                threshold=threshold,
-                candidate_source=source,
-                redact_scores=cfg.acceptance.mode == "vector",
-            ),
-            encoding="utf-8",
-        )
-        if infrastructure_failures:
-            append_infrastructure_failures_to_report(
-                report_path, infrastructure_failures
-            )
-    trace_path = (
-        _write_trace_file(
-            path=planned_trace_path,
-            records=records,
-            redact_scores=cfg.acceptance.mode == "vector",
-        )
-        if planned_trace_path is not None
-        else None
-    )
 
     summary: dict[str, Any] = {
         "candidate_id": candidate.id,

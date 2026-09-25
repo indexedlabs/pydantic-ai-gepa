@@ -8,7 +8,7 @@ minibatch, then uses held-out validation to decide whether to adopt it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import os
@@ -42,6 +42,13 @@ from .layout import (
     run_dir,
     run_state_path,
     runs_dir,
+)
+from .reflector import default_reflector, write_packet
+from .reflector_recovery import (
+    continue_run,
+    durable_eval,
+    remember_comparison,
+    state_for_save,
 )
 from .runs import MinibatchStore, ParetoLog, utc_now_iso
 from .store import ComponentStore
@@ -136,8 +143,17 @@ class RunState:
     select_context: dict[str, Any] | None = None
     infrastructure_retry_minibatch_id: str | None = None
 
+    reflector: dict[str, Any] = field(default_factory=default_reflector)
+    last_reflector_comparison: dict[str, Any] | None = None
+    continuation: dict[str, Any] | None = None
+    project_root: str | None = None
+
     def to_dict(self) -> dict[str, Any]:
         return {
+            "reflector": self.reflector,
+            "last_reflector_comparison": self.last_reflector_comparison,
+            "continuation": self.continuation,
+            "project_root": self.project_root,
             "run_id": self.run_id,
             "status": self.status,
             "max_iterations": self.max_iterations,
@@ -202,6 +218,10 @@ class RunState:
     @staticmethod
     def from_dict(data: dict[str, Any]) -> RunState:
         return RunState(
+            reflector=dict(data.get("reflector") or default_reflector()),
+            last_reflector_comparison=data.get("last_reflector_comparison"),
+            continuation=data.get("continuation"),
+            project_root=data.get("project_root"),
             run_id=str(data["run_id"]),
             status=str(data["status"]),  # type: ignore[arg-type]
             max_iterations=int(data["max_iterations"]),
@@ -349,12 +369,14 @@ class RunState:
         )
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(self.to_dict(), handle, indent=2)
+                json.dump(state_for_save(self).to_dict(), handle, indent=2)
                 handle.write("\n")
             os.replace(tmp_name, path)
         except BaseException:
             os.unlink(tmp_name)
             raise
+        if self.lanes == 0 and self.status != "running":
+            write_packet(self.run_id, root)
         return path
 
 
@@ -681,7 +703,8 @@ def _evaluate_validation_candidate(
         workspace_root=workspace_root,
         candidate_root=candidate_root,
     )
-    outcome = run_eval_once(
+    outcome = durable_eval(
+        run_eval_once,
         candidate_file=None,
         minibatch_id=None,
         size=state.size,
@@ -820,7 +843,8 @@ def _mark_done(state: RunState) -> RunState:
 def _fresh_baseline_outcome(state: RunState) -> tuple[RunState, EvalOutcome]:
     epoch = state.next_epoch
     retry_minibatch_id = state.infrastructure_retry_minibatch_id
-    outcome = run_eval_once(
+    outcome = durable_eval(
+        run_eval_once,
         candidate_file=None,
         minibatch_id=retry_minibatch_id,
         size=state.size,
@@ -870,7 +894,8 @@ def _capture_reflection_baseline(
     minibatch_id = str(first_outcome.summary["minibatch_id"])
 
     while len(outcomes) < target_repetitions:
-        outcome = run_eval_once(
+        outcome = durable_eval(
+            run_eval_once,
             candidate_file=None,
             minibatch_id=minibatch_id,
             size=state.size,
@@ -1003,7 +1028,8 @@ def _evaluate_reflected_candidate(
                 if case_id not in gate_case_ids
             ]
             supplemental_records = gate_outcomes[0].records
-        outcome = run_eval_once(
+        outcome = durable_eval(
+            run_eval_once,
             candidate_file=None,
             minibatch_id=state.reflection_minibatch_id,
             size=state.size,
@@ -1200,7 +1226,8 @@ def _evaluate_gate_cases(
     comparison_result: AcceptanceComparison | None = None
     candidate_id: str | None = None
     while len(candidate_samples) < max_candidate_samples:
-        outcome = run_eval_once(
+        outcome = durable_eval(
+            run_eval_once,
             candidate_file=None,
             minibatch_id=state.reflection_minibatch_id,
             size=state.size,
@@ -1402,6 +1429,10 @@ def _public_state(
 ) -> dict[str, Any]:
     payload = state.to_dict()
     payload["state_path"] = str(run_state_path(state.run_id))
+    if state.lanes == 0:
+        payload["reflector_packet_path"] = str(
+            run_dir(state.run_id) / "reflector_packet.json"
+        )
     payload["final_report_path"] = str(final_report) if final_report else None
     if state.status == "done":
         payload["next_command"] = None
@@ -1802,6 +1833,7 @@ def start(
         straggler_timeout_secs=straggler_timeout_secs,
         journal_tail_lines=journal_tail_lines,
         stall_threshold=resolved_stall_threshold,
+        project_root=str(workspace_root.resolve()),
     )
     state.save()
     state, outcomes = _advance_to_reflection_or_done(state)
@@ -1844,8 +1876,13 @@ def continue_(
         "--gate-case",
         help="Case name from the current reflection minibatch to evaluate first. Repeatable.",
     ),
+    reflector_epoch: int | None = typer.Option(None, "--reflector-epoch"),
 ) -> None:
     """Resume after reflection edits and advance to the next pause or completion."""
+    continue_run(run_id, gate_case, reflector_epoch, _continue_impl)
+
+
+def _continue_impl(run_id: str | None, gate_case: list[str]) -> None:
     state = _load_state(run_id)
     if state.validation_dataset_path is not None:
         _assert_validation_dataset_unchanged(state)
@@ -2000,6 +2037,7 @@ def continue_(
                 )
                 state = _with_timestamp(state, last_comparison=comparison)
 
+        state = remember_comparison(state, comparison)
         if comparison["improved"]:
             state = _consume_candidate_verdict(state, accepted=True)
             if validation_outcome is not None:
@@ -2031,6 +2069,18 @@ def continue_(
     _emit_status(
         state, outcomes=outcomes, final_report=final_path, final_report_text=final_text
     )
+
+
+@app.command("resume")
+def resume(
+    run_id: str | None = typer.Option(None, "--run-id"),
+    reason: str | None = typer.Option(None, "--reason"),
+    reflector: str | None = typer.Option(None, "--reflector"),
+) -> None:
+    """Re-issue a durable packet after losing the previous reflector."""
+    from .reflector import resume as resume_reflector
+
+    resume_reflector(run_id, reason, reflector)
 
 
 @app.command("select")
