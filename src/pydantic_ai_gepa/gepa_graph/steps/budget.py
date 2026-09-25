@@ -30,3 +30,16 @@ def can_reflect_or_evaluate(
         state.mark_stopped(reason=meter.stop_reason)
         return False
     return True
+
+
+def can_reflect_and_evaluate(state: GepaState, rollouts: int) -> bool:
+    """Require both a reflection and its child minibatch to fit before paying."""
+    if not can_evaluate(state, rollouts):
+        return False
+    meter = state.spend_meter
+    if meter is not None and not meter.can_start(
+        "reflection", following_rollouts=rollouts
+    ):
+        state.mark_stopped(reason=meter.stop_reason)
+        return False
+    return True

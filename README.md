@@ -363,6 +363,7 @@ Key arguments for `optimize_agent`:
 
 `max_token_cost` uses observed mean costs to guard the next step. The first step
 and in-flight requests can overshoot; `result.spend_report` reports actual spend.
+The cap applies per engine run; composition helpers' comparison evaluations are not metered.
 Unknown model prices stop capped runs; pass `price_fn(response) -> float | None`
 to supply custom prices in dollars (`None` falls back to the bundled catalog).
 

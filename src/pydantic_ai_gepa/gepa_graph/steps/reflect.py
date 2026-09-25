@@ -47,7 +47,7 @@ from ...skills.search import LocalSkillsSearchProvider
 from ...spend import SpendCapability
 from ...types import DEFAULT_MAX_SPAWNED_AGENTS
 from .continue_step import IterationAction
-from .budget import can_evaluate, can_reflect_or_evaluate
+from .budget import can_evaluate, can_reflect_and_evaluate
 
 _IMPROVEMENT_EPSILON = 1e-9
 _TOKEN_RE = re.compile(r"[a-zA-Z0-9_/-]{3,}")
@@ -131,10 +131,7 @@ async def _reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteratio
         state.last_accepted = False
         return "continue"
 
-    if not can_evaluate(state, len(minibatch)):
-        return "continue"
-
-    if not can_reflect_or_evaluate(state, "reflection"):
+    if not can_reflect_and_evaluate(state, len(minibatch)):
         return "continue"
 
     reflection_model = _resolve_model(deps)

@@ -345,6 +345,7 @@ class EngineConfig(BaseModel):
     max_metric_calls: int = Field(default=200, gt=0)
     max_iterations: int | None = Field(default=None, gt=0)
     max_token_cost: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    """Dollar cap per engine run; composition helpers' comparison evaluations are not metered."""
     stop_at_score: float | None = None
     seed: int = 0
     engine_config: dict[str, Any] = Field(default_factory=dict)

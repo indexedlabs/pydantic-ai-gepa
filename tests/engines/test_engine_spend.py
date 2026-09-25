@@ -162,3 +162,26 @@ async def test_coding_agent_reports_zero_proposals_when_seed_is_unaffordable() -
     assert summary["proposals"] == 0
     assert summary["proposal_wall_times_seconds"] == []
     assert summary["proposal_wall_time_seconds"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("turns", [[2, 3], [None, None], [2, None]])
+async def test_coding_proposer_can_optionally_report_agent_turns(turns) -> None:
+    reports = iter(turns)
+
+    async def propose(context):
+        reported = next(reports)
+        if reported is not None:
+            context.usage.agent_turns = reported
+        return context.candidate
+
+    config = EngineConfig(
+        engine="coding_agent",
+        max_iterations=2,
+        engine_config={"propose": propose, "minibatch_size": 1},
+    )
+    result = await CodingAgentEngine(config).run(_task(), config, BudgetTracker(20))
+    summary = next(event.data for event in result.history if event.kind == "summary")
+    assert summary["proposals"] == 2
+    assert summary["proposal_agent_turns"] == turns
+    assert summary["agent_turns"] == (5 if turns == [2, 3] else None)

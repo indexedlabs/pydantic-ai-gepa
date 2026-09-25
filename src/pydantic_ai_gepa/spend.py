@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from threading import RLock
 from typing import Any, Literal
@@ -57,6 +58,12 @@ class SpendReport(BaseModel):
     stop_reason: str | None = None
 
 
+@dataclass
+class _StepUsage:
+    category: SpendCategory
+    requests: int = 0
+
+
 class SpendMeter:
     """Thread-safe response ledger and running-mean step projections.
 
@@ -81,6 +88,9 @@ class SpendMeter:
         }
         self._observations: dict[SpendCategory, int] = {"reflection": 0, "rollout": 0}
         self.stop_reason: str | None = None
+        self._step_usage: ContextVar[_StepUsage | None] = ContextVar(
+            "gepa_step_usage", default=None
+        )
 
     def check(self) -> None:
         """Prevent queued work or another tool round after a cost stop."""
@@ -92,19 +102,27 @@ class SpendMeter:
 
     def record(self, category: SpendCategory, response: ModelResponse) -> None:
         """Record exactly one new response, including an over-budget response."""
-        dollars = self.price_fn(response) if self.price_fn is not None else None
-        if dollars is None:
-            try:
+        price_error: Exception | None = None
+        try:
+            dollars = self.price_fn(response) if self.price_fn is not None else None
+            if dollars is None:
                 dollars = float(response.cost().total_price)
-            except (LookupError, ValueError, AssertionError):
-                pass
-        if dollars is not None and (not math.isfinite(dollars) or dollars < 0):
-            raise ValueError(
-                "price_fn must return finite nonnegative US dollars or None"
-            )
+            dollars = float(dollars)
+            if not math.isfinite(dollars) or dollars < 0:
+                raise ValueError(
+                    "price_fn must return finite nonnegative US dollars or None"
+                )
+        except Exception as error:
+            # Pricing failures must not become ordinary failed cases/proposals:
+            # retain the paid response and use the graceful cost-stop path.
+            price_error = error
+            dollars = None
         name = response.model_name or "<unknown>"
         with self._lock:
             usage = self._usage[category].setdefault(name, ModelSpend())
+            observation = self._step_usage.get()
+            if observation is not None and observation.category == category:
+                observation.requests += 1
             usage.requests += 1
             usage.input_tokens += response.usage.input_tokens
             usage.output_tokens += response.usage.output_tokens
@@ -114,6 +132,10 @@ class SpendMeter:
                 usage.unpriced_output_tokens += response.usage.output_tokens
                 if self.max_token_cost is not None:
                     self.stop_reason = f"Cannot price model {name!r} with a cost budget"
+                    if price_error is not None:
+                        self.stop_reason += (
+                            f": {type(price_error).__name__}: {price_error}"
+                        )
             else:
                 usage.dollars += dollars
                 if (
@@ -122,13 +144,15 @@ class SpendMeter:
                 ):
                     self.stop_reason = self.stop_reason or COST_STOP_REASON
             if self.stop_reason is not None:
-                raise CostBudgetExceeded(self.stop_reason)
+                raise CostBudgetExceeded(self.stop_reason) from price_error
 
     def _total(self, category: SpendCategory | None = None) -> float:
         categories = [category] if category else self._usage
         return sum(u.dollars for c in categories for u in self._usage[c].values())
 
-    def can_start(self, category: SpendCategory, count: int = 1) -> bool:
+    def can_start(
+        self, category: SpendCategory, count: int = 1, *, following_rollouts: int = 0
+    ) -> bool:
         """Allow the first observation; otherwise require the projected spend to fit."""
         with self._lock:
             if self.stop_reason is not None:
@@ -137,6 +161,11 @@ class SpendMeter:
             projection = (
                 self._total(category) / observations * count if observations else 0
             )
+            rollout_observations = self._observations["rollout"]
+            if following_rollouts and rollout_observations:
+                projection += (
+                    self._total("rollout") / rollout_observations * following_rollouts
+                )
             if self.max_token_cost is not None and (
                 self._total() >= self.max_token_cost
                 or self._total() + projection > self.max_token_cost
@@ -148,15 +177,15 @@ class SpendMeter:
     @contextmanager
     def step(self, category: SpendCategory) -> Iterator[None]:
         """Observe a complete rollout or reflection step, including failures."""
-        with self._lock:
-            requests_before = sum(u.requests for u in self._usage[category].values())
+        observation = _StepUsage(category)
+        token = self._step_usage.set(observation)
         try:
             yield
         finally:
+            self._step_usage.reset(token)
             with self._lock:
-                requests_after = sum(u.requests for u in self._usage[category].values())
-                # A skipped reflection is not a zero-cost proposal observation.
-                if category == "rollout" or requests_after > requests_before:
+                # Concurrent runs must not count another run's responses.
+                if observation.requests:
                     self._observations[category] += 1
 
     def report(self) -> SpendReport:

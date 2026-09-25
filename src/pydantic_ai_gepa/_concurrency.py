@@ -17,9 +17,15 @@ async def gather_cancelling_on_provider_stop(*awaitables: Awaitable[T]) -> list[
 
     After a billing or credential stop every other case fails the same way, so
     cases still in flight are cancelled rather than calling the provider again,
-    possibly after their caller has left the candidate context. Other failures
-    keep ``gather``'s behavior: the remaining cases run to completion, so paid
-    rollouts still record usage and cache their results. Cancellation reaches
+    possibly after their caller has left the candidate context.
+
+    UsageBudgetExceeded (including token/request limits) drains all tasks without
+    cancelling them before re-raising, so the caller waits for stragglers and
+    can report all in-flight responses. Cost meters block queued requests and
+    further model rounds after a cost stop.
+
+    Other failures keep ``gather``'s behavior: the remaining cases run to
+    completion, so paid rollouts still record usage and cache their results. Cancellation reaches
     coroutines only; work already handed to a thread keeps running.
     """
 

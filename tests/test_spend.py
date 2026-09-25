@@ -378,3 +378,121 @@ async def test_optimization_records_unpriced_usage_and_enforces_unknown_model_po
     else:
         assert report.stop_reason is None
         assert result.best_score == 0.5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_price", [float("nan"), float("inf"), -0.1, "invalid"])
+async def test_bad_price_override_stops_optimization_and_records_usage(
+    bad_price,
+) -> None:
+    result = await optimize_agent(
+        **_optimization_inputs(),
+        max_token_cost=0.35,
+        price_fn=lambda response: bad_price,
+    )
+    report = result.spend_report
+    assert report.stopped_by_cost
+    assert "student-test" in report.stop_reason
+    assert report.unpriced_usage["student-test"].requests == 1
+    assert report.by_model["student-test"].input_tokens > 0
+    assert "ValueError" in report.stop_reason or "TypeError" in report.stop_reason
+    assert result.raw_result.stop_reason == report.stop_reason
+
+
+@pytest.mark.asyncio
+async def test_raising_price_override_records_reflector_and_stops_gracefully() -> None:
+    result = await optimize_agent(
+        **_optimization_inputs(),
+        max_token_cost=0.35,
+        price_fn=lambda response: {"student-test": 0.1}[response.model_name],
+    )
+    report = result.spend_report
+    assert report.stopped_by_cost
+    assert "reflector-test" in report.stop_reason
+    assert "KeyError" in report.stop_reason
+    assert report.unpriced_usage["reflector-test"].requests == 1
+    assert report.by_model["reflector-test"].output_tokens > 0
+    assert report.rollout_dollars == pytest.approx(0.2)
+    assert result.best_score == 0.5
+
+
+@pytest.mark.parametrize("capped", [True, False])
+def test_pricing_failure_is_unpriced_even_for_catalog_model(capped: bool) -> None:
+    error = RuntimeError("pricing unavailable")
+
+    def broken_price(response):
+        raise error
+
+    meter = SpendMeter(max_token_cost=1 if capped else None, price_fn=broken_price)
+    if capped:
+        with pytest.raises(CostBudgetExceeded, match="RuntimeError") as caught:
+            meter.record("rollout", _response("gpt-4o"))
+        assert caught.value.__cause__ is error
+    else:
+        meter.record("rollout", _response("gpt-4o"))
+    report = meter.report()
+    assert report.stopped_by_cost == capped
+    assert report.unpriced_usage["gpt-4o"].requests == 1
+    assert report.total_dollars == 0
+
+
+@pytest.mark.asyncio
+async def test_joint_projection_does_not_buy_unaffordable_reflection_and_child() -> (
+    None
+):
+    result = await optimize_agent(
+        **_optimization_inputs(), max_token_cost=0.65, price_fn=lambda response: 0.1
+    )
+    report = result.spend_report
+    assert report.stopped_by_cost
+    # After one rejected proposal and the next parent batch, $0.15 remains.
+    # Reflection and child evaluation each fit separately, but need $0.20 together.
+    assert report.total_dollars == pytest.approx(0.5)
+    assert report.by_model["reflector-test"].requests == 1
+    assert report.by_model["student-test"].requests == 4
+    assert result.raw_result.stop_reason == COST_STOP_REASON
+
+
+@pytest.mark.asyncio
+async def test_empty_rollout_observations_ignore_concurrent_paid_responses() -> None:
+    meter = SpendMeter(max_token_cost=0.19, price_fn=lambda response: 0.1)
+    capability = SpendCapability(meter, "rollout")
+    setup_started = asyncio.Event()
+    paid_finished = asyncio.Event()
+
+    async def failed_setup():
+        setup_started.set()
+        await paid_finished.wait()
+        raise RuntimeError("setup failed before a model request")
+
+    async def paid_run():
+        await setup_started.wait()
+        with meter.step("rollout"):
+            meter.record("rollout", _response())
+        paid_finished.set()
+
+    results = await asyncio.gather(
+        capability.wrap_run(cast(Any, None), handler=failed_setup),
+        paid_run(),
+        return_exceptions=True,
+    )
+    assert isinstance(results[0], RuntimeError)
+    # An additional empty/failed step must not dilute the $0.10 mean either.
+    with meter.step("rollout"):
+        pass
+    assert not meter.can_start("rollout")
+    assert meter.report().total_dollars == 0.1
+
+
+@pytest.mark.asyncio
+async def test_bad_price_override_without_cap_keeps_all_usage_unpriced() -> None:
+    result = await optimize_agent(
+        **_optimization_inputs(),
+        max_iterations=1,
+        price_fn=lambda response: float("nan"),
+    )
+    report = result.spend_report
+    assert not report.stopped_by_cost
+    assert report.total_dollars == 0
+    assert report.unpriced_usage["student-test"].requests > 0
+    assert report.unpriced_usage["reflector-test"].requests > 0
