@@ -37,9 +37,8 @@ def use_rollout_kind(kind: RolloutKind) -> Iterator[None]:
     The step declares the kind of the dataset its cases come from: reflect
     minibatches evaluate training-set cases (``"training"``, the default),
     while full validation and merge subsamples evaluate validation-set cases
-    (``"validation"``). ``validation_active()`` cannot carry this distinction:
-    merge subsamples also run under ``validation_evaluation`` for evidence
-    hygiene, so the kind is declared explicitly by the step.
+    (``"validation"``). The kind is a cost bucket, declared by the step rather
+    than inferred from the evidence-withholding context.
     """
     token = _rollout_kind.set(kind)
     try:
