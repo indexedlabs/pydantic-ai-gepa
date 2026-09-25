@@ -438,16 +438,24 @@ training-only continuation.
 
 The harness stores the dataset path and digest in a private `.gepa-heldout/`
 record beside the dataset. Paired per-case evidence stays in the neighboring
-`.gepa-validation-evidence/`; both directories must remain inaccessible to the
-reflector. Public state records `heldout_required` and aggregates only. Dataset
-identity changes, paths inside any checkout or `GEPA_DIR`, and data recoverable
+`.gepa-validation-evidence/`, with detailed spend checkpoints in
+`.gepa-validation-spend/`; all must remain inaccessible to the reflector.
+Public state records `heldout_required` and aggregates only. Dataset identity
+changes, paths inside any checkout or `GEPA_DIR`, and data recoverable
 from Git objects are refused. If Git ever held the data, use a fresh repository
 without those objects. Validation produces no public reports or traces.
 
-The reflector's sandbox must deny data reads outside its worktree and
-`GEPA_DIR`; keep the entire held-out directory outside both. A normal
-workspace-write policy that allows global reads is insufficient. For Codex CLI
-0.156, an example named profile in the orchestrator's Codex configuration is:
+The reflector's sandbox must restrict data reads to its worktree and
+`GEPA_DIR`, plus the runtime paths needed to execute commands. **Keep the entire
+held-out directory outside every path the sandbox can read**, including
+system temporary directories: Codex's `:minimal` grant includes `/tmp`,
+`/private/tmp`, and system temporary locations such as `/var/folders` and
+`$TMPDIR`. Putting validation outside the worktree and `GEPA_DIR` alone does
+not establish isolation. A home-directory sibling such as
+`/Users/operator/.gepa-heldout/run-1/` works when no readable grant covers it.
+
+This named profile was verified locally with Codex CLI 0.157.0. Write it to the
+launcher's `CODEX_HOME/config.toml` (a scratch `CODEX_HOME` works for probes):
 
 ```toml
 [permissions.gepa-reflector.filesystem]
@@ -460,17 +468,19 @@ enabled = false
 ```
 
 Use `codex sandbox -P gepa-reflector -C /absolute/candidate-worktree -- COMMAND`
-for a no-model shell probe. `:minimal` allows OS runtime reads; provision the
-Python runtime and dependencies within the worktree or grant narrowly scoped
-runtime reads as needed. Do not inherit `:workspace`/`:read-only` or grant `"/"`
-reads. Verify that an attempted read of the held-out file fails on the target
-host. See the [Codex permissions reference](https://learn.chatgpt.com/docs/config-file/config-reference).
-Local verification on Codex CLI 0.156.1 accepted this profile but **allowed**
-a held-out file under `/private/tmp` to be read from outside both grants.
-The probe stopped at that failed denial check. This profile is therefore an
-example of the requested configuration, **not a verified isolation boundary**
-on that host. Do not launch a held-out reflector until the deployment's
-read-denial probe passes; changing only the environment is insufficient.
+with that `CODEX_HOME`. Define the profile in the config file rather than `-c`
+overrides: dotted path keys (for example `~/.gepa/...`) can be split on their
+dots by override processing. Provision Python and its dependencies under the
+worktree's interpreter directory, or grant narrowly scoped runtime reads.
+Do not inherit `:workspace`/`:read-only` or grant `"/"` reads. See the
+[Codex permissions reference](https://learn.chatgpt.com/docs/config-file/config-reference).
+
+The no-model probe verified that sandboxed environment/config/state/packet
+output contained no held-out path, a direct read of the home-directory held-out
+file failed with `Operation not permitted`, sandboxed `continue` enqueued,
+the external harness scored, and sandboxed `continue` returned the accepted
+verdict. Repeat this read-denial and scoring probe for the actual deployment's
+paths and grants; system-temp placement does not protect held-out data.
 
 Process isolation is the barrier, not secrecy of the path: `ps` can expose
 another process's arguments and environment. Run files are shared coordination
@@ -496,11 +506,16 @@ response. Validation response checkpoints stay beside the private validation
 evidence outside checkouts; the workspace receives one aggregate row when a
 validation eval ends. Budget checks include all private checkpoints. Public
 reports withhold live validation spend and tokens with `validation_in_progress: true`,
-then include the aggregate when the eval ends or its owner dies. Private
-checkpoints preserve paid spend after crashes. If a checkpoint is missing, status
-warns with `validation_checkpoint_missing: true`; admission refuses when any
-registered eval lacks a published aggregate. Validation's highest rollout cost
-stays private for admission checks.
+then include the published aggregate when the eval ends. The harness can also
+recover paid spend from private checkpoints after an owner dies. Reflector status
+without the harness environment reads published aggregates only; unfinished
+validation remains flagged and blocks admission until the harness recovers it.
+If a checkpoint is missing, harness status warns with
+`validation_checkpoint_missing: true`; admission refuses when any registered eval
+lacks a published aggregate. Validation's highest rollout cost stays private for
+harness admission checks. Public files contain no private checkpoint paths.
+Harness spend-cap stops pass their output and exit code 70 through the nomination
+result, preserving the incumbent when validation is incomplete.
 For a one-case validation set, the aggregate total inherently reveals that case's cost.
 Status reports a torn final ledger line with `ledger_torn_tail: true`; evaluation
 refuses a malformed ledger rather than assuming the missing spend is zero.
