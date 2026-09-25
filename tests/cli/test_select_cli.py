@@ -23,6 +23,7 @@ from pydantic_ai_gepa.cli import app as gepa_app
 from pydantic_ai_gepa.cli.lanes import LaneState, load_lane_state
 from pydantic_ai_gepa.cli.run import RunState
 from pydantic_ai_gepa.cli.runs import ParetoLog, utc_now_iso
+from tests.cli.helpers import normalize_cli_output
 
 EVALUATE_MODULE_SOURCE = textwrap.dedent("""
     import os
@@ -1309,14 +1310,13 @@ def test_run_start_refuses_reflector_accessible_validation(
     result = _run("run", "start", "--lanes", str(lanes), "--size", "3")
 
     assert result.exit_code == 2, result.output
-    # Ignore Rich's borders and line wrapping when checking the full message.
-    message = "".join(result.output.replace("│", "").split())
+    message = normalize_cli_output(result.output)
     for expected in (
         str(validation_path.resolve()),
         "Keep the validation dataset outside the GEPA workspace/repository",
         "Start the workspace from Git history that never contained the validation dataset",
     ):
-        assert "".join(expected.split()) in message
+        assert normalize_cli_output(expected) in message
     assert "withheld-case" not in result.output
     assert not list((git_repo / ".gepa" / "runs").glob("*/pareto.jsonl"))
 
