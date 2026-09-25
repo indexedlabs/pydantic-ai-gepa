@@ -79,3 +79,26 @@ def test_current_best_candidate_selector_defaults_to_zero() -> None:
     state.best_candidate_idx = None
 
     assert selector.select(state) == 0
+
+
+def test_pareto_selector_removes_dominated_tied_winners() -> None:
+    state = _build_state()
+    state.candidates[0].validation_scores = {"a": 1.0, "b": 0.2}
+    state.candidates[1].validation_scores = {"a": 1.0, "b": 0.8}
+    state.candidates[2].validation_scores = {"a": 0.0, "b": 1.0}
+    state.pareto_front = {
+        "a": ParetoFrontEntry(data_id="a", best_score=1.0, candidate_indices={0, 1}),
+        "b": ParetoFrontEntry(data_id="b", best_score=1.0, candidate_indices={2}),
+    }
+    selector = ParetoCandidateSelector(seed=0)
+    selected = {selector.select(state) for _ in range(100)}
+    assert selected == {1, 2}
+
+
+def test_pareto_selector_preserves_coverage_when_all_scores_tie() -> None:
+    state = _build_state()
+    state.pareto_front = {
+        "a": ParetoFrontEntry(data_id="a", best_score=1.0, candidate_indices={0, 1, 2}),
+    }
+    selector = ParetoCandidateSelector(seed=0)
+    assert {selector.select(state) for _ in range(20)} == {2}

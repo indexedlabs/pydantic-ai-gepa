@@ -7,6 +7,7 @@ from typing import Protocol
 import random
 
 from ..models import GepaState
+from ..evaluation.pareto import remove_dominated_programs
 
 
 class CandidateSelector(Protocol):
@@ -25,11 +26,24 @@ class ParetoCandidateSelector:
 
     def select(self, state: GepaState) -> int:
         """Select a candidate weighted by Pareto-front frequency."""
-        counts = Counter()
-        for entry in state.pareto_front.values():
-            for idx in entry.candidate_indices:
-                if 0 <= idx < len(state.candidates):
-                    counts[idx] += 1
+        fronts = remove_dominated_programs(
+            {
+                key: {
+                    idx
+                    for idx in entry.candidate_indices
+                    if 0 <= idx < len(state.candidates)
+                }
+                for key, entry in state.pareto_front.items()
+            },
+            {
+                idx: sum(candidate.validation_scores.values())
+                / len(candidate.validation_scores)
+                if candidate.validation_scores
+                else 0.0
+                for idx, candidate in enumerate(state.candidates)
+            },
+        )
+        counts = Counter(idx for winners in fronts.values() for idx in sorted(winners))
 
         if counts:
             candidates = list(counts.keys())

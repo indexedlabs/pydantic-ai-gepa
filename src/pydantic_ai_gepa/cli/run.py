@@ -119,6 +119,8 @@ class RunState:
     last_comparison: dict[str, Any] | None = None
     best_candidate_id: str | None = None
     best_commit_sha: str | None = None
+    next_parent_candidate_id: str | None = None
+    next_parent_commit_sha: str | None = None
     best_mean_score: float | None = None
     heldout_required: bool = False
     validation_seeded: bool = False
@@ -212,6 +214,8 @@ class RunState:
             "last_comparison": self.last_comparison,
             "best_candidate_id": self.best_candidate_id,
             "best_commit_sha": self.best_commit_sha,
+            "next_parent_candidate_id": self.next_parent_candidate_id,
+            "next_parent_commit_sha": self.next_parent_commit_sha,
             "best_mean_score": self.best_mean_score,
             "validation_seeded": self.validation_seeded,
             "validation_evaluations": self.validation_evaluations,
@@ -353,6 +357,8 @@ class RunState:
             ),
             best_candidate_id=data.get("best_candidate_id"),
             best_commit_sha=data.get("best_commit_sha"),
+            next_parent_candidate_id=data.get("next_parent_candidate_id"),
+            next_parent_commit_sha=data.get("next_parent_commit_sha"),
             best_mean_score=(
                 float(data["best_mean_score"])
                 if data.get("best_mean_score") is not None
@@ -461,7 +467,13 @@ class RunState:
         after_state_save(root)
         if self.lanes == 0 and self.status != "running":
             try:
-                write_packet(self.run_id, root)
+                packet_path = write_packet(self.run_id, root)
+                if self.next_parent_candidate_id:
+                    from .front import write_parent_packet
+
+                    write_parent_packet(
+                        packet_path, state_for_save(self), root or repo_root()
+                    )
             except Exception as exc:
                 public_echo(
                     f"Warning: state saved but reflector packet could not be refreshed "
@@ -783,7 +795,21 @@ def _evaluate_validation_candidate(
         dataset_role="validation",
         persist_report=False,
         redact_selection_evidence=True,
+        persist_validation_replay=bool(state.continuation)
+        and lane is None
+        and state.lanes == 0,
     )
+    if lane is None and state.lanes == 0:
+        from .front import ValidationFront, snapshot_components
+
+        snapshot_components(outcome, workspace_root or repo_root())
+        front = ValidationFront(workspace_root or repo_root(), state.run_id)
+        front.record(outcome)
+        if (
+            state.acceptance_paired_min_cases is None
+            or _validation_schedule(state, workspace_root)[0] != 1
+        ):
+            front.retire_replay(outcome)
     return (
         _with_timestamp(
             state,
@@ -795,7 +821,7 @@ def _evaluate_validation_candidate(
 
 
 def _mark_best_from_validation(state: RunState, outcome: EvalOutcome) -> RunState:
-    """Adopt a validation-scored candidate as the current optimization parent."""
+    """Adopt a validation-scored candidate as the run's best."""
 
     return _with_timestamp(
         _mark_best_candidate(state, outcome),
@@ -1153,6 +1179,33 @@ def _advance_to_reflection_or_done(
     outcomes.extend(validation_outcomes)
     if state.status in {"paused_after_infrastructure_error", "done"}:
         return state, outcomes
+    if (
+        state.heldout_required
+        and state.lanes == 0
+        and state.iterations < state.max_iterations
+    ):
+        from .front import ValidationFront
+
+        parent = ValidationFront(repo_root(), state.run_id).select(
+            seed=state.seed, round_id=state.iterations
+        )
+        if parent is None and state.best_candidate_id:
+            parent = {
+                "candidate_id": state.best_candidate_id,
+                "commit_sha": state.best_commit_sha,
+            }
+        if parent and parent["candidate_id"] != _current_baseline_candidate_id(
+            state.candidate_source, active_run_id=state.run_id
+        ):
+            return _with_timestamp(
+                state,
+                status="paused_after_candidate_eval",
+                next_parent_candidate_id=parent["candidate_id"],
+                next_parent_commit_sha=parent["commit_sha"],
+            ), outcomes
+        state = _with_timestamp(
+            state, next_parent_candidate_id=None, next_parent_commit_sha=None
+        )
     while state.iterations < state.max_iterations:
         state, outcome = _fresh_baseline_outcome(state)
         outcomes.append(outcome)
@@ -1699,6 +1752,12 @@ def _public_state(
     else:
         payload["next_command"] = f"gepa run continue --run-id {state.run_id}"
     payload["evaluations_this_call"] = [outcome.summary for outcome in outcomes]
+    if state.next_parent_candidate_id and state.status != "done":
+        from .front import parent_restore_command
+
+        payload["parent_restore_command"] = parent_restore_command(
+            state, root or repo_root()
+        )
     if state.iterations_since_acceptance >= state.stall_threshold:
         payload["stall"] = {
             "stalled": True,
@@ -1714,7 +1773,14 @@ def _emit_status(
     final_report: Path | None = None,
     final_report_text: str | None = None,
 ) -> None:
-    if state.status == "paused_for_reflection":
+    if state.next_parent_candidate_id and state.status != "done":
+        public_echo(
+            f"Next parent: {state.next_parent_candidate_id}. Restore it, then continue the run."
+        )
+        from .front import parent_restore_command
+
+        public_echo(f"  {parent_restore_command(state, repo_root())}")
+    elif state.status == "paused_for_reflection":
         editable_surface = (
             "source/artifacts and commit the result"
             if state.candidate_source == "git"
@@ -2199,6 +2265,28 @@ def _continue_impl(run_id: str | None, gate_case: list[str]) -> None:
         return
 
     outcomes: list[EvalOutcome] = []
+    if state.next_parent_candidate_id:
+        if (
+            _current_baseline_candidate_id(
+                state.candidate_source, active_run_id=state.run_id
+            )
+            != state.next_parent_candidate_id
+        ):
+            state.save()
+            _emit_status(state, outcomes=[])
+            return
+        state, outcomes = _advance_to_reflection_or_done(state)
+        state.save()
+        final_path, final_text = (
+            _write_final_report(state) if state.status == "done" else (None, None)
+        )
+        _emit_status(
+            state,
+            outcomes=outcomes,
+            final_report=final_path,
+            final_report_text=final_text,
+        )
+        return
     if state.lanes > 0:
         state, outcomes = _advance_to_reflection_or_done(state)
         state, outcomes = _fan_out_lane_run_if_ready(state, outcomes)
@@ -2341,6 +2429,14 @@ def _continue_impl(run_id: str | None, gate_case: list[str]) -> None:
         ):
             state = _consume_candidate_verdict(state, accepted=False)
             state = _with_timestamp(state, status="paused_after_candidate_eval")
+            if (
+                state.heldout_required
+                and validation_outcomes
+                and comparison.get("candidate_id")
+                != state.reflection_baseline_candidate_id
+            ):
+                state, advanced_outcomes = _advance_to_reflection_or_done(state)
+                outcomes.extend(advanced_outcomes)
     else:
         state, outcomes = _advance_to_reflection_or_done(state)
 
@@ -2370,6 +2466,14 @@ def resume(
     from .reflector import resume as resume_reflector
 
     resume_reflector(run_id, reason, reflector, abandon_continuation)
+    state = _load_state(run_id)
+    if state.next_parent_candidate_id:
+        from .front import write_parent_packet
+
+        write_parent_packet(
+            run_dir(state.run_id) / "reflector_packet.json", state, repo_root()
+        )
+        _emit_status(state, outcomes=[])
 
 
 @app.command("select")

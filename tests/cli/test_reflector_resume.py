@@ -1035,10 +1035,11 @@ def test_components_can_abandon_an_unrestorable_continuation(
 
 
 @pytest.mark.parametrize("paired_threshold", [None, 100])
-def test_nonpaired_validation_never_writes_private_replay_evidence(
+def test_nonpaired_validation_requires_writable_private_front(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, paired_threshold: int | None
 ) -> None:
     from pydantic_ai_gepa.cli import validation
+    from pydantic_ai_gepa.cli import front
     from pydantic_ai_gepa.cli import eval as eval_module
     from pydantic_ai_gepa.evaluation import EvaluationRecord
 
@@ -1057,18 +1058,15 @@ def test_nonpaired_validation_never_writes_private_replay_evidence(
         raise PermissionError("validation directory is read-only")
 
     monkeypatch.setattr(validation, "write_validation_evidence", readonly_evidence)
+    monkeypatch.setattr(front, "write_validation_evidence", readonly_evidence)
     options = (
         ()
         if paired_threshold is None
         else ("--acceptance-paired-min-cases", str(paired_threshold))
     )
-    started = _start(*options, budget=13)
-    run_id = str(started["run_id"])
-    _commit_score(git_repo, "good")
-    proposed = True
-    continued = scored_continue("run", "continue", "--run-id", run_id)
-    assert continued.exit_code == 0, continued.output
-    assert len(ParetoLog(run_id).validation_rows()) == 6
+    started = _run("run", "start", *options, "--max-iterations", "13")
+    assert started.exit_code == 1
+    assert isinstance(started.exception, PermissionError)
     assert not (validation_path.parent / ".gepa-validation-evidence").exists()
 
 
@@ -1116,7 +1114,7 @@ def test_private_replay_snapshots_removed_after_completion_or_abandonment(
     run_id = str(started["run_id"])
     directory = validation_path.parent / ".gepa-validation-evidence"
     incumbent_files = set(directory.glob("*.json"))
-    assert len(incumbent_files) == 1
+    assert len(incumbent_files) == 2  # Incumbent and persistent parent front.
     proposed = True
     candidate = _commit_score(validation_repo, "paired proposal")
     original_eval = run_module.run_eval_once
@@ -1130,8 +1128,8 @@ def test_private_replay_snapshots_removed_after_completion_or_abandonment(
     monkeypatch.setattr(run_module, "run_eval_once", die_after_validation)
     assert scored_continue("run", "continue", "--run-id", run_id).exit_code == 1
     assert (
-        len(list(directory.glob("*.json"))) == 3
-    )  # Incumbent, backup, candidate eval.
+        len(list(directory.glob("*.json"))) == 4
+    )  # Incumbent, persistent front, backup, candidate eval.
     before = ParetoLog(run_id).iter_rows()
     monkeypatch.setattr(
         run_module, "run_eval_once", lambda **kwargs: pytest.fail("all samples paid")
