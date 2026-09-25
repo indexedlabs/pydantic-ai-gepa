@@ -16,7 +16,9 @@ async def start_step(ctx: StepContext[GepaState, GepaDeps, None]) -> None:
     state = ctx.state
     if state.spend_meter is None:
         state.spend_meter = SpendMeter(
-            state.config.max_token_cost, state.config.price_fn
+            state.config.max_token_cost,
+            state.config.price_fn,
+            max_concurrent=state.config.max_concurrent_evaluations,
         )
     if hasattr(ctx.deps.adapter, "spend_meter"):
         ctx.deps.adapter.spend_meter = state.spend_meter

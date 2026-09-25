@@ -285,8 +285,19 @@ async def optimize_agent(
             (e.g., cap tool calls per evaluation to prevent runaway tool loops). When None,
             no per-run usage limits are enforced.
         max_token_cost: Optional positive run-level US dollar cap, including reflection
-            and rollouts. Uses observed mean costs to project the next step; the
-            first step and in-flight requests can overshoot, reported honestly.
+            and rollouts. A batch is projected at its own kind's observed mean
+            (training vs validation rollouts), and each rollout is admitted
+            against the cap with in-flight rollouts reserved at their kind's
+            highest observed cost. The margin is one rollout per in-flight slot
+            at that high. The first rollout of a kind runs alone and can
+            overshoot by its own cost. Up to ``max_concurrent_evaluations``
+            in-flight rollouts can each set a new price high for their kind;
+            the run then overshoots by the sum of their excesses. Reflection
+            overshoot stays bounded by the reflection projection plus the
+            response backstop. Near the cap the gate is conservative: with
+            nothing in flight it stops once the kind's highest observed rollout
+            no longer fits, so one outlier rollout can end a run with headroom
+            left. Overshoot is reported honestly in the spend report.
         price_fn: Optional response-to-dollars override; None falls back to the
             bundled price catalog. Unknown prices stop capped runs gracefully.
         gepa_usage_limits: Optional UsageLimits applied cumulatively across the entire

@@ -7,8 +7,11 @@ from pydantic_graph import StepContext
 
 from typing import Literal, Sequence, cast
 
+from pydantic_ai.messages import ModelResponse, TextPart
+from pydantic_ai.usage import RequestUsage
 from pydantic_evals import Case
 
+from pydantic_ai_gepa import spend as spend_module
 from pydantic_ai_gepa.gepa_graph.datasets import ListDataLoader
 from pydantic_ai_gepa.gepa_graph.deps import GepaDeps
 from pydantic_ai_gepa.gepa_graph.evaluation import (
@@ -38,6 +41,7 @@ from pydantic_ai_gepa.gepa_graph.selectors import (
     CurrentBestCandidateSelector,
     RoundRobinComponentSelector,
 )
+from pydantic_ai_gepa.spend import COST_STOP_REASON, SpendMeter
 from pydantic_ai_gepa.types import RolloutOutput
 from pydantic_ai_gepa.adapter import Adapter, SharedReflectiveDataset
 from pydantic_ai_gepa._validation import validation_active
@@ -501,3 +505,78 @@ async def test_merge_step_skips_when_duplicate_detected() -> None:
     assert state.last_accepted is False
     assert len(state.candidates) == 3
     assert state.merge_attempts == 0
+
+
+def _priceable_response() -> ModelResponse:
+    return ModelResponse(
+        parts=[TextPart("ok")],
+        model_name="merge-student-test",
+        usage=RequestUsage(input_tokens=10, output_tokens=5),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cap", "expected_action", "expected_calls"),
+    [(1.0, "continue", 0), (10.0, "evaluate", 1)],
+)
+async def test_merge_subsample_projects_as_validation_kind(
+    cap: float, expected_action: str, expected_calls: int
+) -> None:
+    """Merge subsamples are validation instances and cost validation dollars."""
+    state = _make_state()
+    # Training rollouts observed at $0.005, validation rollouts at $0.50.
+    meter = SpendMeter(max_token_cost=cap, price_fn=lambda response: 0.005)
+    with meter.step("rollout", kind="training"):
+        meter.record("rollout", _priceable_response())
+    meter.price_fn = lambda response: 0.5
+    with meter.step("rollout", kind="validation"):
+        meter.record("rollout", _priceable_response())
+    state.spend_meter = meter
+    # Spent $0.505. A 3-case subsample projects at $0.015 on the training mean
+    # but at $1.50 on the validation mean, which is what merge subsamples cost.
+    assert meter.can_start("rollout", 3, rollout_kind="training")
+
+    ancestor_idx, parent1_idx, parent2_idx = _build_lineage(state)
+    validation_items = await _validation_instances(state)
+    subsample = validation_items[:3]
+    merged_candidate = CandidateProgram(
+        idx=len(state.candidates),
+        components={
+            "instructions": ComponentValue(
+                name="instructions", text="Parent1 instructions", version=3
+            ),
+            "tools": ComponentValue(name="tools", text="Parent2 tools", version=3),
+        },
+        creation_type="merge",
+        parent_indices=[parent1_idx, parent2_idx],
+        discovered_at_iteration=3,
+        discovered_at_evaluation=10,
+    )
+
+    declared_kinds: list[str] = []
+
+    class KindRecordingEvaluator(_StubEvaluator):
+        async def evaluate_batch(self, **kwargs):
+            declared_kinds.append(spend_module._rollout_kind.get())
+            return await super().evaluate_batch(**kwargs)
+
+    evaluator = KindRecordingEvaluator(_evaluation_results(subsample, [1.0] * 3))
+    builder = _StubMergeBuilder(
+        pair=(parent1_idx, parent2_idx),
+        ancestor_idx=ancestor_idx,
+        merged_candidate=merged_candidate,
+        subsample=subsample,
+    )
+    ctx = _ctx(state, _make_deps(merge_builder=builder, evaluator=evaluator))
+
+    action = await merge_step(ctx)
+
+    assert action == expected_action
+    assert evaluator.calls == expected_calls
+    if expected_action == "continue":
+        # Projected at the validation mean, the subsample cannot fit the cap.
+        assert state.stop_reason == COST_STOP_REASON
+    else:
+        # The merge batch runs tagged as validation rollouts for admission.
+        assert declared_kinds == ["validation"]
