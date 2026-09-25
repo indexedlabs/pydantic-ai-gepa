@@ -191,6 +191,10 @@ class OptimizationTask:
                 self._evaluation_cache.setdefault(cache_key, result)
         return result
 
+    async def validation_case_count(self) -> int:
+        """Return the validation evaluation size without exposing its cases."""
+        return len(await self._validation_cases())
+
     async def _validation_cases(self) -> Sequence[Case[Any, Any, Any]]:
         """Materialize and memoize the validation loader's cases for evaluation."""
         if self._val_cases is None:
