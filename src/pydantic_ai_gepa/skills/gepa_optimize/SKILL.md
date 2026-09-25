@@ -117,8 +117,8 @@ acceptance**. Component, vector and pinned-scorer held-out modes currently fail
 closed before candidate imports. A dirty-tree refusal asks you to commit
 before nominating. Keep the nominated tree unchanged until the result arrives.
 The harness checks the shared checkout for stale nominations, but scores a
-private archive of the nominated commit. No worktree registration, index update,
-or ref write exposes that checkout in the shared repository.
+private checkout of the nominated commit's raw objects. No worktree registration,
+index update, or ref write exposes that checkout in the shared repository.
 
 The reflector receives training feedback reports, aggregate validation verdicts
 and exit codes. Arbitrary child-written traces are kept private and discarded. `--wait-secs` defaults to 300; `0` enqueues
@@ -206,9 +206,10 @@ process group, then sweeps same-user processes for the child's inherited
 Seatbelt permissions to catch descendants that called `setsid()`. Finding a
 survivor or failing process inspection refuses the evaluation instead of
 returning a quality score. This repeated sweep is not an atomic process
-container: enumeration and PID reuse races remain. Private checkout/scratch
-directories are removed on exit. Archives containing symlinks or special files
-are refused.
+container: enumeration and PID reuse races remain, and a descendant that changes
+UID is outside the sweep. Private checkout/scratch directories are removed on
+exit. Checkouts are built from raw Git tree/blob objects without worktree
+conversion; symlinks, gitlinks and special files are refused.
 
 The current backend is macOS Seatbelt (`/usr/bin/sandbox-exec`). It denies writes
 outside private scratch, reads of the held-out directory outside the child's own
@@ -234,6 +235,14 @@ Reserved harness/runtime names (including `GEPA_HELDOUT_DATASET` and
 Held-out harness commands skip candidate-owned `.env` files. Install the harness and its Python dependencies
 in storage the reflector cannot modify, and keep provider credentials out of the
 reflector environment.
+
+The reflector must not be able to write the shared repository's `.git/config`,
+`.git/info/attributes`, or the file named by `core.attributesFile`. Other harness
+Git commands inherited from #62 still use local configuration and attributes,
+which can select executable filters or helpers. Hardening those commands is a
+separate follow-up. The README profile grants worktree writes, so in a
+single-checkout layout it does not by itself protect `.git/` inside that tree;
+the orchestrator must enforce this additional restriction.
 
 Sandbox rollouts run serially; the parent retains cost admission and response-level
 accounting. Public spend uses a fixed `sandbox` model bucket to prevent model names
@@ -279,8 +288,9 @@ What this does not cover:
   child can outlive it: Seatbelt does not mediate their creation. The library
   does not remove them. macOS records no creator PID for queues or semaphore
   sets, so it cannot distinguish them from objects created by other programs.
-  The cleanup/deployment contract is pending a project decision; reader-side
-  denial is verified only for the two Codex profiles above.
+  The project handles these objects through the reflector-profile requirement;
+  reader-side denial is verified only for the two Codex profiles above. A
+  separate scoring UID or VM is a hardening follow-up.
 - Process arguments and environment visible to another same-user process during
   scoring. Raw `KERN_PROCARGS2` works under both tested reflector profiles, and
   a process can rewrite its own argument strings to expose case data. No child

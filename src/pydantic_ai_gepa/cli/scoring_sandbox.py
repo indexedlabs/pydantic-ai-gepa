@@ -10,7 +10,6 @@ import asyncio
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict
-import io
 import json
 import math
 import os
@@ -20,7 +19,6 @@ import select
 import signal
 import subprocess
 import sys
-import tarfile
 import tempfile
 import time
 from typing import Any, Iterator
@@ -183,45 +181,104 @@ def private_checkout(project: Path, sha: str) -> Iterator[tuple[Path, Path, Path
         checkout, scratch = base / "checkout", base / "scratch"
         checkout.mkdir(mode=0o700)
         scratch.mkdir(mode=0o700)
-        # Disable replace refs and user/system config. archive's builtin tar
-        # format uses no hooks, smudge filters, external archivers or checkout.
-        result = subprocess.run(
-            [
-                "git",
-                "--no-replace-objects",
-                "-C",
-                str(repository),
-                "archive",
-                "--format=tar",
-                sha,
-            ],
-            env={
-                "PATH": "/usr/bin:/bin",
-                "GIT_CONFIG_NOSYSTEM": "1",
-                "GIT_CONFIG_GLOBAL": "/dev/null",
-            },
-            capture_output=True,
-        )
-        if result.returncode:
-            raise ScoringSandboxError("Cannot create private candidate checkout.")
+        # Read raw objects, never worktree conversions. In particular, do not
+        # use archive, checkout, or cat-file's --filters/--textconv options.
+        command = ["git", "--no-replace-objects", "-C", str(repository)]
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+        }
         try:
-            with tarfile.open(fileobj=io.BytesIO(result.stdout)) as archive:
-                # Reject symlinks entirely: no candidate-controlled link can
-                # redirect extraction, imports, or the scratch write allowance.
-                for member in archive.getmembers():
-                    target = checkout / member.name
-                    if not target.resolve().is_relative_to(checkout) or not (
-                        member.isfile() or member.isdir()
-                    ):
-                        raise ScoringSandboxError(
-                            "Private candidate archives cannot contain links or special files."
-                        )
-                archive.extractall(checkout, filter="data")
-        except (tarfile.TarError, OSError):
+            result = subprocess.run(
+                [*command, "ls-tree", "-r", "-t", "-z", "--full-tree", sha],
+                env=env,
+                capture_output=True,
+            )
+            if result.returncode:
+                raise ScoringSandboxError("Cannot read candidate tree.")
+            entries = _checkout_entries(checkout, result.stdout)
+            _write_checkout_blobs(command, env, entries)
+        except OSError:
             raise ScoringSandboxError(
-                "Cannot extract private candidate checkout."
+                "Cannot create private candidate checkout."
             ) from None
         yield private, checkout / prefix, scratch
+
+
+def _checkout_entries(
+    checkout: Path, listing: bytes
+) -> list[tuple[Path, bytes, bytes]]:
+    entries = []
+    if listing and not listing.endswith(b"\0"):
+        raise ScoringSandboxError("Invalid candidate tree listing.")
+    for record in listing.split(b"\0")[:-1]:
+        metadata, separator, name = record.partition(b"\t")
+        fields = metadata.split(b" ")
+        if not separator or len(fields) != 3:
+            raise ScoringSandboxError("Invalid candidate tree listing.")
+        mode, kind, oid = fields
+        if (mode, kind) not in {
+            (b"040000", b"tree"),
+            (b"100644", b"blob"),
+            (b"100755", b"blob"),
+        }:
+            raise ScoringSandboxError(
+                "Private candidate checkouts cannot contain links or special files."
+            )
+        target = checkout / os.fsdecode(name)
+        if (
+            not re.fullmatch(rb"[0-9a-f]{40}|[0-9a-f]{64}", oid)
+            or any(part in (b"", b".", b"..") for part in name.split(b"/"))
+            or Path(os.fsdecode(name)).is_absolute()
+            or not target.resolve().is_relative_to(checkout)
+        ):
+            raise ScoringSandboxError("Invalid candidate checkout path or object ID.")
+        entries.append((target, mode, oid))
+    return entries
+
+
+def _write_checkout_blobs(
+    command: list[str], env: dict[str, str], entries: list[tuple[Path, bytes, bytes]]
+) -> None:
+    with subprocess.Popen(
+        [*command, "cat-file", "--batch"],
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    ) as reader:
+        assert reader.stdin is not None and reader.stdout is not None
+        try:
+            for target, mode, oid in entries:
+                if mode == b"040000":
+                    # ls-tree -t emits parent trees before their children.
+                    target.mkdir(mode=0o700)
+                    continue
+                reader.stdin.write(oid + b"\n")
+                reader.stdin.flush()
+                header = reader.stdout.readline(256)
+                match = re.fullmatch(oid + rb" blob ([0-9]+)\n", header)
+                if match is None:
+                    raise ScoringSandboxError("Invalid candidate blob response.")
+                remaining = int(match[1])
+                with target.open("xb") as output:
+                    while remaining:
+                        block = reader.stdout.read(min(remaining, 1024 * 1024))
+                        if not block:
+                            raise ScoringSandboxError("Truncated candidate blob.")
+                        output.write(block)
+                        remaining -= len(block)
+                if reader.stdout.read(1) != b"\n":
+                    raise ScoringSandboxError("Invalid candidate blob terminator.")
+                target.chmod(0o755 if mode == b"100755" else 0o644)
+            reader.stdin.close()
+            if reader.stdout.read(1) or reader.wait():
+                raise ScoringSandboxError("Cannot read candidate blobs.")
+        finally:
+            if reader.poll() is None:
+                reader.kill()
+            reader.wait()
 
 
 class Channel:

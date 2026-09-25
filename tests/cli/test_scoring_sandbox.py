@@ -411,7 +411,7 @@ def test_worker_cleanup_failure_does_not_expose_command(
             original_wait(*args, **kwargs)
             raise sandbox.subprocess.TimeoutExpired("PRIVATE_COMMAND_SENTINEL", 5)
 
-        # Only replace the scoring worker's wait, not Git archive invocations.
+        # Only replace the scoring worker's wait, not Git object reads.
         if kwargs.get("start_new_session"):
             process.wait = wait
         return process
@@ -587,13 +587,118 @@ def test_protocol_rejects_duplicate_keys():
         sandbox._unique_keys([("score", 0), ("score", 1)])
 
 
-def test_candidate_archive_refuses_symlinks(git_repo, private):
+def test_candidate_checkout_refuses_symlinks(git_repo, private):
     (git_repo / "link").symlink_to(private)
     _git(git_repo, "add", "link")
     _git(git_repo, "commit", "-m", "Candidate symlink")
     with pytest.raises(sandbox.ScoringSandboxError, match="links or special files"):
         with sandbox.private_checkout(git_repo, _git(git_repo, "rev-parse", "HEAD")):
             pytest.fail("must reject before extraction")
+    assert not list((private.parent / ".gepa-heldout/work").iterdir())
+
+
+def test_candidate_checkout_refuses_gitlinks(git_repo, private):
+    sha = _git(git_repo, "rev-parse", "HEAD")
+    _git(git_repo, "update-index", "--add", "--cacheinfo", f"160000,{sha},submodule")
+    _git(git_repo, "commit", "-m", "Candidate gitlink")
+    with pytest.raises(sandbox.ScoringSandboxError, match="links or special files"):
+        with sandbox.private_checkout(git_repo, _git(git_repo, "rev-parse", "HEAD")):
+            pytest.fail("must reject gitlinks")
+    assert not list((private.parent / ".gepa-heldout/work").iterdir())
+
+
+def test_private_checkout_reads_raw_blobs_without_smudge_filters(git_repo, private):
+    import shlex
+    import stat
+
+    marker = private.parent / "smudge-executed"
+    # Install the driver in local config, which the old environment isolation
+    # did not disable. The command would both mark execution and change bytes.
+    _git(
+        git_repo,
+        "config",
+        "filter.hostile.smudge",
+        f"touch {shlex.quote(str(marker))}; printf converted",
+    )
+    _git(git_repo, "config", "filter.hostile.required", "true")
+    _git(git_repo, "config", "filter.hostile.clean", "cat")
+    (git_repo / ".gitattributes").write_text(
+        "raw.dat filter=hostile\nignored.dat export-ignore\n"
+    )
+    raw = b"raw\x00blob\r\n" + b"x" * (1024 * 1024 + 7)
+    (git_repo / "raw.dat").write_bytes(raw)
+    (git_repo / "ignored.dat").write_bytes(b"raw despite export-ignore\n")
+    nested = git_repo / "nested" / "directory"
+    nested.mkdir(parents=True)
+    executable = nested / "tab\tnewline\nscript"
+    executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    _git(git_repo, "add", ".gitattributes", "raw.dat", "ignored.dat", "nested")
+    _git(git_repo, "commit", "-m", "Candidate with worktree conversion")
+    sha = _git(git_repo, "rev-parse", "HEAD")
+    before = {
+        str(p.relative_to(git_repo / ".git")): p.read_bytes()
+        for p in (git_repo / ".git").rglob("*")
+        if p.is_file()
+    }
+    assert not marker.exists()
+    with sandbox.private_checkout(git_repo, sha) as (_, checkout, scratch):
+        assert (checkout / "raw.dat").read_bytes() == raw
+        assert (checkout / "ignored.dat").read_bytes() == b"raw despite export-ignore\n"
+        assert (
+            checkout / executable.relative_to(git_repo)
+        ).read_bytes() == executable.read_bytes()
+        assert (
+            stat.S_IMODE((checkout / executable.relative_to(git_repo)).stat().st_mode)
+            == 0o755
+        )
+        assert stat.S_IMODE((checkout / "raw.dat").stat().st_mode) == 0o644
+        for directory in [
+            checkout,
+            scratch,
+            *(p for p in checkout.rglob("*") if p.is_dir()),
+        ]:
+            assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+        assert not marker.exists()
+    assert before == {
+        str(p.relative_to(git_repo / ".git")): p.read_bytes()
+        for p in (git_repo / ".git").rglob("*")
+        if p.is_file()
+    }
+    assert not marker.exists()
+    assert not list((private.parent / ".gepa-heldout/work").iterdir())
+
+
+@pytest.mark.parametrize(
+    "name", [b"/absolute", b"../escape", b"dir/../escape", b"./file", b"dir//file", b""]
+)
+def test_checkout_tree_rejects_invalid_paths(tmp_path, name):
+    listing = b"100644 blob " + b"a" * 40 + b"\t" + name + b"\0"
+    with pytest.raises(sandbox.ScoringSandboxError, match="checkout path"):
+        sandbox._checkout_entries(tmp_path, listing)
+
+
+def test_missing_blob_reaps_reader_and_removes_checkout(git_repo, private, monkeypatch):
+    (git_repo / "missing.dat").write_bytes(b"unique missing raw object")
+    _git(git_repo, "add", "missing.dat")
+    _git(git_repo, "commit", "-m", "Candidate missing object")
+    sha = _git(git_repo, "rev-parse", "HEAD")
+    oid = _git(git_repo, "rev-parse", "HEAD:missing.dat")
+    (git_repo / ".git" / "objects" / oid[:2] / oid[2:]).unlink()
+    original_popen = sandbox.subprocess.Popen
+    readers = []
+
+    def popen(command, *args, **kwargs):
+        process = original_popen(command, *args, **kwargs)
+        if "cat-file" in command:
+            readers.append(process)
+        return process
+
+    monkeypatch.setattr(sandbox.subprocess, "Popen", popen)
+    with pytest.raises(sandbox.ScoringSandboxError, match="blob response"):
+        with sandbox.private_checkout(git_repo, sha):
+            pytest.fail("must reject missing raw objects")
+    assert readers and all(reader.poll() is not None for reader in readers)
     assert not list((private.parent / ".gepa-heldout/work").iterdir())
 
 
@@ -651,14 +756,14 @@ def test_private_checkout_uses_sha_and_changes_no_shared_git(
     }
     original = sandbox.sandbox_command
 
-    def change_after_archive(profile, command):
+    def change_after_checkout(profile, command):
         (git_repo / "score.txt").write_text("good")
         (git_repo / "task_pkg/evaluation.py").write_text(
             "raise RuntimeError('shared tree imported')"
         )
         return original(profile, command)
 
-    monkeypatch.setattr(sandbox, "sandbox_command", change_after_archive)
+    monkeypatch.setattr(sandbox, "sandbox_command", change_after_checkout)
     # The committed score is 'bad', even while the shared worktree says 'good'.
     assert score(git_repo, sha)[0].score == 0
     after = {
