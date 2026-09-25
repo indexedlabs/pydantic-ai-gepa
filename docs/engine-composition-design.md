@@ -35,6 +35,29 @@ what makes cross-engine comparison fair: a winner is always chosen by
 `task.evaluate(...)` on the same valset, never by trusting an engine's
 internally-reported minibatch score.
 
+### What an engine sees under composition
+
+Validation is withheld: an engine run by a composition helper never gets
+validation cases, outputs or per-case scores. The helper hands it a restricted
+task view, not the `OptimizationTask`:
+
+- `seed_candidate()`, `train_loader()`, `validation_case_count()`,
+  `concurrency`, and `test_set` (always `None`).
+- `score_validation(candidate, *, budget=None, cache=False)` -> `ValidationScore`
+  (`score`, `num_cases`, `selectable`, aggregate `objective_scores`). The harness
+  scores inside `validation_evaluation()`, in a context captured when the view
+  was built, so an override the engine sets cannot reach validation rollouts.
+  `evaluate(candidate)` is an alias that returns the same `ValidationScore`.
+- No `val_loader()`, and none of the live rollout objects (`agent`, `metric`,
+  `input_type`, `skills_fs`, `skills_capabilities`, `case_factory`); an engine
+  that needs its own training rollouts brings its own machinery.
+
+The library's `GepaEngine` and `CodingAgentEngine` (exact classes, not registry
+names or subclasses) keep the full task surface, because their Pareto
+selection needs per-case validation scores; their reflectors still never see
+validation. Engines run directly, outside a composition helper, receive the
+`OptimizationTask` itself.
+
 ## Engine contract
 
 ```python
