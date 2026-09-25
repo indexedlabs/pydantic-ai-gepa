@@ -35,7 +35,7 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Literal, Sequence, cast
+from typing import TYPE_CHECKING, Any, Iterator, Literal, Sequence, cast
 
 import typer
 
@@ -73,6 +73,7 @@ from .layout import (
     resolve_case_factory,
     resolve_evaluate,
     resolve_metric,
+    resolve_module_attr,
     resolve_skills,
     run_dir,
     vector_records_path,
@@ -89,6 +90,7 @@ from .runs import (
     utc_now_iso,
 )
 from .store import ComponentStore
+from .spend import evaluation_spend, spend_report, validate_cap
 from ..vector_acceptance import (
     VectorRecord,
     VectorRecordKey,
@@ -97,6 +99,10 @@ from ..vector_acceptance import (
     scorer_identity,
     side_info_vector,
 )
+
+
+if TYPE_CHECKING:
+    from .run import RunState
 
 
 GEPA_TRACE_FILE_ENV = "GEPA_TRACE_FILE"
@@ -374,6 +380,9 @@ def run_eval_once(
     persist_report: bool = True,
     redact_selection_evidence: bool = False,
     persist_validation_replay: bool = False,
+    max_token_cost: float | None = None,
+    spend_state: RunState | None = None,
+    spend_kind: str | None = None,
 ) -> EvalOutcome:
     """Evaluate one baseline/candidate and append the standard run artifacts.
 
@@ -388,6 +397,7 @@ def run_eval_once(
     corresponding Python project inside the lane worktree — candidate
     identity, cwd, and module imports resolve there).
     """
+    validate_cap(max_token_cost)
     if dataset_role == "validation":
         # Held-out evidence is selection-only by contract. Derive every
         # redaction control from the role so a future caller cannot
@@ -650,94 +660,131 @@ def run_eval_once(
         if capture_traces
         else None
     )
-    if source == "git":
-        configured_refs = (cfg.agent, cfg.evaluate, cfg.metric, cfg.case_factory)
-        scorer_root = (
-            primary_project_root
-            if cfg.acceptance.pinned_scorer
-            else active_candidate_project
+    insert_repo_root_on_path(primary_project_root)
+    price_fn = (
+        resolve_module_attr(
+            cfg.price_fn, kind="price_fn", expected_root=primary_project_root
         )
-        candidate_components: dict[str, str] = {}
-        if cfg.acceptance.pinned_scorer:
-            for relative in cfg.acceptance.component_files:
-                path = active_candidate_project / relative
-                if not path.is_file():
-                    raise typer.BadParameter(
-                        f"Declared candidate component file is missing: {relative}"
-                    )
-                try:
-                    candidate_components[relative] = path.read_bytes().decode("utf-8")
-                except UnicodeDecodeError as exc:
-                    raise typer.BadParameter(
-                        f"Declared component file {relative} must be UTF-8 text."
-                    ) from exc
-        previous_payload = os.environ.get(GEPA_CANDIDATE_COMPONENTS_ENV)
-        if cfg.acceptance.pinned_scorer:
-            os.environ[GEPA_CANDIDATE_COMPONENTS_ENV] = json.dumps(
-                candidate_components, sort_keys=True
+        if cfg.price_fn
+        else None
+    )
+    kind = (
+        "validation"
+        if dataset_role == "validation"
+        else (
+            spend_kind
+            or (
+                "probe"
+                if row_scope == "probe"
+                else "gate"
+                if selected_case_ids and not write_pareto
+                else "training"
             )
-        with candidate_import_context(
-            primary_project_root=primary_project_root,
-            candidate_project_root=scorer_root,
-            refs=configured_refs,
-        ):
-            agent = resolve_agent(cfg, expected_root=scorer_root) if cfg.agent else None
-            evaluate = resolve_evaluate(cfg, expected_root=scorer_root)
-            metric = (
-                resolve_metric(cfg, expected_root=scorer_root)
-                if cfg.metric
-                else default_substring_metric
+        )
+    )
+    with evaluation_spend(
+        run_id=active_run_id,
+        root=primary_project_root,
+        eval_id=eval_id,
+        kind=kind,
+        count=len(subset),
+        concurrency=concurrency,
+        cap=max_token_cost,
+        price_fn=price_fn,
+        state=spend_state,
+    ) as meter:
+        if source == "git":
+            configured_refs = (cfg.agent, cfg.evaluate, cfg.metric, cfg.case_factory)
+            scorer_root = (
+                primary_project_root
+                if cfg.acceptance.pinned_scorer
+                else active_candidate_project
             )
-            case_factory = resolve_case_factory(cfg, expected_root=scorer_root)
-            skills_fs = resolve_skills(cfg, root=scorer_root)
-            with _expose_trace_path(planned_trace_path):
-                if evaluate is not None:
-                    records = asyncio.run(
-                        evaluate_callable_dataset(
-                            evaluate=evaluate,
-                            metric=metric,
-                            dataset=subset,
-                            concurrency=concurrency,
-                            case_factory=case_factory,
+            candidate_components: dict[str, str] = {}
+            if cfg.acceptance.pinned_scorer:
+                for relative in cfg.acceptance.component_files:
+                    path = active_candidate_project / relative
+                    if not path.is_file():
+                        raise typer.BadParameter(
+                            f"Declared candidate component file is missing: {relative}"
                         )
-                    )
-                else:
-                    assert agent is not None
-                    records = asyncio.run(
-                        evaluate_candidate_dataset(
-                            agent=agent,
-                            metric=metric,
-                            dataset=subset,
-                            candidate=Candidate(
-                                id=candidate.id,
-                                components=candidate_components,
-                            ).to_candidate_map(),
-                            concurrency=concurrency,
-                            case_factory=case_factory,
-                            capture_traces=capture_traces,
-                            skills_fs=skills_fs,
+                    try:
+                        candidate_components[relative] = path.read_bytes().decode(
+                            "utf-8"
                         )
-                    )
-        if previous_payload is None:
-            os.environ.pop(GEPA_CANDIDATE_COMPONENTS_ENV, None)
-        else:
-            os.environ[GEPA_CANDIDATE_COMPONENTS_ENV] = previous_payload
-    else:
-        assert metric is not None
-        with _expose_trace_path(planned_trace_path):
-            assert agent is not None
-            records = asyncio.run(
-                evaluate_candidate_dataset(
-                    agent=agent,
-                    metric=metric,
-                    dataset=subset,
-                    candidate=candidate.to_candidate_map(),
-                    concurrency=concurrency,
-                    case_factory=case_factory,
-                    capture_traces=capture_traces,
-                    skills_fs=skills_fs,
+                    except UnicodeDecodeError as exc:
+                        raise typer.BadParameter(
+                            f"Declared component file {relative} must be UTF-8 text."
+                        ) from exc
+            previous_payload = os.environ.get(GEPA_CANDIDATE_COMPONENTS_ENV)
+            if cfg.acceptance.pinned_scorer:
+                os.environ[GEPA_CANDIDATE_COMPONENTS_ENV] = json.dumps(
+                    candidate_components, sort_keys=True
                 )
-            )
+            with candidate_import_context(
+                primary_project_root=primary_project_root,
+                candidate_project_root=scorer_root,
+                refs=configured_refs,
+            ):
+                agent = (
+                    resolve_agent(cfg, expected_root=scorer_root) if cfg.agent else None
+                )
+                evaluate = resolve_evaluate(cfg, expected_root=scorer_root)
+                metric = (
+                    resolve_metric(cfg, expected_root=scorer_root)
+                    if cfg.metric
+                    else default_substring_metric
+                )
+                case_factory = resolve_case_factory(cfg, expected_root=scorer_root)
+                skills_fs = resolve_skills(cfg, root=scorer_root)
+                with _expose_trace_path(planned_trace_path):
+                    if evaluate is not None:
+                        records = asyncio.run(
+                            evaluate_callable_dataset(
+                                evaluate=evaluate,
+                                metric=metric,
+                                dataset=subset,
+                                concurrency=concurrency,
+                                case_factory=case_factory,
+                            )
+                        )
+                    else:
+                        assert agent is not None
+                        records = asyncio.run(
+                            evaluate_candidate_dataset(
+                                agent=agent,
+                                metric=metric,
+                                dataset=subset,
+                                candidate=Candidate(
+                                    id=candidate.id,
+                                    components=candidate_components,
+                                ).to_candidate_map(),
+                                concurrency=concurrency,
+                                case_factory=case_factory,
+                                capture_traces=capture_traces,
+                                skills_fs=skills_fs,
+                            )
+                        )
+            if previous_payload is None:
+                os.environ.pop(GEPA_CANDIDATE_COMPONENTS_ENV, None)
+            else:
+                os.environ[GEPA_CANDIDATE_COMPONENTS_ENV] = previous_payload
+        else:
+            assert metric is not None
+            with _expose_trace_path(planned_trace_path):
+                assert agent is not None
+                records = asyncio.run(
+                    evaluate_candidate_dataset(
+                        agent=agent,
+                        metric=metric,
+                        dataset=subset,
+                        candidate=candidate.to_candidate_map(),
+                        concurrency=concurrency,
+                        case_factory=case_factory,
+                        capture_traces=capture_traces,
+                        skills_fs=skills_fs,
+                    )
+                )
 
     if supplemental_records:
         records = [*supplemental_records, *records]
@@ -873,6 +920,7 @@ def run_eval_once(
         ),
         "iterations": iteration,
         "max_iterations": max_iterations,
+        "spend": spend_report(active_run_id, primary_project_root, meter.run_cap),
         "report_path": str(report_path) if report_path else None,
         "trace_path": str(trace_path) if trace_path else None,
         "row_scope": row_scope,
@@ -952,6 +1000,11 @@ def _format_output_lines(outcome: EvalOutcome) -> str:
 
 
 def eval_(
+    max_token_cost: float | None = typer.Option(
+        None,
+        "--max-token-cost",
+        help="Run rollout spend cap in US dollars (finite and > 0).",
+    ),
     candidate_file: Path | None = typer.Option(
         None,
         "--candidate-file",
@@ -1014,6 +1067,7 @@ def eval_(
         typer.echo("--candidate-source must be 'components' or 'git'.", err=True)
         raise typer.Exit(code=2)
     outcome = run_eval_once(
+        max_token_cost=max_token_cost,
         candidate_file=candidate_file,
         minibatch_id=minibatch_id,
         size=size,

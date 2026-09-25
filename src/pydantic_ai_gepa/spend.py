@@ -255,3 +255,27 @@ class SpendCapability(AbstractCapability[Any]):
             with self.meter.step("rollout"):
                 return await handler()
         return await handler()
+
+
+_active_rollout: ContextVar[SpendCapability | None] = ContextVar(
+    "gepa_active_rollout", default=None
+)
+
+
+def current_rollout_capability() -> SpendCapability | None:
+    """Capability for agents called by the current CLI evaluate/metric callback.
+
+    Attach this to student and judge agents (including nested agents) to account
+    for their responses. Outside a CLI evaluation this returns ``None``.
+    """
+    return _active_rollout.get()
+
+
+@contextmanager
+def rollout_spend(meter: SpendMeter) -> Iterator[None]:
+    """Expose an evaluation's meter to caller-owned agents."""
+    token = _active_rollout.set(SpendCapability(meter, "rollout"))
+    try:
+        yield
+    finally:
+        _active_rollout.reset(token)

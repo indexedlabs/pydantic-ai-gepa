@@ -403,6 +403,53 @@ reports or traces. Run summaries, lane packets, Pareto output, and final reports
 contain aggregate validation scores and outcomes, without case identifiers,
 outputs, feedback, or per-case scores. Training reports retain full feedback.
 
+### CLI rollout spend caps
+
+`gepa run start --max-token-cost 5.0` caps the managed run's metered rollout
+spend in US dollars; the value must be finite and positive. `gepa eval --run-id`
+obeys that run's cap, and a one-off `gepa eval --max-token-cost 5.0` can impose a
+cap too. Status, start/continue summaries, and the final report include aggregate
+training-side and validation dollars, per-model tokens/requests/dollars, and
+unpriced usage, even without a cap. Reflector subscription/spend is excluded.
+
+The run's locked `spend.jsonl` ledger checkpoints aggregate deltas after each
+response and survives resume, reflector replacement, and concurrent lanes.
+Batch projections use each evaluation kind's own observed mean. Short file locks
+reserve projected batch costs against other processes' outstanding reservations;
+finished evals settle to actual spend, and reservations whose owning PID is gone
+are reclaimed on the next admission/check. Capped rollouts keep configured
+concurrency while remaining headroom covers concurrency × the kind's highest
+observed rollout cost. An unobserved kind, or a batch near the cap, starts one
+rollout at a time and rechecks before each start. Uncapped concurrency is unchanged.
+
+The margin is **one rollout per concurrent eval process**, provided no rollout
+costs more than the highest observed for its kind. A new price high can add the
+cost of rollouts already in flight at that moment. Response prices are known only
+after the call; this is not a prepaid guarantee. All received responses, including
+in-flight overshoot, are charged. A cost stop exits 70, preserves the incumbent,
+writes the final report, and never makes a partial eval selectable.
+
+For custom models, set `price_fn = "my_suite:price"` in `gepa.toml`, where
+`price(response: ModelResponse) -> float | None` returns dollars (`None` uses
+the bundled offline price catalog). Pricing is loaded from the primary scorer
+workspace. Unknown prices stop capped work rather than counting as free.
+
+Agent rollouts are metered automatically. Plain `evaluate` callables and metrics
+must attach the context-scoped capability to **every** student, judge, or nested
+agent they run:
+
+```python
+from pydantic_ai_gepa.spend import current_rollout_capability
+
+capability = current_rollout_capability()  # None outside a CLI evaluation
+result = await judge.run(prompt, capabilities=[capability] if capability else [])
+```
+
+Judge usage is included in rollout spend. A capped callable rollout reporting no
+metered responses stops with `Evaluate callable reported no spend`; suites that
+make no model calls should omit the cap. Validation ledger entries contain only
+aggregates, with no case identifiers, scores, or per-case costs.
+
 ### Pinned-scorer component IDs
 
 Assertion-vector runs can set `acceptance.pinned_scorer = true` to load the

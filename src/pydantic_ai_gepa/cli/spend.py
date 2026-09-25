@@ -1,0 +1,483 @@
+"""Durable aggregate rollout spend shared by every CLI process in a run."""
+
+from __future__ import annotations
+
+import asyncio
+import fcntl
+import json
+import os
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
+from pathlib import Path
+from threading import RLock
+from typing import TYPE_CHECKING, Any, AsyncIterator, Iterator
+
+from pydantic_ai.messages import ModelResponse
+
+import typer
+
+from ..spend import (
+    COST_STOP_REASON,
+    CostBudgetExceeded,
+    SpendMeter,
+    PriceFn,
+    SpendCategory,
+    rollout_spend,
+)
+from .layout import run_dir, run_state_path
+
+if TYPE_CHECKING:
+    from .run import RunState
+
+
+def validate_cap(value: float | None) -> None:
+    try:
+        SpendMeter(value)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@contextmanager
+def _lock(path: Path) -> Iterator[None]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _rows(run_id: str, root: Path | None) -> list[dict[str, Any]]:
+    path = run_dir(run_id, root) / "spend.jsonl"
+    if not path.exists():
+        return []
+    # Never silently discard a malformed ledger: unknown spend must fail closed.
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def _add_models(target: dict[str, Any], source: dict[str, Any]) -> None:
+    for name, usage in source.items():
+        combined = target.setdefault(name, {})
+        for key, value in usage.items():
+            combined[key] = combined.get(key, 0) + value
+
+
+def _report(rows: list[dict[str, Any]], cap: float | None) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "max_token_cost": cap,
+        "total_dollars": 0.0,
+        "training_dollars": 0.0,
+        "validation_dollars": 0.0,
+        "by_model": {},
+        "unpriced_usage": {},
+        "unmetered_rollouts": 0,
+        "stopped_by_cost": False,
+        "stop_reason": None,
+    }
+    for row in rows:
+        if cap is None:
+            result["max_token_cost"] = row.get("max_token_cost")
+        result["unmetered_rollouts"] += row.get("unmetered_rollouts", 0)
+        dollars = row["total_dollars"]
+        result["total_dollars"] += dollars
+        side = "validation" if row["kind"] == "validation" else "training"
+        result[f"{side}_dollars"] += dollars
+        _add_models(result["by_model"], row["by_model"])
+        _add_models(result["unpriced_usage"], row["unpriced_usage"])
+        if row["stop_reason"]:
+            result["stopped_by_cost"] = True
+            result["stop_reason"] = row["stop_reason"]
+    return result
+
+
+def spend_report(
+    run_id: str, root: Path | None = None, cap: float | None = None
+) -> dict[str, Any]:
+    with _lock(run_dir(run_id, root) / "spend.lock"):
+        return _report(_rows(run_id, root), cap)
+
+
+def _kind_costs(rows: list[dict[str, Any]], kind: str) -> tuple[int, float, float]:
+    matching = [row for row in rows if row["kind"] == kind]
+    observations = sum(row["rollouts_completed"] for row in matching)
+    dollars = sum(row.get("completed_rollout_dollars", 0.0) for row in matching)
+    highest = max(
+        (row.get("max_rollout_dollars", 0.0) for row in matching), default=0.0
+    )
+    return observations, dollars / observations if observations else 0.0, highest
+
+
+def _reservations(run_id: str, root: Path | None) -> dict[str, Any]:
+    """Read under spend.lock; dead owners no longer reserve future work."""
+    from .lanes import _pid_alive
+
+    path = run_dir(run_id, root) / "spend-reservations.json"
+    reservations = json.loads(path.read_text()) if path.exists() else {}
+    return {
+        key: value for key, value in reservations.items() if _pid_alive(value["pid"])
+    }
+
+
+def _save_reservations(
+    run_id: str, root: Path | None, reservations: dict[str, Any]
+) -> None:
+    path = run_dir(run_id, root) / "spend-reservations.json"
+    temporary = path.with_suffix(".tmp")
+    with temporary.open("w") as handle:
+        json.dump(reservations, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def _reserved_other(
+    reservations: dict[str, Any], rows: list[dict[str, Any]], eval_id: str
+) -> float:
+    paid: dict[str, float] = {}
+    for row in rows:
+        key = row["eval_id"]
+        paid[key] = paid.get(key, 0.0) + row["total_dollars"]
+    return sum(
+        max(0.0, value["dollars"] - paid.get(key, 0.0))
+        for key, value in reservations.items()
+        if key != eval_id
+    )
+
+
+@dataclass
+class _RolloutUsage:
+    requests: int = 0
+    dollars: float = 0.0
+
+
+class EvalSpendMeter(SpendMeter):
+    """Append aggregate deltas after each response, including failed responses.
+
+    Summing ledger rows is the only accounting authority. Checkpointing each
+    response also preserves received usage if a process dies before eval ends.
+    No case identities or scores enter this ledger.
+    """
+
+    def __init__(
+        self,
+        run_id: str,
+        root: Path | None,
+        eval_id: str,
+        kind: str,
+        cap: float | None,
+        price_fn: PriceFn | None,
+        count: int,
+        concurrency: int,
+    ) -> None:
+        super().__init__(cap, price_fn)
+        self.run_id, self.root, self.eval_id, self.kind = run_id, root, eval_id, kind
+        self.run_cap = cap
+        self.started = self.completed = self.unmetered = 0
+        self.count, self.concurrency = count, max(1, concurrency)
+        self._condition = asyncio.Condition()
+        self._active = 0
+        self.completed_dollars = self.highest = 0.0
+        self._requests: ContextVar[_RolloutUsage | None] = ContextVar(
+            "rollout_requests", default=None
+        )
+        self._persist_lock = RLock()
+        self._saved: dict[str, Any] = {}
+
+    def flush(self) -> None:
+        with self._persist_lock:
+            report = self.report().model_dump()
+            current = {
+                "total_dollars": report["total_dollars"],
+                "by_model": report["by_model"],
+                "unpriced_usage": report["unpriced_usage"],
+                "rollouts_started": self.started,
+                "rollouts_completed": self.completed,
+                "unmetered_rollouts": self.unmetered,
+                "max_token_cost": self.run_cap,
+                "completed_rollout_dollars": self.completed_dollars,
+                "max_rollout_dollars": self.highest,
+                "stop_reason": report["stop_reason"],
+            }
+            if current == self._saved:
+                return
+            row = dict(current, eval_id=self.eval_id, kind=self.kind)
+            for field in (
+                "total_dollars",
+                "rollouts_started",
+                "rollouts_completed",
+                "unmetered_rollouts",
+                "completed_rollout_dollars",
+            ):
+                row[field] -= self._saved.get(field, 0)
+            for field in ("by_model", "unpriced_usage"):
+                row[field] = {
+                    name: {
+                        key: value
+                        - self._saved.get(field, {}).get(name, {}).get(key, 0)
+                        for key, value in usage.items()
+                    }
+                    for name, usage in current[field].items()
+                }
+            directory = run_dir(self.run_id, self.root)
+            with _lock(directory / "spend.lock"):
+                with (directory / "spend.jsonl").open("a") as handle:
+                    handle.write(json.dumps(row) + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            self._saved = current
+
+    def _check_shared(self, *, after_response: bool = False) -> None:
+        if self.run_cap is None:
+            return
+        with _lock(run_dir(self.run_id, self.root) / "spend.lock"):
+            rows = _rows(self.run_id, self.root)
+            report = _report(rows, self.run_cap)
+            other = _reserved_other(
+                _reservations(self.run_id, self.root), rows, self.eval_id
+            )
+        remaining = self.run_cap - report["total_dollars"] - other
+        reason = report["stop_reason"]
+        if report["total_dollars"] > self.run_cap or (
+            not after_response and remaining <= 0
+        ):
+            reason = reason or COST_STOP_REASON
+        if reason:
+            self.stop_reason = reason
+            self.flush()
+            raise CostBudgetExceeded(reason)
+        # Other processes may have settled below their reservation. Refresh the
+        # local backstop from current shared headroom before another request.
+        if not after_response:
+            self.max_token_cost = self.report().total_dollars + remaining
+
+    def check(self) -> None:
+        self._check_shared()
+        super().check()
+
+    def record(self, category: SpendCategory, response: ModelResponse) -> None:
+        with self._persist_lock:
+            usage = self._requests.get()
+            before = self.report().total_dollars
+            if usage is not None:
+                usage.requests += 1
+            try:
+                super().record(category, response)
+            finally:
+                if usage is not None:
+                    usage.dollars += self.report().total_dollars - before
+                self.flush()
+            self._check_shared(after_response=True)
+
+    def _admit_rollout(self) -> bool:
+        """Reserve a start, or wait for this process's existing rollouts to drain."""
+        self.check()
+        if self.run_cap is None:
+            return True
+        with _lock(run_dir(self.run_id, self.root) / "spend.lock"):
+            rows = _rows(self.run_id, self.root)
+            reservations = _reservations(self.run_id, self.root)
+            spent = sum(row["total_dollars"] for row in rows)
+            remaining = (
+                self.run_cap - spent - _reserved_other(reservations, rows, self.eval_id)
+            )
+            observations, mean, highest = _kind_costs(rows, self.kind)
+            limit = (
+                self.concurrency
+                if observations and remaining >= self.concurrency * highest
+                else 1
+            )
+            if self._active >= limit:
+                return False
+            # The batch mean reserves future work; a highest-cost floor also
+            # covers in-flight slots so concurrent processes cannot each spend
+            # the same apparently free headroom using an underestimated mean.
+            inflight = (self._active + 1) * highest
+            # Near the cap a single rollout may use the last projected budget;
+            # its actual cost is guarded by the response backstop.
+            if limit == 1 and not self._active:
+                inflight = min(inflight, remaining)
+            reservation = max(mean * (self.count - self.completed), inflight)
+            if remaining <= 0 or reservation > remaining:
+                if self._active:
+                    return False
+                self.stop_reason = COST_STOP_REASON
+                raise CostBudgetExceeded()
+            reservations[self.eval_id] = {
+                "pid": os.getpid(),
+                "dollars": self.report().total_dollars + reservation,
+            }
+            _save_reservations(self.run_id, self.root, reservations)
+        return True
+
+    @asynccontextmanager
+    async def rollout(self) -> AsyncIterator[None]:
+        async with self._condition:
+            while not self._admit_rollout():
+                await self._condition.wait()
+            self._active += 1
+            self.started += 1
+        usage = _RolloutUsage()
+        token = self._requests.set(usage)
+        self.flush()
+        try:
+            yield
+            if not usage.requests:
+                self.unmetered += 1
+            if self.run_cap is not None and not usage.requests:
+                self.stop_reason = (
+                    "Evaluate callable reported no spend (no metered response)"
+                )
+                raise CostBudgetExceeded(self.stop_reason)
+            self.completed += 1
+            self.completed_dollars += usage.dollars
+        finally:
+            self._requests.reset(token)
+            self.highest = max(self.highest, usage.dollars)
+            self.flush()
+            async with self._condition:
+                self._active -= 1
+                self._condition.notify_all()
+
+
+def _finish_cost_stop(
+    run_id: str,
+    root: Path | None,
+    state: RunState | None,
+    reason: str,
+    cap: float | None,
+) -> None:
+    from .events import EventDraft, emit, list_events
+    from .run import RunState, _public_state, _write_final_report
+    from .runs import ParetoLog, utc_now_iso
+
+    path = run_state_path(run_id, root)
+    if not path.exists():
+        typer.echo(
+            json.dumps(
+                {"spend": spend_report(run_id, root, cap), "stop_reason": reason}
+            )
+        )
+        return
+    state = state or RunState.from_dict(json.loads(path.read_text()))
+    state = replace(
+        state,
+        status="done",
+        continuation=None,
+        select_phase=None,
+        select_context=None,
+        iterations=ParetoLog(run_id, root).count_budget_rows()
+        + state.gate_consumed_iterations,
+        updated_at=utc_now_iso(),
+        last_comparison={"reason_code": "cost_budget_exhausted", "stop_reason": reason},
+    )
+    state.save(root)
+    final_path, _ = _write_final_report(state, root=root)
+    if not any(event.type == "run_done" for event in list_events(run_id, root)):
+        emit(
+            run_id,
+            "run",
+            EventDraft(
+                type="run_done",
+                lane=None,
+                payload={
+                    "final_report_path": str(final_path),
+                },
+            ),
+            root=root,
+        )
+    payload = _public_state(state, outcomes=[], final_report=final_path, root=root)
+    payload["spend"] = spend_report(run_id, root, state.max_token_cost)
+    typer.echo(json.dumps({"run": payload}))
+
+
+@contextmanager
+def evaluation_spend(
+    *,
+    run_id: str,
+    root: Path | None,
+    eval_id: str,
+    kind: str,
+    count: int,
+    cap: float | None,
+    price_fn: PriceFn | None,
+    concurrency: int = 1,
+    state: RunState | None = None,
+) -> Iterator[EvalSpendMeter]:
+    """Reserve an eval under a short lock; release it after actual spend settles."""
+    validate_cap(cap)
+    from .run import RunState
+    from .runs import ParetoLog
+
+    path = run_state_path(run_id, root)
+    managed = (
+        RunState.from_dict(json.loads(path.read_text())) if path.exists() else None
+    )
+    if managed and managed.max_token_cost is not None:
+        cap = (
+            min(cap, managed.max_token_cost)
+            if cap is not None
+            else managed.max_token_cost
+        )
+    meter = EvalSpendMeter(
+        run_id, root, eval_id, kind, cap, price_fn, count, concurrency
+    )
+    try:
+        with _lock(run_dir(run_id, root) / "spend.lock"):
+            rows = _rows(run_id, root)
+            report = _report(rows, cap)
+            if report["stopped_by_cost"]:
+                state = managed
+                raise CostBudgetExceeded(report["stop_reason"])
+            if cap is not None:
+                known_evals = {row["eval_id"] for row in rows}
+                if report["unmetered_rollouts"] or any(
+                    row.extra.get("eval_id") not in known_evals
+                    for row in ParetoLog(run_id, root).iter_rows()
+                ):
+                    raise CostBudgetExceeded(
+                        "Cannot cap prior evaluations that reported no spend"
+                    )
+                if report["unpriced_usage"]:
+                    raise CostBudgetExceeded(
+                        "Cannot cap previously unpriced models: "
+                        + ", ".join(report["unpriced_usage"])
+                    )
+                reservations = _reservations(run_id, root)
+                remaining = (
+                    cap
+                    - report["total_dollars"]
+                    - _reserved_other(reservations, rows, eval_id)
+                )
+                _, mean, _ = _kind_costs(rows, kind)
+                projected = mean * count
+                if remaining <= 0 or projected > remaining:
+                    raise CostBudgetExceeded()
+                reservations[eval_id] = {"pid": os.getpid(), "dollars": projected}
+                _save_reservations(run_id, root, reservations)
+                meter.max_token_cost = remaining
+        with rollout_spend(meter):
+            yield meter
+    except CostBudgetExceeded as exc:
+        meter.stop_reason = exc.stop_reason
+        meter.flush()
+        # Only terminal state/report emission is serialized, never paid work.
+        with _lock(run_dir(run_id, root) / "spend-finalize.lock"):
+            latest = (
+                RunState.from_dict(json.loads(path.read_text()))
+                if path.exists()
+                else None
+            )
+            terminal = (
+                latest if latest and latest.status == "done" else state or managed
+            )
+            _finish_cost_stop(run_id, root, terminal, exc.stop_reason, cap)
+        raise typer.Exit(code=70) from exc
+    finally:
+        meter.flush()
+        if cap is not None:
+            with _lock(run_dir(run_id, root) / "spend.lock"):
+                reservations = _reservations(run_id, root)
+                reservations.pop(eval_id, None)
+                _save_reservations(run_id, root, reservations)

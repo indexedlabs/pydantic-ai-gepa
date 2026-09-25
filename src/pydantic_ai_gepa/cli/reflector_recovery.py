@@ -62,6 +62,7 @@ def state_for_save(state: RunState) -> RunState:
     replay = _replay.get()
     if replay is not None:
         budget_exhausted = (state.last_comparison or {}).get("reason_code") in {
+            "cost_budget_exhausted",
             "candidate_budget_exhausted",
             "baseline_budget_exhausted",
             "validation_budget_exhausted",
