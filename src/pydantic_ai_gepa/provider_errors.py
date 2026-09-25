@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 
 from pydantic_ai.exceptions import ModelHTTPError
@@ -9,6 +10,7 @@ from pydantic_ai.exceptions import ModelHTTPError
 
 PROVIDER_STOP_ERROR_CODES = frozenset(
     {
+        "billing_hard_limit_reached",
         "credit_balance_exhausted",
         "insufficient_quota",
         # OpenAI hard spend limits: the project's or the organization's monthly cap.
@@ -18,6 +20,8 @@ PROVIDER_STOP_ERROR_CODES = frozenset(
 )
 """Provider error codes that mean billing, not the request, is the problem."""
 _CREDENTIAL_ERROR_STATUS_CODES = frozenset({401, 403})
+# How `str(ModelHTTPError)` renders a credential failure.
+_CREDENTIAL_STATUS_TEXT = re.compile(r"\bstatus_code: (?:401|403)\b")
 
 
 class ProviderStopError(RuntimeError):
@@ -56,21 +60,30 @@ def is_provider_stop_error(exc: BaseException) -> bool:
             continue
         if error.status_code in _CREDENTIAL_ERROR_STATUS_CODES:
             return True
-        if mentions_provider_stop_code(str(error.body)):
+        body = str(error.body).lower()
+        if any(code in body for code in PROVIDER_STOP_ERROR_CODES):
             return True
     return False
 
 
-def mentions_provider_stop_code(text: str) -> bool:
-    """Return whether an error message or body names a billing stop code."""
+def is_provider_stop_message(text: str) -> bool:
+    """Return whether a provider error's text describes a stop failure.
+
+    For runners that only see a failed case's message, such as a child process's
+    saved ``str(exc)``. It matches the billing codes and a 401/403 status as
+    ``ModelHTTPError`` renders it. Pass only messages of provider HTTP errors:
+    a code echoed in case content would match too.
+    """
 
     lowered = text.lower()
-    return any(code in lowered for code in PROVIDER_STOP_ERROR_CODES)
+    return bool(_CREDENTIAL_STATUS_TEXT.search(lowered)) or any(
+        code in lowered for code in PROVIDER_STOP_ERROR_CODES
+    )
 
 
 __all__ = [
     "PROVIDER_STOP_ERROR_CODES",
     "ProviderStopError",
     "is_provider_stop_error",
-    "mentions_provider_stop_code",
+    "is_provider_stop_message",
 ]

@@ -15,7 +15,7 @@ from pydantic_ai_gepa.evaluation import evaluate_callable_dataset
 from pydantic_ai_gepa.provider_errors import (
     ProviderStopError,
     is_provider_stop_error,
-    mentions_provider_stop_code,
+    is_provider_stop_message,
 )
 from pydantic_ai_gepa.types import MetricResult
 
@@ -29,6 +29,7 @@ from pydantic_ai_gepa.types import MetricResult
             "code": "credit_balance_exhausted",
         },
         {"code": "project_spend_limit_exceeded"},
+        {"code": "billing_hard_limit_reached"},
         {"code": "organization_spend_limit_exceeded"},
     ],
 )
@@ -100,12 +101,16 @@ def test_provider_stop_error_stops_directly_and_through_a_cause() -> None:
     assert not is_provider_stop_error(RuntimeError("case failed"))
 
 
-def test_stop_codes_are_found_in_error_text() -> None:
-    assert mentions_provider_stop_code(
-        "status_code: 429, model_name: gpt-6-sol, body: {'code': 'insufficient_quota'}"
-    )
-    assert mentions_provider_stop_code("Error code: 429 - PROJECT_SPEND_LIMIT_EXCEEDED")
-    assert not mentions_provider_stop_code("status_code: 429, rate_limit_exceeded")
+def test_stop_failures_are_found_in_provider_error_text() -> None:
+    def text(status: int, body: object) -> str:
+        return str(ModelHTTPError(status_code=status, model_name="m", body=body))
+
+    assert is_provider_stop_message(text(429, {"code": "insufficient_quota"}))
+    assert is_provider_stop_message("Error code: 429 - PROJECT_SPEND_LIMIT_EXCEEDED")
+    assert is_provider_stop_message(text(401, {"code": "invalid_api_key"}))
+    assert is_provider_stop_message(text(403, None))
+    assert not is_provider_stop_message(text(429, {"code": "rate_limit_exceeded"}))
+    assert not is_provider_stop_message(text(4010, None))
 
 
 @pytest.mark.asyncio
@@ -119,3 +124,33 @@ async def test_plain_callable_evaluation_propagates_provider_stop_error() -> Non
             metric=lambda case, output: 0.0,
             dataset=[Case(name="case-1", inputs="x")],
         )
+
+
+@pytest.mark.asyncio
+async def test_a_stop_cancels_cases_already_in_flight() -> None:
+    import asyncio
+
+    started = asyncio.Event()
+    cancelled: list[str] = []
+
+    async def evaluate(case: Case) -> object:
+        if case.name == "stops":
+            await started.wait()
+            raise ProviderStopError("insufficient_quota")
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.append(case.name or "")
+            raise
+        return "late"
+
+    with pytest.raises(ProviderStopError):
+        await evaluate_callable_dataset(
+            evaluate=evaluate,
+            metric=lambda case, output: 0.0,
+            dataset=[Case(name="slow", inputs="x"), Case(name="stops", inputs="y")],
+            concurrency=2,
+        )
+    # The slow case was cancelled and drained before the stop propagated.
+    assert cancelled == ["slow"]
