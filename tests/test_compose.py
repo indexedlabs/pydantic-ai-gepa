@@ -225,6 +225,8 @@ async def test_optimize_best_of_uses_fair_valset_scores_not_reported_scores() ->
     assert result.best_index == 1
     assert result.best.best_candidate == result.results[1].best_candidate
     assert result.fair_scores == [0.0, 1.0]
+    assert [len(vote.samples) for vote in result.fair_votes] == [3, 3]
+    assert result.comparison_metric_calls == 6
     assert [item.best_score for item in result.results] == [99.0, -1.0]
     assert result.total_metric_calls == 0
 
@@ -297,6 +299,8 @@ async def test_optimize_vote_selects_the_highest_valset_score() -> None:
     assert result.best_index == 1
     assert result.best.best_candidate["instructions"].text == "correct"
     assert result.fair_scores == [0.0, 1.0]
+    assert [len(vote.samples) for vote in result.fair_votes] == [3, 3]
+    assert result.comparison_metric_calls == 6
 
 
 @pytest.mark.asyncio
@@ -342,7 +346,6 @@ async def test_composition_with_real_gepa_and_coding_agent_engines(
             engine_config={
                 "propose": propose,
                 "minibatch_size": 1,
-                "acceptance_repetitions": 3,
             },
         ),
     ]
@@ -354,8 +357,6 @@ async def test_composition_with_real_gepa_and_coding_agent_engines(
                 phase_two=configs[1],
                 phase_one_metric_calls=16,
                 phase_two_metric_calls=8,
-                fair_vote_repetitions=3,
-                fair_vote_max_repetitions=3,
             ),
         )
         assert [item.engine for item in result.results] == [
@@ -384,3 +385,20 @@ async def test_composition_with_real_gepa_and_coding_agent_engines(
         item.num_metric_calls for item in result.results
     )
     assert result.total_metric_calls <= (24 if helper == "omni" else 16)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("helper", ["best_of", "vote"])
+async def test_fair_vote_max_defaults_to_the_requested_initial_repetitions(
+    helper: str,
+) -> None:
+    optimize = {"best_of": optimize_best_of, "vote": optimize_vote}[helper]
+    result = await optimize(
+        _task(),
+        [_config(_candidate("wrong")), _config(_candidate("correct"))],
+        max_metric_calls=2,
+        fair_vote_repetitions=4,
+    )
+    assert result.best.best_candidate["instructions"].text == "correct"
+    assert [len(vote.samples) for vote in result.fair_votes] == [4, 4]
+    assert result.comparison_metric_calls == 8
