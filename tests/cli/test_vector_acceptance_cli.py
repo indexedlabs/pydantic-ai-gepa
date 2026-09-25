@@ -213,16 +213,15 @@ def _start(
     return payload, RunState.from_dict(json.loads(path.read_text(encoding="utf-8")))
 
 
-def _configure_validation(repo: Path, *, pinned_scorer: bool) -> None:
+def _configure_validation(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, *, pinned_scorer: bool
+) -> None:
     config = repo / ".gepa" / "gepa.toml"
     config.write_text(
-        _config(pinned_scorer=pinned_scorer).replace(
-            'dataset = ".gepa/dataset.jsonl"\n',
-            'dataset = ".gepa/dataset.jsonl"\n'
-            f'validation_dataset = "{repo.parent / "validation.jsonl"}"\n',
-        ),
+        _config(pinned_scorer=pinned_scorer),
         encoding="utf-8",
     )
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(repo.parent / "validation.jsonl"))
     (repo.parent / "validation.jsonl").write_text(
         json.dumps(
             {
@@ -235,7 +234,7 @@ def _configure_validation(repo: Path, *, pinned_scorer: bool) -> None:
         encoding="utf-8",
     )
     _git(repo, "add", ".gepa/gepa.toml")
-    _git(repo, "commit", "-m", "Configure vector validation")
+    _git(repo, "commit", "--allow-empty", "-m", "Configure vector validation")
 
 
 def _continue_vector_lane(repo: Path, run_id: str, lane: str, value: str) -> LaneState:
@@ -263,15 +262,15 @@ def _continue_vector_lane(repo: Path, run_id: str, lane: str, value: str) -> Lan
 
 def test_vector_mode_never_persists_validation_assertions(
     vector_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = vector_repo / ".gepa" / "gepa.toml"
     config.write_text(
-        _config().replace(
-            'dataset = ".gepa/dataset.jsonl"\n',
-            'dataset = ".gepa/dataset.jsonl"\n'
-            f'validation_dataset = "{vector_repo.parent / "validation.jsonl"}"\n',
-        ),
+        _config(),
         encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "GEPA_HELDOUT_DATASET", str(vector_repo.parent / "validation.jsonl")
     )
     (vector_repo.parent / "validation.jsonl").write_text(
         json.dumps(
@@ -285,7 +284,7 @@ def test_vector_mode_never_persists_validation_assertions(
         encoding="utf-8",
     )
     _git(vector_repo, "add", ".gepa/gepa.toml")
-    _git(vector_repo, "commit", "-m", "Configure held-out validation")
+    _git(vector_repo, "commit", "--allow-empty", "-m", "Configure held-out validation")
 
     payload, state = _start(vector_repo)
     run_id = str(payload["run_id"])
@@ -304,8 +303,10 @@ def test_vector_mode_never_persists_validation_assertions(
     assert "secret-vector-validation" not in persisted
 
 
-def test_vector_validation_requires_lane_selection(vector_repo: Path) -> None:
-    _configure_validation(vector_repo, pinned_scorer=True)
+def test_vector_validation_requires_lane_selection(
+    vector_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_validation(vector_repo, monkeypatch, pinned_scorer=True)
 
     result = _run(
         "--gepa-dir",
@@ -324,8 +325,9 @@ def test_vector_validation_requires_lane_selection(vector_repo: Path) -> None:
 
 def test_vector_validation_requires_replicated_maximum(
     vector_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _configure_validation(vector_repo, pinned_scorer=True)
+    _configure_validation(vector_repo, monkeypatch, pinned_scorer=True)
 
     result = _run(
         "--gepa-dir",
@@ -348,8 +350,9 @@ def test_vector_validation_requires_replicated_maximum(
 
 def test_vector_validation_uses_comparator_ranking_without_persisting_detail(
     vector_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _configure_validation(vector_repo, pinned_scorer=True)
+    _configure_validation(vector_repo, monkeypatch, pinned_scorer=True)
 
     payload, _ = _start(vector_repo, lanes=3)
     run_id = str(payload["run_id"])
@@ -396,7 +399,7 @@ def test_vector_validation_resume_restarts_one_comparable_round(
 ) -> None:
     import pydantic_ai_gepa.cli.select as select_module
 
-    _configure_validation(vector_repo, pinned_scorer=True)
+    _configure_validation(vector_repo, monkeypatch, pinned_scorer=True)
     payload, _ = _start(vector_repo, lanes=2)
     run_id = str(payload["run_id"])
     resolved = {

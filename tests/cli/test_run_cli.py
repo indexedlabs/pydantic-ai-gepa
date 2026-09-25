@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Iterator
 
 import pytest
+from tests.cli.harness_helpers import scored_continue
 from click.testing import Result
 from typer.testing import CliRunner
 
@@ -139,7 +140,9 @@ def test_run_start_defaults_match_minibatch_evaluation(repo: Path) -> None:
     assert len(baseline_samples) == 3
 
 
-def test_continue_rejects_external_validation_tampered_after_start(repo: Path) -> None:
+def test_continue_rejects_external_validation_tampered_after_start(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     validation_path = repo.parent / "validation.jsonl"
     validation_path.write_text(
         json.dumps(
@@ -147,10 +150,7 @@ def test_continue_rejects_external_validation_tampered_after_start(repo: Path) -
         )
         + "\n"
     )
-    config = repo / ".gepa" / "gepa.toml"
-    config.write_text(
-        config.read_text() + f'validation_dataset = "{validation_path}"\n'
-    )
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(validation_path))
     started = _run(
         "run",
         "start",
@@ -170,7 +170,7 @@ def test_continue_rejects_external_validation_tampered_after_start(repo: Path) -
         json.dumps({"name": "tampered", "inputs": "x", "expected_output": "Berlin"})
         + "\n"
     )
-    result = _run("run", "continue", "--run-id", str(payload["run_id"]))
+    result = scored_continue("run", "continue", "--run-id", str(payload["run_id"]))
     assert result.exit_code == 2, result.output
     assert "changed after run start" in result.output
 
@@ -189,12 +189,7 @@ def test_held_out_validation_selects_without_exposing_reflection_evidence(
         "\n".join(json.dumps(row) for row in validation_cases) + "\n",
         encoding="utf-8",
     )
-    config = repo / ".gepa" / "gepa.toml"
-    config.write_text(
-        config.read_text(encoding="utf-8")
-        + f'validation_dataset = "{validation_path}"\n',
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(validation_path))
 
     started = _run(
         "run",
@@ -225,7 +220,9 @@ def test_held_out_validation_selects_without_exposing_reflection_evidence(
         return outcome
 
     monkeypatch.setattr(run_module, "run_eval_once", training_wins_validation_loses)
-    result = _run("run", "continue", "--run-id", str(start_payload["run_id"]))
+    result = scored_continue(
+        "run", "continue", "--run-id", str(start_payload["run_id"])
+    )
 
     assert result.exit_code == 0, result.output
     payload = _run_payload(result.output)
@@ -266,7 +263,9 @@ def test_held_out_validation_selects_without_exposing_reflection_evidence(
     assert ParetoLog(str(start_payload["run_id"])).count_budget_rows() == 13
 
 
-def test_held_out_final_report_is_aggregate_only(repo: Path) -> None:
+def test_held_out_final_report_is_aggregate_only(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     validation_path = repo.parent / "validation.jsonl"
     validation_path.write_text(
         json.dumps(
@@ -278,16 +277,13 @@ def test_held_out_final_report_is_aggregate_only(repo: Path) -> None:
         )
         + "\n"
     )
-    config = repo / ".gepa" / "gepa.toml"
-    config.write_text(
-        config.read_text() + f'validation_dataset = "{validation_path}"\n'
-    )
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(validation_path))
     started = _run("run", "start", "--size", "2", "--max-iterations", "3")
     assert started.exit_code == 0, started.output
     payload = _run_payload(started.output)
     run_id = str(payload["run_id"])
     if payload["status"] != "done":
-        done = _run("run", "continue", "--run-id", run_id)
+        done = scored_continue("run", "continue", "--run-id", run_id)
         assert done.exit_code == 0, done.output
         payload = _run_payload(done.output)
     assert payload["status"] == "done"
@@ -859,11 +855,9 @@ def test_paired_config_drives_single_repetition_promotion(
     validation_path = repo.parent / "validation.jsonl"
     validation_path.write_text("\n".join(json.dumps(row) for row in validation) + "\n")
     config = repo / ".gepa" / "gepa.toml"
-    config.write_text(
-        config.read_text()
-        + f'validation_dataset = "{validation_path}"\n'
-        + "[acceptance]\npaired_min_cases = 2\n"
-    )
+    config.write_text(config.read_text() + "[acceptance]\npaired_min_cases = 2\n")
+
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(validation_path))
 
     async def evaluate(**kwargs):
         improved = kwargs["candidate"]["instructions"].text == "Improved prompt"
@@ -895,16 +889,18 @@ def test_paired_config_drives_single_repetition_promotion(
     for case in validation:
         assert case["name"] not in started.output
     run_id = str(start_payload["run_id"])
-    seed_state = _load_state(run_id)
+    seed_state = _load_state(run_id).restore_validation_evidence()
     assert seed_state.best_validation_per_case_scores == {
         "held-out-a": 0.4,
         "held-out-b": 0.4,
     }
     assert_validation_ids_withheld()
     ComponentStore().write("instructions", "Improved prompt")
-    result = _run("run", "continue", "--run-id", str(start_payload["run_id"]))
+    result = scored_continue(
+        "run", "continue", "--run-id", str(start_payload["run_id"])
+    )
     assert result.exit_code == 0, (result.output, result.exception)
-    state = _load_state(str(start_payload["run_id"]))
+    state = _load_state(str(start_payload["run_id"])).restore_validation_evidence()
     assert state.best_validation_samples == (0.6,)
     assert state.best_validation_per_case_scores == {
         "held-out-a": 0.6,

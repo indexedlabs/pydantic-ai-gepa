@@ -9,7 +9,7 @@ from pydantic_ai_gepa.cli.validation import validation_dataset_path
 
 
 @pytest.mark.parametrize("failure", ["rev-parse", "read", "hash-object", "cat-file"])
-def test_validation_verification_refusals_name_resolved_path_and_remediation(
+def test_validation_verification_refusals_withhold_path_and_explain_remediation(
     tmp_path, monkeypatch, failure
 ):
     project = tmp_path / "project"
@@ -39,16 +39,10 @@ def test_validation_verification_refusals_name_resolved_path_and_remediation(
         validation_dataset_path("../validation.jsonl", project_root=project)
 
     message = str(error.value)
-    assert str(validation.resolve()) in message
-    assert (
-        "Keep the validation dataset outside the GEPA workspace/repository" in message
-    )
-    assert (
-        "Start the workspace from Git history that never contained the validation dataset"
-        in message
-    )
-    assert "validation_dataset" in message
-    assert "--validation-dataset" in message
+    assert str(validation.resolve()) not in message
+    assert "outside every checkout and GEPA_DIR" in message
+    assert "Git history that never contained" in message
+    assert "GEPA_HELDOUT_DATASET" in message
     assert "private-case" not in message
 
 
@@ -81,7 +75,7 @@ def test_validation_missing_git_is_clean_refusal(tmp_path, monkeypatch):
     ) as error:
         validation_dataset_path(str(validation), project_root=project)
     assert isinstance(error.value.__cause__, FileNotFoundError)
-    assert str(validation.resolve()) in str(error.value)
+    assert str(validation.resolve()) not in str(error.value)
     assert "Git history that never contained" in str(error.value)
 
 
@@ -106,5 +100,5 @@ def test_validation_git_os_error_is_clean_refusal(tmp_path, monkeypatch, operati
         typer.BadParameter, match="Cannot verify validation dataset isolation"
     ) as error:
         validation_dataset_path(str(validation), project_root=project)
-    assert str(validation.resolve()) in str(error.value)
-    assert "outside the GEPA workspace/repository" in str(error.value)
+    assert str(validation.resolve()) not in str(error.value)
+    assert "outside every checkout and GEPA_DIR" in str(error.value)

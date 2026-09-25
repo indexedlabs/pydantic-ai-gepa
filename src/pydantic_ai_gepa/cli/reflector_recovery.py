@@ -90,6 +90,10 @@ def _row_outcome(
     state: RunState, row: ParetoRow, iteration: int, threshold: float
 ) -> EvalOutcome:
     validation = row.extra.get("dataset_role") == "validation"
+    if validation:
+        from .validation import check_heldout_pin
+
+        check_heldout_pin(repo_root(), state.run_id)
     eval_id = row.extra.get("eval_id", "")
     stem = f"{iteration:04d}-{eval_id}-{row.candidate_id}"
     report = run_dir(state.run_id) / "reports" / f"{stem}.md"
@@ -336,6 +340,8 @@ def after_state_save(root: Path | None = None) -> None:
 def abandon_continuation(state: RunState, *, reason: str) -> RunState:
     if state.continuation is None:
         return state
+    if state.heldout_required:
+        state = state.restore_validation_evidence()
     from .lanes import _append_journal
     from .runs import utc_now_iso
 
@@ -403,6 +409,8 @@ def continue_run(
     gate_case: list[str],
     reflector_epoch: int | None,
     execute: Callable[..., None],
+    *,
+    locked: bool = False,
 ) -> None:
     from .reflector import already_scored, run_lock
     from .run import (
@@ -414,8 +422,10 @@ def continue_run(
     )
 
     initial = _load_state(run_id)
-    with run_lock(initial.run_id):
-        state = _load_state(initial.run_id)
+    from contextlib import nullcontext
+
+    with nullcontext() if locked else run_lock(initial.run_id):
+        state = _load_state(initial.run_id).restore_validation_evidence()
         epoch = state.reflector["epoch"]
         if reflector_epoch is not None and reflector_epoch != epoch:
             typer.echo(
@@ -427,7 +437,7 @@ def continue_run(
         if state.lanes > 0 or state.status == "done":
             execute(state.run_id, gate_case)
             return
-        if state.validation_dataset_path is not None:
+        if state.heldout_required:
             _assert_validation_dataset_unchanged(state)
         if gate_case and state.reflection_minibatch_id is not None:
             _validate_gate_cases(state, gate_case)

@@ -79,10 +79,7 @@ def init(
     validation_dataset: str | None = typer.Option(
         None,
         "--validation-dataset",
-        help=(
-            "Optional held-out validation JSONL outside the repository, used to select candidates. "
-            "When omitted, managed runs retain legacy training-only selection."
-        ),
+        help=("Removed: use GEPA_HELDOUT_DATASET in the harness environment. "),
     ),
     metric: str | None = typer.Option(
         None,
@@ -134,13 +131,9 @@ def init(
         raise typer.Exit(code=2)
 
     if validation_dataset is not None:
-        from .validation import validation_dataset_path
+        from .validation import refuse_legacy_validation
 
-        validation_dataset = str(
-            validation_dataset_path(
-                validation_dataset, project_root=Path.cwd(), allow_missing=True
-            )
-        )
+        refuse_legacy_validation()
 
     # Sanity-check the agent ref (and metric / case_factory refs, when
     # provided) before persisting config.
@@ -232,12 +225,7 @@ def init(
     typer.echo(
         "Next steps:\n"
         f"  1. Write reflection-training cases as JSONL at {resolved_dataset}\n"
-        + (
-            f"     Write held-out validation cases at {validation_dataset}\n"
-            if validation_dataset
-            else ""
-        )
-        + f"  2. Run `gepa{workspace_hint} eval --size N` to score the baseline + write the per-case report"
+        f"  2. Run `gepa{workspace_hint} eval --size N` to score the baseline + write the per-case report"
     )
 
 

@@ -256,14 +256,6 @@ class GepaConfig:
     than the hardcoded default.
     """
 
-    validation_dataset: str | None = None
-    """Optional held-out validation JSONL used for candidate selection.
-
-    When omitted, managed CLI runs retain the legacy training-only selection
-    flow for backwards compatibility. Validation cases are evaluated by the
-    optimizer but are never exposed to the external reflection agent.
-    """
-
     metric: str | None = None
     """Optional ``module.path:attr`` reference for a custom metric callable."""
 
@@ -326,11 +318,10 @@ class GepaConfig:
         dataset = data.get("dataset", default_dataset_path())
         if not isinstance(dataset, str):
             raise GepaConfigError("Invalid 'dataset' value: expected a path string.")
-        validation_dataset = data.get("validation_dataset")
-        if validation_dataset is not None and not isinstance(validation_dataset, str):
-            raise GepaConfigError(
-                "Invalid 'validation_dataset' value: expected a path string or omit."
-            )
+        if "validation_dataset" in data:
+            from .validation import refuse_legacy_validation
+
+            refuse_legacy_validation()
         metric = data.get("metric")
         if metric is not None and (not isinstance(metric, str) or ":" not in metric):
             raise GepaConfigError(
@@ -364,7 +355,6 @@ class GepaConfig:
             evaluate=evaluate,
             candidate_source=candidate_source,
             dataset=dataset,
-            validation_dataset=validation_dataset,
             metric=metric,
             case_factory=case_factory,
             defaults=defaults,
@@ -734,8 +724,10 @@ def write_default_config(
             f'dataset = "{resolved_dataset}"',
         ]
     )
-    if validation_dataset:
-        lines.append(f'validation_dataset = "{validation_dataset}"')
+    if validation_dataset is not None:
+        from .validation import refuse_legacy_validation
+
+        refuse_legacy_validation()
     if metric:
         lines.append(f'metric = "{metric}"')
     if case_factory:
@@ -962,6 +954,10 @@ def load_dotenv(root: Path | None = None) -> dict[str, str]:
         key = key.strip()
         if key.startswith("export "):
             key = key[len("export ") :].strip()
+        if key == "GEPA_HELDOUT_DATASET":
+            from .validation import refuse_legacy_validation
+
+            refuse_legacy_validation()
         if not key:
             continue
         value = raw_value.strip()

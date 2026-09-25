@@ -75,7 +75,7 @@ def test_config_parse_minimal(tmp_path: Path) -> None:
     cfg = GepaConfig.load(cfg_path)
     assert cfg.agent == "pkg.agents:my_agent"
     assert cfg.dataset == ".gepa/dataset.jsonl"
-    assert cfg.validation_dataset is None
+    assert not hasattr(cfg, "validation_dataset")
     assert cfg.defaults == {}
     assert cfg.stall_threshold == 5
     assert cfg.acceptance.paired_min_cases is None
@@ -119,19 +119,16 @@ def test_config_parse_with_defaults(tmp_path: Path) -> None:
     assert cfg.defaults == {"minibatch_size": 5, "max_iterations": 20}
 
 
-def test_config_parse_with_held_out_validation(tmp_path: Path) -> None:
-    cfg_path = tmp_path / "gepa.toml"
-    cfg_path.write_text(
-        'agent = "pkg.agents:other"\n'
-        'dataset = "data/train.jsonl"\n'
-        'validation_dataset = "data/validation.jsonl"\n',
-        encoding="utf-8",
+def test_config_refuses_public_held_out_path(tmp_path: Path) -> None:
+    import typer
+
+    path = tmp_path / "gepa.toml"
+    path.write_text(
+        'agent = "pkg:agent"\nvalidation_dataset = "/private/secret.jsonl"\n'
     )
-
-    cfg = GepaConfig.load(cfg_path)
-
-    assert cfg.dataset == "data/train.jsonl"
-    assert cfg.validation_dataset == "data/validation.jsonl"
+    with pytest.raises(typer.BadParameter, match="GEPA_HELDOUT_DATASET") as error:
+        GepaConfig.load(path)
+    assert "/private/secret.jsonl" not in str(error.value)
 
 
 def test_config_parse_with_skills(tmp_path: Path) -> None:

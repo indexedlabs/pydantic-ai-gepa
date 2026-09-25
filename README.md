@@ -341,7 +341,13 @@ tests/                # Test suite
 
 ## External-reflection CLI
 
-In addition to the Python `optimize_agent()` entry point, `pydantic-ai-gepa` ships a `gepa` CLI that lets coding agents (Claude Code, Codex, etc.) drive the optimization loop directly. The CLI exposes `init`, `run`, `eval`, `apply`, `components`, `pareto`, `journal`, `next`, `ack`, and `lane`. For agent-driven optimization, prefer `gepa init --validation-dataset PATH` followed by `gepa run start --max-iterations N`: it evaluates training minibatches until reflection is useful, writes report and trace paths, pauses for the coding agent to edit components or source, then `gepa run continue` requires a training-minibatch improvement before scoring the proposal on held-out validation. Validation decides promotion, while its cases, reports, traces, and per-case scores remain outside reflection artifacts. Each validation row evaluates the complete validation dataset, so the row budget is a lifecycle bound rather than a direct model-call or cost bound. Stochastic pipelines can use `--acceptance-repetitions`, `--acceptance-max-repetitions`, `--acceptance-confidence`, and `--acceptance-min-delta` so training-gate decisions carry repeated samples, variance, confidence bounds, and an accepted/rejected/equivalent/inconclusive verdict instead of comparing two single rollout means. In git candidate mode, `gepa run start --lanes N` additionally fans the run out into N worktree-backed reflection lanes evaluated in the background and coordinated by an event stream (`gepa next` / `gepa ack` / `gepa run select`), so a coding agent can orchestrate several isolated reflector subagents in parallel — see the "Parallel reflection lanes" section of the bundled skill at [`src/pydantic_ai_gepa/skills/gepa_optimize/SKILL.md`](src/pydantic_ai_gepa/skills/gepa_optimize/SKILL.md) for the orchestrator loop, the subagent dispatch contract, and the content-file convention.
+In addition to the Python `optimize_agent()` entry point, `pydantic-ai-gepa`
+ships a `gepa` CLI for external reflection. Coding agents inspect training
+reports and edit candidates; an orchestrator-owned harness scores held-out
+runs. A training improvement must also improve validation before promotion.
+Stochastic pipelines can configure acceptance repetitions, confidence and
+minimum delta. Git runs can use `run start --lanes N` for parallel reflection;
+see the [bundled skill](src/pydantic_ai_gepa/skills/gepa_optimize/SKILL.md).
 
 Every single-path pause writes `runs/<id>/reflector_packet.json`: the current
 candidate, scored baseline, training reports and traces, last comparison,
@@ -383,25 +389,91 @@ harness-owned `.gepa-validation-evidence` directory beside the external dataset,
 never in public run artifacts. Missing incumbent evidence prevents promotion until
 it can be collected from the incumbent tree.
 
-Keep the validation dataset outside the repository and all candidate worktrees,
-in both git and component modes. For example:
+For held-out runs, the **harness process started by the orchestrator** holds
+`GEPA_HELDOUT_DATASET` (an absolute path). Never give that variable, its value,
+or the held-out directory to the reflector or any process it launches.
+`gepa.toml` must contain only the training `dataset`; the old
+`validation_dataset` setting and `init --validation-dataset` are refused with
+exit 2. Held-out entries in the repository's `.env` are also refused. Legacy
+state carrying a validation path is refused; start a new run in a clean workspace.
 
 ```bash
-gepa init --agent mypkg.agents:my_agent \
-  --validation-dataset /srv/gepa-heldout/my-project/validation.jsonl
-gepa run start --max-iterations 50
+# Orchestrator / harness shell only:
+gepa init --agent mypkg.agents:my_agent
+export GEPA_HELDOUT_DATASET=/srv/gepa-heldout/my-project/validation.jsonl
+gepa run start --heldout-required --max-iterations 50
+gepa harness serve --run-id RUN_ID
+
+# Separate reflector shell, launched without the private environment:
+gepa run continue --run-id RUN_ID --reflector-epoch 1
 ```
 
-Replace the example absolute path with the harness-owned dataset location.
-Managed runs refuse validation paths inside a checkout or tracked by its git
-repository; move existing data outside the repository and update
-`validation_dataset` in `.gepa/gepa.toml`. If the data was committed or staged,
-use a fresh candidate repository without those Git objects; moving the file
-alone does not remove historical access. The harness pins the external file's
-identity and rechecks it on resume and lane selection. Validation writes no
-reports or traces. Run summaries, lane packets, Pareto output, and final reports
-contain aggregate validation scores and outcomes, without case identifiers,
-outputs, feedback, or per-case scores. Training reports retain full feedback.
+`continue` atomically nominates the candidate and waits for a harness result.
+It never evaluates a held-out run, even if the variable was accidentally set
+in its environment. The harness takes the run lock, checks the epoch and clean
+candidate identity, evaluates the training gate, then confirms training winners
+on validation. It rechecks the tree before saving state and after scoring.
+Keep the nominated tree unchanged until the result arrives. This version uses
+checks around scoring in the existing checkout, rather than a detached checkout.
+
+The reflector receives the usual training reports, trace paths, aggregate
+validation verdict and exit code. `--wait-secs` defaults to 300; `0` enqueues
+and returns immediately. A timeout exits **75**: run the same command again to
+reattach without duplicating the nomination. A different pending candidate or
+gate selection is refused. `harness serve --once` processes one current
+nomination (and retires old epochs), then returns. Interrupted scoring resumes
+from the existing paid evaluation ledger. Normal `run resume` still issues a
+new epoch and packet without reading validation.
+
+Harness commands are held-out `run start`, `harness serve`, lane `run select`,
+`eval --dataset-role validation`, and held-out `run resume --abandon-continuation`
+when private recovery evidence must be retired. They fail closed without the
+harness environment. Reflector commands are `run continue`, `run status`, normal
+`run resume`, and reading `reflector_packet.json`. `lane continue` evaluates only
+training; the orchestrator's `run select` performs held-out selection. Runs
+started without the variable or `--heldout-required` retain in-process,
+training-only continuation.
+
+The harness stores the dataset path and digest in a private `.gepa-heldout/`
+record beside the dataset. Paired per-case evidence stays in the neighboring
+`.gepa-validation-evidence/`; both directories must remain inaccessible to the
+reflector. Public state records `heldout_required` and aggregates only. Dataset
+identity changes, paths inside any checkout or `GEPA_DIR`, and data recoverable
+from Git objects are refused. If Git ever held the data, use a fresh repository
+without those objects. Validation produces no public reports or traces.
+
+The reflector's sandbox must deny data reads outside its worktree and
+`GEPA_DIR`; keep the entire held-out directory outside both. A normal
+workspace-write policy that allows global reads is insufficient. For Codex CLI
+0.156, an example named profile in the orchestrator's Codex configuration is:
+
+```toml
+[permissions.gepa-reflector.filesystem]
+":minimal" = "read"
+"/absolute/candidate-worktree" = "write"
+"/absolute/training-gepa-dir" = "write"
+
+[permissions.gepa-reflector.network]
+enabled = false
+```
+
+Use `codex sandbox -P gepa-reflector -C /absolute/candidate-worktree -- COMMAND`
+for a no-model shell probe. `:minimal` allows OS runtime reads; provision the
+Python runtime and dependencies within the worktree or grant narrowly scoped
+runtime reads as needed. Do not inherit `:workspace`/`:read-only` or grant `"/"`
+reads. Verify that an attempted read of the held-out file fails on the target
+host. See the [Codex permissions reference](https://learn.chatgpt.com/docs/config-file/config-reference).
+Local verification on Codex CLI 0.156.1 accepted this profile but **allowed**
+a held-out file under `/private/tmp` to be read from outside both grants.
+The probe stopped at that failed denial check. This profile is therefore an
+example of the requested configuration, **not a verified isolation boundary**
+on that host. Do not launch a held-out reflector until the deployment's
+read-denial probe passes; changing only the environment is insufficient.
+
+Process isolation is the barrier, not secrecy of the path: `ps` can expose
+another process's arguments and environment. Run files are shared coordination
+state, not authenticated messages; protection against a reflector forging
+state/results in `GEPA_DIR` requires an additional ownership or IPC boundary.
 
 ### Pinned-scorer component IDs
 

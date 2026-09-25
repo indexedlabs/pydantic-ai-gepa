@@ -39,6 +39,7 @@ def _state(**overrides):
             best_validation_samples=(0.5, 0.5, 0.5),
             reflection_baseline_commit_sha="incumbent",
             lanes=2,
+            heldout_required=True,
         ),
         **overrides,
     )
@@ -58,9 +59,7 @@ def selection(monkeypatch, tmp_path):
         )
         for index in (1, 2)
     ]
-    config = SimpleNamespace(
-        validation_dataset="validation.jsonl", acceptance=SimpleNamespace(mode="scalar")
-    )
+    config = SimpleNamespace(acceptance=SimpleNamespace(mode="scalar"))
     monkeypatch.setattr(select.GepaConfig, "load", lambda _: config)
     monkeypatch.setattr(select, "load_all_lane_states", lambda *_: lanes)
     monkeypatch.setattr(select, "_is_ancestor", lambda *_: True)

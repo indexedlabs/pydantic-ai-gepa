@@ -52,13 +52,15 @@ def default_reflector() -> dict[str, Any]:
 
 
 @contextmanager
-def run_lock(run_id: str, root: Path | None = None) -> Iterator[None]:
+def run_lock(
+    run_id: str, root: Path | None = None, *, wait: bool = False
+) -> Iterator[None]:
     """Serialize continuation and handoff; kernel releases the lock on death."""
     path = run_dir(run_id, root) / "run.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+", encoding="utf-8") as handle:
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
         except BlockingIOError as exc:
             handle.seek(0)
             pid = handle.read().strip() or "unknown"

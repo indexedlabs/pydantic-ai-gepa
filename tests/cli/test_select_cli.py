@@ -321,7 +321,7 @@ def test_select_promotes_winner_journals_losers_and_refans(git_repo: Path) -> No
 
 
 def test_select_uses_held_out_validation_instead_of_training_delta(
-    git_repo: Path,
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     validation_path = git_repo.parent / "validation.jsonl"
     validation_path.write_text(
@@ -329,17 +329,13 @@ def test_select_uses_held_out_validation_instead_of_training_delta(
         + "\n",
         encoding="utf-8",
     )
-    config = git_repo / ".gepa" / "gepa.toml"
-    config.write_text(
-        config.read_text(encoding="utf-8")
-        + f'validation_dataset = "{validation_path}"\n',
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(validation_path))
     _git(git_repo, "add", ".gepa/gepa.toml")
-    _git(git_repo, "commit", "-m", "Configure held-out validation")
+    _git(git_repo, "commit", "--allow-empty", "-m", "Configure held-out validation")
 
     run = _start_lane_run(git_repo, lanes=2)
     run_id = _run_id(run)
+    monkeypatch.delenv("GEPA_HELDOUT_DATASET")
     lane_1 = _drive_lane(
         git_repo,
         run_id,
@@ -354,6 +350,7 @@ def test_select_uses_held_out_validation_instead_of_training_delta(
     )
     assert (lane_1.verdict_delta or 0.0) < (lane_2.verdict_delta or 0.0)
 
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(validation_path))
     result = _select(git_repo, run_id)
 
     assert result.exit_code == 0, result.output
@@ -373,19 +370,16 @@ def test_select_uses_held_out_validation_instead_of_training_delta(
 
 
 def test_select_rejects_external_validation_tampered_after_start(
-    git_repo: Path,
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     validation_path = git_repo.parent / "validation.jsonl"
     validation_path.write_text(
         json.dumps({"name": "secret-holdout", "inputs": "x", "expected_output": "v"})
         + "\n"
     )
-    config = git_repo / ".gepa" / "gepa.toml"
-    config.write_text(
-        config.read_text() + f'validation_dataset = "{validation_path}"\n'
-    )
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(validation_path))
     _git(git_repo, "add", ".gepa/gepa.toml")
-    _git(git_repo, "commit", "-m", "Configure external validation")
+    _git(git_repo, "commit", "--allow-empty", "-m", "Configure external validation")
     run_id = _run_id(_start_lane_run(git_repo, lanes=1))
     _drive_lane(git_repo, run_id, "lane-1", {"out_case-2.txt": "b\n"})
     validation_path.write_text(
@@ -410,7 +404,7 @@ def test_select_done_run_does_not_require_validation_file(git_repo: Path) -> Non
 
 
 def test_select_rejects_candidate_that_changes_pinned_validation_data(
-    git_repo: Path,
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     validation_path = git_repo.parent / "validation.jsonl"
     validation_path.write_text(
@@ -419,13 +413,9 @@ def test_select_rejects_candidate_that_changes_pinned_validation_data(
         encoding="utf-8",
     )
     config = git_repo / ".gepa" / "gepa.toml"
-    config.write_text(
-        config.read_text(encoding="utf-8")
-        + f'validation_dataset = "{validation_path}"\n',
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(validation_path))
     _git(git_repo, "add", ".gepa/gepa.toml")
-    _git(git_repo, "commit", "-m", "Configure held-out validation")
+    _git(git_repo, "commit", "--allow-empty", "-m", "Configure held-out validation")
     run = _start_lane_run(git_repo, lanes=1)
     run_id = _run_id(run)
     lane = _drive_lane(
@@ -434,16 +424,15 @@ def test_select_rejects_candidate_that_changes_pinned_validation_data(
         "lane-1",
         {
             "out_case-2.txt": "b\n",
-            ".gepa/gepa.toml": config.read_text().replace(
-                str(validation_path), str(validation_path.parent / "tampered.jsonl")
-            ),
+            ".gepa/gepa.toml": config.read_text()
+            + 'validation_dataset = "/private/tampered.jsonl"\n',
         },
     )
 
     result = _select(git_repo, run_id)
 
     assert result.exit_code == 2
-    assert "Candidate changed validation_dataset" in result.output
+    assert "GEPA_HELDOUT_DATASET" in result.output
     assert _state(git_repo, run_id).best_commit_sha != lane.candidate_sha
     assert len(ParetoLog(run_id, git_repo).validation_rows()) == 3  # repeated seed only
 
@@ -457,14 +446,9 @@ def test_lane_validation_infrastructure_failure_retries_without_leaking(
         + "\n",
         encoding="utf-8",
     )
-    config = git_repo / ".gepa" / "gepa.toml"
-    config.write_text(
-        config.read_text(encoding="utf-8")
-        + f'validation_dataset = "{validation_path}"\n',
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(validation_path))
     _git(git_repo, "add", ".gepa/gepa.toml")
-    _git(git_repo, "commit", "-m", "Configure held-out validation")
+    _git(git_repo, "commit", "--allow-empty", "-m", "Configure held-out validation")
 
     run = _start_lane_run(git_repo, lanes=1)
     run_id = _run_id(run)
@@ -510,14 +494,9 @@ def test_lane_validation_recovers_after_crash_before_checkpoint(
         + "\n",
         encoding="utf-8",
     )
-    config = git_repo / ".gepa" / "gepa.toml"
-    config.write_text(
-        config.read_text(encoding="utf-8")
-        + f'validation_dataset = "{validation_path}"\n',
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(validation_path))
     _git(git_repo, "add", ".gepa/gepa.toml")
-    _git(git_repo, "commit", "-m", "Configure held-out validation")
+    _git(git_repo, "commit", "--allow-empty", "-m", "Configure held-out validation")
     run = _start_lane_run(git_repo, lanes=1)
     run_id = _run_id(run)
     lane = _drive_lane(
@@ -564,14 +543,9 @@ def test_validation_seed_failure_is_redacted_and_has_no_bogus_report_path(
         + "\n",
         encoding="utf-8",
     )
-    config = git_repo / ".gepa" / "gepa.toml"
-    config.write_text(
-        config.read_text(encoding="utf-8")
-        + f'validation_dataset = "{validation_path}"\n',
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(validation_path))
     _git(git_repo, "add", ".gepa/gepa.toml")
-    _git(git_repo, "commit", "-m", "Configure held-out validation")
+    _git(git_repo, "commit", "--allow-empty", "-m", "Configure held-out validation")
     monkeypatch.setenv("GEPA_TEST_FAIL_VALIDATION", "1")
 
     result = _run(
@@ -1304,7 +1278,7 @@ def test_old_two_sample_baseline_cannot_promote_deterministic_lane(
 @pytest.mark.parametrize("lanes", [0, 1])
 @pytest.mark.parametrize("location", ["inside", "tracked", "history", "symlink"])
 def test_run_start_refuses_reflector_accessible_validation(
-    git_repo: Path, lanes: int, location: str
+    git_repo: Path, lanes: int, location: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     inside = git_repo / ".gepa" / "validation.jsonl"
     outside = git_repo.parent / "validation.jsonl"
@@ -1328,30 +1302,27 @@ def test_run_start_refuses_reflector_accessible_validation(
         _git(git_repo, "add", "-u")
         _git(git_repo, "commit", "-m", "Remove exposed validation")
         validation_path = outside
-    config = git_repo / ".gepa" / "gepa.toml"
-    config.write_text(
-        config.read_text() + f'validation_dataset = "{validation_path}"\n'
-    )
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(validation_path))
     _git(git_repo, "add", ".gepa/gepa.toml")
-    _git(git_repo, "commit", "-m", "Configure validation location")
+    _git(git_repo, "commit", "--allow-empty", "-m", "Configure validation location")
 
     result = _run("run", "start", "--lanes", str(lanes), "--size", "3")
 
     assert result.exit_code == 2, result.output
     message = normalize_cli_output(result.output)
     for expected in (
-        str(validation_path.resolve()),
-        "Keep the validation dataset outside the GEPA workspace/repository",
-        "Start the workspace from Git history that never contained the validation dataset",
+        "outside every checkout and GEPA_DIR",
+        "Git history that never contained the held-out data",
     ):
         assert normalize_cli_output(expected) in message
+    assert str(validation_path.resolve()) not in result.output
     assert "withheld-case" not in result.output
     assert not list((git_repo / ".gepa" / "runs").glob("*/pareto.jsonl"))
 
 
 @pytest.mark.parametrize("lanes", [0, 1])
 def test_external_validation_leaves_only_aggregate_artifacts(
-    git_repo: Path, lanes: int
+    git_repo: Path, lanes: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     validation_path = git_repo.parent / "validation.jsonl"
     validation_path.write_text(
@@ -1364,12 +1335,9 @@ def test_external_validation_leaves_only_aggregate_artifacts(
         )
         + "\n"
     )
-    config = git_repo / ".gepa" / "gepa.toml"
-    config.write_text(
-        config.read_text() + f'validation_dataset = "{validation_path}"\n'
-    )
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(validation_path))
     _git(git_repo, "add", ".gepa/gepa.toml")
-    _git(git_repo, "commit", "-m", "Configure external validation")
+    _git(git_repo, "commit", "--allow-empty", "-m", "Configure external validation")
 
     result = _run(
         "run",
