@@ -153,7 +153,7 @@ def test_git_managed_run_advances_best_commit_on_improvement(
         "--size",
         "1",
         "--max-iterations",
-        "2",
+        "7",
     )
     start_payload = _run_payload(start.output)
     baseline_sha = _git(git_repo, "rev-parse", "HEAD")
@@ -180,7 +180,7 @@ def test_git_managed_run_advances_best_commit_on_improvement(
 def test_git_managed_run_reports_reset_then_detects_equivalent_discard(
     git_repo: Path,
 ) -> None:
-    start = _run("run", "start", "--size", "1", "--max-iterations", "3")
+    start = _run("run", "start", "--size", "1", "--max-iterations", "8")
     start_payload = _run_payload(start.output)
     run_id = str(start_payload["run_id"])
     baseline_sha = _git(git_repo, "rev-parse", "HEAD")

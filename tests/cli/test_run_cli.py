@@ -484,7 +484,7 @@ def test_managed_run_repeats_baseline_and_candidate_on_saved_minibatch(
     assert isinstance(baseline_samples, list)
     assert isinstance(baseline_report_paths, list)
     assert len(baseline_samples) == 5
-    assert len(set(baseline_report_paths)) == 5
+    assert len(set(baseline_report_paths)) == 6
 
     result = _run("run", "continue", "--run-id", str(start_payload["run_id"]))
 
@@ -773,3 +773,57 @@ def test_managed_run_prints_final_report_at_max_iterations(repo: Path) -> None:
     assert payload["final_report_path"] == str(final_report_path(run_id, repo))
     assert Path(str(payload["final_report_path"])).exists()
     assert "GEPA Run Final Report" in done.output
+
+
+def test_paired_config_drives_single_repetition_promotion(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pydantic_ai_gepa.cli import eval as eval_module
+    from pydantic_ai_gepa.cli.store import ComponentStore
+
+    validation = [
+        {"name": "held-out-a", "inputs": "?", "expected_output": "a"},
+        {"name": "held-out-b", "inputs": "?", "expected_output": "b"},
+    ]
+    (repo / ".gepa" / "validation.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in validation) + "\n"
+    )
+    config = repo / ".gepa" / "gepa.toml"
+    config.write_text(
+        config.read_text()
+        + 'validation_dataset = ".gepa/validation.jsonl"\n'
+        + "[acceptance]\npaired_min_cases = 2\n"
+    )
+
+    async def evaluate(**kwargs):
+        improved = kwargs["candidate"]["instructions"].text == "Improved prompt"
+        return [
+            EvaluationRecord(
+                case_id=case.name,
+                score=0.6 if improved else 0.4,
+                feedback="Synthetic feedback",
+                payload={},
+            )
+            for case in kwargs["dataset"]
+        ]
+
+    monkeypatch.setattr(eval_module, "evaluate_candidate_dataset", evaluate)
+    started = _run("run", "start", "--size", "2", "--max-iterations", "6")
+    assert started.exit_code == 0, (started.output, started.exception)
+    start_payload = _run_payload(started.output)
+    assert start_payload["acceptance_paired_min_cases"] == 2
+    assert start_payload["reflection_baseline_samples"] == [0.4]
+    assert start_payload["best_validation_samples"] == [0.4]
+    assert "best_validation_per_case_scores" not in start_payload
+    assert "held-out-a" not in started.output
+    ComponentStore().write("instructions", "Improved prompt")
+    result = _run("run", "continue", "--run-id", str(start_payload["run_id"]))
+    assert result.exit_code == 0, (result.output, result.exception)
+    state = _load_state(str(start_payload["run_id"]))
+    assert state.best_validation_samples == (0.6,)
+    assert state.best_validation_per_case_scores == {
+        "held-out-a": 0.6,
+        "held-out-b": 0.6,
+    }
+    assert state.validation_evaluations == 2
+    assert "held-out-a" not in result.output

@@ -1062,7 +1062,30 @@ def _capture_reflection_baseline(
             )
             return paused, outcomes
 
-    return _mark_reflection_pause(state, outcomes), outcomes
+    state = _mark_reflection_pause(state, outcomes)
+    # Keep the failure that triggered reflection visible, but never use its
+    # selected score as statistical evidence.
+    selected_report = first_outcome.summary.get("report_path")
+    selected_trace = first_outcome.summary.get("trace_path")
+    if selected_report:
+        state = replace(
+            state,
+            reflection_baseline_report_path=str(selected_report),
+            reflection_baseline_report_paths=(
+                str(selected_report),
+                *state.reflection_baseline_report_paths,
+            ),
+        )
+    if selected_trace:
+        state = replace(
+            state,
+            reflection_baseline_trace_path=str(selected_trace),
+            reflection_baseline_trace_paths=(
+                str(selected_trace),
+                *state.reflection_baseline_trace_paths,
+            ),
+        )
+    return state, outcomes
 
 
 def _advance_to_reflection_or_done(

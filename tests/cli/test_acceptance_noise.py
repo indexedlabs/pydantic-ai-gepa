@@ -145,6 +145,8 @@ def test_reflection_baseline_discards_failure_selected_sample(
     )
     assert len(calls) == len(outcomes) == 3
     assert selected not in outcomes
+    assert state.reflection_baseline_report_path == selected.summary["report_path"]
+    assert len(state.reflection_baseline_report_paths) == 4
     assert state.reflection_baseline_samples == (0.6, 0.6, 0.6)
     assert state.reflection_baseline_eval_ids == ("eval-2", "eval-3", "eval-4")
     assert state.iterations == 4

@@ -290,9 +290,11 @@ def test_vector_mode_never_persists_validation_assertions(
     payload, state = _start(vector_repo)
     run_id = str(payload["run_id"])
 
-    assert state.validation_evaluations == 1
+    assert state.validation_evaluations == 3
     vectors = VectorRecordStore(vector_records_path(run_id, vector_repo)).records()
-    assert len(vectors) == len(state.reflection_baseline_samples)
+    # The failure-selected training row is retained in the ledger but excluded
+    # from the fresh comparison baseline.
+    assert len(vectors) == len(state.reflection_baseline_samples) + 1
     run_root = vector_repo / ".gepa" / "runs" / run_id
     persisted = "\n".join(
         path.read_text(encoding="utf-8", errors="replace")
@@ -374,9 +376,9 @@ def test_vector_validation_uses_comparator_ranking_without_persisting_detail(
     )
     assert final.best_commit_sha == resolved["lane-2"].candidate_sha
     assert final.best_commit_sha != resolved["lane-3"].candidate_sha
-    assert final.validation_evaluations == 9
+    assert final.validation_evaluations == 11
     validation_rows = ParetoLog(run_id, vector_repo).validation_rows()
-    assert len(validation_rows) == 9
+    assert len(validation_rows) == 11
     assert all(row.per_case_scores == {} for row in validation_rows)
 
     run_root = vector_repo / ".gepa" / "runs" / run_id
@@ -448,8 +450,8 @@ def test_vector_validation_resume_restarts_one_comparable_round(
         json.loads((vector_repo / ".gepa" / "runs" / run_id / "state.json").read_text())
     )
     assert final.best_commit_sha == resolved["lane-2"].candidate_sha
-    assert final.validation_evaluations == 11
-    assert len(ParetoLog(run_id, vector_repo).validation_rows()) == 11
+    assert final.validation_evaluations == 13
+    assert len(ParetoLog(run_id, vector_repo).validation_rows()) == 13
 
 
 def test_validation_ranking_key_requires_finite_non_boolean_numbers() -> None:
@@ -879,7 +881,9 @@ def test_periodic_rebaseline_is_paired_journaled_and_never_reverts_incumbent(
     assert run_start["candidate_id"] == initial.reflection_baseline_candidate_id
     assert set(run_start["component_hashes"]) == {"score.txt"}
     assert isinstance(run_start["component_hashes"]["score.txt"], str)
-    assert len(run_start["vector_record_keys"]) == initial.acceptance_max_repetitions
+    assert len(run_start["vector_record_keys"]) == max(
+        3, initial.acceptance_max_repetitions
+    )
 
     lane = load_lane_state(vector_repo, run_id, "lane-1")
     worktree = Path(str(lane.worktree_path))
@@ -944,8 +948,12 @@ def test_periodic_rebaseline_is_paired_journaled_and_never_reverts_incumbent(
     rebaseline_context = rebaselines[0]["comparison"]["detail"]["context"]
     assert rebaseline_context["accepted_promotion_count"] == 1
     assert rebaseline_context["run_start_baseline"] == run_start
-    assert rebaselines[0]["comparison"]["detail"]["incumbent_records"] == 2
-    assert rebaselines[0]["comparison"]["detail"]["candidate_records"] == 2
+    assert rebaselines[0]["comparison"]["detail"]["incumbent_records"] == len(
+        run_start["vector_record_keys"]
+    )
+    assert rebaselines[0]["comparison"]["detail"]["candidate_records"] == len(
+        run_start["vector_record_keys"]
+    )
 
 
 def test_promotion_counter_is_not_doubled_when_select_resumes_after_a_crash(
