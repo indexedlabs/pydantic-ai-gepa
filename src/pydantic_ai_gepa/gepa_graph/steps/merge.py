@@ -9,6 +9,7 @@ from pydantic_graph import StepContext
 
 from pydantic_evals import Case
 from ..._validation import validation_evaluation
+from ...spend import use_rollout_kind
 from ..deps import GepaDeps
 from ..models import CandidateProgram, GepaState
 from .continue_step import IterationAction
@@ -66,13 +67,16 @@ async def merge_step(ctx: StepContext[GepaState, GepaDeps, None]) -> IterationAc
         return reject()
     subsample_batch = [instance for _, instance in subsample]
 
-    if not can_evaluate(state, len(subsample_batch)):
+    # Merge subsamples are shared validation instances, so they project and
+    # admit at validation-kind costs, not the cheaper training mean.
+    if not can_evaluate(state, len(subsample_batch), rollout_kind="validation"):
         return "continue"
 
     state.record_merge_attempt()
 
     with (
         validation_evaluation(deps.memory_exporter),
+        use_rollout_kind("validation"),
         logfire.span(
             "evaluate merged candidate",
             candidate_idx=merged_candidate.idx,

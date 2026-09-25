@@ -28,6 +28,7 @@ from pydantic_ai_gepa.spend import (
     CostBudgetExceeded,
     SpendCapability,
     SpendMeter,
+    use_rollout_kind,
 )
 from pydantic_ai_gepa.types import MetricResult, ReflectionConfig, RolloutOutput
 
@@ -390,27 +391,12 @@ async def test_expensive_reflection_backstop_preserves_seed_and_actual_overshoot
 
 
 @pytest.mark.asyncio
-async def test_initial_validation_drains_and_prices_in_flight_requests_before_return() -> (
-    None
-):
-    all_started = asyncio.Event()
-    first_priced = asyncio.Event()
-    started = 0
-    completed: list[int] = []
+async def test_unobserved_validation_batch_runs_one_rollout_before_cap_binds() -> None:
+    started: list[int] = []
     priced: list[str | None] = []
 
-    async def delayed_student(messages, info):
-        nonlocal started
-        index = started
-        started += 1
-        if started == 3:
-            all_started.set()
-        await all_started.wait()
-        if index:
-            await first_priced.wait()
-            # Keep these requests in flight when the first response exceeds cap.
-            await asyncio.sleep(0.01)
-        completed.append(index)
+    async def student(messages, info):
+        started.append(len(started))
         return ModelResponse(
             parts=[TextPart("ok")],
             usage=RequestUsage(input_tokens=10, output_tokens=3),
@@ -418,14 +404,14 @@ async def test_initial_validation_drains_and_prices_in_flight_requests_before_re
 
     def price_response(response: ModelResponse) -> float:
         priced.append(response.model_name)
-        first_priced.set()
         return 0.2
 
     inputs = _optimization_inputs()
     inputs["agent"] = Agent(
-        FunctionModel(delayed_student, model_name="concurrent-student-test"),
+        FunctionModel(student, model_name="concurrent-student-test"),
         instructions="Original instructions",
     )
+    seed = extract_seed_candidate(inputs["agent"])
     inputs["valset"] = [
         Case(name=f"validation-{index}", inputs=f"prompt {index}") for index in range(3)
     ]
@@ -434,19 +420,24 @@ async def test_initial_validation_drains_and_prices_in_flight_requests_before_re
         timeout=5,
     )
 
-    assert sorted(completed) == [0, 1, 2]
-    assert priced == ["concurrent-student-test"] * 3
+    # An unobserved rollout kind runs one rollout at a time: the first $0.20
+    # validation rollout is the kind's first observation and crosses the $0.10
+    # cap by itself (the stated one-rollout margin); the rest of the batch is
+    # never admitted, so nothing else is priced.
+    assert started == [0]
+    assert priced == ["concurrent-student-test"]
     assert result.raw_result is not None
     assert result.raw_result.stop_reason == COST_STOP_REASON
-    assert result.spend_report.total_dollars == pytest.approx(0.6)
-    assert result.spend_report.rollout_dollars == pytest.approx(0.6)
+    assert result.spend_report.total_dollars == pytest.approx(0.2)
+    assert result.spend_report.rollout_dollars == pytest.approx(0.2)
     assert result.spend_report.reflection_dollars == 0
-    assert result.spend_report.by_model["concurrent-student-test"].requests == 3
-    assert result.spend_report.by_model["concurrent-student-test"].input_tokens == 30
+    assert result.spend_report.by_model["concurrent-student-test"].requests == 1
+    assert result.spend_report.stopped_by_cost
+    assert result.best_score is None
+    assert result.best_candidate == seed
     snapshot = result.spend_report.model_dump()
     await asyncio.sleep(0.02)
-    assert started == 3
-    assert len(priced) == 3
+    assert started == [0]
     assert result.spend_report.model_dump() == snapshot
 
 
@@ -590,3 +581,377 @@ async def test_bad_price_override_without_cap_keeps_all_usage_unpriced() -> None
     assert report.total_dollars == 0
     assert report.unpriced_usage["student-test"].requests > 0
     assert report.unpriced_usage["reflector-test"].requests > 0
+
+
+@pytest.mark.asyncio
+async def test_expensive_validation_probe_ends_within_one_rollout_of_cap() -> None:
+    """The reviewer's OTTO-4763 probe on the Python API.
+
+    Four validation rollouts at $0.50 each; training rollouts and reflection
+    cost $0.005; cap $0.60 with enough concurrency to start the whole batch.
+    """
+    from pydantic_ai_gepa._validation import validation_active
+
+    def price_response(response: ModelResponse) -> float:
+        if response.model_name == "reflector-test":
+            return 0.005
+        return 0.5 if validation_active() else 0.005
+
+    inputs = _optimization_inputs()
+    seed = extract_seed_candidate(inputs["agent"])
+    inputs["valset"] = [
+        Case(name=f"validation-{index}", inputs=f"prompt {index}") for index in range(4)
+    ]
+    result = await optimize_agent(
+        **inputs, max_token_cost=0.60, price_fn=price_response
+    )
+
+    report = result.spend_report
+    assert report.stopped_by_cost
+    assert report.stop_reason == COST_STOP_REASON
+    assert result.raw_result is not None
+    assert result.raw_result.stop_reason == COST_STOP_REASON
+    # The first $0.50 validation rollout observes its kind; the other three are
+    # never admitted. The run ends under the cap; the stated margin is one
+    # rollout at the kind's observed high: 0.60 + 0.50.
+    assert report.by_model["student-test"].requests == 1
+    assert report.rollout_dollars == pytest.approx(0.50)
+    assert report.total_dollars == pytest.approx(0.50)
+    assert report.total_dollars <= 0.60 + 0.50
+    # OTTO-4707: the partly validated seed is never picked and reports no score.
+    assert result.best_score is None
+    assert result.best_candidate == seed
+
+
+@pytest.mark.asyncio
+async def test_per_kind_projection_is_not_diluted_by_cheap_training_rollouts() -> None:
+    """Validation is first observed after many cheap training rollouts.
+
+    A blended mean ($0.017) projects a 4-case validation batch at $0.07 and
+    admits it; the per-kind guard sees the observed $0.50 validation cost.
+    """
+    meter = SpendMeter(
+        max_token_cost=0.80, price_fn=lambda response: 0.005, max_concurrent=4
+    )
+    for _ in range(40):
+        with meter.step("rollout", kind="training"):
+            meter.record("rollout", _response())
+
+    assert meter.can_start("rollout", 4, rollout_kind="validation")
+    capability = SpendCapability(meter, "rollout")
+    started = 0
+
+    async def expensive_rollout() -> None:
+        nonlocal started
+        started += 1
+        meter.record("rollout", _response())
+
+    async def validation_rollout() -> None:
+        with use_rollout_kind("validation"):
+            await capability.wrap_run(cast(Any, None), handler=expensive_rollout)
+
+    # The unobserved validation kind admits one rollout; at $0.50 it is the
+    # blended mean's blind spot but still fits under the remaining $0.60.
+    meter.price_fn = lambda response: 0.5
+    first = await asyncio.gather(validation_rollout(), return_exceptions=True)
+    assert first == [None]
+    assert meter.report().total_dollars == pytest.approx(0.70)
+
+    # Now the kind is observed: the batch guard projects 4 * $0.50 and refuses,
+    # while the blended projection would still allow it.
+    assert meter.can_start("rollout", 4)
+    assert not meter.can_start("rollout", 4, rollout_kind="validation")
+    results = await asyncio.gather(
+        *(validation_rollout() for _ in range(3)), return_exceptions=True
+    )
+    assert all(isinstance(result, CostBudgetExceeded) for result in results)
+    assert started == 1
+    assert meter.report().total_dollars == pytest.approx(0.70)
+    assert meter.report().stop_reason == COST_STOP_REASON
+
+
+@pytest.mark.asyncio
+async def test_admission_serializes_an_unobserved_kind_and_stops_at_cap() -> None:
+    meter = SpendMeter(
+        max_token_cost=0.60, price_fn=lambda response: 0.5, max_concurrent=4
+    )
+    capability = SpendCapability(meter, "rollout")
+    in_flight = 0
+    max_in_flight = 0
+    completed = 0
+
+    async def rollout() -> None:
+        nonlocal in_flight, max_in_flight, completed
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
+        try:
+            await asyncio.sleep(0.01)
+            meter.record("rollout", _response())
+            completed += 1
+        finally:
+            in_flight -= 1
+
+    async def one() -> None:
+        await capability.wrap_run(cast(Any, None), handler=rollout)
+
+    results = await asyncio.gather(*(one() for _ in range(4)), return_exceptions=True)
+    # One $0.50 rollout observed the kind; the next cannot fit in the remaining
+    # $0.10, so the run stops with nothing in flight instead of overshooting.
+    assert completed == 1
+    assert max_in_flight == 1
+    assert sum(isinstance(result, CostBudgetExceeded) for result in results) == 3
+    assert meter.report().total_dollars == pytest.approx(0.50)
+    assert meter.report().stop_reason == COST_STOP_REASON
+
+
+@pytest.mark.asyncio
+async def test_admission_drops_to_one_rollout_near_the_cap() -> None:
+    meter = SpendMeter(
+        max_token_cost=0.55, price_fn=lambda response: 0.1, max_concurrent=8
+    )
+    capability = SpendCapability(meter, "rollout")
+
+    async def seed() -> None:
+        meter.record("rollout", _response())
+
+    await capability.wrap_run(cast(Any, None), handler=seed)
+    assert meter.report().total_dollars == pytest.approx(0.1)
+
+    in_flight = 0
+    max_in_flight = 0
+    completed = 0
+
+    async def rollout() -> None:
+        nonlocal in_flight, max_in_flight, completed
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
+        try:
+            await asyncio.sleep(0.005)
+            meter.record("rollout", _response())
+            completed += 1
+        finally:
+            in_flight -= 1
+
+    async def one() -> None:
+        await capability.wrap_run(cast(Any, None), handler=rollout)
+
+    results = await asyncio.gather(*(one() for _ in range(8)), return_exceptions=True)
+    # Headroom $0.45 is below 8 * $0.10, so rollouts run one at a time: four
+    # fit ($0.20-$0.50), then no further rollout fits with nothing in flight.
+    assert max_in_flight == 1
+    assert completed == 4
+    assert sum(isinstance(result, CostBudgetExceeded) for result in results) == 4
+    assert meter.report().total_dollars == pytest.approx(0.50)
+    assert meter.report().stop_reason == COST_STOP_REASON
+
+
+@pytest.mark.asyncio
+async def test_admission_releases_waiting_rollouts_as_in_flight_ones_finish() -> None:
+    meter = SpendMeter(
+        max_token_cost=1.00, price_fn=lambda response: 0.1, max_concurrent=3
+    )
+    capability = SpendCapability(meter, "rollout")
+
+    async def seed() -> None:
+        meter.record("rollout", _response())
+
+    await capability.wrap_run(cast(Any, None), handler=seed)
+
+    gate = asyncio.Event()
+    started = 0
+    completed = 0
+
+    async def rollout() -> None:
+        nonlocal started, completed
+        started += 1
+        await gate.wait()
+        meter.record("rollout", _response())
+        completed += 1
+
+    async def one() -> None:
+        await capability.wrap_run(cast(Any, None), handler=rollout)
+
+    tasks = [asyncio.create_task(one()) for _ in range(5)]
+    await asyncio.sleep(0.05)
+    # Headroom $0.90 covers 3 * $0.10, so the concurrency limit binds, not the
+    # cap: three rollouts run, two wait for in-flight slots.
+    assert started == 3
+    gate.set()
+    await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
+    assert completed == 5
+    assert meter.report().total_dollars == pytest.approx(0.60)
+    assert not meter.report().stopped_by_cost
+
+
+@pytest.mark.asyncio
+async def test_in_flight_rollouts_settle_when_a_new_price_high_stops_the_run() -> None:
+    prices = iter([0.1, 2.0, 0.1])
+    meter = SpendMeter(
+        max_token_cost=1.00,
+        price_fn=lambda response: next(prices),
+        max_concurrent=2,
+    )
+    capability = SpendCapability(meter, "rollout")
+
+    async def seed() -> None:
+        meter.record("rollout", _response())
+
+    await capability.wrap_run(cast(Any, None), handler=seed)
+
+    expensive_started = asyncio.Event()
+    cheap_release = asyncio.Event()
+
+    async def expensive() -> None:
+        expensive_started.set()
+        await asyncio.sleep(0)
+        # A new price high for the kind crosses the cap while admitted.
+        meter.record("rollout", _response())
+
+    async def cheap() -> None:
+        await expensive_started.wait()
+        await cheap_release.wait()
+        meter.record("rollout", _response())
+
+    async def queued() -> None:
+        meter.record("rollout", _response())
+
+    async def run(handler) -> Exception | None:
+        try:
+            await capability.wrap_run(cast(Any, None), handler=handler)
+        except Exception as error:  # noqa: BLE001 - collected for assertions
+            return error
+        return None
+
+    expensive_task = asyncio.create_task(run(expensive))
+    cheap_task = asyncio.create_task(run(cheap))
+    queued_task = asyncio.create_task(run(queued))
+    await asyncio.wait_for(expensive_task, timeout=5)
+    # The queued rollout was waiting for a slot and exits on the stop; the
+    # in-flight cheap rollout still settles and is paid for.
+    assert isinstance(
+        await asyncio.wait_for(queued_task, timeout=5), CostBudgetExceeded
+    )
+    cheap_release.set()
+    cheap_error = await asyncio.wait_for(cheap_task, timeout=5)
+
+    assert isinstance(await expensive_task, CostBudgetExceeded)
+    assert isinstance(cheap_error, CostBudgetExceeded)
+    report = meter.report()
+    assert report.by_model["custom-test"].requests == 3
+    assert report.rollout_dollars == pytest.approx(0.1 + 2.0 + 0.1)
+    assert report.stopped_by_cost
+    assert report.stop_reason == COST_STOP_REASON
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_token_cost", [None, 100.0])
+async def test_admission_never_serializes_without_a_binding_cap(
+    max_token_cost: float | None,
+) -> None:
+    # Uncapped meters admit immediately; so do capped meters without a
+    # configured concurrency (the CLI-managed path gates rollouts itself).
+    meter = SpendMeter(max_token_cost=max_token_cost, price_fn=lambda response: 0.1)
+    capability = SpendCapability(meter, "rollout")
+    all_started = asyncio.Event()
+    started = 0
+    completed = 0
+
+    async def rollout() -> None:
+        nonlocal started, completed
+        started += 1
+        if started == 4:
+            all_started.set()
+        await all_started.wait()
+        meter.record("rollout", _response())
+        completed += 1
+
+    async def one() -> None:
+        await capability.wrap_run(cast(Any, None), handler=rollout)
+
+    await asyncio.wait_for(asyncio.gather(*(one() for _ in range(4))), timeout=5)
+    assert started == completed == 4
+    assert meter.report().total_dollars == pytest.approx(0.4)
+    assert not meter.report().stopped_by_cost
+
+
+@pytest.mark.asyncio
+async def test_admission_keeps_full_concurrency_with_ample_headroom() -> None:
+    meter = SpendMeter(
+        max_token_cost=10.0, price_fn=lambda response: 0.1, max_concurrent=4
+    )
+    capability = SpendCapability(meter, "rollout")
+
+    async def seed() -> None:
+        meter.record("rollout", _response())
+
+    await capability.wrap_run(cast(Any, None), handler=seed)
+
+    all_started = asyncio.Event()
+    started = 0
+
+    async def rollout() -> None:
+        nonlocal started
+        started += 1
+        if started == 4:
+            all_started.set()
+        await all_started.wait()
+        meter.record("rollout", _response())
+
+    async def one() -> None:
+        await capability.wrap_run(cast(Any, None), handler=rollout)
+
+    await asyncio.wait_for(asyncio.gather(*(one() for _ in range(4))), timeout=5)
+    assert started == 4
+    assert meter.report().total_dollars == pytest.approx(0.5)
+    assert not meter.report().stopped_by_cost
+
+
+@pytest.mark.asyncio
+async def test_admission_release_survives_a_second_cancellation() -> None:
+    """A rollout cancelled again while releasing must not leak its slot."""
+    meter = SpendMeter(
+        max_token_cost=10.0, price_fn=lambda response: 0.1, max_concurrent=2
+    )
+    capability = SpendCapability(meter, "rollout")
+
+    async def seed() -> None:
+        meter.record("rollout", _response())
+
+    await capability.wrap_run(cast(Any, None), handler=seed)
+
+    entered = asyncio.Event()
+    never = asyncio.Event()
+
+    async def rollout() -> None:
+        entered.set()
+        await never.wait()
+
+    task = asyncio.create_task(capability.wrap_run(cast(Any, None), handler=rollout))
+    await entered.wait()
+    assert meter._active["training"] == 1
+    assert meter._reserved == pytest.approx(0.1)
+
+    # Hold the condition lock so the release's notify acquire has to queue,
+    # then cancel the rollout a second time while it is queued there.
+    await meter._condition.acquire()
+    task.cancel()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert meter._active["training"] == 0
+    assert meter._reserved == pytest.approx(0.0)
+    task.cancel()
+    meter._condition.release()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The condition is not corrupted: a later rollout is admitted normally.
+    async def followup() -> None:
+        meter.record("rollout", _response())
+
+    await asyncio.wait_for(
+        capability.wrap_run(cast(Any, None), handler=followup), timeout=5
+    )
+    assert meter._active["training"] == 0
+    assert meter._reserved == pytest.approx(0.0)
+    assert meter.report().total_dollars == pytest.approx(0.2)
+    assert not meter.report().stopped_by_cost
