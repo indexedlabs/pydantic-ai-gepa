@@ -170,3 +170,39 @@ async def test_parallel_evaluator_collects_trajectories() -> None:
 
     assert result.trajectories is not None
     assert len(result.trajectories) == len(batch)
+
+
+class _StoppingAdapter(_RecordingAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.cancelled: list[str] = []
+
+    async def evaluate(self, batch, candidate, capture_traces, example_bank=None):
+        from pydantic_ai_gepa.provider_errors import ProviderStopError
+
+        if batch[0].name == "stops":
+            await self.started.wait()
+            raise ProviderStopError("insufficient_quota")
+        self.started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            self.cancelled.append(batch[0].name)
+            raise
+        raise AssertionError("not reached")
+
+
+@pytest.mark.asyncio
+async def test_parallel_evaluator_cancels_in_flight_cases_on_provider_stop() -> None:
+    from pydantic_ai_gepa.provider_errors import ProviderStopError
+
+    adapter = _StoppingAdapter()
+    with pytest.raises(ProviderStopError):
+        await ParallelEvaluator().evaluate_batch(
+            candidate=_make_candidate(),
+            batch=[_make_data_inst("slow"), _make_data_inst("stops")],
+            adapter=adapter,
+            max_concurrent=2,
+        )
+    assert adapter.cancelled == ["slow"]

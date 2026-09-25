@@ -563,6 +563,28 @@ async def test_llm_generator_returns_existing_text_on_agent_failure() -> None:
 
 
 @pytest.mark.asyncio
+async def test_llm_generator_stops_on_reflector_billing_failure() -> None:
+    """A reflector out of credit fails every later round too, so the run stops."""
+    from pydantic_ai.exceptions import ModelHTTPError
+
+    candidate = _make_candidate()
+    reflective_data = ComponentReflectiveDataset(
+        records_by_component={"instructions": [_make_reflective_record()]}
+    )
+
+    async def out_of_credit(messages, agent_info):
+        raise ModelHTTPError(429, "reflector", {"code": "project_spend_limit_exceeded"})
+
+    with pytest.raises(ModelHTTPError, match="project_spend_limit_exceeded"):
+        await InstructionProposalGenerator().propose_texts(
+            candidate=candidate,
+            reflective_data=reflective_data,
+            components=["instructions"],
+            model=FunctionModel(function=out_of_credit),
+        )
+
+
+@pytest.mark.asyncio
 async def test_prompt_includes_output_tool_details() -> None:
     candidate = _make_candidate()
     record = _make_reflective_record()

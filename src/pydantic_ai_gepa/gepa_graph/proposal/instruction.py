@@ -24,6 +24,7 @@ from pydantic_ai.messages import (
 )
 
 from pydantic_ai_gepa.inspection import InspectionAborted
+from pydantic_ai_gepa.provider_errors import is_provider_stop_error
 
 from ...adapter import (
     ReflectiveDataset,
@@ -448,6 +449,9 @@ class InstructionProposalGenerator:
         except InspectionAborted:
             raise
         except Exception as error:
+            if is_provider_stop_error(error):
+                # Billing or credentials: every later round would fail the same way.
+                raise
             # An empty proposal is a silent no-op round: the engine skips
             # evaluation and the reflector re-derives the same work next
             # iteration with no idea it was lost. Make the cause loud.

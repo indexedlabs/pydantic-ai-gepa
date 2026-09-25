@@ -23,6 +23,7 @@ from .components import (
     extract_seed_candidate_with_input_type,
 )
 from .exceptions import UsageBudgetExceeded
+from .provider_errors import PROVIDER_STOP_REASON, is_provider_stop_error
 from .gepa_graph import create_deps, create_gepa_graph
 from .gepa_graph.datasets import DatasetInput, resolve_dataset
 from .gepa_graph.models import (
@@ -431,17 +432,27 @@ async def optimize_agent(
         )
         gepa_result = GepaResult.from_state(state)
     except Exception as exc:
-        if raise_on_exception:
-            raise
-        logfire.error(
-            "Optimization failed",
+        if not is_provider_stop_error(exc):
+            if raise_on_exception:
+                raise
+            logfire.error(
+                "Optimization failed",
+                exception=exc,
+            )
+            logfire.error(
+                "Optimization failed while returning fallback result",
+                exception=exc,
+            )
+            return _fallback_result(normalized_seed_candidate)
+        # Billing or credentials: keep the best-so-far candidate, as a usage-budget
+        # stop does, instead of discarding the run's progress.
+        state.mark_stopped(reason=PROVIDER_STOP_REASON)
+        logfire.warning(
+            "Optimization stopped by a provider billing or credential failure",
             exception=exc,
+            total_evaluations=state.total_evaluations,
         )
-        logfire.error(
-            "Optimization failed while returning fallback result",
-            exception=exc,
-        )
-        return _fallback_result(normalized_seed_candidate)
+        gepa_result = GepaResult.from_state(state)
     finally:
         adapter.close()
 

@@ -392,3 +392,37 @@ async def test_optimize_agent_stops_on_gepa_usage_budget():
     assert result.raw_result is not None
     assert result.raw_result.stop_reason == "Usage budget exceeded"
     assert result.raw_result.stopped is True
+
+
+@pytest.mark.asyncio
+async def test_optimize_agent_keeps_best_so_far_when_the_reflector_runs_out_of_credit():
+    from pydantic_ai.exceptions import ModelHTTPError
+    from pydantic_ai.models.function import FunctionModel
+
+    from pydantic_ai_gepa.provider_errors import PROVIDER_STOP_REASON
+
+    trainset = [
+        Case(name=f"credit-case-{i}", inputs=f"Prompt {i}", expected_output="ok")
+        for i in range(3)
+    ]
+    agent = Agent(TestModel(custom_output_text="nope"), instructions="Respond.")
+
+    async def out_of_credit(messages, agent_info):
+        raise ModelHTTPError(429, "reflector", {"code": "project_spend_limit_exceeded"})
+
+    def metric(case: Case[str, str, Any], output: RolloutOutput[Any]) -> MetricResult:
+        del case  # unused
+        return MetricResult(score=0.0, feedback="wrong")
+
+    result = await optimize_agent(
+        agent=agent,
+        trainset=trainset,
+        metric=metric,
+        reflection_config=ReflectionConfig(model=FunctionModel(function=out_of_credit)),
+        max_metric_calls=50,
+        seed=0,
+    )
+
+    assert result.raw_result is not None
+    assert result.raw_result.stopped is True
+    assert result.raw_result.stop_reason == PROVIDER_STOP_REASON
