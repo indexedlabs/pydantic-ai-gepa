@@ -274,23 +274,34 @@ def _meter_pipeline(fn: Callable[_P, Awaitable[_R]]) -> Callable[_P, Awaitable[_
         )
         cap = cast(float | None, kwargs.get("max_token_cost"))
         price_fn = cast(PriceFn | None, kwargs.get("price_fn"))
+        outer = _pipeline_meter.get()
         meter = cast(SpendMeter | None, kwargs.get("spend_meter"))
         if meter is not None:
             if cap is not None or price_fn is not None:
                 raise ValueError(
                     "spend_meter is mutually exclusive with max_token_cost and price_fn"
                 )
-            ancestor: SpendMeter | None = meter
-            while ancestor is not None:
-                if ancestor.max_token_cost is not None:
-                    cap = ancestor.max_token_cost
-                    if ancestor.max_concurrent is None:
-                        raise ValueError(
-                            "A capped spend_meter requires max_concurrent for pipeline admission"
-                        )
-                ancestor = ancestor.parent
+            if outer is not None:
+                ancestor = meter.parent
+                while ancestor is not None and ancestor is not outer:
+                    ancestor = ancestor.parent
+                if ancestor is None:
+                    raise ValueError(
+                        "A nested spend_meter must descend from the active pipeline meter"
+                    )
         else:
-            meter = SpendMeter(cap, price_fn, max_concurrent=task.concurrency)
+            meter = SpendMeter(
+                cap, price_fn, max_concurrent=task.concurrency, parent=outer
+            )
+        ancestor: SpendMeter | None = meter
+        while ancestor is not None:
+            if ancestor.max_token_cost is not None:
+                cap = ancestor.max_token_cost
+                if ancestor.max_concurrent is None:
+                    raise ValueError(
+                        "A capped spend_meter requires max_concurrent for pipeline admission"
+                    )
+            ancestor = ancestor.parent
         if cap is not None:
             # Preflight every family before even the seed evaluation costs money.
             for config in cast(Sequence[EngineConfig], configs):
@@ -382,9 +393,15 @@ async def optimize_parallel(
 
     Always returns a list in configuration order. Pass spend_meter to inspect
     the combined report with meter.report(); engine reports remain separate.
+    Under a pipeline cap, reflections run only between rollouts: they wait
+    for all in-flight rollouts to finish and then block new rollout starts.
+    This is a barrier across parallel engines; waiting reflections have no
+    priority over newly queued rollouts.
 
     Pass max_token_cost and optional price_fn, or an existing spend_meter
     (mutually exclusive). Capped supplied meters must set max_concurrent.
+    Nested helpers inherit the active meter as a parent; a supplied nested
+    meter must be a descendant of that active meter.
     A pipeline dollar cap includes all engines, comparisons, and reporting.
     Its margin is one rollout per in-flight slot across the pipeline at its
     kind's highest observed cost; SpendMeter documents first-observation,
@@ -419,6 +436,8 @@ async def optimize_best_of(
 
     Pass max_token_cost and optional price_fn, or an existing spend_meter
     (mutually exclusive). Capped supplied meters must set max_concurrent.
+    Nested helpers inherit the active meter as a parent; a supplied nested
+    meter must be a descendant of that active meter.
     A pipeline dollar cap includes all engines, comparisons, and reporting.
     Its margin is one rollout per in-flight slot across the pipeline at its
     kind's highest observed cost; SpendMeter documents first-observation,
@@ -476,6 +495,8 @@ async def optimize_sequential(
 
     Pass max_token_cost and optional price_fn, or an existing spend_meter
     (mutually exclusive). Capped supplied meters must set max_concurrent.
+    Nested helpers inherit the active meter as a parent; a supplied nested
+    meter must be a descendant of that active meter.
     A pipeline dollar cap includes all engines, comparisons, and reporting.
     Its margin is one rollout per in-flight slot across the pipeline at its
     kind's highest observed cost; SpendMeter documents first-observation,
@@ -496,6 +517,7 @@ async def optimize_sequential(
     seed = await task.seed_candidate()
     seed_evaluation = await _evaluate(task, seed, budget=comparison_budget)
     seed_score = seed_evaluation.score
+    incumbent_selectable = seed_evaluation.selectable
     adopted_result = EngineResult(
         engine="seed",
         best_candidate=seed,
@@ -541,7 +563,7 @@ async def optimize_sequential(
         )
         votes.append(vote)
         adopted = evaluation.selectable and (
-            adopted_result.best_score is None or evaluation.score >= seed_score
+            not incumbent_selectable or evaluation.score >= seed_score
         )
         phases.append(
             {
@@ -553,6 +575,7 @@ async def optimize_sequential(
             }
         )
         if adopted:
+            incumbent_selectable = True
             seed, seed_score, adopted_result, adopted_index = (
                 result.best_candidate,
                 evaluation.score,
@@ -588,6 +611,8 @@ async def optimize_vote(
 
     Pass max_token_cost and optional price_fn, or an existing spend_meter
     (mutually exclusive). Capped supplied meters must set max_concurrent.
+    Nested helpers inherit the active meter as a parent; a supplied nested
+    meter must be a descendant of that active meter.
     A pipeline dollar cap includes all engines, comparisons, and reporting.
     Its margin is one rollout per in-flight slot across the pipeline at its
     kind's highest observed cost; SpendMeter documents first-observation,
@@ -620,6 +645,8 @@ async def optimize_omni(
 
     Pass max_token_cost and optional price_fn, or an existing spend_meter
     (mutually exclusive). Capped supplied meters must set max_concurrent.
+    Nested helpers inherit the active meter as a parent; a supplied nested
+    meter must be a descendant of that active meter.
     A pipeline dollar cap includes all engines, comparisons, and reporting.
     Its margin is one rollout per in-flight slot across the pipeline at its
     kind's highest observed cost; SpendMeter documents first-observation,
@@ -818,6 +845,8 @@ async def optimize_adaptive_sequential(
 
     Pass max_token_cost and optional price_fn, or an existing spend_meter
     (mutually exclusive). Capped supplied meters must set max_concurrent.
+    Nested helpers inherit the active meter as a parent; a supplied nested
+    meter must be a descendant of that active meter.
     A pipeline dollar cap includes all engines, comparisons, and reporting.
     Its margin is one rollout per in-flight slot across the pipeline at its
     kind's highest observed cost; SpendMeter documents first-observation,

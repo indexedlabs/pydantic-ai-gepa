@@ -1,6 +1,9 @@
 """Offline regression coverage for one dollar cap across composed engines."""
 
 import asyncio
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Any
 
 import pytest
 from pydantic_ai import Agent
@@ -19,13 +22,27 @@ from pydantic_ai_gepa.compose import (
     optimize_sequential,
     optimize_vote,
 )
-from pydantic_ai_gepa.engines import EngineConfig, OptimizationTask
+from pydantic_ai_gepa.engines import (
+    BudgetTracker,
+    EngineConfig,
+    EngineResult,
+    OptimizationTask,
+    register_engine,
+    unregister_engine,
+)
+from pydantic_ai_gepa.engines.gepa_engine import GepaEngine
+from pydantic_ai_gepa.gepa_graph.models import ComponentValue
 from pydantic_ai_gepa.gepa_graph.proposal.instruction import (
     ComponentUpdate,
     InstructionProposalOutput,
     TrajectoryAnalysis,
 )
-from pydantic_ai_gepa.spend import CostBudgetExceeded, SpendMeter
+from pydantic_ai_gepa.spend import (
+    COST_STOP_REASON,
+    CostBudgetExceeded,
+    SpendMeter,
+    _pipeline_meter,
+)
 from pydantic_ai_gepa.types import MetricResult, ReflectionConfig
 
 
@@ -117,12 +134,18 @@ async def test_pipeline_cap_combines_engines_and_helper_rollouts(helper):
     assert report.reflection_dollars > 0
     assert "secret-validation" not in report.model_dump_json()
     assert "private-training" not in report.model_dump_json()
-    from pydantic_ai_gepa.spend import _pipeline_meter
-
     assert _pipeline_meter.get() is None
     if helper is not optimize_parallel:
-        # The seed was completely evaluated before optimization exhausted dollars.
-        assert result.best.engine == "seed"
+        # A refused engine projection may leave room for a fair comparison.
+        # Keep the last fairly accepted incumbent when the pipeline later stops.
+        accepted = [
+            phase["stage"]
+            for phase in result.phases
+            if phase.get("adopted", phase.get("improved", False))
+        ]
+        assert result.best_index == (accepted[-1] if accepted else -1)
+        if not accepted:
+            assert result.best.engine == "seed"
         assert result.best.best_score == 0.5
         assert report.total_dollars > sum(
             _engine_spend(r)["total_dollars"] for r in result.results
@@ -543,3 +566,273 @@ async def test_unselectable_comparison_at_exact_cap_returns_unscored_seed(helper
     assert result.best.engine == "seed"
     assert result.best.best_score is None
     assert result.fair_votes == []
+
+
+@contextmanager
+def _registered(engine: Any) -> Iterator[str]:
+    register_engine(engine.name, lambda config: engine)
+    try:
+        yield engine.name
+    finally:
+        unregister_engine(engine.name)
+
+
+class _StaticEngine:
+    name = "review-static"
+    supports_token_cost = True  # Proposes fixed text without making model calls.
+
+    async def run(
+        self, task: OptimizationTask, config: EngineConfig, budget: BudgetTracker
+    ) -> EngineResult:
+        budget.spend(1)
+        candidate = await task.seed_candidate()
+        if config.engine_config.get("regress"):
+            candidate = {
+                "instructions": ComponentValue(name="instructions", text="worse")
+            }
+        return EngineResult(
+            engine=self.name,
+            best_candidate=candidate,
+            best_score=None,
+            num_metric_calls=1,
+        )
+
+
+def _scored_task(*, seed_selectable: bool = True) -> OptimizationTask:
+    task = _task()
+
+    def metric(case, output):
+        override = task.agent._override_instructions.get()
+        active = override.value if override is not None else task.agent._instructions
+        worse = "worse" in str(active)
+        return MetricResult(
+            score=0.1 if worse else 0.9,
+            side_info={"selectable": worse or seed_selectable},
+        )
+
+    task.metric = metric
+    return task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cap", [None, 5.0])
+async def test_sequential_keeps_fair_incumbent_when_engine_score_is_none(cap):
+    with _registered(_StaticEngine()) as name:
+        result = await optimize_sequential(
+            _scored_task(),
+            [
+                EngineConfig(engine=name, max_metric_calls=1),
+                EngineConfig(
+                    engine=name, max_metric_calls=1, engine_config={"regress": True}
+                ),
+            ],
+            max_metric_calls=2,
+            max_token_cost=cap,
+            price_fn=_price,
+        )
+    assert result.results[0].best_score is None
+    assert result.fair_scores == [0.9, 0.1]
+    assert [phase["adopted"] for phase in result.phases] == [True, False]
+    assert result.best_index == 0
+    assert result.best.best_candidate["instructions"].text == "seed"
+
+
+@pytest.mark.asyncio
+async def test_uncapped_adaptive_accepts_selectable_slice_over_unselectable_seed():
+    with _registered(_StaticEngine()) as name:
+        result = await optimize_adaptive_sequential(
+            _scored_task(seed_selectable=False),
+            [
+                EngineConfig(
+                    engine=name, max_metric_calls=1, engine_config={"regress": True}
+                )
+            ],
+            max_metric_calls=1,
+            price_fn=_price,
+        )
+    assert result.best_index == 0
+    assert result.best.best_candidate["instructions"].text == "worse"
+    assert result.phases[0]["improved"]
+    assert result.fair_scores == [0.1]
+    assert result.spend_report.max_token_cost is None
+
+
+@pytest.mark.asyncio
+async def test_nested_helper_inherits_outer_spend_cap_and_pricing():
+    raw_task = _task()
+    inner_results = []
+    prices = []
+
+    class NestedEngine:
+        name = "review-nested"
+        supports_token_cost = True
+
+        async def run(self, task, config, budget):
+            inner = await optimize_sequential(
+                raw_task, [_config()], max_metric_calls=20
+            )
+            inner_results.append(inner)
+            budget.spend(inner.total_metric_calls)
+            return inner.best.model_copy(
+                update={
+                    "engine": self.name,
+                    "num_metric_calls": inner.total_metric_calls,
+                }
+            )
+
+    meter = SpendMeter(
+        0.5,
+        lambda response: prices.append(_price(response)) or _price(response),
+        max_concurrent=2,
+    )
+    with _registered(NestedEngine()) as name:
+        await optimize_parallel(
+            raw_task,
+            [EngineConfig(engine=name, max_metric_calls=20)],
+            max_metric_calls=20,
+            spend_meter=meter,
+        )
+    assert 0 < meter.report().total_dollars == sum(prices)
+    assert meter.report().total_dollars <= 0.5 + 2 * 0.125
+    assert meter.report().stopped_by_cost
+    assert inner_results[0].spend_report.total_dollars == meter.report().total_dollars
+    assert inner_results[0].spend_report.stopped_by_cost
+    assert not inner_results[0].spend_report.unpriced_usage
+    assert _pipeline_meter.get() is None
+
+
+@pytest.mark.asyncio
+async def test_nested_implicit_meter_checks_ancestor_engine_support():
+    outer = SpendMeter(1, _price, max_concurrent=2)
+    token = _pipeline_meter.set(outer)
+    try:
+        with pytest.raises(ValueError, match="best_of_n.*cannot meter"):
+            await optimize_sequential(
+                _task(),
+                [
+                    EngineConfig(
+                        engine="best_of_n", engine_config={"propose": lambda seed: seed}
+                    )
+                ],
+                max_metric_calls=20,
+            )
+        assert _pipeline_meter.get() is outer
+    finally:
+        _pipeline_meter.reset(token)
+    assert outer.report().total_dollars == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reuse_outer", [False, True])
+async def test_nested_supplied_meter_must_descend_from_outer(reuse_outer):
+    outer = SpendMeter(1, _price, max_concurrent=2)
+    supplied = outer if reuse_outer else SpendMeter(price_fn=_price)
+    token = _pipeline_meter.set(outer)
+    try:
+        with pytest.raises(ValueError, match="must descend"):
+            await optimize_sequential(
+                _task(), [_config(calls=1)], max_metric_calls=1, spend_meter=supplied
+            )
+        assert _pipeline_meter.get() is outer
+    finally:
+        _pipeline_meter.reset(token)
+    assert supplied.report().total_dollars == 0
+    assert outer.report().total_dollars == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("depth", [1, 2])
+async def test_nested_supplied_descendant_accounts_into_outer(depth):
+    outer = SpendMeter(5, _price, max_concurrent=2)
+    supplied = outer
+    for _ in range(depth):
+        supplied = SpendMeter(parent=supplied)
+    token = _pipeline_meter.set(outer)
+    try:
+        result = await optimize_sequential(
+            _task(), [_config(calls=1)], max_metric_calls=1, spend_meter=supplied
+        )
+        assert _pipeline_meter.get() is outer
+    finally:
+        _pipeline_meter.reset(token)
+    assert result.spend_report.total_dollars == 0.375
+    assert outer.report().total_dollars == supplied.report().total_dollars == 0.375
+
+
+@pytest.mark.asyncio
+async def test_large_gepa_projection_stops_only_its_engine():
+    small = _task()
+    large = _task(cases=4)
+    meter = SpendMeter(0.5, _price, max_concurrent=2)
+    token = _pipeline_meter.set(meter)
+    try:
+        await small.evaluate(await small.seed_candidate())  # Observe validation cost.
+    finally:
+        _pipeline_meter.reset(token)
+    refused = asyncio.Event()
+
+    class ScheduledGepa:
+        name = "review-projection"
+        supports_token_cost = True
+
+        async def run(self, task, config, budget):
+            is_large = config.max_metric_calls == 4
+            if not is_large:
+                await asyncio.wait_for(refused.wait(), timeout=5)
+            gepa_config = config.model_copy(update={"engine": "gepa"})
+            result = await GepaEngine(gepa_config).run(
+                large if is_large else small, gepa_config, budget
+            )
+            if is_large:
+                refused.set()
+            return result
+
+    with _registered(ScheduledGepa()) as name:
+        results = await optimize_parallel(
+            small,
+            [
+                EngineConfig(engine=name, max_metric_calls=4, max_token_cost=100),
+                EngineConfig(engine=name, max_metric_calls=1, max_token_cost=100),
+            ],
+            max_metric_calls=5,
+            spend_meter=meter,
+        )
+    assert results[0].num_metric_calls == 0
+    assert results[0].history[-1].data["stop_reason"] == COST_STOP_REASON
+    assert results[0].history[-1].data["spend_report"]["stopped_by_cost"]
+    assert results[1].num_metric_calls == 1
+    assert results[1].best_score == 0.5
+    assert meter.report().total_dollars == 0.25
+    assert not meter.report().stopped_by_cost
+    token = _pipeline_meter.set(meter)
+    try:
+        comparison = await small.evaluate(results[1].best_candidate)
+        assert comparison.selectable
+        assert meter.report().total_dollars == 0.375
+        assert not meter.report().stopped_by_cost
+        await small.evaluate(results[1].best_candidate)
+    finally:
+        _pipeline_meter.reset(token)
+    with pytest.raises(CostBudgetExceeded):
+        meter.check()
+    assert meter.report().total_dollars == 0.5
+    assert meter.report().stopped_by_cost
+
+
+@pytest.mark.asyncio
+async def test_projection_probe_does_not_stop_intermediate_ancestors():
+    outer = SpendMeter(5, _price, max_concurrent=2)
+    middle = SpendMeter(0.375, parent=outer, max_concurrent=2)
+    token = _pipeline_meter.set(middle)
+    try:
+        task = _task()
+        await task.evaluate(await task.seed_candidate())
+    finally:
+        _pipeline_meter.reset(token)
+    child = SpendMeter(parent=middle)
+    assert not child.can_start("rollout", 3, rollout_kind="validation")
+    assert child.stop_reason == COST_STOP_REASON
+    assert middle.stop_reason is None
+    assert outer.stop_reason is None
+    sibling = SpendMeter(parent=middle)
+    assert sibling.can_start("rollout", 1, rollout_kind="validation")

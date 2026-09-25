@@ -267,8 +267,28 @@ class SpendMeter:
         ``rollout_kind`` projects a rollout batch at that kind's own mean so an
         expensive validation batch is not underestimated by cheap training
         rollouts; an unobserved kind projects zero, as before. ``following_rollouts``
-        are training rollouts and project at the training mean.
+        are training rollouts and project at the training mean. A projection
+        refusal stops the requesting meter only; ancestor projections are
+        probes so siblings may still fit. Actual exhaustion stops the ancestor.
         """
+        return self._can_start(
+            category,
+            count,
+            following_rollouts=following_rollouts,
+            rollout_kind=rollout_kind,
+            stop_on_projection=True,
+        )
+
+    def _can_start(
+        self,
+        category: SpendCategory,
+        count: int,
+        *,
+        following_rollouts: int,
+        rollout_kind: RolloutKind | None,
+        stop_on_projection: bool,
+    ) -> bool:
+        """Check ancestors without turning a child's projection into a global stop."""
         with self._lock:
             if self.stop_reason is not None:
                 return False
@@ -290,22 +310,25 @@ class SpendMeter:
                     / training_observations
                     * following_rollouts
                 )
-            if self.max_token_cost is not None and (
-                self._total() >= self.max_token_cost
-                or self._total() + projection > self.max_token_cost
+            if self.max_token_cost is not None:
+                if self._total() >= self.max_token_cost:
+                    self.stop_reason = COST_STOP_REASON
+                    return False
+                if self._total() + projection > self.max_token_cost:
+                    if stop_on_projection:
+                        self.stop_reason = COST_STOP_REASON
+                    return False
+            if self.parent is not None and not self.parent._can_start(
+                category,
+                count,
+                following_rollouts=following_rollouts,
+                rollout_kind=rollout_kind,
+                stop_on_projection=False,
             ):
-                self.stop_reason = COST_STOP_REASON
+                if stop_on_projection:
+                    self.stop_reason = self.parent.stop_reason or COST_STOP_REASON
                 return False
-            return (
-                self.parent.can_start(
-                    category,
-                    count,
-                    following_rollouts=following_rollouts,
-                    rollout_kind=rollout_kind,
-                )
-                if self.parent is not None
-                else True
-            )
+            return True
 
     @contextmanager
     def step(
@@ -426,6 +449,9 @@ class SpendMeter:
 
         Only child meters use this gate. Uncapped composition never waits.
         A nested reflection agent shares its outer agent's reservation.
+        Under a pipeline cap this is a barrier: reflections run only between
+        rollouts, after all in-flight rollouts finish. Waiting reflections do
+        not have priority over new rollout admissions.
         """
         root: SpendMeter | None = None
         ancestor = self.parent
@@ -441,8 +467,8 @@ class SpendMeter:
                 root.check()
                 await root._condition.wait()
             root.check()
-            if not root.can_start("reflection"):
-                raise CostBudgetExceeded(root.stop_reason or COST_STOP_REASON)
+            if not self.can_start("reflection"):
+                raise CostBudgetExceeded(self.stop_reason or COST_STOP_REASON)
             root._reflection_active = True
             token = root._in_admission.set(True)
         try:
