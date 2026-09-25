@@ -11,7 +11,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import RLock
-from typing import TYPE_CHECKING, Any, AsyncIterator, Iterator
+from typing import TYPE_CHECKING, Any, AsyncIterator, Iterator, NoReturn
 
 from pydantic_ai.messages import ModelResponse
 
@@ -49,12 +49,38 @@ def _lock(path: Path) -> Iterator[None]:
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def _rows(run_id: str, root: Path | None) -> list[dict[str, Any]]:
-    path = run_dir(run_id, root) / "spend.jsonl"
+def _read_rows(
+    path: Path, warnings: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
     if not path.exists():
         return []
-    # Never silently discard a malformed ledger: unknown spend must fail closed.
-    return [json.loads(line) for line in path.read_text().splitlines()]
+    contents = path.read_text()
+    lines = contents.splitlines()
+    rows = []
+    for index, line in enumerate(lines):
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            if warnings is None or index != len(lines) - 1 or contents.endswith("\n"):
+                raise
+            warnings["ledger_torn_tail"] = True
+    return rows
+
+
+def _rows(
+    run_id: str, root: Path | None, warnings: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    directory = run_dir(run_id, root)
+    rows = _read_rows(directory / "spend.jsonl", warnings)
+    pointer = directory / "validation-spend-path"
+    if pointer.exists():
+        completed = {row["eval_id"] for row in rows if row["kind"] == "validation"}
+        rows.extend(
+            row
+            for row in _read_rows(Path(pointer.read_text()), warnings)
+            if row["eval_id"] not in completed
+        )
+    return rows
 
 
 def _add_models(target: dict[str, Any], source: dict[str, Any]) -> None:
@@ -96,7 +122,8 @@ def spend_report(
     run_id: str, root: Path | None = None, cap: float | None = None
 ) -> dict[str, Any]:
     with _lock(run_dir(run_id, root) / "spend.lock"):
-        return _report(_rows(run_id, root), cap)
+        warnings: dict[str, Any] = {}
+        return dict(_report(_rows(run_id, root, warnings), cap), **warnings)
 
 
 def _kind_costs(rows: list[dict[str, Any]], kind: str) -> tuple[int, float, float]:
@@ -115,21 +142,53 @@ def _reservations(run_id: str, root: Path | None) -> dict[str, Any]:
 
     path = run_dir(run_id, root) / "spend-reservations.json"
     reservations = json.loads(path.read_text()) if path.exists() else {}
+    private = _private_reservations_path(run_id, root)
+    if private is not None and private.exists():
+        reservations.update(json.loads(private.read_text()))
     return {
         key: value for key, value in reservations.items() if _pid_alive(value["pid"])
     }
 
 
-def _save_reservations(
-    run_id: str, root: Path | None, reservations: dict[str, Any]
-) -> None:
-    path = run_dir(run_id, root) / "spend-reservations.json"
+def _private_reservations_path(run_id: str, root: Path | None) -> Path | None:
+    pointer = run_dir(run_id, root) / "validation-spend-path"
+    return (
+        Path(pointer.read_text()).with_suffix(".reservations.json")
+        if pointer.exists()
+        else None
+    )
+
+
+def _write_reservations(path: Path, reservations: dict[str, Any]) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
     with temporary.open("w") as handle:
         json.dump(reservations, handle)
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)
+
+
+def _save_reservations(
+    run_id: str, root: Path | None, reservations: dict[str, Any]
+) -> None:
+    private = _private_reservations_path(run_id, root)
+    # Validation reservation updates can also reveal individual response costs.
+    public_rows = {
+        key: value
+        for key, value in reservations.items()
+        if value.get("kind") != "validation"
+    }
+    _write_reservations(run_dir(run_id, root) / "spend-reservations.json", public_rows)
+    if private is not None:
+        _write_reservations(
+            private,
+            {
+                key: value
+                for key, value in reservations.items()
+                if value.get("kind") == "validation"
+            },
+        )
 
 
 def _reserved_other(
@@ -155,9 +214,8 @@ class _RolloutUsage:
 class EvalSpendMeter(SpendMeter):
     """Append aggregate deltas after each response, including failed responses.
 
-    Summing ledger rows is the only accounting authority. Checkpointing each
-    response also preserves received usage if a process dies before eval ends.
-    No case identities or scores enter this ledger.
+    Validation deltas stay private until an eval aggregate is published.
+    Checkpointing each response preserves received usage after a process dies.
     """
 
     def __init__(
@@ -170,10 +228,14 @@ class EvalSpendMeter(SpendMeter):
         price_fn: PriceFn | None,
         count: int,
         concurrency: int,
+        private_path: Path | None = None,
+        persist_stop: bool = True,
     ) -> None:
         super().__init__(cap, price_fn)
         self.run_id, self.root, self.eval_id, self.kind = run_id, root, eval_id, kind
         self.run_cap = cap
+        self.private_path = private_path
+        self.persist_stop = persist_stop
         self.started = self.completed = self.unmetered = 0
         self.count, self.concurrency = count, max(1, concurrency)
         self._condition = asyncio.Condition()
@@ -198,7 +260,7 @@ class EvalSpendMeter(SpendMeter):
                 "max_token_cost": self.run_cap,
                 "completed_rollout_dollars": self.completed_dollars,
                 "max_rollout_dollars": self.highest,
-                "stop_reason": report["stop_reason"],
+                "stop_reason": report["stop_reason"] if self.persist_stop else None,
             }
             if current == self._saved:
                 return
@@ -222,11 +284,38 @@ class EvalSpendMeter(SpendMeter):
                 }
             directory = run_dir(self.run_id, self.root)
             with _lock(directory / "spend.lock"):
-                with (directory / "spend.jsonl").open("a") as handle:
+                path = self.private_path or directory / "spend.jsonl"
+                path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                with path.open("a") as handle:
                     handle.write(json.dumps(row) + "\n")
                     handle.flush()
                     os.fsync(handle.fileno())
             self._saved = current
+
+    def finish(self) -> None:
+        self.flush()
+        if self.private_path is not None:
+            # Publish once per validation eval. The private deltas remain the
+            # authority until this aggregate exists, including after a crash.
+            with _lock(run_dir(self.run_id, self.root) / "spend.lock"):
+                row = dict(self._saved, eval_id=self.eval_id, kind=self.kind)
+                with (run_dir(self.run_id, self.root) / "spend.jsonl").open(
+                    "a"
+                ) as handle:
+                    handle.write(json.dumps(row) + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+
+    def callable_completed(self) -> None:
+        """Require metering only after both callable and metric succeeded."""
+        usage = self._requests.get()
+        if usage is not None and not usage.requests:
+            self.unmetered += 1
+            if self.run_cap is not None:
+                self.stop_reason = (
+                    "Evaluate callable reported no spend (no metered response)"
+                )
+                raise CostBudgetExceeded(self.stop_reason)
 
     def _check_shared(self, *, after_response: bool = False) -> None:
         if self.run_cap is None:
@@ -307,6 +396,7 @@ class EvalSpendMeter(SpendMeter):
             reservations[self.eval_id] = {
                 "pid": os.getpid(),
                 "dollars": self.report().total_dollars + reservation,
+                "kind": self.kind,
             }
             _save_reservations(self.run_id, self.root, reservations)
         return True
@@ -323,13 +413,6 @@ class EvalSpendMeter(SpendMeter):
         self.flush()
         try:
             yield
-            if not usage.requests:
-                self.unmetered += 1
-            if self.run_cap is not None and not usage.requests:
-                self.stop_reason = (
-                    "Evaluate callable reported no spend (no metered response)"
-                )
-                raise CostBudgetExceeded(self.stop_reason)
             self.completed += 1
             self.completed_dollars += usage.dollars
         finally:
@@ -404,6 +487,7 @@ def evaluation_spend(
     price_fn: PriceFn | None,
     concurrency: int = 1,
     state: RunState | None = None,
+    validation_spend_path: Path | None = None,
 ) -> Iterator[EvalSpendMeter]:
     """Reserve an eval under a short lock; release it after actual spend settles."""
     validate_cap(cap)
@@ -420,15 +504,70 @@ def evaluation_spend(
             if cap is not None
             else managed.max_token_cost
         )
-    meter = EvalSpendMeter(
-        run_id, root, eval_id, kind, cap, price_fn, count, concurrency
+    own_cap = managed is None or cap == managed.max_token_cost
+    ad_hoc_cap = cap is not None and (
+        managed is None
+        or managed.max_token_cost is None
+        or cap < managed.max_token_cost
     )
+    if kind == "validation" and validation_spend_path is None:
+        raise ValueError("Validation spend requires a private checkpoint path")
+    if validation_spend_path is not None:
+        from .validation import validation_dataset_path
+
+        validation_spend_path = validation_dataset_path(
+            str(validation_spend_path),
+            project_root=root or Path.cwd(),
+            allow_missing=True,
+        )
+    meter = EvalSpendMeter(
+        run_id,
+        root,
+        eval_id,
+        kind,
+        cap,
+        price_fn,
+        count,
+        concurrency,
+        validation_spend_path,
+        persist_stop=own_cap,
+    )
+    admitted = False
+
+    def refuse(reason: str) -> NoReturn:
+        typer.echo(reason, err=True)
+        raise typer.Exit(code=2)
+
+    def register_private_path() -> None:
+        if validation_spend_path is not None:
+            pointer = run_dir(run_id, root) / "validation-spend-path"
+            if not pointer.exists():
+                temporary = pointer.with_suffix(".tmp")
+                with temporary.open("w") as handle:
+                    handle.write(str(validation_spend_path))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, pointer)
+
     try:
         with _lock(run_dir(run_id, root) / "spend.lock"):
-            rows = _rows(run_id, root)
+            try:
+                rows = _rows(run_id, root)
+            except json.JSONDecodeError:
+                refuse("Cannot evaluate with a malformed spend ledger")
             report = _report(rows, cap)
+            if ad_hoc_cap and cap is not None and report["total_dollars"] >= cap:
+                refuse(
+                    "One-off max-token-cost cannot cover run spend and this evaluation"
+                )
+            pointer = run_dir(run_id, root) / "validation-spend-path"
+            if (
+                validation_spend_path is not None
+                and pointer.exists()
+                and pointer.read_text() != str(validation_spend_path)
+            ):
+                refuse("Validation spend checkpoint path changed")
             if report["stopped_by_cost"]:
-                state = managed
                 raise CostBudgetExceeded(report["stop_reason"])
             if cap is not None:
                 known_evals = {row["eval_id"] for row in rows}
@@ -436,11 +575,9 @@ def evaluation_spend(
                     row.extra.get("eval_id") not in known_evals
                     for row in ParetoLog(run_id, root).iter_rows()
                 ):
-                    raise CostBudgetExceeded(
-                        "Cannot cap prior evaluations that reported no spend"
-                    )
+                    refuse("Cannot cap prior evaluations that reported no spend")
                 if report["unpriced_usage"]:
-                    raise CostBudgetExceeded(
+                    refuse(
                         "Cannot cap previously unpriced models: "
                         + ", ".join(report["unpriced_usage"])
                     )
@@ -453,13 +590,27 @@ def evaluation_spend(
                 _, mean, _ = _kind_costs(rows, kind)
                 projected = mean * count
                 if remaining <= 0 or projected > remaining:
+                    if not own_cap:
+                        refuse(
+                            "One-off max-token-cost cannot cover run spend and this evaluation"
+                        )
                     raise CostBudgetExceeded()
-                reservations[eval_id] = {"pid": os.getpid(), "dollars": projected}
+                register_private_path()
+                reservations[eval_id] = {
+                    "pid": os.getpid(),
+                    "dollars": projected,
+                    "kind": kind,
+                }
                 _save_reservations(run_id, root, reservations)
                 meter.max_token_cost = remaining
+            register_private_path()
+            admitted = True
         with rollout_spend(meter):
             yield meter
     except CostBudgetExceeded as exc:
+        admitted = True
+        with _lock(run_dir(run_id, root) / "spend.lock"):
+            register_private_path()
         meter.stop_reason = exc.stop_reason
         meter.flush()
         # Only terminal state/report emission is serialized, never paid work.
@@ -469,14 +620,23 @@ def evaluation_spend(
                 if path.exists()
                 else None
             )
-            terminal = (
-                latest if latest and latest.status == "done" else state or managed
-            )
-            _finish_cost_stop(run_id, root, terminal, exc.stop_reason, cap)
+            terminal = latest if latest and latest.status == "done" else state or latest
+            if own_cap:
+                _finish_cost_stop(run_id, root, terminal, exc.stop_reason, cap)
+            else:
+                typer.echo(
+                    json.dumps(
+                        {
+                            "spend": spend_report(run_id, root, cap),
+                            "stop_reason": exc.stop_reason,
+                        }
+                    )
+                )
         raise typer.Exit(code=70) from exc
     finally:
-        meter.flush()
-        if cap is not None:
+        if admitted:
+            meter.finish()
+        if admitted and cap is not None:
             with _lock(run_dir(run_id, root) / "spend.lock"):
                 reservations = _reservations(run_id, root)
                 reservations.pop(eval_id, None)

@@ -79,7 +79,7 @@ from .layout import (
     vector_records_path,
 )
 from .metrics import default_substring_metric
-from .validation import validation_dataset_path
+from .validation import validation_dataset_path, validation_spend_path
 from .runs import (
     Minibatch,
     MinibatchStore,
@@ -692,6 +692,15 @@ def run_eval_once(
         cap=max_token_cost,
         price_fn=price_fn,
         state=spend_state,
+        validation_spend_path=(
+            validation_spend_path(
+                str(dataset_path),
+                project_root=primary_project_root,
+                run_id=active_run_id,
+            )
+            if kind == "validation"
+            else None
+        ),
     ) as meter:
         if source == "git":
             configured_refs = (cfg.agent, cfg.evaluate, cfg.metric, cfg.case_factory)

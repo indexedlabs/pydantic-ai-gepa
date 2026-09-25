@@ -411,9 +411,17 @@ obeys that run's cap, and a one-off `gepa eval --max-token-cost 5.0` can impose 
 cap too. Status, start/continue summaries, and the final report include aggregate
 training-side and validation dollars, per-model tokens/requests/dollars, and
 unpriced usage, even without a cap. Reflector subscription/spend is excluded.
+An incompatible cap (prior unmetered/unpriced work or a one-off limit below
+recorded spend) exits 2 without changing the ledger or managed run state. A
+tighter one-off cap stops that eval without finalizing the managed run.
 
-The run's locked `spend.jsonl` ledger checkpoints aggregate deltas after each
-response and survives resume, reflector replacement, and concurrent lanes.
+The run's locked `spend.jsonl` ledger checkpoints training-side deltas after each
+response. Validation response checkpoints stay beside the private validation
+evidence outside checkouts; the workspace receives one aggregate row when a
+validation eval ends. Reports and budget checks include unfinished private
+checkpoints, so paid spend survives crashes, resume, and concurrent lanes.
+Status reports a torn final ledger line with `ledger_torn_tail: true`; evaluation
+refuses a malformed ledger rather than assuming the missing spend is zero.
 Batch projections use each evaluation kind's own observed mean. Short file locks
 reserve projected batch costs against other processes' outstanding reservations;
 finished evals settle to actual spend, and reservations whose owning PID is gone
@@ -445,10 +453,11 @@ capability = current_rollout_capability()  # None outside a CLI evaluation
 result = await judge.run(prompt, capabilities=[capability] if capability else [])
 ```
 
-Judge usage is included in rollout spend. A capped callable rollout reporting no
-metered responses stops with `Evaluate callable reported no spend`; suites that
-make no model calls should omit the cap. Validation ledger entries contain only
-aggregates, with no case identifiers, scores, or per-case costs.
+Judge usage is included in rollout spend. A successful capped callable rollout
+reporting no metered responses stops with `Evaluate callable reported no spend`;
+suites that make no model calls should omit the cap. Ordinary failed rollouts
+retain the existing failure/retry behavior. Workspace validation ledger entries
+contain only eval aggregates, with no case identifiers, scores, or per-case costs.
 
 ### Pinned-scorer component IDs
 

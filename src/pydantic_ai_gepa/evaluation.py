@@ -192,6 +192,11 @@ async def evaluate_callable_dataset(
                 if inspect.isawaitable(metric_result):
                     metric_result = await metric_result
                 score, feedback, side_info = _coerce_metric_result(metric_result)
+                capability = current_rollout_capability()
+                if capability is not None and hasattr(
+                    capability.meter, "callable_completed"
+                ):
+                    capability.meter.callable_completed()
                 payload: dict[str, Any] = {
                     "output": output,
                     "score": score,

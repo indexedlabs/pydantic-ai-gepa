@@ -115,6 +115,17 @@ def validation_evidence_path(dataset: str, *, project_root: Path, run_id: str) -
     )
 
 
+def validation_spend_path(dataset: str, *, project_root: Path, run_id: str) -> Path:
+    """Keep spend separate from optional, disposable paired replay evidence."""
+    evidence = validation_evidence_path(
+        dataset, project_root=project_root, run_id=run_id
+    )
+    return (
+        evidence.parent.with_name(".gepa-validation-spend")
+        / evidence.with_suffix(".jsonl").name
+    )
+
+
 def write_validation_evidence(
     dataset: str,
     *,
