@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from contextvars import copy_context
-from typing import Any, Literal, cast
+from functools import wraps
+from typing import Any, Literal, ParamSpec, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -25,6 +26,7 @@ from .engines.base import OptimizationEngine, ValidationScore
 from .engines.coding_agent_engine import CodingAgentEngine
 from .engines.gepa_engine import GepaEngine
 from .gepa_graph.models import CandidateMap
+from .spend import CostBudgetExceeded, PriceFn, SpendMeter, SpendReport, _pipeline_meter
 
 
 class FairVote(BaseModel):
@@ -58,6 +60,7 @@ class PipelineResult(BaseModel):
     decision: dict[str, Any] = Field(default_factory=dict)
     test_score: float | None = None
     phases: list[dict[str, Any]] = Field(default_factory=list)
+    spend_report: SpendReport = Field(default_factory=SpendReport)
 
     model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
 
@@ -255,21 +258,167 @@ def _engine_task_view(
 SelectionRule = Callable[[Sequence[FairVote]], int]
 
 
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _meter_pipeline(fn: Callable[_P, Awaitable[_R]]) -> Callable[_P, Awaitable[_R]]:
+    """Scope accounting to this invocation, including concurrent engine tasks."""
+
+    @wraps(fn)
+    async def metered(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        task = cast(OptimizationTask, args[0] if args else kwargs["task"])
+        plan = args[1] if len(args) > 1 else kwargs.get("plan", kwargs.get("configs"))
+        configs = (
+            [*plan.phase_one, plan.phase_two] if isinstance(plan, OmniPlan) else plan
+        )
+        cap = cast(float | None, kwargs.get("max_token_cost"))
+        price_fn = cast(PriceFn | None, kwargs.get("price_fn"))
+        outer = _pipeline_meter.get()
+        meter = cast(SpendMeter | None, kwargs.get("spend_meter"))
+        if meter is not None:
+            if cap is not None or price_fn is not None:
+                raise ValueError(
+                    "spend_meter is mutually exclusive with max_token_cost and price_fn"
+                )
+            if outer is not None:
+                ancestor = meter.parent
+                while ancestor is not None and ancestor is not outer:
+                    ancestor = ancestor.parent
+                if ancestor is None:
+                    raise ValueError(
+                        "A nested spend_meter must descend from the active pipeline meter"
+                    )
+        else:
+            meter = SpendMeter(
+                cap, price_fn, max_concurrent=task.concurrency, parent=outer
+            )
+        ancestor: SpendMeter | None = meter
+        while ancestor is not None:
+            if ancestor.max_token_cost is not None:
+                cap = ancestor.max_token_cost
+                if ancestor.max_concurrent is None:
+                    raise ValueError(
+                        "A capped spend_meter requires max_concurrent for pipeline admission"
+                    )
+            ancestor = ancestor.parent
+        if cap is not None:
+            # Preflight every family before even the seed evaluation costs money.
+            for config in cast(Sequence[EngineConfig], configs):
+                engine = get_engine(config.engine, config)
+                if not getattr(engine, "supports_token_cost", False):
+                    raise ValueError(
+                        f"Engine {config.engine!r} cannot meter dollars and does not support max_token_cost."
+                    )
+        token = _pipeline_meter.set(meter)
+        try:
+            result = await fn(*args, **kwargs)
+            _cost_stopped()  # Mark an exact-cap completion without discarding evidence.
+            if isinstance(result, PipelineResult):
+                report = meter.report()
+                result = result.model_copy(
+                    update={
+                        "spend_report": report,
+                        "decision": {
+                            **result.decision,
+                            **(
+                                {
+                                    "stopped_by_cost": True,
+                                    "stop_reason": report.stop_reason,
+                                }
+                                if report.stopped_by_cost
+                                else {}
+                            ),
+                        },
+                    }
+                )
+            return cast(_R, result)
+        finally:
+            _pipeline_meter.reset(token)
+
+    return metered
+
+
+def _cost_stopped() -> bool:
+    meter = _pipeline_meter.get()
+    if meter is None:
+        return False
+    try:
+        meter.check()
+    except CostBudgetExceeded:
+        return True
+    return False
+
+
+class _InterruptedEvaluation(CandidateEvaluation):
+    """Internal marker: a cost stop discarded this entire evaluation."""
+
+
+async def _evaluate(
+    task: OptimizationTask, candidate: CandidateMap, **kwargs: Any
+) -> CandidateEvaluation:
+    """Discard all evidence from an interrupted helper evaluation."""
+    try:
+        evaluation = await task.evaluate(candidate, **kwargs)
+        if evaluation.selectable or not _cost_stopped():
+            return evaluation
+        # No selectable evidence survives an exact-cap completion either.
+    except CostBudgetExceeded:
+        pass
+    return _InterruptedEvaluation(
+        score=0.0, records=[], side_info={}, num_cases=0, selectable=False
+    )
+
+
+async def _seed_result(task: OptimizationTask) -> EngineResult:
+    return EngineResult(
+        engine="seed",
+        best_candidate=await task.seed_candidate(),
+        best_score=None,
+        num_metric_calls=0,
+    )
+
+
+@_meter_pipeline
 async def optimize_parallel(
     task: OptimizationTask,
     configs: Sequence[EngineConfig],
     *,
+    max_token_cost: float | None = None,
+    price_fn: PriceFn | None = None,
+    spend_meter: SpendMeter | None = None,
     max_metric_calls: int,
 ) -> list[EngineResult]:
-    """Run engines concurrently in pre-reserved isolated budget slices."""
+    """Run engines concurrently in pre-reserved isolated budget slices.
+
+    Always returns a list in configuration order. Pass spend_meter to inspect
+    the combined report with meter.report(); engine reports remain separate.
+    Under a pipeline cap, reflections run only between rollouts: they wait
+    for all in-flight rollouts to finish and then block new rollout starts.
+    This is a barrier across parallel engines; waiting reflections have no
+    priority over newly queued rollouts.
+
+    Pass max_token_cost and optional price_fn, or an existing spend_meter
+    (mutually exclusive). Capped supplied meters must set max_concurrent.
+    Nested helpers inherit the active meter as a parent; a supplied nested
+    meter must be a descendant of that active meter.
+    A pipeline dollar cap includes all engines, comparisons, and reporting.
+    Its margin is one rollout per in-flight slot across the pipeline at its
+    kind's highest observed cost; SpendMeter documents first-observation,
+    new-high, and reflection projection/response-backstop caveats.
+    """
     budget = BudgetTracker(max_metric_calls)
     return await _run_parallel(task, configs, budget, legacy_fallback=True)
 
 
+@_meter_pipeline
 async def optimize_best_of(
     task: OptimizationTask,
     configs: Sequence[EngineConfig],
     *,
+    max_token_cost: float | None = None,
+    price_fn: PriceFn | None = None,
+    spend_meter: SpendMeter | None = None,
     max_metric_calls: int,
     comparison_metric_calls: int | None = None,
     fair_vote_repetitions: int = 3,
@@ -281,7 +430,19 @@ async def optimize_best_of(
     acceptance_confidence: float = 0.9,
     acceptance_min_delta: float = 0.0,
 ) -> PipelineResult:
-    """Parallel exploration plus a charged repeated matched comparison."""
+    """Parallel exploration plus a charged repeated matched comparison.
+
+    An interrupted comparison is discarded in full; return the unscored seed.
+
+    Pass max_token_cost and optional price_fn, or an existing spend_meter
+    (mutually exclusive). Capped supplied meters must set max_concurrent.
+    Nested helpers inherit the active meter as a parent; a supplied nested
+    meter must be a descendant of that active meter.
+    A pipeline dollar cap includes all engines, comparisons, and reporting.
+    Its margin is one rollout per in-flight slot across the pipeline at its
+    kind's highest observed cost; SpendMeter documents first-observation,
+    new-high, and reflection projection/response-backstop caveats.
+    """
     if fair_vote_max_repetitions is None:
         fair_vote_max_repetitions = fair_vote_repetitions
     await _require_comparison_budget(
@@ -304,17 +465,43 @@ async def optimize_best_of(
         min_delta=acceptance_min_delta,
         baseline_index=None,
     )
+    if not votes and _cost_stopped():
+        return PipelineResult(
+            results=results,
+            best=await _seed_result(task),
+            best_index=-1,
+            fair_scores=[],
+            total_metric_calls=budget.spent,
+            comparison_metric_calls=comparison_budget.spent,
+            decision=decision,
+        )
     return _pipeline_result(results, winner, votes, budget, comparison_budget, decision)
 
 
+@_meter_pipeline
 async def optimize_sequential(
     task: OptimizationTask,
     configs: Sequence[EngineConfig],
     *,
+    max_token_cost: float | None = None,
+    price_fn: PriceFn | None = None,
+    spend_meter: SpendMeter | None = None,
     max_metric_calls: int,
     comparison_metric_calls: int | None = None,
 ) -> PipelineResult:
-    """Run fresh sequential stages while never adopting a regressing seed."""
+    """Run fresh sequential stages while never adopting a regressing seed.
+
+    A cost-interrupted comparison retains the last accepted incumbent.
+
+    Pass max_token_cost and optional price_fn, or an existing spend_meter
+    (mutually exclusive). Capped supplied meters must set max_concurrent.
+    Nested helpers inherit the active meter as a parent; a supplied nested
+    meter must be a descendant of that active meter.
+    A pipeline dollar cap includes all engines, comparisons, and reporting.
+    Its margin is one rollout per in-flight slot across the pipeline at its
+    kind's highest observed cost; SpendMeter documents first-observation,
+    new-high, and reflection projection/response-backstop caveats.
+    """
     if not configs:
         raise ValueError("At least one engine config is required.")
     budget = BudgetTracker(max_metric_calls)
@@ -328,12 +515,13 @@ async def optimize_sequential(
         )
     )
     seed = await task.seed_candidate()
-    seed_evaluation = await task.evaluate(seed, budget=comparison_budget)
+    seed_evaluation = await _evaluate(task, seed, budget=comparison_budget)
     seed_score = seed_evaluation.score
+    incumbent_selectable = seed_evaluation.selectable
     adopted_result = EngineResult(
         engine="seed",
         best_candidate=seed,
-        best_score=seed_score,
+        best_score=seed_score if seed_evaluation.selectable else None,
         num_metric_calls=0,
         history=[EngineEvent(kind="seed", data={"fair_score": seed_score})],
     )
@@ -342,6 +530,8 @@ async def optimize_sequential(
     votes: list[FairVote] = []
     phases: list[dict[str, Any]] = []
     for index, config in enumerate(configs):
+        if _cost_stopped():
+            break
         # A stage slice is reserved independently. It cannot steal capacity
         # allocated to later stages, which keeps accounting deterministic.
         if budget.remaining == 0:
@@ -359,9 +549,11 @@ async def optimize_sequential(
         finally:
             budget.release_slice(local)
         results.append(result)
-        evaluation = await task.evaluate(
-            result.best_candidate, budget=comparison_budget
+        evaluation = await _evaluate(
+            task, result.best_candidate, budget=comparison_budget
         )
+        if isinstance(evaluation, _InterruptedEvaluation):
+            break
         vote = FairVote(
             candidate_index=index,
             samples=[evaluation.score],
@@ -370,7 +562,9 @@ async def optimize_sequential(
             selectable=evaluation.selectable,
         )
         votes.append(vote)
-        adopted = evaluation.selectable and evaluation.score >= seed_score
+        adopted = evaluation.selectable and (
+            not incumbent_selectable or evaluation.score >= seed_score
+        )
         phases.append(
             {
                 "stage": index,
@@ -381,6 +575,7 @@ async def optimize_sequential(
             }
         )
         if adopted:
+            incumbent_selectable = True
             seed, seed_score, adopted_result, adopted_index = (
                 result.best_candidate,
                 evaluation.score,
@@ -404,29 +599,59 @@ async def optimize_vote(
     task: OptimizationTask,
     configs: Sequence[EngineConfig],
     *,
+    max_token_cost: float | None = None,
+    price_fn: PriceFn | None = None,
+    spend_meter: SpendMeter | None = None,
     max_metric_calls: int,
     comparison_metric_calls: int | None = None,
     fair_vote_repetitions: int = 3,
     fair_vote_max_repetitions: int | None = None,
 ) -> PipelineResult:
-    """Alias for a repeated, matched, charged cross-engine vote."""
+    """Alias for a repeated, matched, charged cross-engine vote.
+
+    Pass max_token_cost and optional price_fn, or an existing spend_meter
+    (mutually exclusive). Capped supplied meters must set max_concurrent.
+    Nested helpers inherit the active meter as a parent; a supplied nested
+    meter must be a descendant of that active meter.
+    A pipeline dollar cap includes all engines, comparisons, and reporting.
+    Its margin is one rollout per in-flight slot across the pipeline at its
+    kind's highest observed cost; SpendMeter documents first-observation,
+    new-high, and reflection projection/response-backstop caveats.
+    """
     return await optimize_best_of(
         task,
         configs,
         max_metric_calls=max_metric_calls,
+        max_token_cost=max_token_cost,
+        price_fn=price_fn,
+        spend_meter=spend_meter,
         comparison_metric_calls=comparison_metric_calls,
         fair_vote_repetitions=fair_vote_repetitions,
         fair_vote_max_repetitions=fair_vote_max_repetitions,
     )
 
 
+@_meter_pipeline
 async def optimize_omni(
     task: OptimizationTask,
     plan: OmniPlan,
     *,
+    max_token_cost: float | None = None,
+    price_fn: PriceFn | None = None,
+    spend_meter: SpendMeter | None = None,
     selection_rule: SelectionRule | None = None,
 ) -> PipelineResult:
-    """Run the first-class Omni explore → fair-vote → fresh-continuation flow."""
+    """Run the first-class Omni explore → fair-vote → fresh-continuation flow.
+
+    Pass max_token_cost and optional price_fn, or an existing spend_meter
+    (mutually exclusive). Capped supplied meters must set max_concurrent.
+    Nested helpers inherit the active meter as a parent; a supplied nested
+    meter must be a descendant of that active meter.
+    A pipeline dollar cap includes all engines, comparisons, and reporting.
+    Its margin is one rollout per in-flight slot across the pipeline at its
+    kind's highest observed cost; SpendMeter documents first-observation,
+    new-high, and reflection projection/response-backstop caveats.
+    """
     # Validate every named non-optimization evaluator budget before any engine
     # or rollout can start. An underfunded fair vote/report is a plan error,
     # never a partially optimized run.
@@ -457,7 +682,7 @@ async def optimize_omni(
     seed_result = EngineResult(
         engine="seed",
         best_candidate=seed,
-        best_score=0.0,
+        best_score=None,
         num_metric_calls=0,
         history=[EngineEvent(kind="seed")],
     )
@@ -474,6 +699,16 @@ async def optimize_omni(
         min_delta=plan.acceptance_min_delta,
         baseline_index=0,
     )
+    if not votes:
+        return PipelineResult(
+            results=comparable,
+            best=seed_result,
+            best_index=0,
+            fair_scores=[],
+            total_metric_calls=phase_one_budget.spent,
+            comparison_metric_calls=comparison_budget.spent,
+            decision=decision,
+        )
     seed_result = seed_result.model_copy(update={"best_score": votes[0].mean_score})
     comparable[0] = seed_result
     if (
@@ -483,6 +718,17 @@ async def optimize_omni(
         winner_index = 0
         decision = {**decision, "seed_monotonic_override": True}
     winner = comparable[winner_index]
+    if _cost_stopped():
+        return PipelineResult(
+            results=comparable,
+            best=winner,
+            best_index=winner_index,
+            fair_scores=[vote.mean_score for vote in votes],
+            fair_votes=votes,
+            total_metric_calls=phase_one_budget.spent,
+            comparison_metric_calls=comparison_budget.spent,
+            decision=decision,
+        )
     # A fresh registry lookup (rather than reusing phase one) is intentional.
     phase_two_budget = BudgetTracker(plan.phase_two_metric_calls)
     engine = get_engine(plan.phase_two.engine, plan.phase_two)
@@ -509,7 +755,8 @@ async def optimize_omni(
     # A continuation is adopted only after the shared uncertainty-aware
     # acceptance primitive cleared the configured practical delta.
     adopted_continuation = (
-        continuation_winner_index == 1
+        bool(continuation_votes)
+        and continuation_winner_index == 1
         and continuation_votes[1].selectable
         and continuation_decision.get("acceptance", {}).get("verdict") == "accepted"
     )
@@ -524,13 +771,13 @@ async def optimize_omni(
     )
     test_score: float | None = None
     reporting_calls = 0
-    if test_case_count:
+    if test_case_count and not _cost_stopped():
         assert final_budget is not None
-        test = await task.evaluate(
-            final.best_candidate, budget=final_budget, dataset="test"
+        test = await _evaluate(
+            task, final.best_candidate, budget=final_budget, dataset="test"
         )
-        test_score = test.score
-        reporting_calls = test.num_cases
+        test_score = test.score if test.selectable else None
+        reporting_calls = final_budget.spent
     return PipelineResult(
         results=[*comparable, continuation],
         best=final,
@@ -575,10 +822,14 @@ async def optimize_omni(
     )
 
 
+@_meter_pipeline
 async def optimize_adaptive_sequential(
     task: OptimizationTask,
     configs: Sequence[EngineConfig],
     *,
+    max_token_cost: float | None = None,
+    price_fn: PriceFn | None = None,
+    spend_meter: SpendMeter | None = None,
     max_metric_calls: int,
     plateau_min_improvement: float = 0.0,
     comparison_metric_calls: int | None = None,
@@ -588,7 +839,19 @@ async def optimize_adaptive_sequential(
     cycle: bool = False,
     max_slices: int | None = None,
 ) -> PipelineResult:
-    """Run bounded fresh slices and switch only after observed plateaus."""
+    """Run bounded fresh slices and switch only after observed plateaus.
+
+    A cost-interrupted comparison retains the last accepted incumbent.
+
+    Pass max_token_cost and optional price_fn, or an existing spend_meter
+    (mutually exclusive). Capped supplied meters must set max_concurrent.
+    Nested helpers inherit the active meter as a parent; a supplied nested
+    meter must be a descendant of that active meter.
+    A pipeline dollar cap includes all engines, comparisons, and reporting.
+    Its margin is one rollout per in-flight slot across the pipeline at its
+    kind's highest observed cost; SpendMeter documents first-observation,
+    new-high, and reflection projection/response-backstop caveats.
+    """
     if not configs:
         raise ValueError("At least one engine config is required.")
     if patience < 1 or min_evaluations_per_engine < 1:
@@ -614,11 +877,11 @@ async def optimize_adaptive_sequential(
         )
     comparison = BudgetTracker(comparison_metric_calls or cap)
     seed = await task.seed_candidate()
-    incumbent = await task.evaluate(seed, budget=comparison)
+    incumbent = await _evaluate(task, seed, budget=comparison)
     best = EngineResult(
         engine="seed",
         best_candidate=seed,
-        best_score=incumbent.score,
+        best_score=incumbent.score if incumbent.selectable else None,
         num_metric_calls=0,
     )
     results: list[EngineResult] = []
@@ -629,7 +892,8 @@ async def optimize_adaptive_sequential(
     plateau_rounds = 0
     calls_for_engine = 0
     while (
-        budget.remaining > 0
+        not _cost_stopped()
+        and budget.remaining > 0
         and len(results) < slice_limit
         and (cycle or index < len(configs))
     ):
@@ -647,7 +911,9 @@ async def optimize_adaptive_sequential(
             budget.release_slice(local)
         results.append(result)
         consumed = slice_size - local.remaining
-        observed = await task.evaluate(result.best_candidate, budget=comparison)
+        observed = await _evaluate(task, result.best_candidate, budget=comparison)
+        if isinstance(observed, _InterruptedEvaluation):
+            break
         vote = FairVote(
             candidate_index=len(results) - 1,
             samples=[observed.score],
@@ -658,9 +924,9 @@ async def optimize_adaptive_sequential(
             selectable=observed.selectable,
         )
         votes.append(vote)
-        improved = (
-            observed.selectable
-            and observed.score > incumbent.score + plateau_min_improvement
+        improved = observed.selectable and (
+            not incumbent.selectable
+            or observed.score > incumbent.score + plateau_min_improvement
         )
         if improved:
             best = result
@@ -742,6 +1008,8 @@ async def _run_parallel(
         engines = [get_engine(config.engine, config) for config in configs]
         results: list[EngineResult] = []
         for engine, config in zip(engines, configs):
+            if _cost_stopped():
+                break
             engine_task = _engine_task_view(task, engine)
             before = budget.spent
             result = await engine.run(engine_task, config, budget)
@@ -802,6 +1070,13 @@ async def _select_fair_winner(
     min_delta: float = 0.0,
     baseline_index: int | None = None,
 ) -> tuple[int, list[FairVote], BudgetTracker, dict[str, Any]]:
+    if not results and _cost_stopped():
+        return (
+            0,
+            [],
+            BudgetTracker(metric_calls or 1),
+            {"kind": "cost_interrupted_comparison", "comparison_discarded": True},
+        )
     if not results:
         raise ValueError("At least one engine result is required.")
     if not 1 <= repetitions <= max_repetitions <= 5:
@@ -821,7 +1096,18 @@ async def _select_fair_winner(
     for _ in range(repetitions):
         for index, result in enumerate(results):
             evaluations[index].append(
-                await task.evaluate(result.best_candidate, budget=budget)
+                await _evaluate(task, result.best_candidate, budget=budget)
+            )
+        if any(
+            isinstance(sample, _InterruptedEvaluation)
+            for samples in evaluations
+            for sample in samples
+        ):
+            return (
+                baseline_index or 0,
+                [],
+                budget,
+                {"kind": "cost_interrupted_comparison", "comparison_discarded": True},
             )
         rounds += 1
     votes = _votes(evaluations)
@@ -850,7 +1136,18 @@ async def _select_fair_winner(
     while continue_rounds and rounds < max_repetitions:
         for index, result in enumerate(results):
             evaluations[index].append(
-                await task.evaluate(result.best_candidate, budget=budget)
+                await _evaluate(task, result.best_candidate, budget=budget)
+            )
+        if any(
+            isinstance(sample, _InterruptedEvaluation)
+            for samples in evaluations
+            for sample in samples
+        ):
+            return (
+                baseline_index or 0,
+                [],
+                budget,
+                {"kind": "cost_interrupted_comparison", "comparison_discarded": True},
             )
         rounds += 1
         votes = _votes(evaluations)
