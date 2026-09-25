@@ -415,6 +415,12 @@ file-path component IDs. Non-component run metadata belongs in
 
 Key arguments for `optimize_agent`:
 
+`max_token_cost` uses observed mean costs to guard the next step. The first step
+and in-flight requests can overshoot; `result.spend_report` reports actual spend.
+The cap applies per engine run; composition helpers' comparison evaluations are not metered.
+Unknown model prices stop capped runs; pass `price_fn(response) -> float | None`
+to supply custom prices in dollars (`None` falls back to the bundled catalog).
+
 ```python
 from pydantic_ai_gepa import ReflectionConfig
 
@@ -422,6 +428,7 @@ result = await optimize_agent(
     ...,
     # Budget
     max_metric_calls=200,          # Maximum number of evaluations
+    max_token_cost=5.0,            # Optional US dollar cap across reflection + rollouts
 
     # Reflection settings
     reflection_config=ReflectionConfig(

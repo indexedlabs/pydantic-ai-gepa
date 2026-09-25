@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pydantic_graph import StepContext
 
+from ...spend import SpendMeter
 from ..deps import GepaDeps
 from ..example_bank import InMemoryExampleBank
 from ..models import CandidateMap, CandidateProgram, ComponentValue, GepaState
@@ -13,6 +14,14 @@ async def start_step(ctx: StepContext[GepaState, GepaDeps, None]) -> None:
     """Initialize the GEPA optimization by adding the seed candidate."""
 
     state = ctx.state
+    if state.spend_meter is None:
+        state.spend_meter = SpendMeter(
+            state.config.max_token_cost, state.config.price_fn
+        )
+    if hasattr(ctx.deps.adapter, "spend_meter"):
+        ctx.deps.adapter.spend_meter = state.spend_meter
+    elif state.config.max_token_cost is not None:
+        raise ValueError("A cost budget requires an adapter with spend_meter support")
 
     if state.candidates:
         if state.iteration < 0:

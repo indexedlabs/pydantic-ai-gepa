@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, cast
 
 from pydantic_ai import usage as _usage
@@ -28,9 +29,9 @@ class GepaEngine:
 
     ``engine_config`` supports the scalar GEPA knobs accepted by
     :func:`pydantic_ai_gepa.runner.optimize_agent`.  ``reflection_config`` and
-    ``agent_usage_limits`` are intentionally only accepted as their already
-    constructed Python objects; registry-based configuration is therefore
-    limited to the scalar knobs.
+    ``agent_usage_limits`` and ``gepa_usage_limits`` accept constructed Python
+    objects. ``price_fn`` accepts a callable pricing override for custom models.
+    JSON-based configuration is limited to the scalar knobs.
 
     When ``EngineConfig.stop_at_score`` is set, the run ends once the best
     validation score reaches the target. It also overrides ``perfect_score``
@@ -39,6 +40,7 @@ class GepaEngine:
     """
 
     name = "gepa"
+    supports_token_cost = True
 
     def __init__(self, config: EngineConfig) -> None:
         """Capture GEPA-specific options supplied through ``engine_config``."""
@@ -59,6 +61,9 @@ class GepaEngine:
         agent_usage_limits = self._complex_option(
             "agent_usage_limits", _usage.UsageLimits
         )
+        gepa_usage_limits = self._complex_option(
+            "gepa_usage_limits", _usage.UsageLimits
+        )
 
         adapter = create_adapter(
             agent=task.agent,
@@ -71,6 +76,7 @@ class GepaEngine:
             optimize_tools=self._option("optimize_tools", False),
             optimize_output_type=self._option("optimize_output_type", False),
             agent_usage_limits=agent_usage_limits,
+            gepa_usage_limits=gepa_usage_limits,
         )
         gepa_config = self._build_config(
             config=config,
@@ -106,8 +112,10 @@ class GepaEngine:
             if run_output is None:
                 raise RuntimeError("GEPA graph run did not produce a result.")
             gepa_result = run_output
-        except UsageBudgetExceeded:
-            state.mark_stopped(reason="Usage budget exceeded")
+        except UsageBudgetExceeded as exc:
+            state.mark_stopped(
+                reason=getattr(exc, "stop_reason", "Usage budget exceeded")
+            )
             gepa_result = GepaResult.from_state(state)
         except Exception as error:
             if not is_provider_stop_error(error):
@@ -136,6 +144,7 @@ class GepaEngine:
                     "total_evaluations": num_metric_calls,
                     "original_score": gepa_result.original_score,
                     "stop_reason": gepa_result.stop_reason,
+                    "spend_report": gepa_result.spend_report.model_dump(mode="json"),
                 },
             )
         )
@@ -169,6 +178,8 @@ class GepaEngine:
         return GepaConfig(
             max_evaluations=max_evaluations,
             max_iterations=config.max_iterations,
+            max_token_cost=config.max_token_cost,
+            price_fn=self._complex_option("price_fn", Callable),
             stop_at_score=config.stop_at_score,
             minibatch_size=self._option("reflection_minibatch_size", 3),
             perfect_score=float(perfect_score),

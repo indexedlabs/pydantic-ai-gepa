@@ -49,6 +49,7 @@ from .._validation import validation_active
 from ..gepa_graph.proposal.student_tools import create_example_search_tool
 from ..gepa_graph.proposal.student_tools import create_skills_toolset
 from ..exceptions import UsageBudgetExceeded
+from ..spend import SpendCapability, SpendMeter
 from ..components import (
     apply_candidate_to_agent,
     extract_seed_candidate_with_input_type,
@@ -656,6 +657,7 @@ class _BaseAgentAdapter(
         )
         self.agent_usage_limits = agent_usage_limits
         self._gepa_usage_limits = gepa_usage_limits
+        self.spend_meter: SpendMeter | None = None
         self._gepa_usage = _usage.RunUsage()
         self._gepa_usage_lock = asyncio.Lock()
         self._trace_run_id = uuid4().hex
@@ -1095,7 +1097,14 @@ class _BaseAgentAdapter(
                     "gepa_candidate_id": trace_context.candidate_id,
                     "gepa_case_id": trace_context.case_id,
                 },
-                "capabilities": list(self._trace_collector.capabilities(trace_context)),
+                "capabilities": [
+                    *self._trace_collector.capabilities(trace_context),
+                    *(
+                        [SpendCapability(self.spend_meter, "rollout")]
+                        if self.spend_meter is not None
+                        else []
+                    ),
+                ],
             }
         )
         try:
@@ -1251,7 +1260,14 @@ class _BaseAgentAdapter(
                     "gepa_candidate_id": trace_context.candidate_id,
                     "gepa_case_id": trace_context.case_id,
                 },
-                "capabilities": list(self._trace_collector.capabilities(trace_context)),
+                "capabilities": [
+                    *self._trace_collector.capabilities(trace_context),
+                    *(
+                        [SpendCapability(self.spend_meter, "rollout")]
+                        if self.spend_meter is not None
+                        else []
+                    ),
+                ],
             }
         )
         try:
