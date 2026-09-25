@@ -205,6 +205,59 @@ class CodingAgentEngine:
                 )
                 stop_reason = "budget_exhausted"
                 break
+            # The selection batch is charged to the budget but is never
+            # acceptance evidence: reflection keeps it only when it scores
+            # below the failure threshold, so counting it as a baseline sample
+            # would bias the comparison towards false acceptances.
+            try:
+                selection_records = await self._evaluate_minibatch(
+                    task=task,
+                    candidate=parent.candidate,
+                    minibatch=minibatch,
+                    concurrency=concurrency,
+                    budget=budget,
+                    engine_budget=engine_budget,
+                )
+            except BudgetExhausted:
+                stop_reason = "budget_exhausted"
+                break
+            if not self._spend_or_record_overshoot(
+                budget=budget,
+                engine_budget=engine_budget,
+                history=history,
+                stage="baseline_minibatch",
+                records=selection_records,
+            ):
+                stop_reason = "budget_overshoot"
+                break
+            iterations += 1
+            if not selection_records:
+                # An empty minibatch spends nothing and cannot fail; without
+                # this guard an empty trainset would loop forever.
+                stop_reason = "budget_exhausted"
+                break
+            selection_score = _mean_score(selection_records)
+
+            failures = [
+                record
+                for record in selection_records
+                if record.score < failure_threshold
+            ]
+            if not failures:
+                history.append(
+                    EngineEvent(
+                        kind="clean_minibatch",
+                        data={
+                            "iteration": iterations,
+                            "mean_score": selection_score,
+                            "minibatch_case_ids": [
+                                record.case_id for record in selection_records
+                            ],
+                        },
+                    )
+                )
+                continue
+
             effective_max_repetitions = _affordable_repetitions(
                 requested=acceptance_max_repetitions,
                 case_count=len(minibatch),
@@ -254,44 +307,21 @@ class CodingAgentEngine:
                     baseline_budget_exhausted = True
                     break
                 baseline_batches.append(baseline_records)
-            iterations += 1
             if baseline_budget_exhausted or not baseline_batches:
                 stop_reason = "budget_overshoot"
                 break
 
-            baseline_records = baseline_batches[0]
             baseline_samples = [_mean_score(records) for records in baseline_batches]
-            baseline_score = sum(baseline_samples) / len(baseline_samples)
             if budget.exhausted or engine_budget.exhausted:
                 stop_reason = "budget_exhausted"
                 break
 
-            failures = [
-                record
-                for record in baseline_records
-                if record.score < failure_threshold
-            ]
-            if not failures:
-                history.append(
-                    EngineEvent(
-                        kind="clean_minibatch",
-                        data={
-                            "iteration": iterations,
-                            "mean_score": baseline_score,
-                            "minibatch_case_ids": [
-                                record.case_id for record in baseline_records
-                            ],
-                        },
-                    )
-                )
-                continue
-
             context = ReflectionContext(
                 candidate=_copy_candidate(parent.candidate),
                 minibatch_records=failures,
-                report=_format_failure_report(baseline_records, failure_threshold),
+                report=_format_failure_report(selection_records, failure_threshold),
                 iteration=iterations,
-                side_info=_aggregate_side_info(baseline_records),
+                side_info=_aggregate_side_info(selection_records),
             )
             proposal_started = perf_counter()
             proposal = await self._propose(context)
@@ -354,8 +384,9 @@ class CodingAgentEngine:
                 "iteration": iterations,
                 "parent_index": parent.index,
                 "baseline_score": comparison_result.baseline_mean,
+                "selection_score": selection_score,
                 "proposal_score": proposal_score,
-                "minibatch_case_ids": [record.case_id for record in baseline_records],
+                "minibatch_case_ids": [record.case_id for record in selection_records],
                 **comparison_result.to_dict(),
             }
             if comparison_result.improved:
