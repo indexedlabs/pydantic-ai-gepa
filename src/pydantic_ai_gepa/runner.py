@@ -176,6 +176,9 @@ async def optimize_agent(
     enable_cache: bool = False,
     cache_dir: str | None = None,
     cache_verbose: bool = False,
+    cache_metric_identity: str | None = None,
+    cache_metric_results: bool = False,
+    cache_rollouts: bool = False,
     show_progress: bool = False,
     # Reproducibility
     seed: int = 0,
@@ -236,9 +239,24 @@ async def optimize_agent(
         max_iterations: Optional cap on the number of GEPA loop iterations.
 
         # Caching configuration
-        enable_cache: Whether to enable caching of metric results for resumable runs.
+        enable_cache: Whether to enable caching for resumable runs. The cache
+            fails closed: nothing is stored unless you also opt in with
+            ``cache_metric_results`` and/or ``cache_rollouts``, so enabling the
+            cache without an opt-in raises ``ValueError`` before any model call.
         cache_dir: Directory to store cache files. If None, uses '.gepa_cache' in current directory.
         cache_verbose: Whether to log cache hits and misses.
+        cache_metric_identity: Caller-declared string that must change whenever the
+            metric, its grader, judge prompts, or any code they call changes (a
+            version string, a freeze-manifest hash, or
+            ``metric_code_identity(metric)``). Included in every metric-result
+            cache key so a cached score never outlives a grader change.
+        cache_metric_results: Explicit opt-in to cache metric results. Set this for
+            a deterministic metric, or for a judge-model metric when you accept
+            freezing the judge's first sample. Requires ``cache_metric_identity``.
+            Defaults to False (not cached).
+        cache_rollouts: Explicit opt-in to cache agent runs. A rollout that calls a
+            model is sampled; caching freezes its first sample. Defaults to False
+            (not cached).
 
         show_progress: Display a Rich progress bar tied to the evaluation budget.
         # Reproducibility
@@ -273,6 +291,19 @@ async def optimize_agent(
     Returns:
         GepaOptimizationResult with the best candidate and metadata.
     """
+    cache_manager = None
+    if enable_cache:
+        # Construct (and validate) the cache before any dataset or model work so
+        # misconfiguration raises before the agent's model is ever called.
+        cache_manager = CacheManager(
+            cache_dir=cache_dir,
+            enabled=True,
+            verbose=cache_verbose,
+            metric_identity=cache_metric_identity,
+            cache_metric_results=cache_metric_results,
+            cache_rollouts=cache_rollouts,
+        )
+
     train_loader = await resolve_dataset(trainset, name="trainset")
     val_loader = (
         await resolve_dataset(valset, name="valset") if valset is not None else None
@@ -343,14 +374,6 @@ async def optimize_agent(
                 "Failed to pre-seed skills tool components; continuing",
                 exc_info=True,
             )
-
-    cache_manager = None
-    if enable_cache:
-        cache_manager = CacheManager(
-            cache_dir=cache_dir,
-            enabled=True,
-            verbose=cache_verbose,
-        )
 
     adapter = create_adapter(
         agent=agent,

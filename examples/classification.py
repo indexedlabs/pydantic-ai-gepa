@@ -368,6 +368,13 @@ async def main() -> None:
         enable_cache=True,
         cache_dir=".gepa_cache",
         cache_verbose=True,
+        # The metric falls back to a judge model (eval_signature_agent) whose
+        # instructions live outside `metric`, so a version string is the honest
+        # identity: bump it whenever the metric or judge prompt changes.
+        # cache_metric_results=True accepts freezing the judge's first sample.
+        cache_metric_identity="classification-metric-v1",
+        cache_metric_results=True,
+        cache_rollouts=True,
     )
 
     # Serialize the result to a JSON file with datetime suffix
