@@ -163,7 +163,8 @@ async def main(
             indent=2,
         )
 
-    print(f"Best score: {result.best_score:.3f}")
+    score_label = f"{result.best_score:.3f}" if result.best_score is not None else "n/a"
+    print(f"Best score: {score_label}")
     print(f"Metric calls: {result.num_metric_calls}")
     print(f"Iterations: {result.num_iterations}")
     print(f"Run id: {run_id}")

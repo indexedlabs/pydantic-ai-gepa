@@ -399,13 +399,15 @@ class GepaState(BaseModel):
         return self.candidates[self.best_candidate_idx]
 
     def recompute_best_candidate(self) -> CandidateProgram | None:
-        """Recalculate the best candidate based on validation scores."""
+        """Recalculate the best candidate among fully validated candidates."""
         best_idx = None
         best_score = float("-inf")
         best_coverage = -1
+        validation_size = len(self.validation_set or self.training_set)
 
         for idx, candidate in enumerate(self.candidates):
-            if not candidate.validation_scores:
+            # Older saved states may contain merge subsample validation scores.
+            if candidate.coverage < validation_size:
                 continue
             coverage = candidate.coverage
             avg = candidate.avg_validation_score

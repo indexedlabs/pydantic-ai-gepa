@@ -59,6 +59,7 @@ class CandidateProgram(BaseModel):
     creation_type: Literal["seed", "reflection", "merge"] = "seed"
 
     validation_scores: dict[str, float] = Field(default_factory=dict)
+    """Scores from full validation; merge subsamples stay in minibatch_scores."""
     validation_outputs: dict[str, RolloutOutput[Any]] = Field(default_factory=dict)
     minibatch_scores: list[float] | None = None
 

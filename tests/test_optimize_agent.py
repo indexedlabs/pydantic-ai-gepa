@@ -21,7 +21,11 @@ from pydantic_ai_gepa.gepa_graph.proposal.instruction import (
     InstructionProposalOutput,
     TrajectoryAnalysis,
 )
-from pydantic_ai_gepa.runner import optimize_agent
+from pydantic_ai_gepa.runner import (
+    GepaOptimizationResult,
+    _fallback_result,
+    optimize_agent,
+)
 from pydantic_ai_gepa.signature_agent import SignatureAgent
 from pydantic_ai_gepa.types import (
     MetricResult,
@@ -68,13 +72,71 @@ async def test_optimize_agent_returns_seed_when_validation_exceeds_budget():
     )
 
     assert result.best_candidate == result.original_candidate == seed
+    assert result.best_score is None
     assert result.original_score is None
+    assert result.improvement_ratio() is None
     assert result.num_metric_calls == metric_calls == 0
     assert result.raw_result is not None
     assert result.raw_result.stopped
     assert result.raw_result.stop_reason == (
         "Max evaluations reached: budget cannot cover the validation set"
     )
+
+
+@pytest.mark.asyncio
+async def test_optimize_agent_preserves_measured_zero_score():
+    agent = Agent(TestModel(custom_output_text="ok"), instructions="Reply with ok.")
+    cases = [Case(name=f"case-{i}", inputs="Hello") for i in range(3)]
+    metric_calls = 0
+
+    def metric(case: Case[str, str, Any], output: RolloutOutput[Any]) -> MetricResult:
+        nonlocal metric_calls
+        metric_calls += 1
+        return MetricResult(score=0.0)
+
+    result = await optimize_agent(
+        agent=agent,
+        trainset=cases,
+        metric=metric,
+        reflection_config=ReflectionConfig(model=TestModel()),
+        max_metric_calls=3,
+    )
+
+    assert result.best_score == result.original_score == 0.0
+    assert result.best_candidate == result.original_candidate
+    assert result.improvement_ratio() is None
+    assert result.num_metric_calls == metric_calls == 3
+
+
+@pytest.mark.parametrize(
+    ("best_score", "original_score", "ratio"),
+    [(None, None, None), (None, 0.5, None), (0.5, None, None), (0.0, 0.5, -1.0)],
+)
+def test_improvement_ratio_handles_unavailable_scores(
+    best_score, original_score, ratio
+):
+    result = GepaOptimizationResult(
+        best_candidate={},
+        best_score=best_score,
+        original_candidate={},
+        original_score=original_score,
+        num_iterations=0,
+        num_metric_calls=0,
+    )
+    assert result.improvement_ratio() == ratio
+
+
+def test_fallback_result_is_unscored():
+    agent = Agent(TestModel(), instructions="seed")
+    seed = extract_seed_candidate(agent)
+
+    result = _fallback_result(seed)
+
+    assert result.best_candidate == result.original_candidate == seed
+    assert result.best_score is None
+    assert result.original_score is None
+    assert result.improvement_ratio() is None
+    assert result.num_metric_calls == 0
 
 
 @pytest.mark.asyncio

@@ -151,7 +151,7 @@ class GepaEngine:
         return EngineResult(
             engine=self.name,
             best_candidate=best_candidate,
-            best_score=gepa_result.best_score or 0.0,
+            best_score=gepa_result.best_score,
             num_metric_calls=num_metric_calls,
             history=history,
         )

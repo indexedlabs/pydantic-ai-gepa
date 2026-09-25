@@ -68,7 +68,7 @@ def test_state_add_candidate_and_genealogy() -> None:
 
 def test_state_recompute_best_candidate() -> None:
     config = GepaConfig()
-    training_set = [_make_data_inst("1"), _make_data_inst("2"), _make_data_inst("3")]
+    training_set = [_make_data_inst("1"), _make_data_inst("2")]
     state = GepaState(config=config, training_set=ListDataLoader(training_set))
 
     cand_a = CandidateProgram(
@@ -80,7 +80,7 @@ def test_state_recompute_best_candidate() -> None:
     )
     cand_a.record_validation(
         data_id="1",
-        score=0.5,
+        score=1.0,
         output=RolloutOutput.from_success("A1"),
     )
 
@@ -110,3 +110,29 @@ def test_state_recompute_best_candidate() -> None:
     assert best is cand_b
     assert state.best_candidate_idx == 1
     assert state.best_score == pytest.approx(0.85)
+
+
+@pytest.mark.parametrize("explicit_validation", [False, True])
+def test_recompute_clears_best_when_only_partially_validated_candidates_exist(
+    explicit_validation: bool,
+) -> None:
+    cases = [_make_data_inst("1"), _make_data_inst("2")]
+    candidate = CandidateProgram(
+        idx=0,
+        components={"system": "seed"},
+        discovered_at_iteration=0,
+        discovered_at_evaluation=0,
+        validation_scores={"1": 1.0},
+    )
+    state = GepaState(
+        config=GepaConfig(),
+        training_set=cases[:1] if explicit_validation else cases,
+        validation_set=cases if explicit_validation else None,
+        candidates=[candidate],
+        best_candidate_idx=0,
+        best_score=1.0,
+    )
+
+    assert state.recompute_best_candidate() is None
+    assert state.best_candidate_idx is None
+    assert state.best_score is None
