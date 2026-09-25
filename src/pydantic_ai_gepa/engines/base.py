@@ -8,6 +8,7 @@ import inspect
 import json
 import math
 from collections.abc import Awaitable, Callable, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -24,6 +25,7 @@ from ..gepa_graph.models import CandidateMap
 from ..input_type import InputSpec
 from ..skills import SkillsFS
 from ..skills.models import SkillCapability
+from ..spend import _pipeline_meter, rollout_spend, use_rollout_kind
 from ..types import MetricResult, RolloutOutput
 
 Metric = Callable[
@@ -168,6 +170,10 @@ class OptimizationTask:
             if cached is not None:
                 return cached
 
+        meter = _pipeline_meter.get()
+        if meter is not None:
+            meter.check()
+
         # Charge before making a call. This closes the evaluate-then-spend race
         # and means an exhausted budget cannot trigger an invisible evaluator call.
         if budget is not None:
@@ -200,18 +206,22 @@ class OptimizationTask:
             return result
 
         withheld = validation_active()
-        records = await evaluate_candidate_dataset(
-            agent=self.agent,
-            metric=selection_metric if withheld else self.metric,
-            dataset=cases,
-            candidate=candidate,
-            concurrency=self.concurrency,
-            input_type=self.input_type,
-            case_factory=self.case_factory,
-            skills_fs=self.skills_fs,
-            skills_capabilities=self.skills_capabilities,
-            capture_traces=capture_traces,
-        )
+        with (
+            rollout_spend(meter) if meter is not None else nullcontext(),
+            use_rollout_kind("validation"),
+        ):
+            records = await evaluate_candidate_dataset(
+                agent=self.agent,
+                metric=selection_metric if withheld else self.metric,
+                dataset=cases,
+                candidate=candidate,
+                concurrency=self.concurrency,
+                input_type=self.input_type,
+                case_factory=self.case_factory,
+                skills_fs=self.skills_fs,
+                skills_capabilities=self.skills_capabilities,
+                capture_traces=capture_traces,
+            )
         score = (
             sum(record.score for record in records) / len(records) if records else 0.0
         )
@@ -394,7 +404,12 @@ class EngineConfig(BaseModel):
     max_metric_calls: int = Field(default=200, gt=0)
     max_iterations: int | None = Field(default=None, gt=0)
     max_token_cost: float | None = Field(default=None, gt=0, allow_inf_nan=False)
-    """Dollar cap per engine run; composition helpers' comparison evaluations are not metered."""
+    """Dollar cap per engine run, independent of a composition helper's pipeline cap.
+
+    A pipeline cap includes comparison and reporting evaluations. The margin is
+    one rollout per in-flight slot across the pipeline at its kind's highest
+    observed cost, with first-observation, new-high, and reflection caveats
+    documented by SpendMeter."""
     stop_at_score: float | None = None
     seed: int = 0
     engine_config: dict[str, Any] = Field(default_factory=dict)
