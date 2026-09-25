@@ -23,6 +23,7 @@ from pydantic_ai_gepa.cli import app as gepa_app
 from pydantic_ai_gepa.cli.lanes import LaneState, load_lane_state
 from pydantic_ai_gepa.cli.run import RunState
 from pydantic_ai_gepa.cli.runs import ParetoLog, utc_now_iso
+from tests.cli.helpers import normalize_cli_output
 
 EVALUATE_MODULE_SOURCE = textwrap.dedent("""
     import os
@@ -322,7 +323,7 @@ def test_select_promotes_winner_journals_losers_and_refans(git_repo: Path) -> No
 def test_select_uses_held_out_validation_instead_of_training_delta(
     git_repo: Path,
 ) -> None:
-    validation_path = git_repo / ".gepa" / "validation.jsonl"
+    validation_path = git_repo.parent / "validation.jsonl"
     validation_path.write_text(
         json.dumps({"name": "secret-holdout", "inputs": "x", "expected_output": "v"})
         + "\n",
@@ -331,10 +332,10 @@ def test_select_uses_held_out_validation_instead_of_training_delta(
     config = git_repo / ".gepa" / "gepa.toml"
     config.write_text(
         config.read_text(encoding="utf-8")
-        + 'validation_dataset = ".gepa/validation.jsonl"\n',
+        + f'validation_dataset = "{validation_path}"\n',
         encoding="utf-8",
     )
-    _git(git_repo, "add", ".gepa/gepa.toml", ".gepa/validation.jsonl")
+    _git(git_repo, "add", ".gepa/gepa.toml")
     _git(git_repo, "commit", "-m", "Configure held-out validation")
 
     run = _start_lane_run(git_repo, lanes=2)
@@ -371,10 +372,47 @@ def test_select_uses_held_out_validation_instead_of_training_delta(
     ).read_text(encoding="utf-8")
 
 
+def test_select_rejects_external_validation_tampered_after_start(
+    git_repo: Path,
+) -> None:
+    validation_path = git_repo.parent / "validation.jsonl"
+    validation_path.write_text(
+        json.dumps({"name": "secret-holdout", "inputs": "x", "expected_output": "v"})
+        + "\n"
+    )
+    config = git_repo / ".gepa" / "gepa.toml"
+    config.write_text(
+        config.read_text() + f'validation_dataset = "{validation_path}"\n'
+    )
+    _git(git_repo, "add", ".gepa/gepa.toml")
+    _git(git_repo, "commit", "-m", "Configure external validation")
+    run_id = _run_id(_start_lane_run(git_repo, lanes=1))
+    _drive_lane(git_repo, run_id, "lane-1", {"out_case-2.txt": "b\n"})
+    validation_path.write_text(
+        json.dumps({"name": "tampered", "inputs": "x", "expected_output": "b"}) + "\n"
+    )
+    result = _select(git_repo, run_id)
+    assert result.exit_code == 2, result.output
+    assert "changed after run start" in result.output
+
+
+def test_select_done_run_does_not_require_validation_file(git_repo: Path) -> None:
+    from types import SimpleNamespace
+    import typer
+    from pydantic_ai_gepa.cli.select import _run_select_locked
+
+    state = SimpleNamespace(
+        status="done", run_id="finished", validation_dataset_path="missing.jsonl"
+    )
+    with pytest.raises(typer.Exit) as error:
+        _run_select_locked(git_repo, state)
+    assert error.value.exit_code == 1
+
+
 def test_select_rejects_candidate_that_changes_pinned_validation_data(
     git_repo: Path,
 ) -> None:
-    validation_path = git_repo / ".gepa" / "validation.jsonl"
+    validation_path = git_repo.parent / "validation.jsonl"
     validation_path.write_text(
         json.dumps({"name": "secret-holdout", "inputs": "x", "expected_output": "v"})
         + "\n",
@@ -383,10 +421,10 @@ def test_select_rejects_candidate_that_changes_pinned_validation_data(
     config = git_repo / ".gepa" / "gepa.toml"
     config.write_text(
         config.read_text(encoding="utf-8")
-        + 'validation_dataset = ".gepa/validation.jsonl"\n',
+        + f'validation_dataset = "{validation_path}"\n',
         encoding="utf-8",
     )
-    _git(git_repo, "add", ".gepa/gepa.toml", ".gepa/validation.jsonl")
+    _git(git_repo, "add", ".gepa/gepa.toml")
     _git(git_repo, "commit", "-m", "Configure held-out validation")
     run = _start_lane_run(git_repo, lanes=1)
     run_id = _run_id(run)
@@ -396,17 +434,16 @@ def test_select_rejects_candidate_that_changes_pinned_validation_data(
         "lane-1",
         {
             "out_case-2.txt": "b\n",
-            ".gepa/validation.jsonl": json.dumps(
-                {"name": "tampered", "inputs": "x", "expected_output": "b"}
-            )
-            + "\n",
+            ".gepa/gepa.toml": config.read_text().replace(
+                str(validation_path), str(validation_path.parent / "tampered.jsonl")
+            ),
         },
     )
 
     result = _select(git_repo, run_id)
 
     assert result.exit_code == 2
-    assert "Candidate changed the held-out validation dataset" in result.output
+    assert "Candidate changed validation_dataset" in result.output
     assert _state(git_repo, run_id).best_commit_sha != lane.candidate_sha
     assert len(ParetoLog(run_id, git_repo).validation_rows()) == 3  # repeated seed only
 
@@ -414,7 +451,7 @@ def test_select_rejects_candidate_that_changes_pinned_validation_data(
 def test_lane_validation_infrastructure_failure_retries_without_leaking(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    validation_path = git_repo / ".gepa" / "validation.jsonl"
+    validation_path = git_repo.parent / "validation.jsonl"
     validation_path.write_text(
         json.dumps({"name": "secret-holdout", "inputs": "x", "expected_output": "v"})
         + "\n",
@@ -423,10 +460,10 @@ def test_lane_validation_infrastructure_failure_retries_without_leaking(
     config = git_repo / ".gepa" / "gepa.toml"
     config.write_text(
         config.read_text(encoding="utf-8")
-        + 'validation_dataset = ".gepa/validation.jsonl"\n',
+        + f'validation_dataset = "{validation_path}"\n',
         encoding="utf-8",
     )
-    _git(git_repo, "add", ".gepa/gepa.toml", ".gepa/validation.jsonl")
+    _git(git_repo, "add", ".gepa/gepa.toml")
     _git(git_repo, "commit", "-m", "Configure held-out validation")
 
     run = _start_lane_run(git_repo, lanes=1)
@@ -467,7 +504,7 @@ def test_lane_validation_recovers_after_crash_before_checkpoint(
 ) -> None:
     import pydantic_ai_gepa.cli.select as select_module
 
-    validation_path = git_repo / ".gepa" / "validation.jsonl"
+    validation_path = git_repo.parent / "validation.jsonl"
     validation_path.write_text(
         json.dumps({"name": "secret-holdout", "inputs": "x", "expected_output": "v"})
         + "\n",
@@ -476,10 +513,10 @@ def test_lane_validation_recovers_after_crash_before_checkpoint(
     config = git_repo / ".gepa" / "gepa.toml"
     config.write_text(
         config.read_text(encoding="utf-8")
-        + 'validation_dataset = ".gepa/validation.jsonl"\n',
+        + f'validation_dataset = "{validation_path}"\n',
         encoding="utf-8",
     )
-    _git(git_repo, "add", ".gepa/gepa.toml", ".gepa/validation.jsonl")
+    _git(git_repo, "add", ".gepa/gepa.toml")
     _git(git_repo, "commit", "-m", "Configure held-out validation")
     run = _start_lane_run(git_repo, lanes=1)
     run_id = _run_id(run)
@@ -521,7 +558,7 @@ def test_lane_validation_recovers_after_crash_before_checkpoint(
 def test_validation_seed_failure_is_redacted_and_has_no_bogus_report_path(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    validation_path = git_repo / ".gepa" / "validation.jsonl"
+    validation_path = git_repo.parent / "validation.jsonl"
     validation_path.write_text(
         json.dumps({"name": "secret-seed", "inputs": "private", "expected_output": "v"})
         + "\n",
@@ -530,10 +567,10 @@ def test_validation_seed_failure_is_redacted_and_has_no_bogus_report_path(
     config = git_repo / ".gepa" / "gepa.toml"
     config.write_text(
         config.read_text(encoding="utf-8")
-        + 'validation_dataset = ".gepa/validation.jsonl"\n',
+        + f'validation_dataset = "{validation_path}"\n',
         encoding="utf-8",
     )
-    _git(git_repo, "add", ".gepa/gepa.toml", ".gepa/validation.jsonl")
+    _git(git_repo, "add", ".gepa/gepa.toml")
     _git(git_repo, "commit", "-m", "Configure held-out validation")
     monkeypatch.setenv("GEPA_TEST_FAIL_VALIDATION", "1")
 
@@ -555,7 +592,7 @@ def test_validation_seed_failure_is_redacted_and_has_no_bogus_report_path(
     comparison = payload["last_comparison"]
     assert isinstance(comparison, dict)
     assert comparison["candidate_report_path"] is None
-    assert comparison["evaluation_errors"] == [{"error_kind": "system"}]
+    assert comparison["evaluation_errors"] == [{"error_kind": "infrastructure_failure"}]
     run_root = git_repo / ".gepa" / "runs" / str(payload["run_id"])
     persisted = "\n".join(
         path.read_text(encoding="utf-8", errors="replace")
@@ -1262,3 +1299,123 @@ def test_old_two_sample_baseline_cannot_promote_deterministic_lane(
     result = _select(git_repo, run_id)
     assert result.exit_code == 0, result.output
     assert _state(git_repo, run_id).best_commit_sha == incumbent.best_commit_sha
+
+
+@pytest.mark.parametrize("lanes", [0, 1])
+@pytest.mark.parametrize("location", ["inside", "tracked", "history", "symlink"])
+def test_run_start_refuses_reflector_accessible_validation(
+    git_repo: Path, lanes: int, location: str
+) -> None:
+    inside = git_repo / ".gepa" / "validation.jsonl"
+    outside = git_repo.parent / "validation.jsonl"
+    contents = (
+        json.dumps(
+            {"name": "withheld-case", "inputs": "private", "expected_output": "v"}
+        )
+        + "\n"
+    )
+    validation_path = inside
+    if location == "symlink":
+        outside.write_text(contents)
+        inside.symlink_to(outside)
+    else:
+        inside.write_text(contents)
+    if location in {"tracked", "history"}:
+        _git(git_repo, "add", ".gepa/validation.jsonl")
+        _git(git_repo, "commit", "-m", "Previously exposed validation")
+    if location == "history":
+        inside.rename(outside)
+        _git(git_repo, "add", "-u")
+        _git(git_repo, "commit", "-m", "Remove exposed validation")
+        validation_path = outside
+    config = git_repo / ".gepa" / "gepa.toml"
+    config.write_text(
+        config.read_text() + f'validation_dataset = "{validation_path}"\n'
+    )
+    _git(git_repo, "add", ".gepa/gepa.toml")
+    _git(git_repo, "commit", "-m", "Configure validation location")
+
+    result = _run("run", "start", "--lanes", str(lanes), "--size", "3")
+
+    assert result.exit_code == 2, result.output
+    message = normalize_cli_output(result.output)
+    for expected in (
+        str(validation_path.resolve()),
+        "Keep the validation dataset outside the GEPA workspace/repository",
+        "Start the workspace from Git history that never contained the validation dataset",
+    ):
+        assert normalize_cli_output(expected) in message
+    assert "withheld-case" not in result.output
+    assert not list((git_repo / ".gepa" / "runs").glob("*/pareto.jsonl"))
+
+
+@pytest.mark.parametrize("lanes", [0, 1])
+def test_external_validation_leaves_only_aggregate_artifacts(
+    git_repo: Path, lanes: int
+) -> None:
+    validation_path = git_repo.parent / "validation.jsonl"
+    validation_path.write_text(
+        json.dumps(
+            {
+                "name": "withheld-unique-case",
+                "inputs": "withheld-input",
+                "expected_output": "withheld-output",
+            }
+        )
+        + "\n"
+    )
+    config = git_repo / ".gepa" / "gepa.toml"
+    config.write_text(
+        config.read_text() + f'validation_dataset = "{validation_path}"\n'
+    )
+    _git(git_repo, "add", ".gepa/gepa.toml")
+    _git(git_repo, "commit", "-m", "Configure external validation")
+
+    result = _run(
+        "run",
+        "start",
+        "--lanes",
+        str(lanes),
+        "--size",
+        "3",
+        "--acceptance-repetitions",
+        "1",
+    )
+    assert result.exit_code == 0, result.output
+    payload = _run_payload(result.output)
+    run_id = str(payload["run_id"])
+    assert payload["best_mean_score"] == 0.0
+    assert payload["validation_evaluations"] == 3
+    assert not (git_repo / ".gepa" / "validation.jsonl").exists()
+    if lanes:
+        worktree = git_repo / "worktrees" / run_id / "lane-1"
+        assert worktree.is_dir()
+        assert not (worktree / ".gepa" / "validation.jsonl").exists()
+        assert "validation.jsonl" not in _git(worktree, "ls-files")
+        assert load_lane_state(git_repo, run_id, "lane-1").packet_path
+    status = _run("run", "status", "--run-id", run_id)
+    pareto = _run("pareto", "--run-id", run_id)
+    assert status.exit_code == pareto.exit_code == 0
+    event_output = ""
+    if lanes:
+        event = _run("next", "--run-id", run_id, "--json")
+        assert event.exit_code == 0, event.output
+        event_output = event.output
+    artifacts = "\n".join(
+        path.read_text(errors="replace")
+        for path in (git_repo / ".gepa" / "runs" / run_id).rglob("*")
+        if path.is_file()
+    )
+    for secret in ("withheld-unique-case", "withheld-input", "withheld-output"):
+        assert (
+            secret
+            not in result.output
+            + status.output
+            + pareto.output
+            + artifacts
+            + event_output
+        )
+    rows = ParetoLog(run_id, git_repo).validation_rows()
+    assert len(rows) == 3
+    assert all(row.mean_score == 0.0 for row in rows)
+    assert all(row.per_case_scores == {} for row in rows)

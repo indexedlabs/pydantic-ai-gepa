@@ -134,21 +134,7 @@ def _save_state(state: Any, workspace_root: Path) -> None:
     Atomic (tmpfile + os.replace): select's entire idempotent-resume contract
     rests on this file, so a kill mid-write must never leave torn JSON.
     """
-    import tempfile
-
-    path = run_state_path(state.run_id, workspace_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(state.to_dict(), handle, indent=2)
-            handle.write("\n")
-        os.replace(tmp_name, path)
-    except BaseException:
-        os.unlink(tmp_name)
-        raise
+    state.save(workspace_root)
 
 
 def _checkpoint(
@@ -748,11 +734,7 @@ def _phase_promote(
     )
     from .run import _evaluate_validation_candidate
 
-    if (
-        validation_enabled
-        and not vector_validation
-        and not state.best_validation_samples
-    ):
+    if validation_enabled and not vector_validation:
         from .run import _ensure_validation_seed
 
         with _chdir(workspace_root):
@@ -814,9 +796,7 @@ def _phase_promote(
             failure_history = dict(ctx.get("validation_infrastructure_failures") or {})
             failure_history["incumbent"] = {
                 "evaluation_error_count": len(incumbent_failures),
-                "error_kinds": sorted(
-                    {failure.error_kind or "unknown" for failure in incumbent_failures}
-                ),
+                "error_kinds": ["infrastructure_failure"],
             }
             ctx["validation_infrastructure_failures"] = failure_history
             state = _checkpoint(state, workspace_root, "promote", ctx)
@@ -924,9 +904,7 @@ def _phase_promote(
             failure_history = dict(ctx.get("validation_infrastructure_failures") or {})
             failure_history[lane_state.lane] = {
                 "evaluation_error_count": len(failures),
-                "error_kinds": sorted(
-                    {failure.error_kind or "unknown" for failure in failures}
-                ),
+                "error_kinds": ["infrastructure_failure"],
             }
             ctx["validation_infrastructure_failures"] = failure_history
             state = _checkpoint(state, workspace_root, "promote", ctx)
@@ -2025,7 +2003,10 @@ def run_select(run_id: str | None) -> Any:
         )
         if not isinstance(raw, dict):
             raise typer.BadParameter("Managed run state must be a JSON object.")
-        return _run_select_locked(workspace_root, RunState.from_dict(raw))
+        return _run_select_locked(
+            workspace_root,
+            RunState.from_dict(raw).restore_validation_evidence(workspace_root),
+        )
 
 
 def _run_select_locked(workspace_root: Path, run_state: Any) -> Any:
@@ -2035,6 +2016,11 @@ def _run_select_locked(workspace_root: Path, run_state: Any) -> Any:
             err=True,
         )
         raise typer.Exit(code=1)
+
+    if run_state.validation_dataset_path is not None:
+        from .run import _assert_validation_dataset_unchanged
+
+        _assert_validation_dataset_unchanged(run_state, workspace_root=workspace_root)
 
     state = run_state
     if state.select_phase is None:

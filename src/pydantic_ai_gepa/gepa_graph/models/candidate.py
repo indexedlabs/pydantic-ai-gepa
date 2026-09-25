@@ -127,9 +127,8 @@ class CandidateProgram(BaseModel):
         score: float,
         output: RolloutOutput[Any],
     ) -> None:
-        """Record validation metrics for a particular dataset instance."""
+        """Retain scores for harness selection, never validation outputs."""
         self.validation_scores[data_id] = score
-        self.validation_outputs[data_id] = output
 
     @property
     def coverage(self) -> int:

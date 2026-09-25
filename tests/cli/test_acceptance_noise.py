@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 import random
+import json
+from pathlib import Path
 from statistics import mean
 from typing import Any
 
@@ -110,21 +112,54 @@ def test_old_state_defaults_to_no_paired_mode_or_incumbent_evidence() -> None:
         "best_validation_samples",
         "best_validation_per_case_scores",
     ):
-        raw.pop(key)
+        raw.pop(key, None)
     restored = run.RunState.from_dict(raw)
     assert restored.acceptance_paired_min_cases is None
     assert restored.best_validation_samples == ()
     assert restored.best_validation_per_case_scores == {}
 
 
-def test_paired_validation_evidence_roundtrips_with_case_ids() -> None:
+def test_paired_validation_evidence_roundtrips_with_case_ids(tmp_path: Path) -> None:
     state = run._mark_best_validation_samples(
         _state(acceptance_paired_min_cases=2), [_outcome([0.3, 0.5])]
     )
-    restored = run.RunState.from_dict(state.to_dict())
+    from pydantic_ai_gepa.cli.select import _save_state
+    from pydantic_ai_gepa.cli.lanes import _load_run_state
+    from pydantic_ai_gepa.cli.validation import validation_evidence_path
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    dataset = tmp_path / "held-out.jsonl"
+    dataset.write_text('{"name": "private-case"}\n')
+    state = replace(
+        state, validation_dataset_path=str(dataset), validation_dataset_digest="digest"
+    )
+    _save_state(state, workspace)
+    public = json.loads(run.run_state_path(state.run_id, workspace).read_text())
+    assert "best_validation_per_case_scores" not in public
+    assert "case-0" not in json.dumps(public)
+    restored = _load_run_state(workspace, state.run_id)
     assert restored.best_validation_samples == (0.4,)
     assert restored.best_validation_per_case_scores == {"case-0": 0.3, "case-1": 0.5}
     assert restored.acceptance_paired_min_cases == 2
+    # A torn checkpoint (new incumbent, old evidence) cannot reuse stale scores.
+    newer = replace(
+        restored, best_candidate_id="new-incumbent", best_validation_per_case_scores={}
+    )
+    newer.save(workspace)
+    assert (
+        _load_run_state(workspace, state.run_id).best_validation_per_case_scores == {}
+    )
+    evidence = validation_evidence_path(
+        str(dataset), project_root=workspace, run_id=state.run_id
+    )
+    evidence.unlink()
+    missing = restored.restore_validation_evidence(workspace)
+    assert missing.best_validation_per_case_scores == {}
+    comparison = run._validation_improved(
+        missing, [_outcome([0.9, 1.0])], initial=1, maximum=1
+    )
+    assert comparison["reason_code"] == "incumbent_evidence_missing"
 
 
 def test_reflection_baseline_discards_failure_selected_sample(

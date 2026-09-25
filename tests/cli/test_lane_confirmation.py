@@ -207,15 +207,29 @@ def test_lane_confirmation_infrastructure_failure_pauses(selection, monkeypatch)
     assert len(calls) == 3
 
 
-def test_lane_confirmation_paired_mode_uses_one_fresh_sample(selection, monkeypatch):
+@pytest.mark.parametrize("missing_evidence", [False, True])
+def test_lane_confirmation_paired_mode_uses_one_fresh_sample(
+    selection, monkeypatch, missing_evidence
+):
     root, calls, scores = selection
     monkeypatch.setattr(run, "_validation_schedule", lambda *_: (1, 1))
+    incumbent_scores = {f"case-{i}": 0.5 for i in range(3)}
+    if missing_evidence:
+        recovered = []
+
+        def recover(state):
+            recovered.append(state)
+            return replace(state, best_validation_per_case_scores=incumbent_scores), []
+
+        monkeypatch.setattr(run, "_ensure_validation_seed", recover)
     scores["lane-1:confirmation"] = 0.8
     state, ctx, _ = select._phase_promote(
         root,
         _state(
             best_validation_samples=(0.5,),
-            best_validation_per_case_scores={f"case-{i}": 0.5 for i in range(3)},
+            best_validation_per_case_scores={}
+            if missing_evidence
+            else incumbent_scores,
             acceptance_paired_min_cases=3,
         ),
         {},
@@ -224,6 +238,8 @@ def test_lane_confirmation_paired_mode_uses_one_fresh_sample(selection, monkeypa
     assert ctx["validation_confirmation"]["method"] == "paired_t"
     assert state.best_validation_samples == (0.8,)
     assert len(calls) == 3
+    if missing_evidence:
+        assert len(recovered) == 1
 
 
 @pytest.mark.parametrize("effect", [0.0, 0.2])

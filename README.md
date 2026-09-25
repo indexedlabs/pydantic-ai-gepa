@@ -106,6 +106,11 @@ correlated trace capture. This intentionally isolates optimization traces from t
 application's global Logfire/OpenTelemetry provider; ordinary runs of the original
 agent retain their configured instrumentation.
 
+Reflection receives training examples, feedback, and traces. Validation
+rollouts retain only scores for selection: their feedback and side information
+are discarded, and no validation trace file is written. Reflectors may see
+aggregate validation scores and whether a candidate improved or was adopted.
+
 ## Quick Start
 
 ```bash
@@ -361,9 +366,31 @@ paired_min_cases = 100
 ```
 
 Omit `paired_min_cases` to retain repeated evaluation for every dataset size.
-The incumbent's validation evidence is retained in run state and replaced only
-after an accepted promotion. Missing incumbent evidence prevents promotion until
+The incumbent's aggregate validation samples are retained in `state.json` and
+replaced only after an accepted promotion. Paired per-case evidence stays in the
+harness-owned `.gepa-validation-evidence` directory beside the external dataset,
+never in public run artifacts. Missing incumbent evidence prevents promotion until
 it can be collected from the incumbent tree.
+
+Keep the validation dataset outside the repository and all candidate worktrees,
+in both git and component modes. For example:
+
+```bash
+gepa init --agent mypkg.agents:my_agent \
+  --validation-dataset /srv/gepa-heldout/my-project/validation.jsonl
+gepa run start --max-iterations 50
+```
+
+Replace the example absolute path with the harness-owned dataset location.
+Managed runs refuse validation paths inside a checkout or tracked by its git
+repository; move existing data outside the repository and update
+`validation_dataset` in `.gepa/gepa.toml`. If the data was committed or staged,
+use a fresh candidate repository without those Git objects; moving the file
+alone does not remove historical access. The harness pins the external file's
+identity and rechecks it on resume and lane selection. Validation writes no
+reports or traces. Run summaries, lane packets, Pareto output, and final reports
+contain aggregate validation scores and outcomes, without case identifiers,
+outputs, feedback, or per-case scores. Training reports retain full feedback.
 
 ### Pinned-scorer component IDs
 

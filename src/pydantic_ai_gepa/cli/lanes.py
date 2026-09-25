@@ -1522,7 +1522,9 @@ def _load_run_state(workspace_root: Path, run_id: str) -> Any:
             err=True,
         )
         raise typer.Exit(code=1)
-    return RunState.from_dict(json.loads(path.read_text(encoding="utf-8")))
+    return RunState.from_dict(
+        json.loads(path.read_text(encoding="utf-8"))
+    ).restore_validation_evidence(workspace_root)
 
 
 def _resolve_lane_run(run_id: str | None) -> tuple[Path, Any]:

@@ -45,6 +45,7 @@ from .layout import (
 )
 from .runs import MinibatchStore, ParetoLog, utc_now_iso
 from .store import ComponentStore
+from .validation import validation_dataset_path
 
 
 app = typer.Typer(
@@ -154,9 +155,6 @@ class RunState:
             "acceptance_min_delta": self.acceptance_min_delta,
             "acceptance_paired_min_cases": self.acceptance_paired_min_cases,
             "best_validation_samples": list(self.best_validation_samples),
-            "best_validation_per_case_scores": dict(
-                self.best_validation_per_case_scores
-            ),
             "candidate_source": self.candidate_source,
             "iterations": self.iterations,
             "created_at": self.created_at,
@@ -351,7 +349,37 @@ class RunState:
             ),
         )
 
+    def _validation_evidence_identity(self) -> dict[str, Any]:
+        return {
+            "candidate_id": self.best_candidate_id,
+            "dataset_digest": self.validation_dataset_digest,
+            "samples": list(self.best_validation_samples),
+        }
+
+    def restore_validation_evidence(self, root: Path | None = None) -> RunState:
+        from .validation import read_validation_evidence
+
+        if self.acceptance_paired_min_cases is None:
+            return replace(self, best_validation_per_case_scores={})
+        scores = read_validation_evidence(
+            self.validation_dataset_path,
+            project_root=root or repo_root(),
+            run_id=self.run_id,
+            identity=self._validation_evidence_identity(),
+        )
+        return replace(self, best_validation_per_case_scores=scores)
+
     def save(self, root: Path | None = None) -> Path:
+        from .validation import write_validation_evidence
+
+        if self.best_validation_per_case_scores and self.validation_dataset_path:
+            write_validation_evidence(
+                self.validation_dataset_path,
+                project_root=root or repo_root(),
+                run_id=self.run_id,
+                identity=self._validation_evidence_identity(),
+                scores=self.best_validation_per_case_scores,
+            )
         path = run_state_path(self.run_id, root)
         path.parent.mkdir(parents=True, exist_ok=True)
         # Atomic (tmpfile + os.replace): lane evals, select checkpoints, and
@@ -389,7 +417,7 @@ def _load_state(run_id: str | None) -> RunState:
     if not isinstance(raw, dict):
         typer.echo(f"Run state at {path} is not a JSON object.", err=True)
         raise typer.Exit(code=1)
-    return RunState.from_dict(raw)
+    return RunState.from_dict(raw).restore_validation_evidence()
 
 
 def _latest_managed_run_id() -> str | None:
@@ -630,7 +658,7 @@ def _validation_dataset_identity(root: Path | None = None) -> tuple[str, str]:
         raise typer.BadParameter(
             "Held-out validation requires validation_dataset in gepa.toml."
         )
-    path = project_root / cfg.validation_dataset
+    path = validation_dataset_path(cfg.validation_dataset, project_root=project_root)
     try:
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
     except OSError as exc:
@@ -675,18 +703,9 @@ def _assert_validation_dataset_unchanged(
                     "Candidate changed validation_dataset in gepa.toml; held-out "
                     "selection configuration is immutable during a run."
                 )
-    validation_path = Path(configured_path)
-    if not validation_path.is_absolute():
-        candidate_validation = candidate_root / validation_path
-        if (
-            candidate_validation.is_file()
-            and hashlib.sha256(candidate_validation.read_bytes()).hexdigest()
-            != state.validation_dataset_digest
-        ):
-            raise typer.BadParameter(
-                "Candidate changed the held-out validation dataset; restore the "
-                "pinned data before selection."
-            )
+    validation_dataset_path(
+        configured_path, project_root=primary_root, candidate_root=candidate_root
+    )
 
 
 def _evaluate_validation_candidate(
@@ -1903,6 +1922,8 @@ def start(
         acceptance_paired_min_cases = cfg.acceptance.paired_min_cases
     if acceptance_paired_min_cases is not None and acceptance_paired_min_cases < 2:
         raise typer.BadParameter("--acceptance-paired-min-cases must be >= 2.")
+    if cfg.validation_dataset is not None:
+        _validation_dataset_identity()
     vector_validation = (
         cfg.validation_dataset is not None and cfg.acceptance.mode == "vector"
     )
@@ -2058,6 +2079,8 @@ def continue_(
 ) -> None:
     """Resume after reflection edits and advance to the next pause or completion."""
     state = _load_state(run_id)
+    if state.validation_dataset_path is not None:
+        _assert_validation_dataset_unchanged(state)
     if state.lanes > 0 and not (
         state.status == "paused_after_infrastructure_error"
         and state.reflection_minibatch_id is None
