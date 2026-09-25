@@ -44,6 +44,7 @@ def test_candidate_validation_tracking() -> None:
         output=RolloutOutput.from_success("B"),
     )
 
+    assert candidate.validation_outputs == {}
     assert candidate.coverage == 2
     assert candidate.avg_validation_score == pytest.approx(0.8)
 

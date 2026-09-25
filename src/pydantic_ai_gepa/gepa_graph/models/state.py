@@ -449,10 +449,14 @@ class GepaState(BaseModel):
             self.evaluation_errors.append(
                 EvaluationErrorEvent(
                     candidate_idx=candidate_idx,
-                    data_id=data_id,
+                    data_id="withheld" if stage in {"validation", "merge"} else data_id,
                     stage=stage,
                     iteration=self.iteration,
-                    error_message=error_message,
+                    error_message=(
+                        "Validation evaluation failed"
+                        if stage in {"validation", "merge"}
+                        else error_message
+                    ),
                     error_kind=output.error_kind,
                 )
             )

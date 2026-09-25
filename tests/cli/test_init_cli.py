@@ -14,6 +14,7 @@ from typer.testing import CliRunner
 from pydantic_ai_gepa.cli import app as gepa_app
 from pydantic_ai_gepa.cli.layout import GepaConfig, config_path
 from pydantic_ai_gepa.cli.store import ComponentStore
+from tests.cli.helpers import normalize_cli_output
 
 
 AGENT_MODULE_SOURCE = textwrap.dedent('''
@@ -336,6 +337,7 @@ def test_default_workspace_unchanged_when_flag_omitted(empty_repo: Path) -> None
 
 
 def test_init_writes_held_out_validation_dataset(empty_repo: Path) -> None:
+    validation_path = empty_repo.parent / "validation.jsonl"
     result = _run(
         "init",
         "--agent",
@@ -343,14 +345,14 @@ def test_init_writes_held_out_validation_dataset(empty_repo: Path) -> None:
         "--dataset",
         "data/train.jsonl",
         "--validation-dataset",
-        "data/validation.jsonl",
+        str(validation_path),
     )
 
     assert result.exit_code == 0, result.output
     body = (empty_repo / ".gepa" / "gepa.toml").read_text(encoding="utf-8")
     assert 'dataset = "data/train.jsonl"' in body
-    assert 'validation_dataset = "data/validation.jsonl"' in body
-    assert "held-out validation cases at data/validation.jsonl" in result.output
+    assert f'validation_dataset = "{validation_path}"' in body
+    assert f"held-out validation cases at {validation_path}" in result.output
 
 
 def test_parallel_workspaces_isolated(empty_repo: Path) -> None:
@@ -382,3 +384,22 @@ def test_parallel_workspaces_isolated(empty_repo: Path) -> None:
     assert ".gepa.support/dataset.jsonl" in (
         empty_repo / ".gepa.support" / "gepa.toml"
     ).read_text(encoding="utf-8")
+
+
+def test_init_refuses_validation_inside_checkout(empty_repo: Path) -> None:
+    result = _run(
+        "init",
+        "--agent",
+        "agent_pkg.agents:agent",
+        "--validation-dataset",
+        ".gepa/validation.jsonl",
+    )
+    assert result.exit_code == 2, result.output
+    message = normalize_cli_output(result.output)
+    for expected in (
+        str((empty_repo / ".gepa" / "validation.jsonl").resolve()),
+        "Keep the validation dataset outside the GEPA workspace/repository",
+        "Start the workspace from Git history that never contained the validation dataset",
+    ):
+        assert normalize_cli_output(expected) in message
+    assert not (empty_repo / ".gepa" / "validation.jsonl").exists()

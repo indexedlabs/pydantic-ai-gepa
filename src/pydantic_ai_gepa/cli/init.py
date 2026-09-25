@@ -80,7 +80,7 @@ def init(
         None,
         "--validation-dataset",
         help=(
-            "Optional held-out validation JSONL used to select candidates. "
+            "Optional held-out validation JSONL outside the repository, used to select candidates. "
             "When omitted, managed runs retain legacy training-only selection."
         ),
     ),
@@ -132,6 +132,15 @@ def init(
     if candidate_source == "components" and evaluate is not None:
         typer.echo("--evaluate is only supported in git candidate mode.", err=True)
         raise typer.Exit(code=2)
+
+    if validation_dataset is not None:
+        from .validation import validation_dataset_path
+
+        validation_dataset = str(
+            validation_dataset_path(
+                validation_dataset, project_root=Path.cwd(), allow_missing=True
+            )
+        )
 
     # Sanity-check the agent ref (and metric / case_factory refs, when
     # provided) before persisting config.

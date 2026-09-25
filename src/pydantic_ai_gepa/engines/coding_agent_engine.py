@@ -617,13 +617,12 @@ def _best_validation_entry(
 
 
 def _validation_event_data(entry: _CandidatePoolEntry, *, stage: str) -> dict[str, Any]:
-    """Expose selection scores without leaking validation feedback or outputs."""
+    """Expose aggregate selection results without validation case evidence."""
 
     return {
         "stage": stage,
         "candidate_index": entry.index,
         "validation_score": entry.evaluation.score,
-        "validation_case_scores": dict(entry.evaluation.per_case_scores),
         "selectable": entry.evaluation.selectable,
     }
 

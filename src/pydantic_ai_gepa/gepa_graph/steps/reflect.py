@@ -861,7 +861,9 @@ async def _propose_new_texts(
 ) -> ProposalResult:
     proposal = deps.proposal_generator
     kwargs: dict[str, Any] = dict(
-        candidate=parent,
+        candidate=parent.model_copy(
+            update={"validation_scores": {}, "validation_outputs": {}}
+        ),
         reflective_data=reflective_dataset,
         components=components,
         model=model,

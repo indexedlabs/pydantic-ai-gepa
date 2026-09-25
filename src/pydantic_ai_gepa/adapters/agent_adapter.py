@@ -45,6 +45,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.tools import ToolDefinition
 
 from ..cache import CacheManager
+from .._validation import validation_active
 from ..gepa_graph.proposal.student_tools import create_example_search_tool
 from ..gepa_graph.proposal.student_tools import create_skills_toolset
 from ..exceptions import UsageBudgetExceeded
@@ -807,12 +808,15 @@ class _BaseAgentAdapter(
         example_bank: "InMemoryExampleBank | None" = None,
     ) -> dict[str, Any]:
         """Process a single Case and return the metric evaluation."""
+        withheld = validation_active()
+        if withheld:
+            capture_traces = False
         metric_result: MetricResult | None = None
         output: RolloutOutput[Any] | None = None
         trajectory: AgentAdapterTrajectory | None = None
         case_name = self._case_identifier(case, case_index)
         try:
-            if self.cache_manager and candidate:
+            if self.cache_manager and candidate and not withheld:
                 cached_agent_result = self.cache_manager.get_cached_agent_run(
                     case,
                     case_index,
@@ -870,7 +874,7 @@ class _BaseAgentAdapter(
                     )
                     trajectory = None
 
-            if self.cache_manager and candidate:
+            if self.cache_manager and candidate and not withheld:
                 cached_metric = self.cache_manager.get_cached_metric_result(
                     case,
                     case_index,
@@ -901,6 +905,9 @@ class _BaseAgentAdapter(
                     metric_result = await maybe_metric_result
                 else:
                     metric_result = maybe_metric_result
+
+            if withheld:
+                metric_result = MetricResult(score=metric_result.score)
 
             if trajectory is not None:
                 trajectory.metric_feedback = metric_result.feedback

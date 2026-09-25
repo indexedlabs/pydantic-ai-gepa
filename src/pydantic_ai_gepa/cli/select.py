@@ -767,9 +767,7 @@ def _phase_promote(
             failure_history = dict(ctx.get("validation_infrastructure_failures") or {})
             failure_history["incumbent"] = {
                 "evaluation_error_count": len(incumbent_failures),
-                "error_kinds": sorted(
-                    {failure.error_kind or "unknown" for failure in incumbent_failures}
-                ),
+                "error_kinds": ["infrastructure_failure"],
             }
             ctx["validation_infrastructure_failures"] = failure_history
             state = _checkpoint(state, workspace_root, "promote", ctx)
@@ -869,9 +867,7 @@ def _phase_promote(
             failure_history = dict(ctx.get("validation_infrastructure_failures") or {})
             failure_history[lane_state.lane] = {
                 "evaluation_error_count": len(failures),
-                "error_kinds": sorted(
-                    {failure.error_kind or "unknown" for failure in failures}
-                ),
+                "error_kinds": ["infrastructure_failure"],
             }
             ctx["validation_infrastructure_failures"] = failure_history
             state = _checkpoint(state, workspace_root, "promote", ctx)
@@ -1919,6 +1915,11 @@ def _run_select_locked(workspace_root: Path, run_state: Any) -> Any:
             err=True,
         )
         raise typer.Exit(code=1)
+
+    if run_state.validation_dataset_path is not None:
+        from .run import _assert_validation_dataset_unchanged
+
+        _assert_validation_dataset_unchanged(run_state, workspace_root=workspace_root)
 
     state = run_state
     if state.select_phase is None:
