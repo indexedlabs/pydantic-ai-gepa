@@ -141,7 +141,7 @@ class CodingAgentEngine:
             return EngineResult(
                 engine=self.name,
                 best_candidate=seed,
-                best_score=0.0,
+                best_score=None,
                 num_metric_calls=budget.spent - starting_spend,
                 history=history,
             )

@@ -97,7 +97,6 @@ async def merge_step(ctx: StepContext[GepaState, GepaDeps, None]) -> IterationAc
     parent2_scores = _get_subsample_scores(state, parent2_idx, subsample)
 
     merged_candidate.minibatch_scores = list(merged_results.scores)
-    _record_partial_validation(merged_candidate, merged_results)
     state.total_evaluations += len(merged_results.data_ids)
 
     merged_total = sum(merged_results.scores)
@@ -141,18 +140,6 @@ def _component_signature(
             (name, component.text) for name, component in candidate.components.items()
         )
     )
-
-
-def _record_partial_validation(
-    candidate: CandidateProgram,
-    results,
-) -> None:
-    for data_id, score, output in results:
-        candidate.record_validation(
-            data_id=data_id,
-            score=score,
-            output=output,
-        )
 
 
 def _get_subsample_scores(

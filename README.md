@@ -276,6 +276,8 @@ print(f"Best prompt: {result.best_candidate.system_prompt}")
 print(f"Best score: {result.best_score}")
 ```
 
+`best_score` is `None` when no candidate finished full validation, for example when the budget cannot cover the validation set; a measured zero remains `0.0`.
+
 ### With Structured Inputs (SignatureAgent Optimization)
 
 ```python

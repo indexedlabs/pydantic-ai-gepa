@@ -366,7 +366,8 @@ class EngineResult(BaseModel):
 
     engine: str
     best_candidate: CandidateMap
-    best_score: float
+    best_score: float | None
+    """Best validation score, or None if no candidate finished full validation."""
     num_metric_calls: int
     history: list[EngineEvent] = Field(default_factory=list)
 

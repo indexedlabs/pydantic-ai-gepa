@@ -20,6 +20,7 @@ class GepaResult(BaseModel):
     best_candidate_idx: int | None = None
     best_candidate: CandidateProgram | None = None
     best_score: float | None = None
+    """Best validation score, or None if no candidate finished full validation."""
 
     original_candidate_idx: int | None = None
     original_candidate: CandidateProgram | None = None

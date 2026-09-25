@@ -67,8 +67,8 @@ class GepaOptimizationResult(BaseModel):
     best_candidate: CandidateMap
     """The best candidate found during optimization."""
 
-    best_score: float
-    """The validation score of the best candidate."""
+    best_score: float | None
+    """Best validation score, or None if no candidate finished full validation."""
 
     original_candidate: CandidateMap
     """The original candidate before optimization."""
@@ -112,9 +112,14 @@ class GepaOptimizationResult(BaseModel):
         """Calculate the improvement ratio from original to best.
 
         Returns:
-            The ratio of improvement, or None if original score is not available.
+            The ratio of improvement, or None if either score is unavailable
+            or the original score is nonpositive.
         """
-        if self.original_score is not None and self.original_score > 0:
+        if (
+            self.best_score is not None
+            and self.original_score is not None
+            and self.original_score > 0
+        ):
             return (self.best_score - self.original_score) / self.original_score
         return None
 
@@ -524,7 +529,7 @@ async def optimize_agent(
 
     result = GepaOptimizationResult(
         best_candidate=best_candidate_dict,
-        best_score=gepa_result.best_score or 0.0,
+        best_score=gepa_result.best_score,
         original_candidate=original_candidate_dict,
         original_score=gepa_result.original_score,
         num_iterations=gepa_result.iterations,
@@ -654,7 +659,7 @@ def _fallback_result(
     }
     return GepaOptimizationResult(
         best_candidate=candidate_copy,
-        best_score=0.0,
+        best_score=None,
         original_candidate=dict(seed_candidate),
         original_score=None,
         num_iterations=0,

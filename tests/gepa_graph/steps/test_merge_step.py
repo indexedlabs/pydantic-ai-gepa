@@ -307,7 +307,18 @@ async def test_merge_budget_stop_preserves_fully_validated_best(remaining: int) 
     if remaining == 4:
         assert action == "evaluate"
         await evaluate_step(ctx)
-        assert merged_candidate.avg_validation_score > best_score
+        assert merged_candidate.minibatch_scores == [1.0] * 3
+        assert merged_candidate.validation_scores == {}
+        assert all(
+            merged_candidate.idx not in entry.candidate_indices
+            for entry in state.pareto_front.values()
+        )
+        assert (
+            await MergeProposalBuilder().select_merge_subsample(
+                state=state, parent1_idx=parent1_idx, parent2_idx=merged_candidate.idx
+            )
+            == []
+        )
     else:
         assert action == "continue"
     stop = await continue_step(ctx)
@@ -318,6 +329,37 @@ async def test_merge_budget_stop_preserves_fully_validated_best(remaining: int) 
     assert stop.result.best_score == best_score
     assert evaluator.calls == (1 if remaining == 4 else 0)
     assert state.total_evaluations == 10 + evaluator.calls * 3
+
+    def assert_best_unchanged(restored: GepaState) -> None:
+        best = restored.recompute_best_candidate()
+        assert best is not None
+        assert best.idx == best_idx
+        assert restored.best_score == best_score
+
+    assert_best_unchanged(state)
+    restored = GepaState.model_validate(
+        {
+            **state.model_dump(),
+            "training_set": state.training_set,
+            "validation_set": state.validation_set,
+        }
+    )
+    assert_best_unchanged(restored)
+    if remaining == 4:
+        # Simulate a saved state from before merge subsamples were kept separate.
+        legacy = restored.model_dump()
+        legacy["candidates"][-1]["validation_scores"] = {
+            inst.name: 1.0 for inst in subsample
+        }
+        legacy_state = GepaState.model_validate(
+            {
+                **legacy,
+                "training_set": state.training_set,
+                "validation_set": state.validation_set,
+            }
+        )
+        assert legacy_state.candidates[-1].avg_validation_score > best_score
+        assert_best_unchanged(legacy_state)
 
 
 @pytest.mark.asyncio
@@ -375,7 +417,7 @@ async def test_merge_step_accepts_when_scores_non_strictly_better() -> None:
     assert new_candidate.creation_type == "merge"
     assert new_candidate.parent_indices == [parent1_idx, parent2_idx]
     assert new_candidate.minibatch_scores == results.scores
-    assert set(new_candidate.validation_scores) == {inst.name for inst in subsample}
+    assert new_candidate.validation_scores == {}
 
 
 @pytest.mark.asyncio

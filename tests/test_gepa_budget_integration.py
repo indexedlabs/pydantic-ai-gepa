@@ -78,9 +78,10 @@ async def test_engine_returns_and_refunds_unused_budget(
     assert result.best_candidate["instructions"].text == (
         "improved" if spent == 10 else "seed"
     )
-    assert result.best_score == pytest.approx(
-        0.85 if spent == 10 else 0.4 if spent else 0.0
-    )
+    if spent == 0:
+        assert result.best_score is None
+    else:
+        assert result.best_score == pytest.approx(0.85 if spent == 10 else 0.4)
     summary = result.history[-1].data
     assert summary["total_evaluations"] == spent
     assert summary["stop_reason"].startswith("Max evaluations reached")
@@ -100,10 +101,30 @@ async def test_engine_target_stops_and_refunds(
 
     result = await GepaEngine(config).run(task, config, budget)
 
+    assert result.best_score is not None
     assert result.best_score >= target
     assert result.num_metric_calls == budget.spent == len(calls) == spent
     assert result.history[-1].data["stop_reason"] == "Target score reached"
     assert result.history[-1].data["iterations"] < config.max_iterations
+
+
+@pytest.mark.asyncio
+async def test_engine_preserves_measured_zero_score(counted_task) -> None:
+    task, calls = counted_task
+
+    def metric(case: Case[str, str, Any], output: RolloutOutput[Any]) -> MetricResult:
+        calls.append(case.name)
+        return MetricResult(score=0.0)
+
+    task.metric = metric
+    config = _config(3)
+    budget = BudgetTracker(3)
+
+    result = await GepaEngine(config).run(task, config, budget)
+
+    assert result.best_score == 0.0
+    assert result.history[-1].data["original_score"] == 0.0
+    assert result.num_metric_calls == budget.spent == len(calls) == 3
 
 
 @pytest.mark.asyncio
