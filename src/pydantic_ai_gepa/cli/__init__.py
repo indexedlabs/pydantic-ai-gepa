@@ -13,6 +13,7 @@ from . import apply as apply_cmd
 from . import components as components_cmd
 from . import eval as eval_cmd
 from . import events as events_cmd
+from . import harness as harness_cmd
 from . import init as init_cmd
 from . import journal as journal_cmd
 from . import lanes as lanes_cmd
@@ -89,6 +90,9 @@ app.add_typer(
     help="Drive reflection lanes: lease, continue (background eval), reset.",
 )
 app.add_typer(omni_cmd.app, name="omni", help="Durable outer Omni meta-run controller.")
+app.add_typer(
+    harness_cmd.app, name="harness", help="Orchestrator-owned held-out scoring service."
+)
 app.add_typer(
     run_cmd.app,
     name="run",

@@ -25,7 +25,8 @@ from ..spend import (
     SpendCategory,
     rollout_spend,
 )
-from .layout import run_dir, run_state_path
+from .layout import repo_root, run_dir, run_state_path
+from .validation import public_echo
 
 if TYPE_CHECKING:
     from .run import RunState
@@ -81,13 +82,24 @@ def _rows(
 ) -> list[dict[str, Any]]:
     directory = run_dir(run_id, root)
     rows = _read_rows(directory / "spend.jsonl", warnings)
-    pointer = directory / "validation-spend-path"
+    pointer = directory / "validation-spend-registered"
     if pointer.exists():
         from .lanes import _pid_alive
 
         completed = {row["eval_id"] for row in rows if row["kind"] == "validation"}
         owners = _validation_owners(directory)
-        private = Path(pointer.read_text())
+        private = _private_spend_path(run_id, root)
+        if private is None:
+            if set(owners) - completed:
+                if warnings is None:
+                    raise MissingValidationSpend(
+                        "Unfinished validation spend requires the harness environment"
+                    )
+                warnings["validation_in_progress"] = True
+            for row in rows:
+                if row["kind"] == "validation":
+                    row["max_rollout_dollars"] = row["total_dollars"]
+            return rows
         if not private.exists():
             if warnings is not None:
                 warnings["validation_checkpoint_missing"] = True
@@ -201,13 +213,20 @@ def _reservations(run_id: str, root: Path | None) -> dict[str, Any]:
     }
 
 
-def _private_reservations_path(run_id: str, root: Path | None) -> Path | None:
-    pointer = run_dir(run_id, root) / "validation-spend-path"
-    return (
-        Path(pointer.read_text()).with_suffix(".reservations.json")
-        if pointer.exists()
-        else None
+def _private_spend_path(run_id: str, root: Path | None) -> Path | None:
+    from .validation import heldout_dataset, validation_spend_path
+
+    dataset = heldout_dataset(required=False)
+    if dataset is None:
+        return None
+    return validation_spend_path(
+        dataset, project_root=root or repo_root(), run_id=run_id
     )
+
+
+def _private_reservations_path(run_id: str, root: Path | None) -> Path | None:
+    private = _private_spend_path(run_id, root)
+    return private.with_suffix(".reservations.json") if private is not None else None
 
 
 def _write_reservations(path: Path, reservations: dict[str, Any]) -> None:
@@ -504,7 +523,7 @@ def _finish_cost_stop(
 
     path = run_state_path(run_id, root)
     if not path.exists():
-        typer.echo(
+        public_echo(
             json.dumps(
                 {"spend": spend_report(run_id, root, cap), "stop_reason": reason}
             )
@@ -539,7 +558,7 @@ def _finish_cost_stop(
         )
     payload = _public_state(state, outcomes=[], final_report=final_path, root=root)
     payload["spend"] = spend_report(run_id, root, state.max_token_cost)
-    typer.echo(json.dumps({"run": payload}))
+    public_echo(json.dumps({"run": payload}))
 
 
 @contextmanager
@@ -584,7 +603,7 @@ def evaluation_spend(
 
         validation_spend_path = validation_dataset_path(
             str(validation_spend_path),
-            project_root=root or Path.cwd(),
+            project_root=root or repo_root(),
             allow_missing=True,
         )
     meter = EvalSpendMeter(
@@ -602,16 +621,16 @@ def evaluation_spend(
     admitted = False
 
     def refuse(reason: str) -> NoReturn:
-        typer.echo(reason, err=True)
+        public_echo(reason, err=True)
         raise typer.Exit(code=2)
 
     def register_private_path() -> None:
         if validation_spend_path is not None:
-            pointer = run_dir(run_id, root) / "validation-spend-path"
+            pointer = run_dir(run_id, root) / "validation-spend-registered"
             if not pointer.exists():
                 temporary = pointer.with_suffix(".tmp")
                 with temporary.open("w") as handle:
-                    handle.write(str(validation_spend_path))
+                    handle.write("registered\n")
                     handle.flush()
                     os.fsync(handle.fileno())
                 os.replace(temporary, pointer)
@@ -642,11 +661,9 @@ def evaluation_spend(
                 refuse(
                     "One-off max-token-cost cannot cover run spend and this evaluation"
                 )
-            pointer = run_dir(run_id, root) / "validation-spend-path"
             if (
                 validation_spend_path is not None
-                and pointer.exists()
-                and pointer.read_text() != str(validation_spend_path)
+                and _private_spend_path(run_id, root) != validation_spend_path
             ):
                 refuse("Validation spend checkpoint path changed")
             if report["stopped_by_cost"]:
@@ -714,7 +731,7 @@ def evaluation_spend(
             if own_cap:
                 _finish_cost_stop(run_id, root, terminal, exc.stop_reason, cap)
             else:
-                typer.echo(
+                public_echo(
                     json.dumps(
                         {
                             "spend": spend_report(run_id, root, cap),

@@ -35,6 +35,16 @@ git_repo = test_git_candidate_cli.git_repo
 lane_repo = test_select_cli.git_repo
 
 
+def _checkpoint(root, run_id, monkeypatch):
+    from pydantic_ai_gepa.cli.validation import validation_spend_path
+
+    dataset = root.parent / f"{root.name}-heldout" / "validation.jsonl"
+    dataset.parent.mkdir(exist_ok=True)
+    dataset.write_text('{"inputs": "private"}\n')
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(dataset))
+    return validation_spend_path(str(dataset), project_root=root, run_id=run_id)
+
+
 @pytest.mark.parametrize(
     "failure",
     [
@@ -244,10 +254,12 @@ def _private_validation(root: Path, checkpoint: Path, *, crash: bool = False):
 
 
 @pytest.mark.parametrize("crash", [False, True])
-def test_validation_checkpoints_are_private_and_crash_safe(tmp_path: Path, crash: bool):
+def test_validation_checkpoints_are_private_and_crash_safe(
+    tmp_path: Path, crash: bool, monkeypatch
+):
     root = tmp_path / "workspace"
     root.mkdir()
-    checkpoint = tmp_path / "private" / "spend.jsonl"
+    checkpoint = _checkpoint(root, "private", monkeypatch)
     process = multiprocessing.get_context("fork").Process(
         target=_private_validation,
         args=(root, checkpoint),
@@ -270,6 +282,27 @@ def test_validation_checkpoints_are_private_and_crash_safe(tmp_path: Path, crash
 
         observations, mean, highest = _kind_costs(_rows("private", root), "validation")
         assert (observations, mean, highest) == pytest.approx((2, 0.01, 0.01))
+    with monkeypatch.context() as reflector:
+        reflector.delenv("GEPA_HELDOUT_DATASET")
+        public = spend_report("private", root)
+        assert public["validation_dollars"] == pytest.approx(0 if crash else 0.02)
+        if crash:
+            assert public["validation_in_progress"]
+            with pytest.raises(typer.Exit) as missing:
+                with evaluation_spend(
+                    run_id="private",
+                    root=root,
+                    eval_id="no-private-env",
+                    kind="training",
+                    count=1,
+                    cap=1,
+                    price_fn=lambda r: 0.01,
+                ):
+                    pytest.fail("Unrecovered private spend must block admission")
+            assert missing.value.exit_code == 2
+    assert str(checkpoint) not in "\n".join(
+        path.read_text() for path in (root / ".gepa").rglob("*") if path.is_file()
+    )
     # Admission must include private spend, including after a killed process.
     with pytest.raises(typer.Exit) as refused:
         with evaluation_spend(
@@ -332,7 +365,7 @@ def _pollable_validation(root, run_id, checkpoint, connection):
 
 @pytest.mark.parametrize("capped", [False, True])
 def test_live_validation_status_withholds_each_case_until_eval_finishes(
-    repo: Path, capped: bool
+    repo: Path, capped: bool, monkeypatch
 ):
     _price(repo)
     started = (
@@ -345,9 +378,10 @@ def test_live_validation_status_withholds_each_case_until_eval_finishes(
     before = _run_payload(_run("run", "status", "--run-id", run_id).output)["spend"]
     context = multiprocessing.get_context("fork")
     parent, child = context.Pipe()
+    checkpoint = _checkpoint(repo, run_id, monkeypatch)
     process = context.Process(
         target=_pollable_validation,
-        args=(repo, run_id, repo.parent / f"{repo.name}-poll.jsonl", child),
+        args=(repo, run_id, checkpoint, child),
     )
     process.start()
     try:
@@ -391,11 +425,14 @@ def test_live_validation_status_withholds_each_case_until_eval_finishes(
 
 @pytest.mark.parametrize("previous_aggregate", [False, True])
 def test_missing_private_checkpoint_warns_and_refuses_admission(
-    tmp_path: Path, previous_aggregate: bool, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    previous_aggregate: bool,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch,
 ):
     root = tmp_path / "workspace"
     root.mkdir()
-    checkpoint = tmp_path / "private" / "spend.jsonl"
+    checkpoint = _checkpoint(root, "private", monkeypatch)
     if previous_aggregate:
         with evaluation_spend(
             run_id="private",
@@ -451,10 +488,12 @@ def test_missing_private_checkpoint_warns_and_refuses_admission(
     )
 
 
-def test_published_validation_totals_survive_private_file_cleanup(tmp_path: Path):
+def test_published_validation_totals_survive_private_file_cleanup(
+    tmp_path: Path, monkeypatch
+):
     root = tmp_path / "workspace"
     root.mkdir()
-    checkpoint = tmp_path / "private" / "spend.jsonl"
+    checkpoint = _checkpoint(root, "private", monkeypatch)
     _private_validation(root, checkpoint)
     checkpoint.rename(checkpoint.with_suffix(".removed"))
     report = spend_report("private", root)
@@ -845,7 +884,10 @@ def test_callable_without_hook_fails_closed_only_with_cap(git_repo: Path):
 
 def test_expensive_validation_uses_own_projection_and_stays_within_one_rollout(
     tmp_path: Path,
+    monkeypatch,
 ):
+    checkpoint = _checkpoint(tmp_path, "probe", monkeypatch)
+
     async def evaluate(case):
         return (await _metered_agent()).output
 
@@ -858,9 +900,7 @@ def test_expensive_validation_uses_own_projection_and_stays_within_one_rollout(
             count=count,
             cap=0.60,
             price_fn=lambda response: price,
-            validation_spend_path=tmp_path.parent / f"{tmp_path.name}-validation.jsonl"
-            if kind == "validation"
-            else None,
+            validation_spend_path=checkpoint if kind == "validation" else None,
         ):
             return asyncio.run(
                 evaluate_callable_dataset(
@@ -881,12 +921,11 @@ def test_expensive_validation_uses_own_projection_and_stays_within_one_rollout(
     assert report["by_model"]["student"]["requests"] == 7
 
 
-def test_select_validation_refuses_projected_batch_and_preserves_incumbent(repo: Path):
+def test_select_validation_refuses_projected_batch_and_preserves_incumbent(
+    repo: Path, monkeypatch
+):
     _price(repo)
-    cfg = config_path(repo)
-    cfg.write_text(
-        f'validation_dataset = "{repo.parent / "validation.jsonl"}"\n' + cfg.read_text()
-    )
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(repo.parent / "validation.jsonl"))
     (repo.parent / "validation.jsonl").write_text(
         "\n".join(
             json.dumps(
@@ -900,6 +939,7 @@ def test_select_validation_refuses_projected_batch_and_preserves_incumbent(repo:
     assert started.exit_code == 0, started.output
     run_id = _run_payload(started.output)["run_id"]
     state = RunState.from_dict(json.loads(run_state_path(run_id).read_text()))
+    state = state.restore_validation_evidence(repo)
     state, outcome = _evaluate_validation_candidate(state, workspace_root=repo)
     assert outcome.summary["spend"]["validation_dollars"] == pytest.approx(0.08)
     with pytest.raises(typer.Exit):
@@ -1018,7 +1058,7 @@ def test_reflector_replay_does_not_recharge_paid_eval(repo: Path, monkeypatch):
     assert spend_report(run_id)["total_dollars"] == pytest.approx(0.14)
 
 
-def test_select_command_refuses_validation_over_cap(lane_repo: Path):
+def test_select_command_refuses_validation_over_cap(lane_repo: Path, monkeypatch):
     module = lane_repo / "task_pkg/evaluation.py"
     module.write_text(
         module.read_text()
@@ -1042,11 +1082,9 @@ async def evaluate(case):
         json.dumps({"name": "secret-holdout", "inputs": "x", "expected_output": "v"})
         + "\n"
     )
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(validation))
     config = config_path(lane_repo)
-    config.write_text(
-        f'price_fn = "task_pkg.pricing:price"\nvalidation_dataset = "{validation}"\n'
-        + config.read_text()
-    )
+    config.write_text('price_fn = "task_pkg.pricing:price"\n' + config.read_text())
     test_select_cli._git(lane_repo, "add", ".")
     test_select_cli._git(lane_repo, "commit", "-m", "Meter fake student")
     payload = test_select_cli._start_lane_run(lane_repo, 1, "--max-token-cost", "0.45")

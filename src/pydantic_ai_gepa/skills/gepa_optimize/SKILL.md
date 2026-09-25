@@ -63,7 +63,6 @@ test, provider, credential, or worker failures.
 gepa init \
   --agent mypkg.agents:my_agent \
   --metric mypkg.metrics:my_metric \
-  --validation-dataset /srv/gepa-heldout/my-project/validation.jsonl \
   --install-skill
 ```
 
@@ -76,29 +75,133 @@ What each flag does:
 - `--evaluate MODULE:ATTR` — git-mode alternative to `--agent`; points at a
   plain task callable.
 - `--metric MODULE:ATTR` — optional. An async (or sync) callable `(case, output) -> MetricResult | float`. Omit it to use the default substring/equality scorer, which is only useful for trivial expected-output strings.
-- `--validation-dataset PATH` — optional held-out selection set, provisioned by
-  the harness outside the repository. Use an absolute path such as the example
-  above, replacing it with the harness's actual location. Never inspect its
-  cases while acting as the reflector.
 - `--install-skill` — drops this SKILL.md into `<repo>/.agents/skills/gepa-optimize/` so coding agents auto-discover it. Pass it the first time.
 
 Write reflection-training cases at `.gepa/dataset.jsonl`, one JSON object per
 line. The harness provisions held-out selection cases in the same format at
-the external `validation_dataset` path:
+the harness-only `GEPA_HELDOUT_DATASET` path:
 
 ```json
 {"name": "case-1", "inputs": "...", "expected_output": "...", "metadata": {}}
 ```
 
-Keep validation data outside the primary checkout and every candidate worktree
-in both component and git modes. Never commit it to the candidate repository.
-Managed runs refuse a validation path inside a checkout or tracked by that
-repository, including paths that resolve there through symlinks. `start`,
-`continue`, and lane selection recheck the boundary and pinned dataset identity.
-Move an existing dataset outside the repository and update `validation_dataset`
-in `.gepa/gepa.toml` before starting a new run. If Git already contains the
-dataset, use a fresh candidate repository without those objects; deleting or
-moving the file does not remove access through history.
+For held-out runs, the **harness process started by the orchestrator** holds
+`GEPA_HELDOUT_DATASET` (an absolute path). Never give that variable, its value,
+or the held-out directory to the reflector or any process it launches.
+Scoring commands (`run start`, `harness serve`, `run select`, and `eval`) remove
+the variable from `os.environ` before importing or running candidate code and
+keep the path in controller memory during the command.
+`gepa.toml` must contain only the training `dataset`; the old
+`validation_dataset` setting and `init --validation-dataset` are refused with
+exit 2. Held-out entries in the repository's `.env` are also refused. Legacy
+state carrying a validation path is refused; start a new run in a clean workspace.
+
+```bash
+# Orchestrator / harness shell only:
+gepa init --agent mypkg.agents:my_agent
+export GEPA_HELDOUT_DATASET=/srv/gepa-heldout/my-project/validation.jsonl
+gepa run start --heldout-required --max-iterations 50
+gepa harness serve --run-id RUN_ID
+
+# Separate reflector shell, launched without the private environment:
+gepa run continue --run-id RUN_ID --reflector-epoch 1
+```
+
+`continue` atomically nominates the candidate and waits for a harness result.
+It never evaluates a held-out run, even if the variable was accidentally set
+in its environment. The harness takes the run lock, checks the epoch and clean
+candidate identity, evaluates the training gate, then confirms training winners
+on validation. It rechecks the tree before saving state and after scoring.
+Held-out runs require a **committed, clean candidate in both git and component
+mode**: commit component-file edits too. A dirty-tree refusal asks you to commit
+before nominating. Keep the nominated tree unchanged until the result arrives.
+This version checks the existing checkout before and after scoring.
+
+The reflector receives the usual training reports, trace paths, aggregate
+validation verdict and exit code. `--wait-secs` defaults to 300; `0` enqueues
+and returns immediately. Nomination waits up to five seconds for a busy run
+lock; either a lock timeout or a result timeout exits **75**. Run the same command
+again to reattach without duplicating the nomination. A different pending candidate or
+gate selection is refused. `harness serve --once` processes one current
+nomination (and retires old epochs), then returns. Interrupted scoring resumes
+from the existing paid evaluation ledger. Normal `run resume` still issues a
+new epoch and packet without reading validation.
+
+Results contain explicit controller messages only; candidate/evaluator stdout,
+stderr, and logging streams are never relayed to the reflector. Unexpected
+scoring exceptions produce a retryable exit **1** result naming only the exception
+type and the training/held-out phase. The harness keeps serving. Unpaid or
+changed-candidate continuations are retired while paid evaluations remain charged,
+so a fixed commit can be nominated without operator cleanup. After a run finishes,
+`continue` returns its public final status; any undelivered terminal result keeps
+its original output and exit code. Lane runs immediately direct callers to
+`lane continue` and `run select` without queuing a nomination.
+
+Harness commands are held-out `run start`, `harness serve`, lane `run select`,
+`eval --dataset-role validation`, and held-out `run resume --abandon-continuation`
+when private recovery evidence must be retired. They fail closed without the
+harness environment. Reflector commands are `run continue`, `run status`, normal
+`run resume`, and reading `reflector_packet.json`. `lane continue` evaluates only
+training; the orchestrator's `run select` performs held-out selection. Runs
+started without the variable or `--heldout-required` retain in-process,
+training-only continuation.
+
+The harness stores the dataset path and digest in a private `.gepa-heldout/`
+record beside the dataset. Paired per-case evidence stays in the neighboring
+`.gepa-validation-evidence/`, with detailed spend checkpoints in
+`.gepa-validation-spend/`; all must remain inaccessible to the reflector.
+Public state records `heldout_required` and aggregates only. Dataset identity
+changes, paths inside any checkout or `GEPA_DIR`, and data recoverable
+from Git objects are refused. If Git ever held the data, use a fresh repository
+without those objects. Validation produces no public reports or traces.
+
+The reflector's sandbox must restrict data reads to its worktree and
+`GEPA_DIR`, plus the runtime paths needed to execute commands. **Keep the entire
+held-out directory outside every path the sandbox can read**, including
+system temporary directories: Codex's `:minimal` grant includes `/tmp`,
+`/private/tmp`, and system temporary locations such as `/var/folders` and
+`$TMPDIR`. Putting validation outside the worktree and `GEPA_DIR` alone does
+not establish isolation. A home-directory sibling such as
+`/Users/operator/.gepa-heldout/run-1/` works when no readable grant covers it.
+
+This named profile was verified locally with Codex CLI 0.157.0. Write it to the
+launcher's `CODEX_HOME/config.toml` (a scratch `CODEX_HOME` works for probes):
+
+```toml
+[permissions.gepa-reflector.filesystem]
+":minimal" = "read"
+"/absolute/candidate-worktree" = "write"
+"/absolute/training-gepa-dir" = "write"
+
+[permissions.gepa-reflector.network]
+enabled = false
+```
+
+Use `codex sandbox -P gepa-reflector -C /absolute/candidate-worktree -- COMMAND`
+with that `CODEX_HOME`. Define the profile in the config file rather than `-c`
+overrides: dotted path keys (for example `~/.gepa/...`) can be split on their
+dots by override processing. Provision Python and its dependencies under the
+worktree's interpreter directory, or grant narrowly scoped runtime reads.
+Do not inherit `:workspace`/`:read-only` or grant `"/"` reads. See the
+[Codex permissions reference](https://learn.chatgpt.com/docs/config-file/config-reference).
+
+The no-model probe verified that sandboxed environment/config/state/packet
+output contained no held-out path, a direct read of the home-directory held-out
+file failed with `Operation not permitted`, sandboxed `continue` enqueued,
+the external harness scored, and sandboxed `continue` returned the accepted
+verdict. Repeat this read-denial and scoring probe for the actual deployment's
+paths and grants; system-temp placement does not protect held-out data.
+
+Candidate code executed by the harness still runs with scorer privileges and
+can read files the harness can read. **In git mode, a reflector-written candidate
+is not isolated from the held-out file.** Removing the environment variable is
+partial hardening, not a filesystem boundary for that code. A separate held-out
+scoring subprocess with its own sandbox is a follow-up.
+
+Process isolation is the barrier, not secrecy of the path: `ps` can expose
+another process's arguments and environment. Run files are shared coordination
+state, not authenticated messages; protection against a reflector forging
+state/results in `GEPA_DIR` requires an additional ownership or IPC boundary.
 
 In component mode, `gepa init` introspects the agent, writes
 `.gepa/gepa.toml`, and pre-seeds `.gepa/components/<slot>.md` from each slot's
@@ -120,7 +223,6 @@ gepa init \
   --candidate-source git \
   --evaluate mypkg.eval:evaluate \
   --metric mypkg.eval:metric \
-  --validation-dataset /srv/gepa-heldout/my-project/validation.jsonl \
   --install-skill
 ```
 
@@ -130,7 +232,6 @@ This writes the following top-level configuration:
 candidate_source = "git"
 evaluate = "mypkg.eval:evaluate"
 dataset = ".gepa/dataset.jsonl"
-validation_dataset = "/srv/gepa-heldout/my-project/validation.jsonl"
 metric = "mypkg.eval:metric"
 ```
 
@@ -262,11 +363,11 @@ reflection-training minibatches until at least one case falls below
 - `state_path`
 - `next_command`
 
-`gepa run continue` evaluates your edited baseline against the same saved
-training minibatch. With repeated acceptance enabled, it compares rollout-level mean
+`gepa run continue` nominates your edited baseline. The orchestrator's harness
+evaluates it against the same saved training minibatch. With repeated acceptance enabled, it compares rollout-level mean
 samples and reports the observed variance, confidence interval, practical
 minimum delta, and `accepted`, `rejected`, `equivalent`, or `inconclusive`
-training verdict. A training-accepted proposal is then evaluated once on the
+training verdict. The harness then evaluates a training-accepted proposal on the
 complete held-out validation dataset, and only a validation improvement
 advances the baseline. Repetitions remain full
 end-to-end evaluations; they do not freeze intermediate pipeline output or

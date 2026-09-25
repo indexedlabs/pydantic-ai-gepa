@@ -18,6 +18,14 @@ from pydantic_ai_gepa.evaluation import EvaluationRecord
 from pydantic_ai_gepa.types import RolloutOutput
 
 
+@pytest.fixture(autouse=True)
+def synthetic_pin(monkeypatch):
+    monkeypatch.setattr(
+        run, "check_heldout_pin", lambda *args: ("validation.jsonl", "digest")
+    )
+    monkeypatch.setattr(run, "validation_dataset_path", lambda *args, **kwargs: None)
+
+
 def _state(**changes: Any) -> run.RunState:
     return replace(
         run.RunState(
@@ -119,26 +127,42 @@ def test_old_state_defaults_to_no_paired_mode_or_incumbent_evidence() -> None:
     assert restored.best_validation_per_case_scores == {}
 
 
-def test_paired_validation_evidence_roundtrips_with_case_ids(tmp_path: Path) -> None:
+def test_paired_validation_evidence_roundtrips_with_case_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     state = run._mark_best_validation_samples(
         _state(acceptance_paired_min_cases=2), [_outcome([0.3, 0.5])]
     )
     from pydantic_ai_gepa.cli.select import _save_state
     from pydantic_ai_gepa.cli.lanes import _load_run_state
-    from pydantic_ai_gepa.cli.validation import validation_evidence_path
+    from pydantic_ai_gepa.cli.validation import (
+        validation_evidence_path,
+        pin_heldout,
+        heldout_identity,
+        check_heldout_pin,
+    )
+
+    monkeypatch.setattr(run, "check_heldout_pin", check_heldout_pin)
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     dataset = tmp_path / "held-out.jsonl"
     dataset.write_text('{"name": "private-case"}\n')
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(dataset))
+    pin_heldout(workspace, state.run_id)
     state = replace(
-        state, validation_dataset_path=str(dataset), validation_dataset_digest="digest"
+        state,
+        heldout_required=True,
+        validation_dataset_path=str(dataset),
+        validation_dataset_digest=heldout_identity(workspace)[1],
     )
     _save_state(state, workspace)
     public = json.loads(run.run_state_path(state.run_id, workspace).read_text())
     assert "best_validation_per_case_scores" not in public
     assert "case-0" not in json.dumps(public)
-    restored = _load_run_state(workspace, state.run_id)
+    restored = _load_run_state(workspace, state.run_id).restore_validation_evidence(
+        workspace
+    )
     assert restored.best_validation_samples == (0.4,)
     assert restored.best_validation_per_case_scores == {"case-0": 0.3, "case-1": 0.5}
     assert restored.acceptance_paired_min_cases == 2
@@ -148,7 +172,10 @@ def test_paired_validation_evidence_roundtrips_with_case_ids(tmp_path: Path) -> 
     )
     newer.save(workspace)
     assert (
-        _load_run_state(workspace, state.run_id).best_validation_per_case_scores == {}
+        _load_run_state(workspace, state.run_id)
+        .restore_validation_evidence(workspace)
+        .best_validation_per_case_scores
+        == {}
     )
     evidence = validation_evidence_path(
         str(dataset), project_root=workspace, run_id=state.run_id
@@ -165,7 +192,6 @@ def test_paired_validation_evidence_roundtrips_with_case_ids(tmp_path: Path) -> 
 def test_reflection_baseline_discards_failure_selected_sample(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(run, "_held_out_validation_enabled", lambda: False)
     calls: list[dict[str, Any]] = []
 
     def evaluate(**kwargs: Any) -> EvalOutcome:
@@ -176,7 +202,7 @@ def test_reflection_baseline_discards_failure_selected_sample(
     selected = _outcome([0.0], iteration=1)
     # One selected sample + 3 fresh baselines + 3 candidate repetitions.
     state, outcomes = run._capture_reflection_baseline(
-        _state(iterations=1, max_iterations=7), selected
+        _state(heldout_required=False, iterations=1, max_iterations=7), selected
     )
     assert len(calls) == len(outcomes) == 3
     assert selected not in outcomes
@@ -193,7 +219,6 @@ def test_reflection_baseline_budget_reserves_fresh_samples_and_validation(
     monkeypatch: pytest.MonkeyPatch,
     validation: bool,
 ) -> None:
-    monkeypatch.setattr(run, "_held_out_validation_enabled", lambda: validation)
     monkeypatch.setattr(run, "_validation_schedule", lambda *args: (3, 5))
 
     def no_evaluation(**kwargs: Any) -> EvalOutcome:
@@ -201,7 +226,11 @@ def test_reflection_baseline_budget_reserves_fresh_samples_and_validation(
 
     monkeypatch.setattr(run, "run_eval_once", no_evaluation)
     state, outcomes = run._capture_reflection_baseline(
-        _state(iterations=1, max_iterations=9 if validation else 6),
+        _state(
+            heldout_required=validation,
+            iterations=1,
+            max_iterations=9 if validation else 6,
+        ),
         _outcome([0.0], iteration=1),
     )
     assert not outcomes
@@ -215,7 +244,6 @@ def test_reflection_baseline_infrastructure_failure_is_not_evidence(
     monkeypatch: pytest.MonkeyPatch,
     selected_failure: bool,
 ) -> None:
-    monkeypatch.setattr(run, "_held_out_validation_enabled", lambda: False)
     calls: list[int] = []
 
     def evaluate(**kwargs: Any) -> EvalOutcome:
@@ -224,7 +252,8 @@ def test_reflection_baseline_infrastructure_failure_is_not_evidence(
 
     monkeypatch.setattr(run, "run_eval_once", evaluate)
     state, _ = run._capture_reflection_baseline(
-        _state(iterations=1), _outcome([0.0], failed=selected_failure)
+        _state(heldout_required=False, iterations=1),
+        _outcome([0.0], failed=selected_failure),
     )
     assert len(calls) == (0 if selected_failure else 1)
     assert state.status == "paused_after_infrastructure_error"
@@ -245,7 +274,6 @@ def test_seed_collects_repeated_incumbent_validation_evidence(
     monkeypatch: pytest.MonkeyPatch,
     old_run: bool,
 ) -> None:
-    monkeypatch.setattr(run, "_held_out_validation_enabled", lambda: True)
     monkeypatch.setattr(run, "_validation_schedule", lambda *args: (3, 5))
     monkeypatch.setattr(
         run, "_validation_dataset_identity", lambda: ("validation.jsonl", "digest")
@@ -256,6 +284,7 @@ def test_seed_collects_repeated_incumbent_validation_evidence(
     calls = _stub_validation(monkeypatch, [[0.3], [0.5], [0.4]])
     state, outcomes = run._ensure_validation_seed(
         _state(
+            heldout_required=True,
             best_candidate_id="candidate" if old_run else None,
             validation_seeded=old_run,
         )
@@ -270,10 +299,11 @@ def test_seed_collects_repeated_incumbent_validation_evidence(
 def test_seed_budget_cannot_degrade_to_one_sample(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(run, "_held_out_validation_enabled", lambda: True)
     monkeypatch.setattr(run, "_validation_schedule", lambda *args: (3, 5))
     calls = _stub_validation(monkeypatch, [])
-    state, outcomes = run._ensure_validation_seed(_state(max_iterations=2))
+    state, outcomes = run._ensure_validation_seed(
+        _state(heldout_required=True, max_iterations=2)
+    )
     assert not calls and not outcomes
     assert state.best_validation_samples == ()
     assert state.last_comparison["reason_code"] == "validation_budget_exhausted"
@@ -282,7 +312,6 @@ def test_seed_budget_cannot_degrade_to_one_sample(
 def test_validation_seed_failure_does_not_install_training_retry_minibatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(run, "_held_out_validation_enabled", lambda: True)
     monkeypatch.setattr(run, "_validation_schedule", lambda *args: (3, 5))
     monkeypatch.setattr(
         run, "_validation_dataset_identity", lambda: ("validation.jsonl", "digest")
@@ -296,7 +325,7 @@ def test_validation_seed_failure_does_not_install_training_retry_minibatch(
         return replace(state, iterations=state.iterations + 1), outcome
 
     monkeypatch.setattr(run, "_evaluate_validation_candidate", failed_validation)
-    paused, _ = run._ensure_validation_seed(_state())
+    paused, _ = run._ensure_validation_seed(_state(heldout_required=True))
     assert paused.status == "paused_after_infrastructure_error"
     # Validation minibatches are not persisted in the training minibatch store.
     assert paused.infrastructure_retry_minibatch_id is None
@@ -305,7 +334,6 @@ def test_validation_seed_failure_does_not_install_training_retry_minibatch(
 def test_missing_paired_case_evidence_is_recovered_from_incumbent_tree(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(run, "_held_out_validation_enabled", lambda: True)
     monkeypatch.setattr(run, "_validation_schedule", lambda *args: (1, 1))
     monkeypatch.setattr(
         run, "_validation_dataset_identity", lambda: ("validation.jsonl", "digest")
@@ -316,6 +344,7 @@ def test_missing_paired_case_evidence_is_recovered_from_incumbent_tree(
     calls = _stub_validation(monkeypatch, [[0.3, 0.5]])
     state, _ = run._ensure_validation_seed(
         _state(
+            heldout_required=True,
             acceptance_paired_min_cases=2,
             best_candidate_id="candidate",
             best_validation_samples=(0.4,),
@@ -329,12 +358,13 @@ def test_missing_paired_case_evidence_is_recovered_from_incumbent_tree(
 def test_missing_evidence_only_recovered_from_incumbent_tree(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(run, "_held_out_validation_enabled", lambda: True)
     monkeypatch.setattr(
         run, "_current_baseline_candidate_id", lambda *args, **kwargs: "edited"
     )
     calls = _stub_validation(monkeypatch, [])
-    state, outcomes = run._ensure_validation_seed(_state(best_candidate_id="incumbent"))
+    state, outcomes = run._ensure_validation_seed(
+        _state(heldout_required=True, best_candidate_id="incumbent")
+    )
     assert not calls and not outcomes
     assert state.last_comparison["reason_code"] == "incumbent_evidence_missing"
     assert state.best_candidate_id == "incumbent"
@@ -343,20 +373,22 @@ def test_missing_evidence_only_recovered_from_incumbent_tree(
 def test_incumbent_evidence_recovery_preserves_frozen_validation_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(run, "_held_out_validation_enabled", lambda: True)
     monkeypatch.setattr(run, "_validation_schedule", lambda *args: (3, 5))
     monkeypatch.setattr(
         run, "_current_baseline_candidate_id", lambda *args, **kwargs: "incumbent"
     )
     monkeypatch.setattr(
         run,
-        "_validation_dataset_identity",
-        lambda *args: ("validation.jsonl", "changed"),
+        "check_heldout_pin",
+        lambda *args: (_ for _ in ()).throw(
+            typer.BadParameter("Held-out validation dataset changed after run start.")
+        ),
     )
     calls = _stub_validation(monkeypatch, [[0.4], [0.4], [0.4]])
     with pytest.raises(typer.BadParameter, match="validation dataset changed"):
         run._ensure_validation_seed(
             _state(
+                heldout_required=True,
                 best_candidate_id="incumbent",
                 validation_seeded=True,
                 validation_dataset_path="validation.jsonl",
@@ -405,7 +437,6 @@ def test_failed_validation_rollout_pauses_without_scoring(
     monkeypatch: pytest.MonkeyPatch, seed: bool
 ) -> None:
     monkeypatch.setattr(run, "_validation_schedule", lambda *args: (3, 5))
-    monkeypatch.setattr(run, "_held_out_validation_enabled", lambda: True)
     monkeypatch.setattr(
         run, "_validation_dataset_identity", lambda: ("validation.jsonl", "digest")
     )
@@ -416,10 +447,10 @@ def test_failed_validation_rollout_pauses_without_scoring(
 
     monkeypatch.setattr(run, "compare_candidate_samples", no_comparison)
     if seed:
-        state, _ = run._ensure_validation_seed(_state())
+        state, _ = run._ensure_validation_seed(_state(heldout_required=True))
     else:
         state, _, _ = run._confirm_validation_candidate(
-            _state(best_validation_samples=(0.4, 0.4, 0.4))
+            _state(heldout_required=True, best_validation_samples=(0.4, 0.4, 0.4))
         )
     assert len(calls) == 2
     assert state.status == "paused_after_infrastructure_error"
@@ -467,7 +498,6 @@ def test_seeded_managed_confirmation_noise_and_power(
 def test_non_selectable_seed_remains_incumbent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(run, "_held_out_validation_enabled", lambda: True)
     monkeypatch.setattr(run, "_validation_schedule", lambda *args: (3, 5))
     monkeypatch.setattr(
         run, "_validation_dataset_identity", lambda: ("validation.jsonl", "digest")
@@ -485,7 +515,7 @@ def test_non_selectable_seed_remains_incumbent(
         ), outcome
 
     monkeypatch.setattr(run, "_evaluate_validation_candidate", evaluate)
-    state, outcomes = run._ensure_validation_seed(_state())
+    state, outcomes = run._ensure_validation_seed(_state(heldout_required=True))
     assert len(calls) == len(outcomes) == 3
     assert state.status == "running"
     assert state.validation_seeded

@@ -43,7 +43,7 @@ AGENT_MODULE_SOURCE = textwrap.dedent("""
 
 
 def test_validation_role_requires_explicit_validation_dataset(repo: Path) -> None:
-    with pytest.raises(typer.BadParameter, match="requires validation_dataset"):
+    with pytest.raises(typer.BadParameter, match="requires GEPA_HELDOUT_DATASET"):
         run_eval_once(
             candidate_file=None,
             minibatch_id=None,
@@ -536,7 +536,9 @@ def test_eval_lane_budget_cap_is_advisory(repo: Path, tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("alias", ["path", "symlink", "hardlink", "copy"])
-def test_eval_refuses_validation_as_training(repo: Path, alias: str) -> None:
+def test_eval_refuses_validation_as_training(
+    repo: Path, alias: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     validation_path = repo.parent / "validation.jsonl"
     validation_path.write_text(
         json.dumps({"name": "withheld-eval-case", "inputs": "private"}) + "\n"
@@ -553,8 +555,8 @@ def test_eval_refuses_validation_as_training(repo: Path, alias: str) -> None:
     config = repo / ".gepa" / "gepa.toml"
     config.write_text(
         config.read_text().replace(".gepa/dataset.jsonl", str(training_path))
-        + f'validation_dataset = "{validation_path}"\n'
     )
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(validation_path))
 
     result = _run("eval", "--capture-traces", "--output-file", "-")
 
@@ -564,7 +566,9 @@ def test_eval_refuses_validation_as_training(repo: Path, alias: str) -> None:
     assert not list((repo / ".gepa" / "runs").glob("*/reports/*.md"))
 
 
-def test_validation_eval_never_emits_per_case_output(repo: Path) -> None:
+def test_validation_eval_never_emits_per_case_output(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from pydantic_ai_gepa.cli.eval import _format_output_lines
 
     validation_path = repo.parent / "validation.jsonl"
@@ -578,10 +582,7 @@ def test_validation_eval_never_emits_per_case_output(repo: Path) -> None:
         )
         + "\n"
     )
-    config = repo / ".gepa" / "gepa.toml"
-    config.write_text(
-        config.read_text() + f'validation_dataset = "{validation_path}"\n'
-    )
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(validation_path))
     outcome = run_eval_once(
         candidate_file=_candidate_file(
             repo, {"instructions": "You are a geography expert."}

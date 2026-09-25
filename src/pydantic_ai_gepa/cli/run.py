@@ -1,15 +1,14 @@
 """`gepa run` — managed external-reflection optimization loop.
 
 This command group keeps the coding agent in the reflector role while the CLI
-owns loop state. `start` evaluates training minibatches until reflection is
-useful; `continue` first compares the edited candidate on that same training
-minibatch, then uses held-out validation to decide whether to adopt it.
+owns loop state. Held-out runs nominate through `continue`; the orchestrator's
+harness evaluates the training gate and held-out confirmation. Training-only
+runs keep their synchronous continuation.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -54,7 +53,16 @@ from .reflector_recovery import (
 )
 from .runs import MinibatchStore, ParetoLog, utc_now_iso
 from .store import ComponentStore
-from .validation import validation_dataset_path
+from .validation import (
+    public_echo,
+    harness_environment,
+    heldout_dataset,
+    private_evaluation,
+    heldout_identity,
+    check_heldout_pin,
+    pin_heldout,
+    validation_dataset_path,
+)
 
 
 app = typer.Typer(
@@ -112,8 +120,10 @@ class RunState:
     best_candidate_id: str | None = None
     best_commit_sha: str | None = None
     best_mean_score: float | None = None
+    heldout_required: bool = False
     validation_seeded: bool = False
     validation_evaluations: int = 0
+    # Harness-only memory; never serialized or restored by public state reads.
     validation_dataset_path: str | None = None
     validation_dataset_digest: str | None = None
     # Vector runs preserve their initial scored identity for generic periodic
@@ -205,8 +215,7 @@ class RunState:
             "best_mean_score": self.best_mean_score,
             "validation_seeded": self.validation_seeded,
             "validation_evaluations": self.validation_evaluations,
-            "validation_dataset_path": self.validation_dataset_path,
-            "validation_dataset_digest": self.validation_dataset_digest,
+            "heldout_required": self.heldout_required,
             "run_start_baseline": self.run_start_baseline,
             "accepted_promotion_count": self.accepted_promotion_count,
             "lanes": self.lanes,
@@ -226,6 +235,18 @@ class RunState:
 
     @staticmethod
     def from_dict(data: dict[str, Any]) -> RunState:
+        if any(
+            data.get(key) is not None
+            for key in (
+                "validation_dataset_path",
+                "validation_dataset_digest",
+                "best_validation_per_case_scores",
+            )
+        ):
+            raise typer.BadParameter(
+                "Legacy held-out state is unsafe for reflection; start a new run from a clean "
+                "workspace with GEPA_HELDOUT_DATASET in the harness's environment."
+            )
         return RunState(
             reflector=dict(data.get("reflector") or default_reflector()),
             last_reflector_comparison=data.get("last_reflector_comparison"),
@@ -339,8 +360,7 @@ class RunState:
             ),
             validation_seeded=bool(data.get("validation_seeded", False)),
             validation_evaluations=int(data.get("validation_evaluations", 0)),
-            validation_dataset_path=data.get("validation_dataset_path"),
-            validation_dataset_digest=data.get("validation_dataset_digest"),
+            heldout_required=bool(data.get("heldout_required", False)),
             run_start_baseline=(
                 dict(data["run_start_baseline"])
                 if isinstance(data.get("run_start_baseline"), dict)
@@ -384,6 +404,12 @@ class RunState:
     def restore_validation_evidence(self, root: Path | None = None) -> RunState:
         from .validation import read_validation_evidence
 
+        if not self.heldout_required:
+            return self
+        path, digest = check_heldout_pin(root or repo_root(), self.run_id)
+        self = replace(
+            self, validation_dataset_path=path, validation_dataset_digest=digest
+        )
         if self.acceptance_paired_min_cases is None:
             return replace(self, best_validation_per_case_scores={})
         scores = read_validation_evidence(
@@ -403,7 +429,9 @@ class RunState:
 
     def save(self, root: Path | None = None) -> Path:
         from .validation import write_validation_evidence
+        from .harness import check_scoring_tree
 
+        check_scoring_tree()
         if self.best_validation_per_case_scores and self.validation_dataset_path:
             write_validation_evidence(
                 self.validation_dataset_path,
@@ -435,7 +463,7 @@ class RunState:
             try:
                 write_packet(self.run_id, root)
             except Exception as exc:
-                typer.echo(
+                public_echo(
                     f"Warning: state saved but reflector packet could not be refreshed "
                     f"({type(exc).__name__}). Regenerate it with `gepa run resume --run-id {self.run_id}`.",
                     err=True,
@@ -446,20 +474,20 @@ class RunState:
 def _load_state(run_id: str | None) -> RunState:
     active_run_id = run_id or _latest_managed_run_id()
     if active_run_id is None:
-        typer.echo("No run found. Start one with `gepa run start`.", err=True)
+        public_echo("No run found. Start one with `gepa run start`.", err=True)
         raise typer.Exit(code=1)
     path = run_state_path(active_run_id)
     if not path.exists():
-        typer.echo(
+        public_echo(
             f"No managed run state at {path}. Start one with `gepa run start`.",
             err=True,
         )
         raise typer.Exit(code=1)
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
-        typer.echo(f"Run state at {path} is not a JSON object.", err=True)
+        public_echo(f"Run state at {path} is not a JSON object.", err=True)
         raise typer.Exit(code=1)
-    return RunState.from_dict(raw).restore_validation_evidence()
+    return RunState.from_dict(raw)
 
 
 def _latest_managed_run_id() -> str | None:
@@ -690,24 +718,11 @@ def _mark_best_candidate(
 
 
 def _held_out_validation_enabled(root: Path | None = None) -> bool:
-    return GepaConfig.load(config_path(root)).validation_dataset is not None
+    return heldout_dataset(required=False) is not None
 
 
 def _validation_dataset_identity(root: Path | None = None) -> tuple[str, str]:
-    project_root = (root or repo_root()).resolve()
-    cfg = GepaConfig.load(config_path(project_root))
-    if cfg.validation_dataset is None:
-        raise typer.BadParameter(
-            "Held-out validation requires validation_dataset in gepa.toml."
-        )
-    path = validation_dataset_path(cfg.validation_dataset, project_root=project_root)
-    try:
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    except OSError as exc:
-        raise typer.BadParameter(
-            f"Could not read held-out validation dataset at {path}: {exc}"
-        ) from exc
-    return cfg.validation_dataset, digest
+    return heldout_identity((root or repo_root()).resolve())
 
 
 def _assert_validation_dataset_unchanged(
@@ -716,35 +731,14 @@ def _assert_validation_dataset_unchanged(
     workspace_root: Path | None = None,
     candidate_root: Path | None = None,
 ) -> None:
-    """Fail closed if config or candidate edits changed the pinned validation set."""
-
     primary_root = (workspace_root or repo_root()).resolve()
-    configured_path, digest = _validation_dataset_identity(primary_root)
-    if (
-        state.validation_dataset_path != configured_path
-        or state.validation_dataset_digest != digest
-    ):
-        raise typer.BadParameter(
-            "Held-out validation dataset changed after run start; restore the "
-            "pinned gepa.toml and validation data before continuing."
-        )
-    if candidate_root is None or candidate_root.resolve() == primary_root:
-        return
-
-    primary_config = config_path(primary_root).resolve()
-    try:
-        config_relative = primary_config.relative_to(primary_root)
-    except ValueError:
-        config_relative = None
-    if config_relative is not None:
-        candidate_config = candidate_root / config_relative
-        if candidate_config.is_file():
-            candidate_cfg = GepaConfig.load(candidate_config)
-            if candidate_cfg.validation_dataset != configured_path:
-                raise typer.BadParameter(
-                    "Candidate changed validation_dataset in gepa.toml; held-out "
-                    "selection configuration is immutable during a run."
-                )
+    configured_path, _ = check_heldout_pin(primary_root, state.run_id)
+    if candidate_root is not None:
+        primary_config = config_path(primary_root).resolve()
+        if primary_config.is_relative_to(primary_root):
+            candidate_config = candidate_root / primary_config.relative_to(primary_root)
+            if candidate_config.is_file():
+                GepaConfig.load(candidate_config)
     validation_dataset_path(
         configured_path, project_root=primary_root, candidate_root=candidate_root
     )
@@ -766,7 +760,7 @@ def _evaluate_validation_candidate(
         workspace_root=workspace_root,
         candidate_root=candidate_root,
     )
-    outcome = durable_eval(
+    outcome = private_evaluation(durable_eval)(
         run_eval_once,
         spend_state=state,
         candidate_file=None,
@@ -824,9 +818,14 @@ def _validation_schedule(state: RunState, root: Path | None = None) -> tuple[int
     from .dataset import load_dataset
 
     root = root or repo_root()
-    cfg = GepaConfig.load(config_path(root))
-    assert cfg.validation_dataset is not None
-    return _acceptance_schedule(state, len(load_dataset(root / cfg.validation_dataset)))
+    path, _ = check_heldout_pin(root, state.run_id)
+    try:
+        cases = load_dataset(Path(path))
+    except (OSError, ValueError, TypeError):
+        raise typer.BadParameter(
+            "Could not load held-out validation dataset."
+        ) from None
+    return _acceptance_schedule(state, len(cases))
 
 
 def _case_scores(outcome: EvalOutcome) -> dict[str, float]:
@@ -922,8 +921,9 @@ def _confirm_validation_candidate(
 
 def _ensure_validation_seed(state: RunState) -> tuple[RunState, list[EvalOutcome]]:
     """Collect incumbent evidence while its tree is still available."""
-    if not _held_out_validation_enabled():
+    if not state.heldout_required:
         return state, []
+    _assert_validation_dataset_unchanged(state)
     initial = None
     if state.best_validation_samples:
         initial, _ = _validation_schedule(state)
@@ -948,11 +948,6 @@ def _ensure_validation_seed(state: RunState) -> tuple[RunState, list[EvalOutcome
             status="done",
             last_comparison=_inconclusive_comparison("validation_budget_exhausted"),
         ), []
-    if (
-        state.validation_dataset_path is not None
-        or state.validation_dataset_digest is not None
-    ):
-        _assert_validation_dataset_unchanged(state)
     validation_path, validation_digest = _validation_dataset_identity()
     state = _with_timestamp(
         state,
@@ -1061,9 +1056,7 @@ def _capture_reflection_baseline(
 
     remaining_iterations = state.max_iterations - state.iterations
     initial, maximum = _acceptance_schedule(state, len(first_outcome.records))
-    validation_reserve = (
-        _validation_schedule(state)[0] if _held_out_validation_enabled() else 0
-    )
+    validation_reserve = _validation_schedule(state)[0] if state.heldout_required else 0
     # The failure-selected outcome is already charged and is never evidence.
     affordable_repetitions = (remaining_iterations - validation_reserve) // 2
     if affordable_repetitions < initial:
@@ -1104,7 +1097,7 @@ def _capture_reflection_baseline(
             candidate_source=state.candidate_source,
         )
         if str(outcome.summary["candidate_id"]) != expected_candidate_id:
-            typer.echo(
+            public_echo(
                 "The baseline candidate changed while collecting repeated "
                 "evaluations; refusing to compare mixed candidates.",
                 err=True,
@@ -1181,13 +1174,13 @@ def _advance_to_reflection_or_done(
             last_comparison=None,
         )
         if (
-            not _held_out_validation_enabled()
+            not state.heldout_required
             and outcome.n_failures == 0
             and state.best_candidate_id is None
         ):
             state = _mark_best_candidate(state, outcome)
         if state.iterations >= state.max_iterations:
-            if state.best_candidate_id is None and not _held_out_validation_enabled():
+            if state.best_candidate_id is None and not state.heldout_required:
                 state = _mark_best_candidate(state, outcome)
             return _mark_done(state), outcomes
 
@@ -1206,18 +1199,16 @@ def _evaluate_reflected_candidate(
     gate_case_ids: Sequence[str] = (),
 ) -> tuple[RunState, list[EvalOutcome], dict[str, Any]]:
     if state.reflection_minibatch_id is None:
-        typer.echo(
+        public_echo(
             "Run is not waiting on a reflection minibatch; use `gepa run status`.",
             err=True,
         )
         raise typer.Exit(code=1)
     if not state.reflection_baseline_samples:
-        typer.echo("Run state is missing reflection baseline samples.", err=True)
+        public_echo("Run state is missing reflection baseline samples.", err=True)
         raise typer.Exit(code=1)
 
-    validation_reserve = (
-        _validation_schedule(state)[0] if _held_out_validation_enabled() else 0
-    )
+    validation_reserve = _validation_schedule(state)[0] if state.heldout_required else 0
     minibatch = MinibatchStore(state.run_id).load(state.reflection_minibatch_id)
     initial, maximum = _acceptance_schedule(state, len(minibatch.case_ids))
     max_candidate_samples = min(
@@ -1267,7 +1258,7 @@ def _evaluate_reflected_candidate(
         if candidate_id is None:
             candidate_id = current_candidate_id
         elif current_candidate_id != candidate_id:
-            typer.echo(
+            public_echo(
                 "The reflected candidate changed while collecting repeated "
                 "evaluations; refusing to compare mixed candidates.",
                 err=True,
@@ -1567,7 +1558,7 @@ def _current_baseline_candidate_id(
         try:
             state = git_candidate_state(exclude_paths=candidate_identity_exempt_paths())
         except GitCandidateError as exc:
-            typer.echo(str(exc), err=True)
+            public_echo(str(exc), err=True)
             raise typer.Exit(code=1) from exc
         return state.candidate_id
 
@@ -1729,84 +1720,84 @@ def _emit_status(
             if state.candidate_source == "git"
             else "components or source"
         )
-        typer.echo(
+        public_echo(
             "Paused for reflection. Inspect the report and trace file, edit "
             f"{editable_surface}, then run:"
         )
-        typer.echo(f"  gepa run continue --run-id {state.run_id}")
-        typer.echo(f"Report: {state.reflection_baseline_report_path}")
-        typer.echo(f"Trace: {state.reflection_baseline_trace_path}")
+        public_echo(f"  gepa run continue --run-id {state.run_id}")
+        public_echo(f"Report: {state.reflection_baseline_report_path}")
+        public_echo(f"Trace: {state.reflection_baseline_trace_path}")
     elif state.status == "paused_after_candidate_eval":
         comparison = state.last_comparison or {}
         verdict = comparison.get("verdict", "rejected")
         if verdict == "inconclusive":
-            typer.echo(
+            public_echo(
                 "Candidate comparison remains inconclusive after the configured "
                 "repetitions. Revise the candidate or restore the baseline, then run:"
             )
         elif verdict == "equivalent":
-            typer.echo(
+            public_echo(
                 "Candidate is equivalent within the configured practical delta. "
                 "Restore the baseline or revise the candidate, then run:"
             )
         else:
             if comparison.get("rejection_reason") == "validation":
-                typer.echo(
+                public_echo(
                     "Candidate improved the training minibatch but did not improve "
                     "held-out validation. Discard or revise the edits, then run:"
                 )
             else:
-                typer.echo(
+                public_echo(
                     "Candidate did not beat the reflection baseline. Recommendation: "
                     "discard or revise the edits, then run:"
                 )
-        typer.echo(f"  gepa run continue --run-id {state.run_id}")
+        public_echo(f"  gepa run continue --run-id {state.run_id}")
         if comparison and "delta" in comparison:
-            typer.echo(
+            public_echo(
                 f"Baseline {comparison['baseline_mean_score']:.6f}; "
                 f"candidate {comparison['candidate_mean_score']:.6f}; "
                 f"delta {comparison['delta']:.6f}."
             )
             if "lower_bound" in comparison and "upper_bound" in comparison:
-                typer.echo(
+                public_echo(
                     f"{comparison['confidence']:.0%} interval "
                     f"[{comparison['lower_bound']:.6f}, "
                     f"{comparison['upper_bound']:.6f}]; "
                     f"verdict {verdict}."
                 )
-            typer.echo(f"Candidate report: {comparison['candidate_report_path']}")
-            typer.echo(f"Candidate trace: {comparison['candidate_trace_path']}")
+            public_echo(f"Candidate report: {comparison['candidate_report_path']}")
+            public_echo(f"Candidate trace: {comparison['candidate_trace_path']}")
             if comparison.get("validation_evaluated"):
-                typer.echo(
+                public_echo(
                     "Held-out validation was used for selection; no validation "
                     "report or trace was exposed to reflection."
                 )
             if comparison.get("discard_command"):
-                typer.echo(
+                public_echo(
                     "To discard the git candidate and restore the reflection "
                     "baseline, run:"
                 )
-                typer.echo(f"  {comparison['discard_command']}")
+                public_echo(f"  {comparison['discard_command']}")
     elif state.status == "paused_after_infrastructure_error":
         comparison = state.last_comparison or {}
-        typer.echo(
+        public_echo(
             "A required evaluation rollout failed outside the quality "
             "comparison. The incumbent was preserved. Recover the service "
             "or configuration, then retry:"
         )
-        typer.echo(f"  gepa run continue --run-id {state.run_id}")
+        public_echo(f"  gepa run continue --run-id {state.run_id}")
         if comparison.get("candidate_report_path"):
-            typer.echo(f"Failure report: {comparison['candidate_report_path']}")
+            public_echo(f"Failure report: {comparison['candidate_report_path']}")
         if comparison.get("candidate_trace_path"):
-            typer.echo(f"Failure trace: {comparison['candidate_trace_path']}")
+            public_echo(f"Failure trace: {comparison['candidate_trace_path']}")
     elif state.status == "done":
-        typer.echo("Run complete.")
+        public_echo("Run complete.")
         if final_report_text:
-            typer.echo(final_report_text.rstrip())
+            public_echo(final_report_text.rstrip())
     else:
-        typer.echo(f"Run status: {state.status}")
+        public_echo(f"Run status: {state.status}")
 
-    typer.echo(
+    public_echo(
         json.dumps(
             {"run": _public_state(state, outcomes=outcomes, final_report=final_report)}
         )
@@ -1815,7 +1806,7 @@ def _emit_status(
 
 def _validate_max_iterations(max_iterations: int) -> None:
     if max_iterations < 1:
-        typer.echo("--max-iterations must be >= 1.", err=True)
+        public_echo("--max-iterations must be >= 1.", err=True)
         raise typer.Exit(code=2)
 
 
@@ -1827,19 +1818,19 @@ def _validate_acceptance_options(
     min_delta: float,
 ) -> None:
     if repetitions < 1:
-        typer.echo("--acceptance-repetitions must be >= 1.", err=True)
+        public_echo("--acceptance-repetitions must be >= 1.", err=True)
         raise typer.Exit(code=2)
     if max_repetitions < repetitions:
-        typer.echo(
+        public_echo(
             "--acceptance-max-repetitions must be >= --acceptance-repetitions.",
             err=True,
         )
         raise typer.Exit(code=2)
     if not 0.0 < confidence < 1.0:
-        typer.echo("--acceptance-confidence must be between 0 and 1.", err=True)
+        public_echo("--acceptance-confidence must be between 0 and 1.", err=True)
         raise typer.Exit(code=2)
     if min_delta < 0.0:
-        typer.echo("--acceptance-min-delta must be >= 0.", err=True)
+        public_echo("--acceptance-min-delta must be >= 0.", err=True)
         raise typer.Exit(code=2)
 
 
@@ -1878,7 +1869,13 @@ def _fan_out_lane_run_if_ready(
 
 
 @app.command("start")
+@harness_environment()
 def start(
+    heldout_required: bool = typer.Option(
+        False,
+        "--heldout-required",
+        help="Require harness-held validation; fail if its environment is missing.",
+    ),
     max_token_cost: float | None = typer.Option(
         None,
         "--max-token-cost",
@@ -1982,7 +1979,7 @@ def start(
     validate_cap(max_token_cost)
     _validate_max_iterations(max_iterations)
     if lanes < 0:
-        typer.echo("--lanes must be >= 0.", err=True)
+        public_echo("--lanes must be >= 0.", err=True)
         raise typer.Exit(code=2)
     resolved_max_repetitions = (
         acceptance_repetitions
@@ -1997,27 +1994,26 @@ def start(
         min_delta=acceptance_min_delta,
     )
     if candidate_source not in {None, "components", "git"}:
-        typer.echo("--candidate-source must be 'components' or 'git'.", err=True)
+        public_echo("--candidate-source must be 'components' or 'git'.", err=True)
         raise typer.Exit(code=2)
     cfg = GepaConfig.load(config_path())
     if acceptance_paired_min_cases is None:
         acceptance_paired_min_cases = cfg.acceptance.paired_min_cases
     if acceptance_paired_min_cases is not None and acceptance_paired_min_cases < 2:
         raise typer.BadParameter("--acceptance-paired-min-cases must be >= 2.")
-    if cfg.validation_dataset is not None:
+    heldout_required = heldout_required or _held_out_validation_enabled()
+    if heldout_required:
         _validation_dataset_identity()
-    vector_validation = (
-        cfg.validation_dataset is not None and cfg.acceptance.mode == "vector"
-    )
+    vector_validation = heldout_required and cfg.acceptance.mode == "vector"
     if vector_validation and lanes == 0:
-        typer.echo(
+        public_echo(
             "Vector held-out validation requires --lanes greater than zero; "
             "the synchronous loop supports scalar validation only.",
             err=True,
         )
         raise typer.Exit(code=2)
     if vector_validation and resolved_max_repetitions < 2:
-        typer.echo(
+        public_echo(
             "Vector held-out validation requires at least two maximum "
             "acceptance repetitions.",
             err=True,
@@ -2027,7 +2023,7 @@ def start(
         cfg.stall_threshold if stall_threshold is None else stall_threshold
     )
     if resolved_stall_threshold < 1:
-        typer.echo("--stall-threshold must be >= 1.", err=True)
+        public_echo("--stall-threshold must be >= 1.", err=True)
         raise typer.Exit(code=2)
     active_candidate_source = cast(
         CandidateSource, candidate_source or cfg.candidate_source
@@ -2037,7 +2033,7 @@ def start(
 
     if lanes > 0:
         if active_candidate_source != "git":
-            typer.echo(
+            public_echo(
                 "--lanes requires git candidate mode (component-mode lanes share "
                 "one process-global agent and are out of scope, spec-1do).",
                 err=True,
@@ -2054,10 +2050,10 @@ def start(
                 exclude_paths=candidate_identity_exempt_paths(workspace_root),
             )
         except GitCandidateError as exc:
-            typer.echo(str(exc), err=True)
+            public_echo(str(exc), err=True)
             raise typer.Exit(code=1) from exc
         if primary_state.dirty:
-            typer.echo(
+            public_echo(
                 "`gepa run start --lanes` requires a clean primary tree; "
                 "commit or stash your changes first (lane branches are cut "
                 "from a clean commit).",
@@ -2081,7 +2077,7 @@ def start(
             except (json.JSONDecodeError, KeyError, ValueError):
                 continue
             if prior.lanes > 0 and prior.status != "done":
-                typer.echo(
+                public_echo(
                     f"Lane run {prior.run_id} is still active "
                     f"(status {prior.status}); finish it (`gepa run select`) "
                     "or abandon it before starting another lane run.",
@@ -2091,7 +2087,10 @@ def start(
     run_id = new_run_id()
     run_dir(run_id).mkdir(parents=True, exist_ok=True)
     now = utc_now_iso()
+    if heldout_required:
+        pin_heldout(workspace_root, run_id)
     state = RunState(
+        heldout_required=heldout_required,
         run_id=run_id,
         status="running",
         max_iterations=max_iterations,
@@ -2161,20 +2160,31 @@ def continue_(
         help="Case name from the current reflection minibatch to evaluate first. Repeatable.",
     ),
     reflector_epoch: int | None = typer.Option(None, "--reflector-epoch"),
+    wait_secs: float = typer.Option(
+        300.0,
+        "--wait-secs",
+        min=0,
+        help="Wait for harness scoring; 0 enqueues. Timeout exits 75; retry the same command.",
+    ),
 ) -> None:
     """Resume after reflection edits and advance to the next pause or completion."""
-    continue_run(run_id, gate_case, reflector_epoch, _continue_impl)
+    if _load_state(run_id).heldout_required:
+        from .harness import nominate
+
+        nominate(run_id, gate_case, reflector_epoch, wait_secs)
+    else:
+        continue_run(run_id, gate_case, reflector_epoch, _continue_impl)
 
 
 def _continue_impl(run_id: str | None, gate_case: list[str]) -> None:
-    state = state_for_replay(_load_state(run_id))
-    if state.validation_dataset_path is not None:
+    state = state_for_replay(_load_state(run_id).restore_validation_evidence())
+    if state.heldout_required:
         _assert_validation_dataset_unchanged(state)
     if state.lanes > 0 and not (
         state.status == "paused_after_infrastructure_error"
         and state.reflection_minibatch_id is None
     ):
-        typer.echo(
+        public_echo(
             "`gepa run continue` does not drive lane runs. Evaluate a lane with "
             "`gepa lane continue <lane>` and commit the iteration with "
             "`gepa run select`.",
@@ -2213,7 +2223,7 @@ def _continue_impl(run_id: str | None, gate_case: list[str]) -> None:
         )
         == state.reflection_baseline_candidate_id
     ):
-        typer.echo(
+        public_echo(
             "Current components match the reflection baseline; discarding the "
             "losing candidate and advancing."
         )
@@ -2269,7 +2279,7 @@ def _continue_impl(run_id: str | None, gate_case: list[str]) -> None:
         state = _with_timestamp(state, last_comparison=comparison)
         validation_outcomes: list[EvalOutcome] = []
         if (
-            _held_out_validation_enabled()
+            state.heldout_required
             and comparison.get("outcome") == "valid"
             and comparison["improved"]
         ):
@@ -2363,6 +2373,7 @@ def resume(
 
 
 @app.command("select")
+@harness_environment()
 def select(
     run_id: str | None = typer.Option(
         None,
@@ -2418,7 +2429,7 @@ def status(
             lane_state.to_dict()
             for lane_state in load_all_lane_states(workspace_root, state.run_id)
         ]
-    typer.echo(json.dumps(payload))
+    public_echo(json.dumps(payload))
 
 
 __all__ = ["app"]

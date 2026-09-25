@@ -348,11 +348,10 @@ def test_init_writes_held_out_validation_dataset(empty_repo: Path) -> None:
         str(validation_path),
     )
 
-    assert result.exit_code == 0, result.output
-    body = (empty_repo / ".gepa" / "gepa.toml").read_text(encoding="utf-8")
-    assert 'dataset = "data/train.jsonl"' in body
-    assert f'validation_dataset = "{validation_path}"' in body
-    assert f"held-out validation cases at {validation_path}" in result.output
+    assert result.exit_code == 2, result.output
+    assert "GEPA_HELDOUT_DATASET" in result.output
+    assert str(validation_path) not in result.output
+    assert not (empty_repo / ".gepa" / "gepa.toml").exists()
 
 
 def test_parallel_workspaces_isolated(empty_repo: Path) -> None:
@@ -397,9 +396,8 @@ def test_init_refuses_validation_inside_checkout(empty_repo: Path) -> None:
     assert result.exit_code == 2, result.output
     message = normalize_cli_output(result.output)
     for expected in (
-        str((empty_repo / ".gepa" / "validation.jsonl").resolve()),
-        "Keep the validation dataset outside the GEPA workspace/repository",
-        "Start the workspace from Git history that never contained the validation dataset",
+        "GEPA_HELDOUT_DATASET",
+        "harness's environment",
     ):
         assert normalize_cli_output(expected) in message
     assert not (empty_repo / ".gepa" / "validation.jsonl").exists()

@@ -51,9 +51,12 @@ def test_no_effect_runs_rarely_promote_across_multiple_candidates(
             validation_evaluations=state.validation_evaluations + 1,
         ), outcome
 
+    monkeypatch.setattr(
+        run, "check_heldout_pin", lambda *args: ("validation.jsonl", "fixed")
+    )
+    monkeypatch.setattr(run, "validation_dataset_path", lambda *args, **kwargs: None)
     monkeypatch.setattr(run, "run_eval_once", evaluate_training)
     monkeypatch.setattr(run, "_evaluate_validation_candidate", evaluate_validation)
-    monkeypatch.setattr(run, "_held_out_validation_enabled", lambda: True)
     monkeypatch.setattr(run, "_validation_schedule", lambda *args: (3, 5))
     monkeypatch.setattr(
         run, "_validation_dataset_identity", lambda: ("validation.jsonl", "fixed")
@@ -69,7 +72,9 @@ def test_no_effect_runs_rarely_promote_across_multiple_candidates(
     for _ in range(total_runs):
         rows = 0
         candidate_id = "seed"
-        state, seed_outcomes = run._ensure_validation_seed(_state(max_iterations=200))
+        state, seed_outcomes = run._ensure_validation_seed(
+            _state(heldout_required=True, max_iterations=200)
+        )
         assert len(seed_outcomes) == 3
         any_promotion = False
         for candidate_index in range(candidates_per_run):
