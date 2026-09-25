@@ -57,6 +57,21 @@ def _identity_metric_b(case: Any, output: Any) -> MetricResult:
     return MetricResult(score=0.0, feedback="metric-b")
 
 
+def _threshold_metric(case: Any, output: Any, threshold: float = 0.0) -> MetricResult:
+    return MetricResult(score=1.0 if threshold >= 0.5 else 0.0)
+
+
+class _CallableGrader:
+    def __init__(self, threshold: float) -> None:
+        self.threshold = threshold
+
+    def metric(self, case: Any, output: Any) -> MetricResult:
+        return MetricResult(score=self.threshold)
+
+    def __call__(self, case: Any, output: Any) -> MetricResult:
+        return self.metric(case, output)
+
+
 def _dummy_reasoning() -> TrajectoryAnalysis:
     return TrajectoryAnalysis(
         pattern_discovery="baseline patterns observed in testing",
@@ -783,16 +798,44 @@ def test_metric_code_identity_tracks_function_source():
         _identity_metric_b
     )
 
-    # functools.partial layers unwrap to the underlying function.
-    partial_metric = functools.partial(_identity_metric_a)
-    assert metric_code_identity(partial_metric) == metric_code_identity(
-        _identity_metric_a
-    )
-
     # A callable without retrievable source tells the caller to declare a
     # version string instead.
     with pytest.raises(ValueError, match="version string"):
         metric_code_identity(len)
+
+
+def test_metric_code_identity_includes_partial_arguments():
+    """Partials of the same function with different args must not collide."""
+    half = functools.partial(_threshold_metric, threshold=0.5)
+    high = functools.partial(_threshold_metric, threshold=0.9)
+    assert metric_code_identity(half) != metric_code_identity(high)
+    assert metric_code_identity(half) == metric_code_identity(
+        functools.partial(_threshold_metric, threshold=0.5)
+    )
+
+
+def test_metric_code_identity_includes_bound_method_self_state():
+    """A bound method's identity covers the state of the bound instance."""
+    grader_a = _CallableGrader(threshold=0.5)
+    grader_b = _CallableGrader(threshold=0.9)
+    assert metric_code_identity(grader_a.metric) != metric_code_identity(
+        grader_b.metric
+    )
+    assert metric_code_identity(grader_a.metric) == metric_code_identity(
+        _CallableGrader(threshold=0.5).metric
+    )
+
+
+def test_metric_code_identity_for_callable_objects():
+    """Callable objects hash their class source plus their instance state."""
+    grader_a1 = _CallableGrader(threshold=0.5)
+    grader_a2 = _CallableGrader(threshold=0.5)
+    grader_b = _CallableGrader(threshold=0.9)
+    # Two instances of the same class with equal state give equal identities
+    # (stable across processes: no memory-address repr is involved).
+    assert metric_code_identity(grader_a1) == metric_code_identity(grader_a2)
+    # Different instance state gives a different identity.
+    assert metric_code_identity(grader_a1) != metric_code_identity(grader_b)
 
 
 def test_metric_cache_misses_when_evaluators_change():
@@ -1035,3 +1078,101 @@ async def test_optimize_agent_cache_invalidation_end_to_end(
         cache_hits.clear()
         await run("classification-metric-v2")
         assert set(metric_calls) == case_names
+
+
+@pytest.mark.parametrize(
+    ("gold_a", "gold_b"),
+    [
+        ("1", 1),
+        (["a,b"], ["a", "b"]),
+        (None, "None"),
+    ],
+    ids=["str-vs-int", "joined-list-vs-two-items", "none-vs-str"],
+)
+def test_gold_fingerprint_does_not_collide_across_types(gold_a: Any, gold_b: Any):
+    """Type-tagged gold encoding: near-identical serializations still miss."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cache = _metric_cache(tmpdir)
+        output = RolloutOutput.from_success("Result")
+        candidate = _instructions_candidate()
+
+        case_a = Case(name="case-1", inputs="input", expected_output=gold_a)
+        cache.cache_metric_result(
+            case_a,
+            None,
+            output,
+            candidate,
+            MetricResult(score=1.0, feedback="ok"),
+        )
+
+        case_b = Case(name="case-1", inputs="input", expected_output=gold_b)
+        assert cache.get_cached_metric_result(case_b, None, output, candidate) is None
+        # The original entry still hits: the encoding is precise, not noisy.
+        assert (
+            cache.get_cached_metric_result(case_a, None, output, candidate) is not None
+        )
+
+
+def test_callable_object_state_stays_in_serialized_key():
+    """Callable non-dataclass objects serialize via state, not class name."""
+    assert CacheManager._serialize_for_key(
+        _CallableGrader(threshold=0.5)
+    ) != CacheManager._serialize_for_key(_CallableGrader(threshold=0.9))
+
+    # Functions still serialize by qualified name, never by memory address.
+    serialized_fn = CacheManager._serialize_for_key(_identity_metric_a)
+    assert "0x" not in serialized_fn
+    assert "_identity_metric_a" in serialized_fn
+
+
+@pytest.mark.asyncio
+async def test_process_case_with_non_copyable_evaluator_scores_normally():
+    """An evaluator holding a live model must not break key generation.
+
+    LLMJudge(model=OpenAIChatModel(...)) holds an httpx client that cannot be
+    deep-copied; key generation must survive it and the case must be scored by
+    the metric, never failed by the cache.
+    """
+    from pydantic_ai.models.openai import OpenAIChatModel
+    from pydantic_ai.providers.openai import OpenAIProvider
+    from pydantic_evals.evaluators import LLMJudge
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cache = CacheManager(
+            cache_dir=tmpdir,
+            metric_identity="test-metric-v1",
+            cache_metric_results=True,
+        )
+        metric_calls = 0
+
+        def metric(case: Any, output: Any) -> MetricResult:
+            nonlocal metric_calls
+            metric_calls += 1
+            return MetricResult(score=1.0, feedback="ok")
+
+        adapter = AgentAdapter(
+            agent=Agent(TestModel(custom_output_text="hi"), instructions="seed"),
+            metric=metric,
+            cache_manager=cache,
+        )
+        judge = LLMJudge(
+            rubric="Is the answer polite?",
+            model=OpenAIChatModel("gpt-4o", provider=OpenAIProvider(api_key="dummy")),
+        )
+        case = Case(
+            name="c",
+            inputs="q",
+            expected_output="hi",
+            evaluators=[judge],
+        )
+        candidate = {"instructions": ComponentValue(name="instructions", text="x")}
+
+        first = await adapter.process_case(case, 0, candidate=candidate)
+        assert first["output"].success
+        assert first["score"] == 1.0
+
+        # Key generation succeeded, so the metric result was cached: the second
+        # call is served from the cache without re-running the metric.
+        second = await adapter.process_case(case, 0, candidate=candidate)
+        assert second["score"] == 1.0
+        assert metric_calls == 1

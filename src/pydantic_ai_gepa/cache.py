@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import inspect
+import json
 from dataclasses import is_dataclass
 from pathlib import Path
 from collections.abc import Awaitable
@@ -12,6 +13,8 @@ from typing import Any, Callable, TypeVar
 
 import cloudpickle
 import logfire
+
+from pydantic_ai.models import Model
 
 from pydantic_evals import Case
 
@@ -36,9 +39,11 @@ def metric_code_identity(metric: Callable[..., Any]) -> str:
     """Compute a code-identity hash for a metric callable.
 
     Returns a sha256 hex digest of the metric's qualified name plus its source
-    code (``functools.partial`` layers, bound methods and ``__wrapped__``
-    decorators are unwrapped; for a callable object the source of its class is
-    used). Pass the result as ``CacheManager(metric_identity=...)`` so cached
+    code. ``functools.partial`` layers, bound methods and ``__wrapped__``
+    decorators are unwrapped; each partial layer's ``args``/``keywords``, a
+    bound method's ``__self__`` state, and a callable object's instance state
+    are hashed as well, and for a callable object the source of its class is
+    used. Pass the result as ``CacheManager(metric_identity=...)`` so cached
     scores are invalidated whenever the metric's code changes.
 
     This covers only the function's own source. It does **not** cover helpers
@@ -52,25 +57,43 @@ def metric_code_identity(metric: Callable[..., Any]) -> str:
             metric identity instead.
     """
     target: Any = metric
+    state_parts: list[str] = []
     while isinstance(target, functools.partial):
+        # Partial arguments configure the grader; two partials of the same
+        # function with different arguments must not share an identity.
+        state_parts.append(
+            f"partial-args:{CacheManager._serialize_for_key(target.args)}"
+        )
+        state_parts.append(
+            f"partial-kwargs:{CacheManager._serialize_for_key(target.keywords)}"
+        )
         target = target.func
     target = inspect.unwrap(target)
     if inspect.ismethod(target):
+        # A bound method's behavior depends on the instance it is bound to.
+        state_parts.append(
+            f"bound-self:{CacheManager._serialize_for_key(target.__self__)}"
+        )
         target = target.__func__
 
-    module = getattr(target, "__module__", None) or ""
-    qualname = getattr(target, "__qualname__", None) or repr(target)
-
-    source_target = target
-    if not (inspect.isfunction(target) or inspect.isclass(target)):
-        if callable(target):
-            # Callable object: hash the source of its class (covers __call__).
-            source_target = type(target)
-        else:
-            raise ValueError(
-                "metric_code_identity expected a callable; declare a version "
-                "string as the metric identity instead."
-            )
+    if inspect.isfunction(target) or inspect.isclass(target):
+        source_target = target
+        module = getattr(target, "__module__", None) or ""
+        qualname = getattr(target, "__qualname__", None) or repr(target)
+    elif callable(target):
+        # Callable object: hash the source of its class (covers __call__) plus
+        # the instance state (same as a bound method's __self__), identified
+        # by the class's module and qualname so the identity is stable across
+        # processes (an instance repr would embed a memory address).
+        source_target = type(target)
+        module = getattr(source_target, "__module__", None) or ""
+        qualname = getattr(source_target, "__qualname__", None) or "<unknown>"
+        state_parts.append(f"instance-state:{CacheManager._serialize_for_key(target)}")
+    else:
+        raise ValueError(
+            "metric_code_identity expected a callable; declare a version "
+            "string as the metric identity instead."
+        )
 
     try:
         source = inspect.getsource(source_target)
@@ -81,7 +104,8 @@ def metric_code_identity(metric: Callable[..., Any]) -> str:
             "hash as the metric identity instead."
         ) from exc
 
-    return hashlib.sha256(f"{module}:{qualname}\n{source}".encode("utf-8")).hexdigest()
+    payload = "\n".join([f"{module}:{qualname}", *state_parts, source])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 class CacheManager:
@@ -200,19 +224,37 @@ class CacheManager:
             obj_dict = obj.__dict__.copy() if hasattr(obj, "__dict__") else {}
             obj_dict.pop("timestamp", None)  # Remove timestamp if present
             return CacheManager._serialize_for_key(obj_dict)
+        elif isinstance(obj, Model):
+            # A live model object (e.g. the judge model inside an LLMJudge
+            # evaluator) holds non-copyable clients; identify it by system and
+            # model name instead of walking its state. This must come before
+            # the dataclass branch: pydantic-ai models are dataclasses, and
+            # walking their fields recurses into the httpx client.
+            system = getattr(obj, "system", None)
+            model_name = getattr(obj, "model_name", None)
+            if system is not None and model_name is not None:
+                return f"model:{system}:{model_name}"
+            return f"model:{type(obj).__module__}.{type(obj).__qualname__}"
         elif is_dataclass(obj):
-            # Convert dataclass to dict and serialize
-            # Handle dataclass instances
+            # Handle dataclass instances by walking fields with getattr rather
+            # than dataclasses.asdict: asdict deep-copies field values, which
+            # crashes on non-copyable leaves (e.g. a live model's httpx client
+            # inside an LLMJudge evaluator).
             if not isinstance(obj, type):
-                from dataclasses import asdict
+                from dataclasses import fields
 
-                return CacheManager._serialize_for_key(asdict(obj))
+                field_values = {
+                    field.name: getattr(obj, field.name) for field in fields(obj)
+                }
+                return CacheManager._serialize_for_key(field_values)
             else:
                 # If it's a dataclass type (not instance), use its name
                 return f"DataclassType:{obj.__name__}"
-        elif callable(obj):
-            # Functions/methods (e.g. inside evaluator dataclasses) must not
-            # serialize to their default repr, which embeds a memory address.
+        elif inspect.isroutine(obj) or isinstance(obj, type):
+            # Functions, methods, builtins and classes must not serialize to
+            # their default repr, which embeds a memory address. Callable
+            # *objects* deliberately fall through to their __dict__ so their
+            # state stays in the key.
             qualname = getattr(obj, "__qualname__", None)
             module = getattr(obj, "__module__", None)
             if qualname is not None:
@@ -223,8 +265,52 @@ class CacheManager:
             # For other objects, try to use their __dict__
             return CacheManager._serialize_for_key(obj.__dict__)
         else:
-            # Fallback to string representation
-            return str(obj)
+            # Fallback to string representation; a default repr embeds a
+            # memory address, which is unstable across processes, so use the
+            # type instead.
+            text = str(obj)
+            if " at 0x" in text:
+                return f"object:{type(obj).__module__}.{type(obj).__qualname__}"
+            return text
+
+    @staticmethod
+    def _fingerprint_for_key(obj: Any) -> str:
+        """Serialize a value with explicit type tags for cache key generation.
+
+        Unlike ``_serialize_for_key``, this encoding cannot collide across
+        types: ``"1"`` vs ``1``, ``["a,b"]`` vs ``["a", "b"]`` and ``None``
+        vs ``"None"`` all fingerprint differently. It is deterministic across
+        processes: dict keys are sorted by their fingerprint and no memory
+        addresses are embedded. Used for the gold and evaluator key parts,
+        where a silent collision would reuse a stale score.
+        """
+        if obj is None:
+            return "none:"
+        elif isinstance(obj, bool):
+            return f"bool:{json.dumps(obj)}"
+        elif isinstance(obj, int):
+            return f"int:{obj}"
+        elif isinstance(obj, float):
+            return f"float:{obj!r}"
+        elif isinstance(obj, str):
+            return f"str:{json.dumps(obj)}"
+        elif isinstance(obj, (list, tuple)):
+            tag = "list" if isinstance(obj, list) else "tuple"
+            items = ",".join(CacheManager._fingerprint_for_key(item) for item in obj)
+            return f"{tag}:[{items}]"
+        elif isinstance(obj, dict):
+            pairs = sorted(
+                (
+                    CacheManager._fingerprint_for_key(key),
+                    CacheManager._fingerprint_for_key(value),
+                )
+                for key, value in obj.items()
+            )
+            inner = ",".join(f"{key}={value}" for key, value in pairs)
+            return f"dict:{{{inner}}}"
+        else:
+            type_tag = f"{type(obj).__module__}.{type(obj).__qualname__}"
+            return f"{type_tag}:{CacheManager._serialize_for_key(obj)}"
 
     @staticmethod
     def _extract_message_history(case: Case[Any, Any, Any]) -> list[Any] | None:
@@ -268,12 +354,12 @@ class CacheManager:
             # expected output (gold) and its evaluators. Agent-run keys do not
             # depend on the metric or the gold, so they omit these parts.
             key_parts.append(f"metric:{self.metric_identity}")
-            serialized_expected = self._serialize_for_key(case.expected_output)
+            expected_fingerprint = self._fingerprint_for_key(case.expected_output)
             expected_hash = hashlib.sha256(
-                serialized_expected.encode("utf-8")
+                expected_fingerprint.encode("utf-8")
             ).hexdigest()
             key_parts.append(f"expected_output:{expected_hash}")
-            key_parts.append(f"evaluators:{self._serialize_for_key(case.evaluators)}")
+            key_parts.append(f"evaluators:{self._fingerprint_for_key(case.evaluators)}")
 
         resolved_model_identifier = model_identifier or self.model_identifier
         if resolved_model_identifier:
@@ -313,6 +399,39 @@ class CacheManager:
         """Configure the default model identifier used for cache keys."""
         self.model_identifier = model_identifier
 
+    def _try_generate_cache_key(
+        self,
+        key_type: str,
+        case: Case[Any, Any, Any],
+        case_index: int | None,
+        output: RolloutOutput[Any] | None,
+        candidate_text: dict[str, str],
+        model_identifier: str | None = None,
+    ) -> str | None:
+        """Generate a cache key, failing safe.
+
+        A key error (e.g. an exotic value in the case that cannot be
+        serialized) is logged and treated as a cache miss: it must never
+        fail the case being evaluated.
+        """
+        try:
+            return self._generate_cache_key(
+                case,
+                case_index,
+                output,
+                candidate_text,
+                key_type,
+                model_identifier=model_identifier,
+            )
+        except Exception as e:
+            logfire.warn(
+                "Failed to generate cache key; treating as a miss",
+                key_type=key_type,
+                case_label=self._case_label(case, case_index),
+                exception=e,
+            )
+            return None
+
     def get_cached_metric_result(
         self,
         case: Case[Any, Any, Any],
@@ -339,14 +458,16 @@ class CacheManager:
 
         case_label = self._case_label(case, case_index)
         candidate_text = candidate_texts(candidate)
-        cache_key = self._generate_cache_key(
+        cache_key = self._try_generate_cache_key(
+            "metric",
             case,
             case_index,
             output,
             candidate_text,
-            "metric",
             model_identifier=model_identifier,
         )
+        if cache_key is None:
+            return None
         cache_file = self.cache_dir / f"{cache_key}.pkl"
 
         if cache_file.exists():
@@ -397,14 +518,16 @@ class CacheManager:
             return
 
         candidate_text = candidate_texts(candidate)
-        cache_key = self._generate_cache_key(
+        cache_key = self._try_generate_cache_key(
+            "metric",
             case,
             case_index,
             output,
             candidate_text,
-            "metric",
             model_identifier=model_identifier,
         )
+        if cache_key is None:
+            return
         cache_file = self.cache_dir / f"{cache_key}.pkl"
 
         try:
@@ -462,14 +585,16 @@ class CacheManager:
             return None
 
         candidate_text = candidate_texts(candidate)
-        cache_key = self._generate_cache_key(
+        cache_key = self._try_generate_cache_key(
+            "agent_run",
             case,
             case_index,
             None,
             candidate_text,
-            "agent_run",
             model_identifier=model_identifier,
         )
+        if cache_key is None:
+            return None
         # Add capture_traces to the key to differentiate
         cache_key = f"{cache_key}_traces_{capture_traces}"
         cache_file = self.cache_dir / f"{cache_key}.pkl"
@@ -526,14 +651,16 @@ class CacheManager:
             return
 
         candidate_text = candidate_texts(candidate)
-        cache_key = self._generate_cache_key(
+        cache_key = self._try_generate_cache_key(
+            "agent_run",
             case,
             case_index,
             None,
             candidate_text,
-            "agent_run",
             model_identifier=model_identifier,
         )
+        if cache_key is None:
+            return
         # Add capture_traces to the key to differentiate
         cache_key = f"{cache_key}_traces_{capture_traces}"
         cache_file = self.cache_dir / f"{cache_key}.pkl"
