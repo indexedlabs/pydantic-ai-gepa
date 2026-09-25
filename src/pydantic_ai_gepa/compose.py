@@ -9,6 +9,7 @@ from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ._validation import validation_evaluation
 from .acceptance import compare_candidate_samples
 from .engines import (
     BudgetTracker,
@@ -19,6 +20,9 @@ from .engines import (
     OptimizationTask,
     get_engine,
 )
+from .engines.base import OptimizationEngine, ValidationScore
+from .engines.coding_agent_engine import CodingAgentEngine
+from .engines.gepa_engine import GepaEngine
 from .gepa_graph.models import CandidateMap
 
 
@@ -140,9 +144,6 @@ class _EngineTaskView:
     async def train_loader(self) -> Any:
         return await self.__task.train_loader()
 
-    async def val_loader(self) -> Any:
-        return await self.__task.val_loader()
-
     async def validation_case_count(self) -> int:
         return await self.__task.validation_case_count()
 
@@ -176,14 +177,71 @@ class _EngineTaskView:
 
     async def evaluate(
         self, candidate: CandidateMap, **kwargs: Any
+    ) -> ValidationScore | CandidateEvaluation:
+        """Compatibility alias returning aggregates only to untrusted engines."""
+        if kwargs.pop("dataset", "validation") != "validation":
+            raise PermissionError("Engines cannot access the reporting-only test_set.")
+        # Retain the old keyword without allowing engines to request evidence.
+        kwargs.pop("capture_traces", False)
+        return await self.score_validation(candidate, **kwargs)
+
+    async def score_validation(
+        self,
+        candidate: CandidateMap,
+        *,
+        budget: BudgetTracker | None = None,
+        cache: bool = False,
+    ) -> ValidationScore:
+        """Score inside the harness and expose only aggregate selection data."""
+        with validation_evaluation():
+            evaluation = await self.__task.evaluate(
+                candidate, budget=budget, capture_traces=False, cache=cache
+            )
+        return ValidationScore(
+            score=evaluation.score,
+            num_cases=evaluation.num_cases,
+            selectable=evaluation.selectable,
+            objective_scores=dict(evaluation.objective_scores),
+        )
+
+    @property
+    def test_set(self) -> None:
+        return None
+
+
+class _TrustedEngineTaskView(_EngineTaskView):
+    """Internal selection channel for the library's audited Pareto engines."""
+
+    def __init__(self, task: OptimizationTask) -> None:
+        super().__init__(task)
+        self.__task = task
+
+    async def val_loader(self) -> Any:
+        return await self.__task.val_loader()
+
+    async def evaluate(
+        self, candidate: CandidateMap, **kwargs: Any
     ) -> CandidateEvaluation:
         if kwargs.pop("dataset", "validation") != "validation":
             raise PermissionError("Engines cannot access the reporting-only test_set.")
         return await self.__task.evaluate(candidate, **kwargs)
 
-    @property
-    def test_set(self) -> None:
-        return None
+
+def _engine_task_view(
+    task: OptimizationTask,
+    engine: OptimizationEngine,
+    seed: CandidateMap | None = None,
+) -> OptimizationTask:
+    if seed is not None:
+        task = cast(OptimizationTask, _SeededTask(task, seed))
+    # Registry names and subclasses are caller-controlled. Only these exact
+    # implementations keep validation evidence inside library-owned selection.
+    view = (
+        _TrustedEngineTaskView
+        if type(engine) in (GepaEngine, CodingAgentEngine)
+        else _EngineTaskView
+    )
+    return cast(OptimizationTask, view(task))
 
 
 SelectionRule = Callable[[Sequence[FairVote]], int]
@@ -286,13 +344,9 @@ async def optimize_sequential(
         slice_size = min(config.max_metric_calls, budget.remaining)
         local = budget.reserve_slice(slice_size)
         try:
-            stage_task = cast(
-                OptimizationTask,
-                _SeededTask(cast(OptimizationTask, _EngineTaskView(task)), seed),
-            )
-            result = await get_engine(config.engine, config).run(
-                stage_task, config, local
-            )
+            engine = get_engine(config.engine, config)
+            stage_task = _engine_task_view(task, engine, seed)
+            result = await engine.run(stage_task, config, local)
             _reconcile_engine_result(config, result, local)
         finally:
             budget.release_slice(local)
@@ -423,15 +477,9 @@ async def optimize_omni(
     winner = comparable[winner_index]
     # A fresh registry lookup (rather than reusing phase one) is intentional.
     phase_two_budget = BudgetTracker(plan.phase_two_metric_calls)
-    seeded_task = cast(
-        OptimizationTask,
-        _SeededTask(
-            cast(OptimizationTask, _EngineTaskView(task)), winner.best_candidate
-        ),
-    )
-    continuation = await get_engine(plan.phase_two.engine, plan.phase_two).run(
-        seeded_task, plan.phase_two, phase_two_budget
-    )
+    engine = get_engine(plan.phase_two.engine, plan.phase_two)
+    seeded_task = _engine_task_view(task, engine, winner.best_candidate)
+    continuation = await engine.run(seeded_task, plan.phase_two, phase_two_budget)
     _reconcile_engine_result(plan.phase_two, continuation, phase_two_budget)
     (
         continuation_winner_index,
@@ -583,13 +631,9 @@ async def optimize_adaptive_sequential(
             break
         local = budget.reserve_slice(slice_size)
         try:
-            seeded = cast(
-                OptimizationTask,
-                _SeededTask(
-                    cast(OptimizationTask, _EngineTaskView(task)), best.best_candidate
-                ),
-            )
-            result = await get_engine(config.engine, config).run(seeded, config, local)
+            engine = get_engine(config.engine, config)
+            seeded = _engine_task_view(task, engine, best.best_candidate)
+            result = await engine.run(seeded, config, local)
             _reconcile_engine_result(config, result, local)
         finally:
             budget.release_slice(local)
@@ -689,8 +733,8 @@ async def _run_parallel(
         # engines, and each result is reconciled with actual consumption.
         engines = [get_engine(config.engine, config) for config in configs]
         results: list[EngineResult] = []
-        engine_task = cast(OptimizationTask, _EngineTaskView(task))
         for engine, config in zip(engines, configs):
+            engine_task = _engine_task_view(task, engine)
             before = budget.spent
             result = await engine.run(engine_task, config, budget)
             if result.num_metric_calls != budget.spent - before:
@@ -706,9 +750,8 @@ async def _run_parallel(
         )
     slices = [budget.reserve_slice(config.max_metric_calls) for config in configs]
     engines = [get_engine(config.engine, config) for config in configs]
-    engine_task = cast(OptimizationTask, _EngineTaskView(task))
     tasks = [
-        asyncio.create_task(engine.run(engine_task, config, local))
+        asyncio.create_task(engine.run(_engine_task_view(task, engine), config, local))
         for engine, config, local in zip(engines, configs, slices)
     ]
     try:

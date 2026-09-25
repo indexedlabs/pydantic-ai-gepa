@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import math
 from collections.abc import Awaitable, Callable, Sequence
@@ -14,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai.agent import AbstractAgent
 from pydantic_evals import Case
 
+from .._validation import validation_active
 from ..adapters.agent_adapter import CaseFactory
 from ..components import extract_seed_candidate_with_input_type
 from ..evaluation import EvaluationRecord, evaluate_candidate_dataset
@@ -28,6 +30,16 @@ Metric = Callable[
     [Case[Any, Any, Any], RolloutOutput[Any]],
     MetricResult | Awaitable[MetricResult],
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationScore:
+    """Aggregate validation selection result, with no per-case evidence."""
+
+    score: float
+    num_cases: int
+    selectable: bool = True
+    objective_scores: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,9 +172,37 @@ class OptimizationTask:
         # and means an exhausted budget cannot trigger an invisible evaluator call.
         if budget is not None:
             budget.spend(len(cases))
+        selection_records: dict[str, EvaluationRecord] = {}
+        case_ids = {id(case): case.name or f"case-{i}" for i, case in enumerate(cases)}
+
+        async def selection_metric(
+            case: Case[Any, Any, Any], output: RolloutOutput[Any]
+        ) -> MetricResult:
+            result = self.metric(case, output)
+            if inspect.isawaitable(result):
+                result = await result
+            # The adapter strips validation side info before returning. Retain
+            # only selection metadata inside the harness, never feedback.
+            info = result.side_info or {}
+            case_id = case_ids[id(case)]
+            selection_records[case_id] = EvaluationRecord(
+                case_id=case_id,
+                score=result.score,
+                feedback=None,
+                payload={
+                    "side_info": {
+                        key: info[key]
+                        for key in ("scores", "selectable", "infrastructure_valid")
+                        if key in info
+                    }
+                },
+            )
+            return result
+
+        withheld = validation_active()
         records = await evaluate_candidate_dataset(
             agent=self.agent,
-            metric=self.metric,
+            metric=selection_metric if withheld else self.metric,
             dataset=cases,
             candidate=candidate,
             concurrency=self.concurrency,
@@ -175,7 +215,11 @@ class OptimizationTask:
         score = (
             sum(record.score for record in records) / len(records) if records else 0.0
         )
-        objectives, per_case_objectives, selectable = _objective_scores(records)
+        objectives, per_case_objectives, selectable = _objective_scores(
+            [selection_records.get(record.case_id, record) for record in records]
+            if withheld
+            else records
+        )
         result = CandidateEvaluation(
             score=score,
             records=records,
@@ -486,4 +530,5 @@ __all__ = [
     "EngineResult",
     "OptimizationEngine",
     "OptimizationTask",
+    "ValidationScore",
 ]
