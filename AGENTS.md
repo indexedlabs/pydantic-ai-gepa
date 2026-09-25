@@ -1,9 +1,8 @@
 # Repository Guidelines
 
-## Mighty Workflow
-- Use Mighty as the source of truth for spec/task/decision tracking and evidence links.
-- Run `mt prime` at the start of each session and again after context loss (for example compaction, `/clear`, or session resume).
-- Keep this file concise; use `mt prime` output for current workflow details and command guidance.
+## Specs and tasks
+- Do not write to the v1 Mighty graph from this repo: no `mt prime`, `mt new`, `mt task`, `mt decision`, `mt comment` or `mt push`, and do not commit new `.mighty/loro` records.
+- Specs live in the Mighty Next graph and tasks in Linear (Indexed Labs); the orchestrator that dispatched you owns both. The existing `.mighty/` directory is a read-only historical record.
 
 ## Project Structure & Module Organization
 - Core library lives in `src/pydantic_ai_gepa/`, organized by responsibility (`runner.py` exposes the high-level optimization API, `components.py` handles candidate transforms, `cache.py` manages GEPA caching, etc.).
