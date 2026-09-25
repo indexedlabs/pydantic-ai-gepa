@@ -146,6 +146,7 @@ def _report(rows: list[dict[str, Any]], cap: float | None) -> dict[str, Any]:
         "by_model": {},
         "unpriced_usage": {},
         "unmetered_rollouts": 0,
+        "cached_rollouts": 0,
         "stopped_by_cost": False,
         "stop_reason": None,
     }
@@ -153,6 +154,7 @@ def _report(rows: list[dict[str, Any]], cap: float | None) -> dict[str, Any]:
         if cap is None:
             result["max_token_cost"] = row.get("max_token_cost")
         result["unmetered_rollouts"] += row.get("unmetered_rollouts", 0)
+        result["cached_rollouts"] += row.get("cached_rollouts", 0)
         dollars = row["total_dollars"]
         result["total_dollars"] += dollars
         side = "validation" if row["kind"] == "validation" else "training"
@@ -175,7 +177,9 @@ def spend_report(
 
 def _kind_costs(rows: list[dict[str, Any]], kind: str) -> tuple[int, float, float]:
     matching = [row for row in rows if row["kind"] == kind]
-    observations = sum(row["rollouts_completed"] for row in matching)
+    observations = sum(
+        row["rollouts_completed"] - row.get("cached_rollouts", 0) for row in matching
+    )
     dollars = sum(row.get("completed_rollout_dollars", 0.0) for row in matching)
     highest = max(
         (row.get("max_rollout_dollars", 0.0) for row in matching), default=0.0
@@ -256,6 +260,7 @@ def _reserved_other(
 class _RolloutUsage:
     requests: int = 0
     dollars: float = 0.0
+    cached: bool = False
 
 
 class EvalSpendMeter(SpendMeter):
@@ -284,6 +289,7 @@ class EvalSpendMeter(SpendMeter):
         self.private_path = private_path
         self.persist_stop = persist_stop
         self.started = self.completed = self.unmetered = 0
+        self.cached = 0
         self.count, self.concurrency = count, max(1, concurrency)
         self._condition = asyncio.Condition()
         self._active = 0
@@ -305,6 +311,7 @@ class EvalSpendMeter(SpendMeter):
                 "rollouts_started": self.started,
                 "rollouts_completed": self.completed,
                 "unmetered_rollouts": self.unmetered,
+                "cached_rollouts": self.cached,
                 "max_token_cost": self.run_cap,
                 "completed_rollout_dollars": self.completed_dollars,
                 "max_rollout_dollars": self.highest,
@@ -318,6 +325,7 @@ class EvalSpendMeter(SpendMeter):
                 "rollouts_started",
                 "rollouts_completed",
                 "unmetered_rollouts",
+                "cached_rollouts",
                 "completed_rollout_dollars",
             ):
                 row[field] -= self._saved.get(field, 0)
@@ -358,10 +366,15 @@ class EvalSpendMeter(SpendMeter):
                     os.fsync(handle.fileno())
         self._finished = True
 
+    def declare_cached_rollout(self) -> None:
+        usage = self._requests.get()
+        if usage is not None:
+            usage.cached = True
+
     def callable_completed(self) -> None:
         """Require metering only after both callable and metric succeeded."""
         usage = self._requests.get()
-        if usage is not None and not usage.requests:
+        if usage is not None and not usage.requests and not usage.cached:
             self.unmetered += 1
             if self.run_cap is not None:
                 self.stop_reason = (
@@ -466,6 +479,8 @@ class EvalSpendMeter(SpendMeter):
         try:
             yield
             self.completed += 1
+            if usage.cached and not usage.requests:
+                self.cached += 1
             self.completed_dollars += usage.dollars
         finally:
             self._requests.reset(token)

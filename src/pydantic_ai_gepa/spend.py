@@ -271,6 +271,18 @@ def current_rollout_capability() -> SpendCapability | None:
     return _active_rollout.get()
 
 
+def report_cached_rollout() -> None:
+    """Declare that the current CLI callable served a cached result.
+
+    A declared hit with no model responses costs zero and is excluded from cost
+    projections. Any fresh responses are still charged normally. Repeated calls
+    in one rollout count once; outside a CLI rollout this has no effect.
+    """
+    capability = current_rollout_capability()
+    if capability is not None and hasattr(capability.meter, "declare_cached_rollout"):
+        capability.meter.declare_cached_rollout()
+
+
 @contextmanager
 def rollout_spend(meter: SpendMeter) -> Iterator[None]:
     """Expose an evaluation's meter to caller-owned agents."""

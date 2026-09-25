@@ -461,8 +461,13 @@ capability = current_rollout_capability()  # None outside a CLI evaluation
 result = await judge.run(prompt, capabilities=[capability] if capability else [])
 ```
 
+For a suite-owned cache hit, call `pydantic_ai_gepa.spend.report_cached_rollout()`
+from `evaluate` or its metric. Declared hits without model responses count as
+`cached_rollouts` at $0 and do not lower cost projections; fresh calls still need metering.
+
 Judge usage is included in rollout spend. A successful capped callable rollout
-reporting no metered responses stops with `Evaluate callable reported no spend`;
+with neither metered responses nor a cache declaration stops with
+`Evaluate callable reported no spend`;
 suites that make no model calls should omit the cap. Ordinary failed rollouts
 retain the existing failure/retry behavior. Workspace validation ledger entries
 contain only eval aggregates, with no case identifiers, scores, or per-case costs.

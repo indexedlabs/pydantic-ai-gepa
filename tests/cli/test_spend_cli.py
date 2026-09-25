@@ -24,7 +24,7 @@ from pydantic_ai_gepa.evaluation import (
     evaluate_callable_dataset,
     evaluate_candidate_dataset,
 )
-from pydantic_ai_gepa.spend import current_rollout_capability
+from pydantic_ai_gepa.spend import current_rollout_capability, report_cached_rollout
 from pydantic_ai_gepa.types import MetricResult, RolloutOutput
 from pydantic_ai_gepa.evaluation_health import evaluation_infrastructure_failures
 from tests.cli import test_run_cli, test_git_candidate_cli, test_select_cli
@@ -691,6 +691,144 @@ def test_callable_and_judge_are_metered_and_context_does_not_leak(tmp_path: Path
     assert report["by_model"]["student"]["requests"] == 2
     assert report["by_model"]["judge"]["requests"] == 2
     assert current_rollout_capability() is None
+
+
+@pytest.mark.parametrize("declaration", ["evaluate", "metric"])
+def test_cli_callable_declared_cache_hits_complete_at_zero_cost(
+    git_repo: Path, declaration: str
+):
+    (git_repo / "task_pkg/evaluation.py").write_text(f"""
+from pydantic_ai_gepa.spend import report_cached_rollout
+from pydantic_ai_gepa.types import MetricResult
+def evaluate(case):
+    {"report_cached_rollout()" if declaration == "evaluate" else "pass"}
+    return "cached"
+def metric(case, output):
+    {"report_cached_rollout()" if declaration == "metric" else "pass"}
+    return MetricResult(score=0.5)
+""")
+    config = config_path(git_repo)
+    config.write_text('metric = "task_pkg.evaluation:metric"\n' + config.read_text())
+    (git_repo / ".gepa/dataset.jsonl").write_text(
+        "\n".join(json.dumps({"name": f"case-{i}", "inputs": "?"}) for i in range(2))
+        + "\n"
+    )
+    result = _run(
+        "run",
+        "start",
+        "--max-token-cost",
+        "0.001",
+        "--max-iterations",
+        "1",
+        "--size",
+        "2",
+    )
+    assert result.exit_code == 0, result.output
+    run = _run_payload(result.output)
+    assert run["status"] == "done"
+    assert run["spend"]["total_dollars"] == 0
+    assert run["spend"]["cached_rollouts"] == 2
+    assert run["spend"]["unmetered_rollouts"] == 0
+    assert run["spend"]["by_model"] == {}
+    assert not run["spend"]["stopped_by_cost"]
+
+
+def test_declared_hits_do_not_hide_paid_calls_or_dilute_cli_projection(tmp_path: Path):
+    async def evaluate(case):
+        if case.inputs != "undeclared":
+            report_cached_rollout()
+            report_cached_rollout()  # Idempotent within one rollout.
+        if case.inputs == "paid":
+            return (await _metered_agent()).output
+        return "cached"
+
+    def batch(eval_id, inputs, cap=1):
+        with evaluation_spend(
+            run_id="cache",
+            root=tmp_path,
+            eval_id=eval_id,
+            kind="training",
+            count=len(inputs),
+            cap=cap,
+            price_fn=lambda r: 0.1,
+        ):
+            return asyncio.run(
+                evaluate_callable_dataset(
+                    evaluate=evaluate,
+                    metric=lambda c, o: 1.0,
+                    dataset=[Case(inputs=value) for value in inputs],
+                    concurrency=1,
+                )
+            )
+
+    batch("mixed", ["paid", "cached", "cached"])
+    report = spend_report("cache", tmp_path)
+    assert report["total_dollars"] == pytest.approx(0.1)
+    assert report["cached_rollouts"] == 2
+    assert report["by_model"]["student"]["requests"] == 1
+    assert report["unmetered_rollouts"] == 0
+    # $0.15 remaining cannot fit two $0.10 observations. Hits must not lower
+    # the historical mean to $0.10/3 and admit this paid batch.
+    with pytest.raises(typer.Exit) as stopped:
+        batch("projected", ["paid", "paid"], cap=0.25)
+    assert stopped.value.exit_code == 70
+    assert spend_report("cache", tmp_path)["total_dollars"] == pytest.approx(0.1)
+
+
+def test_cache_declaration_is_local_to_one_rollout(tmp_path: Path):
+    report_cached_rollout()  # Outside an eval is harmless and cannot mark it.
+
+    def evaluate(case):
+        if case.inputs == "cached":
+            report_cached_rollout()
+        return "result"
+
+    with pytest.raises(typer.Exit) as stopped:
+        with evaluation_spend(
+            run_id="local-cache",
+            root=tmp_path,
+            eval_id="eval",
+            kind="training",
+            count=2,
+            cap=1,
+            price_fn=lambda r: 0.1,
+        ):
+            asyncio.run(
+                evaluate_callable_dataset(
+                    evaluate=evaluate,
+                    metric=lambda c, o: 1.0,
+                    dataset=[Case(inputs="cached"), Case(inputs="undeclared")],
+                    concurrency=1,
+                )
+            )
+    assert stopped.value.exit_code == 70
+    report = spend_report("local-cache", tmp_path)
+    assert report["total_dollars"] == 0
+    assert report["cached_rollouts"] == 1
+    assert report["unmetered_rollouts"] == 1
+    assert "Evaluate callable reported no spend" in report["stop_reason"]
+
+
+def test_cli_agent_evaluation_does_not_use_library_cache(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from pydantic_ai_gepa import evaluation
+
+    original = evaluation.create_adapter
+    observed = []
+
+    def create_adapter(**kwargs):
+        observed.append(kwargs["cache_manager"])
+        return original(**kwargs)
+
+    monkeypatch.setattr(evaluation, "create_adapter", create_adapter)
+    _price(repo)
+    _eval(repo, "no-library-cache", max_token_cost=1)
+    _eval(repo, "no-library-cache", max_token_cost=1)
+    assert observed == [None, None]
+    assert spend_report("no-library-cache", repo)["total_dollars"] == pytest.approx(
+        0.04
+    )
 
 
 def test_callable_without_hook_fails_closed_only_with_cap(git_repo: Path):
