@@ -49,7 +49,9 @@ class GepaResult(BaseModel):
             original_candidate_idx=0 if original_candidate else None,
             original_candidate=original_candidate,
             original_score=(
-                original_candidate.avg_validation_score if original_candidate else None
+                original_candidate.avg_validation_score
+                if original_candidate and original_candidate.validation_scores
+                else None
             ),
             total_evaluations=state.total_evaluations,
             full_validations=state.full_validations,
