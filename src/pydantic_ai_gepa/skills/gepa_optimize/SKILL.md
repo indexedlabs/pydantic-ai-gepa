@@ -236,13 +236,18 @@ Held-out harness commands skip candidate-owned `.env` files. Install the harness
 in storage the reflector cannot modify, and keep provider credentials out of the
 reflector environment.
 
-The reflector must not be able to write the shared repository's `.git/config`,
-`.git/info/attributes`, or the file named by `core.attributesFile`. Other harness
-Git commands inherited from #62 still use local configuration and attributes,
-which can select executable filters or helpers. Hardening those commands is a
-separate follow-up. The README profile grants worktree writes, so in a
-single-checkout layout it does not by itself protect `.git/` inside that tree;
-the orchestrator must enforce this additional restriction.
+Harness Git commands read reflector objects through a harness-owned repository,
+without loading reflector repository, global or system configuration, executable
+attribute drivers, hooks, fsmonitor, filters, textconv, external diff or lazy fetch.
+The harness trusts its own Git binary and fixed `/usr/bin:/bin` PATH; worktree
+attributes can still apply Git's built-in data conversions. Harness Git storage
+lives beside the held-out set and must be outside the reflector's writable roots,
+just like the private scoring checkout.
+
+Held-out lane start/select and all lane Git mutations (including worktree
+creation/removal, reset, checkout and branch updates) currently fail closed when
+`GEPA_HELDOUT_DATASET` is configured. Use a single-checkout run (`--lanes 0`) for
+held-out scoring; safe lane mutations require a separate design.
 
 Sandbox rollouts run serially; the parent retains cost admission and response-level
 accounting. Public spend uses a fixed `sandbox` model bucket to prevent model names

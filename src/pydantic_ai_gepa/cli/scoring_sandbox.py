@@ -33,6 +33,8 @@ from .layout import GepaConfig, git_root
 from .scoring_proxy import allowed_addresses, connect_proxy
 from .validation import heldout_dataset
 
+from .safe_git import SafeGit, safe_repository, unsafe_checkout_component
+
 MAX_MESSAGE = 1024 * 1024
 RESPONSE_TIMEOUT = 300
 PROVIDER_KEYS = (
@@ -183,22 +185,15 @@ def private_checkout(project: Path, sha: str) -> Iterator[tuple[Path, Path, Path
         scratch.mkdir(mode=0o700)
         # Read raw objects, never worktree conversions. In particular, do not
         # use archive, checkout, or cat-file's --filters/--textconv options.
-        command = ["git", "--no-replace-objects", "-C", str(repository)]
-        env = {
-            "PATH": "/usr/bin:/bin",
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": "/dev/null",
-        }
         try:
-            result = subprocess.run(
-                [*command, "ls-tree", "-r", "-t", "-z", "--full-tree", sha],
-                env=env,
-                capture_output=True,
-            )
-            if result.returncode:
-                raise ScoringSandboxError("Cannot read candidate tree.")
-            entries = _checkout_entries(checkout, result.stdout)
-            _write_checkout_blobs(command, env, entries)
+            with safe_repository(repository) as git:
+                result = git.run(
+                    "ls-tree", "-r", "-t", "-z", "--full-tree", sha, capture_output=True
+                )
+                if result.returncode:
+                    raise ScoringSandboxError("Cannot read candidate tree.")
+                entries = _checkout_entries(checkout, result.stdout)
+                _write_checkout_blobs(git, entries)
         except OSError:
             raise ScoringSandboxError(
                 "Cannot create private candidate checkout."
@@ -229,7 +224,10 @@ def _checkout_entries(
         target = checkout / os.fsdecode(name)
         if (
             not re.fullmatch(rb"[0-9a-f]{40}|[0-9a-f]{64}", oid)
-            or any(part in (b"", b".", b"..") for part in name.split(b"/"))
+            or any(
+                part in (b"", b".", b"..") or unsafe_checkout_component(part)
+                for part in name.split(b"/")
+            )
             or Path(os.fsdecode(name)).is_absolute()
             or not target.resolve().is_relative_to(checkout)
         ):
@@ -239,11 +237,11 @@ def _checkout_entries(
 
 
 def _write_checkout_blobs(
-    command: list[str], env: dict[str, str], entries: list[tuple[Path, bytes, bytes]]
+    git: SafeGit, entries: list[tuple[Path, bytes, bytes]]
 ) -> None:
-    with subprocess.Popen(
-        [*command, "cat-file", "--batch"],
-        env=env,
+    with git.popen(
+        "cat-file",
+        "--batch",
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,

@@ -16,6 +16,8 @@ import sys
 
 import typer
 
+from .safe_git import Repository, run_git as safe_run_git
+
 
 def validation_dataset_path(
     configured_path: str,
@@ -33,9 +35,11 @@ def validation_dataset_path(
         "Start from Git history that never contained the held-out data."
     )
 
-    def run_git(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[Any]:
+    def run_git(
+        repository: Path, *args: str, **kwargs: Any
+    ) -> subprocess.CompletedProcess[Any]:
         try:
-            return subprocess.run(command, env={**os.environ, "LC_ALL": "C"}, **kwargs)
+            return safe_run_git(repository, *args, **kwargs)
         except OSError as exc:
             raise typer.BadParameter(
                 "Cannot verify validation dataset isolation. " + fix
@@ -46,19 +50,20 @@ def validation_dataset_path(
     roots = {project_root.resolve(), (candidate_root or project_root).resolve()}
     repositories: set[Path] = set()
     for root in tuple(roots):
-        result = run_git(
-            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            repository = Path(result.stdout.strip()).resolve()
-            roots.add(repository)
-            repositories.add(repository)
-        elif "not a git repository" not in result.stderr:
+        try:
+            repository = Repository.discover(root).root
+        except FileNotFoundError as exc:
+            if str(exc) != "not a git repository":
+                raise typer.BadParameter(
+                    "Cannot verify validation dataset isolation. " + fix
+                ) from exc
+        except OSError as exc:
             raise typer.BadParameter(
                 "Cannot verify validation dataset isolation. " + fix
-            )
+            ) from exc
+        else:
+            roots.add(repository)
+            repositories.add(repository)
     roots.add(gepa_dir(project_root).resolve())
     if any(
         path.is_relative_to(root) or lexical_path.is_relative_to(root) for root in roots
@@ -78,7 +83,9 @@ def validation_dataset_path(
         # Checking the object database also catches staged files, deleted files,
         # renamed files, other branches and reflogs. Moving a file is not enough.
         hashed = run_git(
-            ["git", "-C", str(repository), "hash-object", "--stdin"],
+            repository,
+            "hash-object",
+            "--stdin",
             input=contents,
             capture_output=True,
         )
@@ -87,13 +94,9 @@ def validation_dataset_path(
                 "Cannot verify validation dataset Git history. " + fix
             )
         found = run_git(
-            [
-                "git",
-                "-C",
-                str(repository),
-                "cat-file",
-                "--batch-check",
-            ],
+            repository,
+            "cat-file",
+            "--batch-check",
             input=hashed.stdout,
             capture_output=True,
         )

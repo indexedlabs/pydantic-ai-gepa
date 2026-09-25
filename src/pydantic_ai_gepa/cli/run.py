@@ -2003,6 +2003,10 @@ def start(
         raise typer.BadParameter("--acceptance-paired-min-cases must be >= 2.")
     heldout_required = heldout_required or _held_out_validation_enabled()
     if heldout_required:
+        if lanes:
+            from .safe_git import refuse_heldout_git_mutations
+
+            refuse_heldout_git_mutations()
         _validation_dataset_identity()
         from . import scoring_sandbox
 
