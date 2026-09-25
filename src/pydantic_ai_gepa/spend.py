@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 from collections.abc import AsyncIterator, Callable, Iterator
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from threading import RLock
@@ -112,6 +112,14 @@ class SpendMeter:
     - Reflection overshoot stays bounded by the reflection projection plus
       the response backstop.
 
+    A child meter forwards each priced response and each step observation to
+    its parent, and must pass both rollout gates. Parent price overrides take
+    precedence; each response is priced once and charged identically to both
+    ledgers. A local cap stops only that child. The parent's report is aggregate
+    across all children and direct evaluations. Composed reflections run one
+    at a time, without competing rollout reservations, to retain the reflection
+    projection/response-backstop caveat above.
+
     Near the cap the gate is conservative: with nothing in flight it stops
     once the kind's highest observed rollout no longer fits, so one outlier
     rollout can end a run with headroom left.
@@ -122,6 +130,8 @@ class SpendMeter:
         max_token_cost: float | None = None,
         price_fn: PriceFn | None = None,
         max_concurrent: int | None = None,
+        *,
+        parent: SpendMeter | None = None,
     ) -> None:
         if max_token_cost is not None and (
             not math.isfinite(max_token_cost) or max_token_cost <= 0
@@ -129,6 +139,7 @@ class SpendMeter:
             raise ValueError("max_token_cost must be finite and > 0")
         if max_concurrent is not None and max_concurrent <= 0:
             raise ValueError("max_concurrent must be > 0")
+        self.parent = parent
         self.max_token_cost = max_token_cost
         self.price_fn = price_fn
         self.max_concurrent = max_concurrent
@@ -152,6 +163,7 @@ class SpendMeter:
         }
         self._active: dict[RolloutKind, int] = {"training": 0, "validation": 0}
         self._reserved = 0.0
+        self._reflection_active = False
         self._condition = asyncio.Condition()
         self._in_admission: ContextVar[bool] = ContextVar(
             "gepa_in_admission", default=False
@@ -163,6 +175,8 @@ class SpendMeter:
 
     def check(self) -> None:
         """Prevent queued work or another tool round after a cost stop."""
+        if self.parent is not None:
+            self.parent.check()
         with self._lock:
             if self.max_token_cost is not None and self._total() >= self.max_token_cost:
                 self.stop_reason = self.stop_reason or COST_STOP_REASON
@@ -173,7 +187,13 @@ class SpendMeter:
         """Record exactly one new response, including an over-budget response."""
         price_error: Exception | None = None
         try:
-            dollars = self.price_fn(response) if self.price_fn is not None else None
+            price_fn = self.price_fn
+            ancestor = self.parent
+            while ancestor is not None:
+                if ancestor.price_fn is not None:
+                    price_fn = ancestor.price_fn
+                ancestor = ancestor.parent
+            dollars = price_fn(response) if price_fn is not None else None
             if dollars is None:
                 dollars = float(response.cost().total_price)
             dollars = float(dollars)
@@ -186,6 +206,15 @@ class SpendMeter:
             # retain the paid response and use the graceful cost-stop path.
             price_error = error
             dollars = None
+        self._record_priced(category, response, dollars, price_error)
+
+    def _record_priced(
+        self,
+        category: SpendCategory,
+        response: ModelResponse,
+        dollars: float | None,
+        price_error: Exception | None,
+    ) -> None:
         name = response.model_name or "<unknown>"
         with self._lock:
             usage = self._usage[category].setdefault(name, ModelSpend())
@@ -214,6 +243,10 @@ class SpendMeter:
                     and self._total() > self.max_token_cost
                 ):
                     self.stop_reason = self.stop_reason or COST_STOP_REASON
+            # Forward even a response that exceeded the local cap. Pricing is
+            # resolved once so the engine and pipeline ledgers agree exactly.
+            if self.parent is not None:
+                self.parent._record_priced(category, response, dollars, price_error)
             if self.stop_reason is not None:
                 raise CostBudgetExceeded(self.stop_reason) from price_error
 
@@ -263,7 +296,16 @@ class SpendMeter:
             ):
                 self.stop_reason = COST_STOP_REASON
                 return False
-            return True
+            return (
+                self.parent.can_start(
+                    category,
+                    count,
+                    following_rollouts=following_rollouts,
+                    rollout_kind=rollout_kind,
+                )
+                if self.parent is not None
+                else True
+            )
 
     @contextmanager
     def step(
@@ -273,7 +315,10 @@ class SpendMeter:
         observation = _StepUsage(category, kind=kind)
         token = self._step_usage.set(observation)
         try:
-            yield
+            with (
+                self.parent.step(category, kind=kind) if self.parent else nullcontext()
+            ):
+                yield
         finally:
             self._step_usage.reset(token)
             with self._lock:
@@ -295,6 +340,8 @@ class SpendMeter:
             if self.stop_reason is not None:
                 raise CostBudgetExceeded(self.stop_reason)
             assert self.max_token_cost is not None and self.max_concurrent is not None
+            if self._reflection_active:
+                return None
             observations = self._kind_observations[kind]
             highest = self._kind_highest[kind]
             remaining = self.max_token_cost - self._total() - self._reserved
@@ -327,6 +374,16 @@ class SpendMeter:
         Uncapped meters (or meters without ``max_concurrent``) admit
         immediately with no waiting or serialization, as before.
         """
+        if self.parent is not None:
+            async with self.parent.admit_rollout(kind):
+                async with self._admit_local_rollout(kind):
+                    yield
+        else:
+            async with self._admit_local_rollout(kind):
+                yield
+
+    @asynccontextmanager
+    async def _admit_local_rollout(self, kind: RolloutKind) -> AsyncIterator[None]:
         if (
             self.max_token_cost is None
             or self.max_concurrent is None
@@ -363,6 +420,39 @@ class SpendMeter:
             async with self._condition:
                 self._condition.notify_all()
 
+    @asynccontextmanager
+    async def admit_reflection(self) -> AsyncIterator[None]:
+        """Keep composed reflection runs from racing reserved rollout dollars.
+
+        Only child meters use this gate. Uncapped composition never waits.
+        A nested reflection agent shares its outer agent's reservation.
+        """
+        root: SpendMeter | None = None
+        ancestor = self.parent
+        while ancestor is not None:
+            if ancestor.max_token_cost is not None:
+                root = ancestor
+            ancestor = ancestor.parent
+        if root is None or root._in_admission.get():
+            yield
+            return
+        async with root._condition:
+            while root._reflection_active or any(root._active.values()):
+                root.check()
+                await root._condition.wait()
+            root.check()
+            if not root.can_start("reflection"):
+                raise CostBudgetExceeded(root.stop_reason or COST_STOP_REASON)
+            root._reflection_active = True
+            token = root._in_admission.set(True)
+        try:
+            yield
+        finally:
+            root._in_admission.reset(token)
+            root._reflection_active = False
+            async with root._condition:
+                root._condition.notify_all()
+
     def report(self) -> SpendReport:
         with self._lock:
             by_model: dict[str, ModelSpend] = {}
@@ -390,8 +480,14 @@ class SpendMeter:
                     if u.unpriced_requests
                 },
                 max_token_cost=self.max_token_cost,
-                stopped_by_cost=self.stop_reason is not None,
-                stop_reason=self.stop_reason,
+                stopped_by_cost=(
+                    self.stop_reason is not None
+                    or (
+                        self.parent is not None and self.parent.report().stopped_by_cost
+                    )
+                ),
+                stop_reason=self.stop_reason
+                or (self.parent.report().stop_reason if self.parent else None),
             )
 
 
@@ -431,7 +527,8 @@ class SpendCapability(AbstractCapability[Any]):
             async with self.meter.admit_rollout(kind):
                 with self.meter.step("rollout", kind=kind):
                     return await handler()
-        return await handler()
+        async with self.meter.admit_reflection():
+            return await handler()
 
 
 _active_rollout: ContextVar[SpendCapability | None] = ContextVar(
@@ -468,3 +565,9 @@ def rollout_spend(meter: SpendMeter) -> Iterator[None]:
         yield
     finally:
         _active_rollout.reset(token)
+
+
+# Internal harness context: no meter accessor is added to engine task views.
+_pipeline_meter: ContextVar[SpendMeter | None] = ContextVar(
+    "gepa_pipeline_meter", default=None
+)

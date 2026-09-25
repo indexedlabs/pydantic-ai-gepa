@@ -13,6 +13,7 @@ from ..provider_errors import PROVIDER_STOP_REASON, is_provider_stop_error
 from ..gepa_graph import create_deps, create_gepa_graph
 from ..gepa_graph.models import CandidateMap, GepaConfig, GepaResult, GepaState
 from ..runner import _resolve_candidate_selector, _resolve_component_selector
+from ..spend import SpendMeter, _pipeline_meter
 from ..types import ReflectionConfig
 from .base import (
     BudgetTracker,
@@ -89,6 +90,14 @@ class GepaEngine:
             training_set=await task.train_loader(),
             validation_set=await task.val_loader(),
         )
+        parent = _pipeline_meter.get()
+        if parent is not None:
+            state.spend_meter = SpendMeter(
+                config.max_token_cost,
+                gepa_config.price_fn,
+                max_concurrent=gepa_config.max_concurrent_evaluations,
+                parent=parent,
+            )
         deps = create_deps(
             adapter,
             gepa_config,
