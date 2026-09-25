@@ -418,6 +418,11 @@ def run_eval_once(
     active_candidate_project = (candidate_root or primary_project_root).resolve()
     cfg = GepaConfig.load(config_path(primary_project_root))
     source = candidate_source or cfg.candidate_source
+    from . import scoring_sandbox
+
+    sandboxed = scoring_sandbox.required()
+    if sandboxed:
+        scoring_sandbox.require_supported(cfg, source)
     agent = None
     evaluate = None
     metric = None
@@ -671,12 +676,13 @@ def run_eval_once(
         if capture_traces
         else None
     )
-    insert_repo_root_on_path(primary_project_root)
+    if not sandboxed:
+        insert_repo_root_on_path(primary_project_root)
     price_fn = (
         resolve_module_attr(
             cfg.price_fn, kind="price_fn", expected_root=primary_project_root
         )
-        if cfg.price_fn
+        if cfg.price_fn and not sandboxed
         else None
     )
     kind = (
@@ -713,7 +719,21 @@ def run_eval_once(
             else None
         ),
     ) as meter:
-        if source == "git":
+        if sandboxed:
+            assert git_state is not None
+            if git_state.dirty:
+                raise scoring_sandbox.ScoringSandboxError(
+                    "Sandbox scoring requires a clean committed candidate."
+                )
+            records = scoring_sandbox.score_cases(
+                config=cfg,
+                project=active_candidate_project,
+                sha=git_state.commit_sha,
+                cases=subset,
+                validation=dataset_role == "validation",
+                meter=meter,
+            )
+        elif source == "git":
             configured_refs = (cfg.agent, cfg.evaluate, cfg.metric, cfg.case_factory)
             scorer_root = (
                 primary_project_root

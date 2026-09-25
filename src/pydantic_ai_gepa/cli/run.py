@@ -1553,7 +1553,6 @@ def _current_baseline_candidate_id(
     """Return the candidate id for the current component files or git tree."""
 
     cfg = GepaConfig.load(config_path())
-    insert_repo_root_on_path()
     if candidate_source == "git":
         try:
             state = git_candidate_state(exclude_paths=candidate_identity_exempt_paths())
@@ -1562,6 +1561,7 @@ def _current_baseline_candidate_id(
             raise typer.Exit(code=1) from exc
         return state.candidate_id
 
+    insert_repo_root_on_path()
     agent = resolve_agent(cfg)
     skills_fs = resolve_skills(cfg)
     components = ComponentStore().effective_candidate(agent, skills_fs=skills_fs)
@@ -2004,6 +2004,12 @@ def start(
     heldout_required = heldout_required or _held_out_validation_enabled()
     if heldout_required:
         _validation_dataset_identity()
+        from . import scoring_sandbox
+
+        if scoring_sandbox.required():
+            scoring_sandbox.require_supported(
+                cfg, candidate_source or cfg.candidate_source
+            )
     vector_validation = heldout_required and cfg.acceptance.mode == "vector"
     if vector_validation and lanes == 0:
         public_echo(
