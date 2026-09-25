@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, AsyncIterator, Mapping, Sequence
 
 import logfire
 from pydantic_ai import UsageLimits
@@ -20,6 +21,8 @@ from .input_type import InputSpec
 from ._concurrency import gather_cancelling_on_provider_stop
 from .provider_errors import is_provider_stop_error
 from .skills import SkillsFS
+from .spend import current_rollout_capability
+from .exceptions import UsageBudgetExceeded
 from .skills.models import SkillCapability
 from .types import MetricResult, RolloutOutput
 
@@ -80,6 +83,10 @@ async def evaluate_candidate_dataset(
         skills_capabilities=skills_capabilities,
     )
 
+    capability = current_rollout_capability()
+    if capability is not None:
+        adapter.spend_meter = capability.meter
+
     candidate_map: CandidateMap = candidate.copy() if candidate is not None else {}
     candidate_text_map = candidate_texts(candidate_map)
 
@@ -87,7 +94,7 @@ async def evaluate_candidate_dataset(
     extra_attributes: dict[str, Any] = {"gen_ai.operation.name": "experiment"}
 
     async def run_case(index: int, case: Case[Any, Any, Any]) -> None:
-        async with semaphore:
+        async with semaphore, _rollout_scope():
             result = await adapter.process_case(
                 case,
                 index,
@@ -171,7 +178,7 @@ async def evaluate_callable_dataset(
 
     async def run_case(index: int, case: Case[Any, Any, Any]) -> None:
         case_id = case.name or f"case-{index}"
-        async with semaphore:
+        async with semaphore, _rollout_scope():
             try:
                 evaluate_input: Any = case
                 if case_factory is not None:
@@ -185,6 +192,13 @@ async def evaluate_callable_dataset(
                 if inspect.isawaitable(metric_result):
                     metric_result = await metric_result
                 score, feedback, side_info = _coerce_metric_result(metric_result)
+                capability = current_rollout_capability()
+                if (
+                    not (isinstance(output, RolloutOutput) and not output.success)
+                    and capability is not None
+                    and hasattr(capability.meter, "callable_completed")
+                ):
+                    capability.meter.callable_completed()
                 payload: dict[str, Any] = {
                     "output": output,
                     "score": score,
@@ -193,7 +207,7 @@ async def evaluate_callable_dataset(
                 if side_info is not None:
                     payload["side_info"] = side_info
             except Exception as exc:
-                if is_provider_stop_error(exc):
+                if isinstance(exc, UsageBudgetExceeded) or is_provider_stop_error(exc):
                     raise
                 output = RolloutOutput.from_error(exc, kind="system")
                 score = 0.0
@@ -236,3 +250,13 @@ __all__ = [
     "evaluate_callable_dataset",
     "evaluate_candidate_dataset",
 ]
+
+
+@asynccontextmanager
+async def _rollout_scope() -> AsyncIterator[None]:
+    capability = current_rollout_capability()
+    if capability is not None and hasattr(capability.meter, "rollout"):
+        async with capability.meter.rollout():
+            yield
+    else:
+        yield

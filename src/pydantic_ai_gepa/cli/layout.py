@@ -264,6 +264,9 @@ class GepaConfig:
     optimizer but are never exposed to the external reflection agent.
     """
 
+    price_fn: str | None = None
+    """Optional response price override (US dollars), resolved from the scorer."""
+
     metric: str | None = None
     """Optional ``module.path:attr`` reference for a custom metric callable."""
 
@@ -331,6 +334,11 @@ class GepaConfig:
             raise GepaConfigError(
                 "Invalid 'validation_dataset' value: expected a path string or omit."
             )
+        price_fn = data.get("price_fn")
+        if price_fn is not None and (
+            not isinstance(price_fn, str) or ":" not in price_fn
+        ):
+            raise GepaConfigError("Invalid price_fn: expected module.path:attr")
         metric = data.get("metric")
         if metric is not None and (not isinstance(metric, str) or ":" not in metric):
             raise GepaConfigError(
@@ -366,6 +374,7 @@ class GepaConfig:
             dataset=dataset,
             validation_dataset=validation_dataset,
             metric=metric,
+            price_fn=price_fn,
             case_factory=case_factory,
             defaults=defaults,
             skills=skills,
