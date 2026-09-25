@@ -2004,6 +2004,12 @@ def start(
     heldout_required = heldout_required or _held_out_validation_enabled()
     if heldout_required:
         _validation_dataset_identity()
+        from . import scoring_sandbox
+
+        if scoring_sandbox.required():
+            scoring_sandbox.require_supported(
+                cfg, candidate_source or cfg.candidate_source
+            )
     vector_validation = heldout_required and cfg.acceptance.mode == "vector"
     if vector_validation and lanes == 0:
         public_echo(

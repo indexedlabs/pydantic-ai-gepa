@@ -38,3 +38,17 @@ jobs:
 
       - name: Run tests
         run: uv run pytest
+
+  scoring-sandbox:
+    runs-on: macos-latest
+    env:
+      GEPA_REQUIRE_SCORING_SANDBOX: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v7
+      - run: uv sync --all-extras --frozen
+      - name: Exercise real Seatbelt isolation (no skips for unusable backend)
+        run: uv run pytest tests/cli/test_scoring_sandbox.py -v

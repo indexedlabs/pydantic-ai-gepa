@@ -418,13 +418,16 @@ It never evaluates a held-out run, even if the variable was accidentally set
 in its environment. The harness takes the run lock, checks the epoch and clean
 candidate identity, evaluates the training gate, then confirms training winners
 on validation. It rechecks the tree before saving state and after scoring.
-Held-out runs require a **committed, clean candidate in both git and component
-mode**: commit component-file edits too. A dirty-tree refusal asks you to commit
+Held-out runs require a **committed, clean git candidate with scalar, unpinned
+acceptance**. Component, vector and pinned-scorer held-out modes currently fail
+closed before candidate imports. A dirty-tree refusal asks you to commit
 before nominating. Keep the nominated tree unchanged until the result arrives.
-This version checks the existing checkout before and after scoring.
+The harness checks the shared checkout for stale nominations, but scores a
+private archive of the nominated commit. No worktree registration, index update,
+or ref write exposes that checkout in the shared repository.
 
-The reflector receives the usual training reports, trace paths, aggregate
-validation verdict and exit code. `--wait-secs` defaults to 300; `0` enqueues
+The reflector receives training feedback reports, aggregate validation verdicts
+and exit codes. Arbitrary child-written traces are kept private and discarded. `--wait-secs` defaults to 300; `0` enqueues
 and returns immediately. Nomination waits up to five seconds for a busy run
 lock; either a lock timeout or a result timeout exits **75**. Run the same command
 again to reattach without duplicating the nomination. A different pending candidate or
@@ -498,11 +501,63 @@ the external harness scored, and sandboxed `continue` returned the accepted
 verdict. Repeat this read-denial and scoring probe for the actual deployment's
 paths and grants; system-temp placement does not protect held-out data.
 
-Candidate code executed by the harness still runs with scorer privileges and
-can read files the harness can read. **In git mode, a reflector-written candidate
-is not isolated from the held-out file.** Removing the environment variable is
-partial hardening, not a filesystem boundary for that code. A separate held-out
-scoring subprocess with its own sandbox is a follow-up.
+Candidate code is scored in a **sandboxed child from a harness-owned detached
+checkout**. The parent reads the held-out dataset and sends one case at a time
+over a pipe; the child returns bounded JSON results. Candidate agent, evaluator,
+metric, case-factory and pricing imports happen only in that child. Training
+scoring inside a held-out harness also uses the child; training-only runs retain
+the in-process evaluator. Children and their private checkout/scratch directories
+are removed after every evaluation, including failures. Archives containing
+symlinks or special files are refused.
+
+The current backend is macOS Seatbelt (`/usr/bin/sandbox-exec`). It denies writes
+outside private scratch, reads of the held-out directory outside the child's own
+checkout/scratch, and network connections except to the harness's loopback CONNECT
+proxy. The proxy listens on `127.0.0.1`; Seatbelt's `localhost:<port>` rule covers
+loopback addresses on that TCP port. Fork/exec is allowed for per-case evaluator
+subprocesses; descendants
+inherit the same Seatbelt restrictions. Linux and hosts with an unusable backend
+**refuse held-out scoring**; there is no unsandboxed fallback or disable flag. macOS CI requires real OS adversarial
+tests. Seatbelt is deprecated; repeat those tests on each deployment OS. Local
+Codex may prohibit nested Seatbelt, so a local skip is not enforcement evidence.
+
+Set `GEPA_HARNESS_ALLOWED_HOSTS=api.openai.com:443,api.anthropic.com:443` in the
+**harness environment** to allow exact CONNECT destinations. The default is empty
+(no external network). Clients must honor `HTTPS_PROXY`/`HTTP_PROXY`; ordinary
+forward-proxy HTTP requests and direct connections are refused. The child inherits
+the fixed provider keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+`GOOGLE_API_KEY`, `GEMINI_API_KEY`) and sandbox settings. To pass another evaluator
+setting, set `GEPA_HARNESS_PASS_ENV=TYPESAFE_API_KEY,OTHER_NAME` in the harness
+environment. Names are never read from a nomination, `gepa.toml` or `.env`.
+Reserved harness/runtime names (including `GEPA_HELDOUT_DATASET` and
+`GEPA_HARNESS_ALLOWED_HOSTS`) and values containing the held-out path are refused.
+Held-out harness commands skip candidate-owned `.env` files. Install the harness and its Python dependencies
+in storage the reflector cannot modify, and keep provider credentials out of the
+reflector environment.
+
+Sandbox rollouts run serially; the parent retains cost admission and response-level
+accounting. Public spend uses a fixed `sandbox` model bucket to prevent model names
+from carrying held-out text. Arbitrary output/side-info/trace artifacts are not
+copied back; training feedback remains available.
+
+What this does not cover:
+
+- Scores and numeric usage feed public aggregates, creating low-bandwidth covert
+  channels across repeated evaluations.
+- Traffic to an allowlisted model endpoint may be readable through its provider
+  account. Keep harness credentials out of the reflector, but this is not enough:
+  candidate code can also supply its own credentials to an allowed host. CONNECT
+  restricts destinations, not accounts, HTTP methods or request contents.
+- Timing, CPU, memory and denial-of-service channels. The sandbox is not a resource
+  limiter (the result reader has a timeout and message-size bound).
+- OS/kernel exploits, changes to the trusted harness/runtime, or other private
+  datasets outside the configured held-out directory.
+- Evaluators that need a local database or another local service. The child has
+  no direct local-service ports; only the allowlisted model proxy is reachable.
+- Parallel rollouts within a scoring child; scoring is serial.
+- Authentication of shared results/state and other `GEPA_DIR` coordination files;
+  a reflector with write access can still forge them. This needs a separate
+  ownership/authentication change.
 
 Process isolation is the barrier, not secrecy of the path: `ps` can expose
 another process's arguments and environment. Run files are shared coordination

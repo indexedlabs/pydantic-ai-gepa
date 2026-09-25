@@ -62,7 +62,11 @@ def _gepa_root(
     """
     if gepa_dir:
         set_gepa_dirname(gepa_dir)
-    if not no_dotenv:
+    from .validation import heldout_dataset
+
+    # A candidate-owned .env cannot configure a harness's network allowlist,
+    # provider credentials, subprocess environment, or observability exports.
+    if not no_dotenv and heldout_dataset(required=False) is None:
         load_dotenv()
 
 

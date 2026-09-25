@@ -2025,8 +2025,13 @@ def _run_select_locked(workspace_root: Path, run_state: Any) -> Any:
 
     if run_state.heldout_required:
         from .run import _assert_validation_dataset_unchanged
+        from . import scoring_sandbox
 
         _assert_validation_dataset_unchanged(run_state, workspace_root=workspace_root)
+        if scoring_sandbox.required():
+            scoring_sandbox.require_supported(
+                GepaConfig.load(config_path(workspace_root)), run_state.candidate_source
+            )
 
     state = run_state
     if state.select_phase is None:

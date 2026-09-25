@@ -664,6 +664,12 @@ def resolve_module_attr(
     ref: str, *, kind: str = "object", expected_root: Path | None = None
 ) -> Any:
     """Resolve a ``module.path:attr`` reference to the named attribute."""
+    from .scoring_sandbox import ScoringSandboxError, required
+
+    if required():
+        raise ScoringSandboxError(
+            "Candidate hooks cannot be imported in a held-out harness process."
+        )
     if ":" not in ref:
         raise GepaConfigError(
             f"Invalid {kind} ref {ref!r}: expected 'module.path:attr'."
