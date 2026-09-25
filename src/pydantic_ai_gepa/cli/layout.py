@@ -256,6 +256,9 @@ class GepaConfig:
     than the hardcoded default.
     """
 
+    price_fn: str | None = None
+    """Optional response price override (US dollars), resolved from the scorer."""
+
     metric: str | None = None
     """Optional ``module.path:attr`` reference for a custom metric callable."""
 
@@ -322,6 +325,11 @@ class GepaConfig:
             from .validation import refuse_legacy_validation
 
             refuse_legacy_validation()
+        price_fn = data.get("price_fn")
+        if price_fn is not None and (
+            not isinstance(price_fn, str) or ":" not in price_fn
+        ):
+            raise GepaConfigError("Invalid price_fn: expected module.path:attr")
         metric = data.get("metric")
         if metric is not None and (not isinstance(metric, str) or ":" not in metric):
             raise GepaConfigError(
@@ -356,6 +364,7 @@ class GepaConfig:
             candidate_source=candidate_source,
             dataset=dataset,
             metric=metric,
+            price_fn=price_fn,
             case_factory=case_factory,
             defaults=defaults,
             skills=skills,

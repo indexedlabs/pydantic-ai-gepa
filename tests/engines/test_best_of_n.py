@@ -114,3 +114,49 @@ def test_best_of_n_requires_a_callable_proposer(propose: object) -> None:
 
     with pytest.raises(TypeError, match=r"engine_config\['propose'\].*callable"):
         BestOfNEngine(config)
+
+
+@pytest.mark.asyncio
+async def test_best_of_n_returns_unscored_seed_when_budget_is_insufficient() -> None:
+    async def propose(seed: CandidateMap) -> CandidateMap:
+        return _candidate("correct")
+
+    task = _task(case_count=2)
+    config = EngineConfig(
+        engine="best_of_n",
+        engine_config={"n": 2, "propose": propose},
+    )
+    budget = BudgetTracker(1)
+
+    result = await get_engine("best_of_n", config).run(task, config, budget)
+
+    assert result.best_candidate == await task.seed_candidate()
+    assert result.best_score is None
+    assert result.num_metric_calls == budget.spent == 0
+    assert budget.remaining == 1
+    assert result.history[-1].data["candidate_scores"] == [None, None, None]
+    assert result.history[-1].data["evaluated_candidates"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget_size", [2, 6])
+async def test_best_of_n_preserves_measured_zero_score(budget_size: int) -> None:
+    async def propose(seed: CandidateMap) -> CandidateMap:
+        return _candidate("still wrong")
+
+    task = _task(case_count=2)
+    config = EngineConfig(
+        engine="best_of_n",
+        engine_config={"n": 2, "propose": propose},
+    )
+    budget = BudgetTracker(budget_size)
+
+    result = await get_engine("best_of_n", config).run(task, config, budget)
+
+    assert result.best_candidate == await task.seed_candidate()
+    assert result.best_score == 0.0
+    assert result.num_metric_calls == budget.spent == budget_size
+    assert result.history[-1].data["candidate_scores"] == (
+        [0.0, None, None] if budget_size == 2 else [0.0, 0.0, 0.0]
+    )
+    assert result.history[-1].data["evaluated_candidates"] == budget_size // 2

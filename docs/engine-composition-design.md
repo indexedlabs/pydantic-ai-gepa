@@ -51,7 +51,7 @@ class OptimizationEngine(Protocol):
 - `EngineConfig`: `engine: str`, `max_metric_calls`, `max_iterations`,
   `stop_at_score: float | None`, and `engine_config: dict[str, Any]` for
   engine-specific knobs.
-- `EngineResult`: `best_candidate: CandidateMap`, `best_score: float`,
+- `EngineResult`: `best_candidate: CandidateMap`, `best_score: float | None` (None when no candidate finished full validation),
   `num_metric_calls: int`, `engine: str`, `history: list[EngineEvent]`.
 - `BudgetTracker`: shared across a pipeline; `max_metric_calls` total. Engines
   call `budget.spend(n)` / check `budget.exhausted`. `max_metric_calls` is the

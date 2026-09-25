@@ -22,11 +22,33 @@ def isolated_environment(monkeypatch):
 
 
 @pytest.fixture
-def heldout(git_repo, monkeypatch):
+def heldout(git_repo, monkeypatch, request):
     (git_repo / "task_pkg" / "evaluation.py").write_text(
         'from pathlib import Path\nasync def evaluate(case):\n    return Path("score.txt").read_text().strip()\n'
     )
-    _git(git_repo, "add", "task_pkg/evaluation.py")
+    metered = getattr(request, "param", False)
+    if metered:
+        (git_repo / "task_pkg/evaluation.py").write_text(
+            """from pathlib import Path
+from pydantic_ai import Agent
+from pydantic_ai.models.test import TestModel
+from pydantic_ai_gepa.spend import current_rollout_capability
+async def evaluate(case):
+    score = Path("score.txt").read_text().strip()
+    name = "jump" if score == "good" and case.name == "WITHHELD_BETA" else "test"
+    await Agent(TestModel(custom_output_text="ok", model_name=name)).run(
+        "?", capabilities=[current_rollout_capability()])
+    if case.name.startswith("WITHHELD"):
+        print("WITHHELD_INPUT diagnostic must stay private")
+    return score
+"""
+        )
+        (git_repo / "task_pkg/pricing.py").write_text(
+            'def price(response): return 0.30 if response.model_name == "jump" else 0.01\n'
+        )
+        config = git_repo / ".gepa/gepa.toml"
+        config.write_text('price_fn = "task_pkg.pricing:price"\n' + config.read_text())
+    _git(git_repo, "add", "task_pkg", ".gepa/gepa.toml")
     _git(git_repo, "commit", "-m", "Use trace-independent fake evaluator")
     private = git_repo.parent / f"private-{git_repo.name}"
     private.mkdir()
@@ -52,6 +74,7 @@ def heldout(git_repo, monkeypatch):
         "1",
         "--acceptance-paired-min-cases",
         "2",
+        *(["--max-token-cost", "0.20"] if metered else []),
     )
     assert started.exit_code == 0, started.output
     run_id = str(_run_payload(started.output)["run_id"])
@@ -319,3 +342,37 @@ def test_harness_replays_budget_exit_code(git_repo, heldout, monkeypatch):
     result = _continue(run_id)
     assert result.exit_code == 70, result.output
     _sweep(git_repo, path, result.output)
+
+
+@pytest.mark.parametrize("heldout", [True], indirect=True)
+def test_validation_spend_stop_crosses_harness_without_promoting_partial_candidate(
+    git_repo, heldout, monkeypatch
+):
+    from pydantic_ai_gepa.cli.spend import spend_report
+
+    path, run_id, start_output = heldout
+    initial = _run_payload(start_output)
+    incumbent = initial["best_candidate_id"]
+    _commit(git_repo)
+    queued = _continue(run_id)
+    assert queued.exit_code == 0, queued.output
+    assert json.loads(queued.output)["status"] == "pending"
+    served = _serve(run_id, path, monkeypatch)
+    assert served.exit_code == 0, served.output
+    delivered = _continue(run_id)
+    assert delivered.exit_code == 70, delivered.output
+    result = _run_payload(delivered.output)
+    assert result["status"] == "done"
+    assert result["last_comparison"]["reason_code"] == "cost_budget_exhausted"
+    assert result["best_candidate_id"] == incumbent
+    assert result["best_mean_score"] == initial["best_mean_score"]
+    assert result["spend"]["validation_dollars"] == pytest.approx(0.33)
+    assert result["spend"]["stopped_by_cost"]
+    # The reflector receives the exact trusted output/code captured by the harness.
+    results = list((git_repo / ".gepa/runs" / run_id / "results").glob("*.json"))
+    stored = json.loads(results[0].read_text())
+    assert delivered.stdout == stored["stdout"]
+    assert delivered.stderr == stored["stderr"]
+    assert delivered.exit_code == stored["exit_code"]
+    assert spend_report(run_id)["total_dollars"] == result["spend"]["total_dollars"]
+    _sweep(git_repo, path, start_output, queued.output, served.output, delivered.output)

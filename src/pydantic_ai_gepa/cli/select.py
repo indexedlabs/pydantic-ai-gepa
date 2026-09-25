@@ -1463,6 +1463,8 @@ def _phase_run_start_rebaseline(
             if not isinstance(raw_key, dict):
                 raise typer.BadParameter("Stored run-start vector key is malformed.")
             outcome = run_eval_once(
+                spend_state=state,
+                spend_kind="baseline",
                 candidate_file=None,
                 minibatch_id=minibatch_id,
                 size=state.size,
@@ -1744,6 +1746,8 @@ def _phase_rebaseline(
 
     with _chdir(baseline_root):
         first = run_eval_once(
+            spend_state=state,
+            spend_kind="baseline",
             candidate_file=None,
             minibatch_id=None,
             size=state.size,
@@ -1781,6 +1785,8 @@ def _phase_rebaseline(
         minibatch_id = str(first.summary["minibatch_id"])
         while len(outcomes) < target_repetitions:
             outcome = run_eval_once(
+                spend_state=state,
+                spend_kind="baseline",
                 candidate_file=None,
                 minibatch_id=minibatch_id,
                 size=state.size,

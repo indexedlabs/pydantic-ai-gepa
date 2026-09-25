@@ -62,7 +62,7 @@ class BestOfNEngine:
             candidates.append(await self._propose(seed))
 
         best_candidate = seed
-        best_score = 0.0
+        best_score: float | None = None
         scores: list[float | None] = []
         history: list[EngineEvent] = []
         for index, candidate in enumerate(candidates):
@@ -83,7 +83,7 @@ class BestOfNEngine:
                 break
 
             scores.append(evaluation.score)
-            if index == 0 or evaluation.score > best_score:
+            if best_score is None or evaluation.score > best_score:
                 best_candidate = candidate
                 best_score = evaluation.score
 

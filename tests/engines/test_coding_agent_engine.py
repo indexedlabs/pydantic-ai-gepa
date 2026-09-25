@@ -51,6 +51,26 @@ def _candidate(text: str) -> CandidateMap:
     return {"instructions": ComponentValue(name="instructions", text=text)}
 
 
+@pytest.mark.asyncio
+async def test_coding_agent_engine_returns_unscored_seed_when_budget_is_insufficient():
+    async def propose(context: ReflectionContext) -> CandidateMap:
+        pytest.fail("An unscored seed should not reach proposal generation")
+
+    task = _task(case_count=3)
+    config = EngineConfig(
+        engine="coding_agent",
+        max_metric_calls=2,
+        engine_config={"propose": propose},
+    )
+    budget = BudgetTracker(2)
+
+    result = await CodingAgentEngine(config).run(task, config, budget)
+
+    assert result.best_candidate == await task.seed_candidate()
+    assert result.best_score is None
+    assert result.num_metric_calls == budget.spent == 0
+
+
 def test_pareto_parent_selection_handles_partial_coordinate_overlap() -> None:
     pool = [
         _CandidatePoolEntry(

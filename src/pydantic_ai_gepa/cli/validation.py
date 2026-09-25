@@ -8,7 +8,9 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
-from typing import Any, Callable, ParamSpec, TypeVar
+from typing import Any, Callable, ParamSpec, TypeVar, TextIO
+from contextvars import ContextVar
+import sys
 
 import typer
 
@@ -122,6 +124,17 @@ def validation_evidence_path(dataset: str, *, project_root: Path, run_id: str) -
     )
 
 
+def validation_spend_path(dataset: str, *, project_root: Path, run_id: str) -> Path:
+    """Keep spend separate from optional, disposable paired replay evidence."""
+    evidence = validation_evidence_path(
+        dataset, project_root=project_root, run_id=run_id
+    )
+    return (
+        evidence.parent.with_name(".gepa-validation-spend")
+        / evidence.with_suffix(".jsonl").name
+    )
+
+
 def write_validation_evidence(
     dataset: str,
     *,
@@ -231,6 +244,16 @@ _P = ParamSpec("_P")
 _T = TypeVar("_T")
 
 
+_public_stdout: ContextVar[TextIO | None] = ContextVar(
+    "heldout_public_stdout", default=None
+)
+
+
+def public_echo(message: str) -> None:
+    """Emit only trusted controller output through private evaluator suppression."""
+    typer.echo(message, file=_public_stdout.get())
+
+
 def private_evaluation(evaluate: Callable[_P, _T]) -> Callable[_P, _T]:
     """Discard evaluator console chatter on held-out calls, including replay."""
     from contextlib import redirect_stderr, redirect_stdout
@@ -242,7 +265,11 @@ def private_evaluation(evaluate: Callable[_P, _T]) -> Callable[_P, _T]:
         if kwargs.get("dataset_role") != "validation":
             return evaluate(*args, **kwargs)
         heldout_dataset()
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            return evaluate(*args, **kwargs)
+        token = _public_stdout.set(_public_stdout.get() or sys.stdout)
+        try:
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                return evaluate(*args, **kwargs)
+        finally:
+            _public_stdout.reset(token)
 
     return wrapped

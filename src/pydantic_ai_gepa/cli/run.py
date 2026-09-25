@@ -97,6 +97,7 @@ class RunState:
     iterations: int
     created_at: str
     updated_at: str
+    max_token_cost: float | None = None
     reflection_minibatch_id: str | None = None
     reflection_baseline_candidate_id: str | None = None
     reflection_baseline_commit_sha: str | None = None
@@ -170,6 +171,7 @@ class RunState:
             "run_id": self.run_id,
             "status": self.status,
             "max_iterations": self.max_iterations,
+            "max_token_cost": self.max_token_cost,
             "size": self.size,
             "seed": self.seed,
             "next_epoch": self.next_epoch,
@@ -251,6 +253,7 @@ class RunState:
             run_id=str(data["run_id"]),
             status=str(data["status"]),  # type: ignore[arg-type]
             max_iterations=int(data["max_iterations"]),
+            max_token_cost=data.get("max_token_cost"),
             size=int(data["size"]),
             seed=int(data["seed"]),
             next_epoch=int(data["next_epoch"]),
@@ -757,6 +760,7 @@ def _evaluate_validation_candidate(
     )
     outcome = private_evaluation(durable_eval)(
         run_eval_once,
+        spend_state=state,
         candidate_file=None,
         minibatch_id=None,
         size=state.size,
@@ -1020,6 +1024,8 @@ def _fresh_baseline_outcome(state: RunState) -> tuple[RunState, EvalOutcome]:
     retry_minibatch_id = state.infrastructure_retry_minibatch_id
     outcome = durable_eval(
         run_eval_once,
+        spend_state=state,
+        spend_kind="baseline",
         candidate_file=None,
         minibatch_id=retry_minibatch_id,
         size=state.size,
@@ -1074,6 +1080,8 @@ def _capture_reflection_baseline(
     while len(outcomes) < target_repetitions:
         outcome = durable_eval(
             run_eval_once,
+            spend_state=state,
+            spend_kind="baseline",
             candidate_file=None,
             minibatch_id=minibatch_id,
             size=state.size,
@@ -1227,6 +1235,7 @@ def _evaluate_reflected_candidate(
             supplemental_records = gate_outcomes[0].records
         outcome = durable_eval(
             run_eval_once,
+            spend_state=state,
             candidate_file=None,
             minibatch_id=state.reflection_minibatch_id,
             size=state.size,
@@ -1444,6 +1453,7 @@ def _evaluate_gate_cases(
     while len(candidate_samples) < max_candidate_samples:
         outcome = durable_eval(
             run_eval_once,
+            spend_state=state,
             candidate_file=None,
             minibatch_id=state.reflection_minibatch_id,
             size=state.size,
@@ -1643,6 +1653,18 @@ def _write_final_report(
                 f"status={row.status}"
             )
 
+    from .spend import spend_report
+
+    lines.extend(
+        [
+            "",
+            "## Rollout Spend",
+            "",
+            json.dumps(
+                spend_report(state.run_id, root, state.max_token_cost), sort_keys=True
+            ),
+        ]
+    )
     text = "\n".join(lines) + "\n"
     path.write_text(text, encoding="utf-8")
     return path, text
@@ -1653,13 +1675,17 @@ def _public_state(
     *,
     outcomes: list[EvalOutcome],
     final_report: Path | None = None,
+    root: Path | None = None,
 ) -> dict[str, Any]:
+    from .spend import spend_report
+
     payload = state_for_save(state).to_dict()
+    payload["spend"] = spend_report(state.run_id, root, cap=state.max_token_cost)
     payload.pop("best_validation_per_case_scores", None)
-    payload["state_path"] = str(run_state_path(state.run_id))
+    payload["state_path"] = str(run_state_path(state.run_id, root))
     if state.lanes == 0:
         payload["reflector_packet_path"] = str(
-            run_dir(state.run_id) / "reflector_packet.json"
+            run_dir(state.run_id, root) / "reflector_packet.json"
         )
     payload["final_report_path"] = str(final_report) if final_report else None
     if state.status == "done":
@@ -1847,6 +1873,11 @@ def start(
         "--heldout-required",
         help="Require harness-held validation; fail if its environment is missing.",
     ),
+    max_token_cost: float | None = typer.Option(
+        None,
+        "--max-token-cost",
+        help="Run rollout spend cap in US dollars (finite and > 0).",
+    ),
     max_iterations: int = typer.Option(
         100,
         "--max-iterations",
@@ -1940,6 +1971,9 @@ def start(
     ),
 ) -> None:
     """Start a managed GEPA run and pause at the first reflection point."""
+    from .spend import validate_cap
+
+    validate_cap(max_token_cost)
     _validate_max_iterations(max_iterations)
     if lanes < 0:
         typer.echo("--lanes must be >= 0.", err=True)
@@ -2057,6 +2091,7 @@ def start(
         run_id=run_id,
         status="running",
         max_iterations=max_iterations,
+        max_token_cost=max_token_cost,
         size=size,
         seed=seed,
         next_epoch=epoch,

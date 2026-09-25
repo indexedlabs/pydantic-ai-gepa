@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, cast
+from pathlib import Path
 
 import pytest
 from pydantic_ai import Agent
@@ -246,6 +247,99 @@ def _optimization_inputs() -> dict[str, Any]:
         "reflection_minibatch_size": 1,
         "seed": 0,
     }
+
+
+@pytest.mark.asyncio
+async def test_optimize_agent_cache_hits_are_free_without_diluting_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib
+
+    start_module = importlib.import_module("pydantic_ai_gepa.gepa_graph.steps.start")
+    from pydantic_ai_gepa.cache import CacheManager
+
+    meters = []
+
+    def new_meter(*args, **kwargs):
+        meter = SpendMeter(*args, **kwargs)
+        meters.append(meter)
+        return meter
+
+    monkeypatch.setattr(start_module, "SpendMeter", new_meter)
+    model_calls = []
+
+    async def student(messages, info):
+        model_calls.append("student")
+        return ModelResponse(
+            parts=[TextPart("ok")], usage=RequestUsage(input_tokens=10, output_tokens=3)
+        )
+
+    hits = {"rollout": 0, "metric": 0}
+
+    def track_hit(method, kind):
+        def tracked(*args, **kwargs):
+            result = method(*args, **kwargs)
+            if result is not None:
+                hits[kind] += 1
+            return result
+
+        return tracked
+
+    monkeypatch.setattr(
+        CacheManager,
+        "get_cached_agent_run",
+        track_hit(CacheManager.get_cached_agent_run, "rollout"),
+    )
+    monkeypatch.setattr(
+        CacheManager,
+        "get_cached_metric_result",
+        track_hit(CacheManager.get_cached_metric_result, "metric"),
+    )
+    inputs = _optimization_inputs()
+    inputs["agent"] = Agent(
+        FunctionModel(student, model_name="cache-student"),
+        instructions="Original instructions",
+    )
+    inputs.update(
+        enable_cache=True,
+        cache_rollouts=True,
+        cache_metric_results=True,
+        cache_metric_identity="spend-test-v1",
+        cache_dir=str(tmp_path / "cache"),
+        max_iterations=1,
+        max_token_cost=10,
+        price_fn=lambda response: 0.1
+        if response.model_name == "cache-student"
+        else 0.01,
+    )
+    first = await optimize_agent(**inputs)
+    first_calls = len(model_calls)
+    assert first_calls > 0
+    assert first.spend_report.rollout_dollars == pytest.approx(first_calls * 0.1)
+    assert first.spend_report.by_model["cache-student"].requests == first_calls
+    assert not first.spend_report.stopped_by_cost
+
+    hits.update(rollout=0, metric=0)
+    model_calls.clear()
+    second = await optimize_agent(**inputs)
+    report = second.spend_report
+    assert hits["rollout"] > 0 and hits["metric"] > 0
+    # Held-out validation still bypasses cache; only fresh model calls cost money.
+    assert 0 < len(model_calls) < first_calls
+    assert report.by_model["cache-student"].requests == len(model_calls)
+    assert report.by_model["cache-student"].input_tokens == len(model_calls) * 10
+    assert report.rollout_dollars == pytest.approx(len(model_calls) * 0.1)
+    assert report.total_dollars == pytest.approx(
+        report.rollout_dollars + report.reflection_dollars
+    )
+    assert not report.stopped_by_cost
+    assert report.rollout_dollars < first.spend_report.rollout_dollars
+    # Cached steps must not dilute the observed $0.10 paid-rollout mean.
+    meter = meters[-1]
+    assert meter.can_start("rollout", 1)
+    unaffordable = int((10 - report.total_dollars) / 0.1) + 2
+    assert not meter.can_start("rollout", unaffordable)
 
 
 @pytest.mark.asyncio
