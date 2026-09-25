@@ -243,6 +243,7 @@ def nominate(
 def _score(path: Path, request: dict[str, Any], state: Any) -> None:
     from .reflector_recovery import CandidateChanged, continue_run
     from .run import _continue_impl, _load_state
+    from .scoring_sandbox import nominated_commit
 
     def check() -> None:
         current = _load_state(state.run_id)
@@ -258,6 +259,7 @@ def _score(path: Path, request: dict[str, Any], state: Any) -> None:
     code = 0
     stale = False
     token = _tree_check.set(check)
+    commit_token = nominated_commit.set(request.get("commit_sha"))
     try:
         with controller_output() as (stdout, stderr):
             try:
@@ -297,6 +299,7 @@ def _score(path: Path, request: dict[str, Any], state: Any) -> None:
                     err=True,
                 )
     finally:
+        nominated_commit.reset(commit_token)
         _tree_check.reset(token)
     final_state = _load_state(state.run_id)
     _atomic_json(

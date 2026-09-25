@@ -664,6 +664,12 @@ def resolve_module_attr(
     ref: str, *, kind: str = "object", expected_root: Path | None = None
 ) -> Any:
     """Resolve a ``module.path:attr`` reference to the named attribute."""
+    from .scoring_sandbox import ScoringSandboxError, required
+
+    if required():
+        raise ScoringSandboxError(
+            "Candidate hooks cannot be imported in a held-out harness process."
+        )
     if ":" not in ref:
         raise GepaConfigError(
             f"Invalid {kind} ref {ref!r}: expected 'module.path:attr'."
@@ -756,6 +762,7 @@ def insert_repo_root_on_path(root: Path | None = None) -> None:
     ``sys.path`` so ``importlib.import_module`` can resolve those modules
     without requiring an editable install.
     """
+    _require_candidate_imports_allowed()
     project = (root or repo_root()).resolve()
     for import_root in reversed((project / "src", project)):
         if not import_root.is_dir():
@@ -764,6 +771,15 @@ def insert_repo_root_on_path(root: Path | None = None) -> None:
         if path_text in sys.path:
             sys.path.remove(path_text)
         sys.path.insert(0, path_text)
+
+
+def _require_candidate_imports_allowed() -> None:
+    from .scoring_sandbox import ScoringSandboxError, required
+
+    if required():
+        raise ScoringSandboxError(
+            "Candidate import paths cannot be installed in a held-out harness process."
+        )
 
 
 def _module_source_paths(module: Any) -> tuple[Path, ...]:
@@ -861,6 +877,8 @@ def candidate_import_context(
     the primary module object and silently evaluates the wrong candidate.
     """
 
+    # Refuse before evicting modules, translating sys.path, or changing cwd.
+    _require_candidate_imports_allowed()
     primary = primary_project_root.resolve()
     candidate = candidate_project_root.resolve()
     primary_repository = git_root(primary)
