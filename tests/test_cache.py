@@ -2,17 +2,27 @@
 
 from __future__ import annotations
 
+import functools
+import hashlib
 import tempfile
+from pathlib import Path
 
+import cloudpickle
 import pytest
 from pydantic import BaseModel
 from dataclasses import dataclass
 from typing import Any
 
 from pydantic_ai import Agent
+from pydantic_ai.messages import ModelResponse, TextPart
+from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 
-from pydantic_ai_gepa.cache import CacheManager, create_cached_metric
+from pydantic_ai_gepa.cache import (
+    CacheManager,
+    create_cached_metric,
+    metric_code_identity,
+)
 from pydantic_ai_gepa.gepa_graph.models import ComponentValue
 from pydantic_ai_gepa.gepa_graph.proposal.instruction import (
     ComponentUpdate,
@@ -23,11 +33,28 @@ from pydantic_ai_gepa.runner import optimize_agent
 from pydantic_ai_gepa.adapters.agent_adapter import AgentAdapter, AgentAdapterTrajectory
 from pydantic_ai_gepa.types import MetricResult, ReflectionConfig, RolloutOutput
 from pydantic_evals import Case
+from pydantic_evals.evaluators import Evaluator, EvaluatorContext
 
 
 @dataclass
 class LabelMetadata:
     label: str
+
+
+@dataclass
+class MinLengthEvaluator(Evaluator[str, str, Any]):
+    min_length: int = 0
+
+    def evaluate(self, ctx: EvaluatorContext[str, str, Any]) -> bool:
+        return len(str(ctx.output)) >= self.min_length
+
+
+def _identity_metric_a(case: Any, output: Any) -> MetricResult:
+    return MetricResult(score=1.0, feedback="metric-a")
+
+
+def _identity_metric_b(case: Any, output: Any) -> MetricResult:
+    return MetricResult(score=0.0, feedback="metric-b")
 
 
 def _dummy_reasoning() -> TrajectoryAnalysis:
@@ -55,7 +82,13 @@ def _prompt_case(
 def test_cache_manager_basic():
     """Test basic cache manager operations."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        cache = CacheManager(cache_dir=tmpdir, enabled=True, verbose=False)
+        cache = CacheManager(
+            cache_dir=tmpdir,
+            enabled=True,
+            verbose=False,
+            metric_identity="test-metric-v1",
+            cache_metric_results=True,
+        )
 
         # Create test data
         case = _prompt_case(
@@ -127,7 +160,13 @@ def test_cache_manager_basic():
 def test_cache_scopes_entries_by_model():
     """Cache keys should include the model identifier."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        cache = CacheManager(cache_dir=tmpdir, enabled=True, verbose=False)
+        cache = CacheManager(
+            cache_dir=tmpdir,
+            enabled=True,
+            verbose=False,
+            metric_identity="test-metric-v1",
+            cache_metric_results=True,
+        )
 
         case = _prompt_case(
             "Test prompt",
@@ -208,7 +247,13 @@ def test_cache_scopes_entries_by_model():
 def test_cache_manager_with_signature():
     """Test cache manager with signature-based data instances."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        cache = CacheManager(cache_dir=tmpdir, enabled=True, verbose=False)
+        cache = CacheManager(
+            cache_dir=tmpdir,
+            enabled=True,
+            verbose=False,
+            metric_identity="test-metric-v1",
+            cache_metric_results=True,
+        )
 
         class TestSignature(BaseModel):
             text: str
@@ -288,7 +333,13 @@ def test_cache_manager_disabled():
 def test_create_cached_metric():
     """Test the cached metric wrapper function."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        cache_manager = CacheManager(cache_dir=tmpdir, enabled=True, verbose=False)
+        cache_manager = CacheManager(
+            cache_dir=tmpdir,
+            enabled=True,
+            verbose=False,
+            metric_identity="test-metric-v1",
+            cache_metric_results=True,
+        )
 
         # Create a mock metric that counts calls
         call_count = 0
@@ -405,6 +456,9 @@ async def test_optimize_agent_with_caching(monkeypatch: pytest.MonkeyPatch):
             enable_cache=True,
             cache_dir=tmpdir,
             cache_verbose=False,
+            cache_metric_identity="classification-metric-v1",
+            cache_metric_results=True,
+            cache_rollouts=True,
         )
 
         first_run_calls = len(metric_calls)
@@ -426,6 +480,9 @@ async def test_optimize_agent_with_caching(monkeypatch: pytest.MonkeyPatch):
             enable_cache=True,
             cache_dir=tmpdir,
             cache_verbose=False,
+            cache_metric_identity="classification-metric-v1",
+            cache_metric_results=True,
+            cache_rollouts=True,
         )
 
         # Every baseline evaluation should be reused. The optimizer may spend the
@@ -442,7 +499,13 @@ async def test_optimize_agent_with_caching(monkeypatch: pytest.MonkeyPatch):
 def test_cache_handles_errors():
     """Test that cache handles errors gracefully."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        cache = CacheManager(cache_dir=tmpdir, enabled=True, verbose=False)
+        cache = CacheManager(
+            cache_dir=tmpdir,
+            enabled=True,
+            verbose=False,
+            metric_identity="test-metric-v1",
+            cache_metric_results=True,
+        )
 
         case = _prompt_case("Test", name="test-1")
 
@@ -474,7 +537,12 @@ def test_cache_handles_errors():
 def test_cache_agent_runs():
     """Test caching of agent execution results."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        cache = CacheManager(cache_dir=tmpdir, enabled=True, verbose=False)
+        cache = CacheManager(
+            cache_dir=tmpdir,
+            enabled=True,
+            verbose=False,
+            cache_rollouts=True,
+        )
 
         # Create test data
         case = _prompt_case(
@@ -552,7 +620,13 @@ def test_cache_agent_runs():
 def test_cache_key_stability():
     """Test that cache keys are stable across different orderings."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        cache = CacheManager(cache_dir=tmpdir, enabled=True, verbose=False)
+        cache = CacheManager(
+            cache_dir=tmpdir,
+            enabled=True,
+            verbose=False,
+            metric_identity="test-metric-v1",
+            cache_metric_results=True,
+        )
 
         case = _prompt_case(
             "Test",
@@ -605,7 +679,12 @@ def test_cache_key_stability():
 @pytest.mark.asyncio
 async def test_cached_agent_run_does_not_replay_stale_trace_identity() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
-        cache = CacheManager(cache_dir=tmpdir, enabled=True, verbose=False)
+        cache = CacheManager(
+            cache_dir=tmpdir,
+            enabled=True,
+            verbose=False,
+            cache_rollouts=True,
+        )
         adapter = AgentAdapter(
             agent=Agent(TestModel(custom_output_text="answer"), instructions="Base"),
             metric=lambda case, output: MetricResult(score=1.0),
@@ -633,3 +712,326 @@ async def test_cached_agent_run_does_not_replay_stale_trace_identity() -> None:
         assert second["output"].trace_id is None
         assert second["output"].trace_completeness is None
         assert second["trajectory"].trace_id is None
+
+
+def _metric_cache(tmpdir: str, **overrides: Any) -> CacheManager:
+    kwargs: dict[str, Any] = {
+        "cache_dir": tmpdir,
+        "enabled": True,
+        "verbose": False,
+        "metric_identity": "test-metric-v1",
+        "cache_metric_results": True,
+    }
+    kwargs.update(overrides)
+    return CacheManager(**kwargs)
+
+
+def _instructions_candidate(text: str = "Test instructions"):
+    return {"instructions": ComponentValue(name="instructions", text=text)}
+
+
+def test_metric_cache_misses_when_gold_changes():
+    """Editing case.expected_output must invalidate cached metric results."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cache = _metric_cache(tmpdir)
+        output = RolloutOutput.from_success("Result")
+        candidate = _instructions_candidate()
+
+        case_gold_a = Case(name="case-1", inputs="input", expected_output="gold-a")
+        cache.cache_metric_result(
+            case_gold_a,
+            None,
+            output,
+            candidate,
+            MetricResult(score=1.0, feedback="Correct"),
+        )
+        assert cache.get_cached_metric_result(
+            case_gold_a, None, output, candidate
+        ) == MetricResult(score=1.0, feedback="Correct")
+
+        # Same case, output, candidate and identity, but different gold.
+        case_gold_b = Case(name="case-1", inputs="input", expected_output="gold-b")
+        assert (
+            cache.get_cached_metric_result(case_gold_b, None, output, candidate) is None
+        )
+
+
+def test_metric_cache_misses_when_metric_identity_changes():
+    """A different metric identity must invalidate cached metric results."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        case = _prompt_case("Test", name="test-1")
+        output = RolloutOutput.from_success("Result")
+        candidate = _instructions_candidate()
+        result = MetricResult(score=0.7, feedback="ok")
+
+        cache_v1 = _metric_cache(tmpdir, metric_identity="metric-v1")
+        cache_v1.cache_metric_result(case, None, output, candidate, result)
+        assert (
+            cache_v1.get_cached_metric_result(case, None, output, candidate) == result
+        )
+
+        cache_v2 = _metric_cache(tmpdir, metric_identity="metric-v2")
+        assert cache_v2.get_cached_metric_result(case, None, output, candidate) is None
+
+
+def test_metric_code_identity_tracks_function_source():
+    """metric_code_identity changes with the function body, not the name."""
+    assert metric_code_identity(_identity_metric_a) == metric_code_identity(
+        _identity_metric_a
+    )
+    assert metric_code_identity(_identity_metric_a) != metric_code_identity(
+        _identity_metric_b
+    )
+
+    # functools.partial layers unwrap to the underlying function.
+    partial_metric = functools.partial(_identity_metric_a)
+    assert metric_code_identity(partial_metric) == metric_code_identity(
+        _identity_metric_a
+    )
+
+    # A callable without retrievable source tells the caller to declare a
+    # version string instead.
+    with pytest.raises(ValueError, match="version string"):
+        metric_code_identity(len)
+
+
+def test_metric_cache_misses_when_evaluators_change():
+    """Editing case-level evaluators must invalidate cached metric results."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cache = _metric_cache(tmpdir)
+        output = RolloutOutput.from_success("Result")
+        candidate = _instructions_candidate()
+
+        case_v1 = Case(
+            name="case-1",
+            inputs="input",
+            expected_output="gold",
+            evaluators=[MinLengthEvaluator(min_length=1)],
+        )
+        cache.cache_metric_result(
+            case_v1,
+            None,
+            output,
+            candidate,
+            MetricResult(score=1.0, feedback="ok"),
+        )
+        assert (
+            cache.get_cached_metric_result(case_v1, None, output, candidate) is not None
+        )
+
+        case_v2 = Case(
+            name="case-1",
+            inputs="input",
+            expected_output="gold",
+            evaluators=[MinLengthEvaluator(min_length=2)],
+        )
+        assert cache.get_cached_metric_result(case_v2, None, output, candidate) is None
+
+
+def test_cache_requires_explicit_opt_in():
+    """An enabled cache with no opt-in (or no identity) fails closed."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with pytest.raises(ValueError, match="would store nothing"):
+            CacheManager(cache_dir=tmpdir, enabled=True)
+
+        with pytest.raises(ValueError, match="requires a non-empty metric_identity"):
+            CacheManager(cache_dir=tmpdir, enabled=True, cache_metric_results=True)
+
+        with pytest.raises(ValueError, match="requires a non-empty metric_identity"):
+            CacheManager(
+                cache_dir=tmpdir,
+                enabled=True,
+                cache_metric_results=True,
+                metric_identity="   ",
+            )
+
+        # Disabled caches skip validation entirely.
+        CacheManager(cache_dir=tmpdir, enabled=False)
+
+
+def test_rollouts_only_opt_in_stores_no_metric_results():
+    """With only cache_rollouts, metric results are never written or read."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cache = CacheManager(cache_dir=tmpdir, enabled=True, cache_rollouts=True)
+        case = _prompt_case("Test", name="test-1")
+        output = RolloutOutput.from_success("Result")
+        candidate = _instructions_candidate()
+
+        cache.cache_metric_result(
+            case,
+            None,
+            output,
+            candidate,
+            MetricResult(score=1.0, feedback="ok"),
+        )
+        assert list(Path(tmpdir).glob("*.pkl")) == []
+        assert cache.get_cached_metric_result(case, None, output, candidate) is None
+
+        cache.cache_agent_run(case, 0, candidate, None, output, capture_traces=False)
+        assert len(list(Path(tmpdir).glob("*.pkl"))) == 1
+        assert (
+            cache.get_cached_agent_run(case, 0, candidate, capture_traces=False)
+            is not None
+        )
+
+
+def test_metric_results_only_opt_in_stores_no_agent_runs():
+    """With only cache_metric_results, agent runs are never written or read."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cache = _metric_cache(tmpdir)
+        case = _prompt_case("Test", name="test-1")
+        output = RolloutOutput.from_success("Result")
+        candidate = _instructions_candidate()
+
+        cache.cache_agent_run(case, 0, candidate, None, output, capture_traces=False)
+        assert list(Path(tmpdir).glob("*.pkl")) == []
+        assert (
+            cache.get_cached_agent_run(case, 0, candidate, capture_traces=False) is None
+        )
+
+        metric_result = MetricResult(score=1.0, feedback="ok")
+        cache.cache_metric_result(case, None, output, candidate, metric_result)
+        assert len(list(Path(tmpdir).glob("*.pkl"))) == 1
+        assert cache.get_cached_metric_result(case, None, output, candidate) == (
+            metric_result
+        )
+
+
+def test_stale_pre_schema_entry_is_not_reused():
+    """An entry written under the pre-change key shape never matches."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cache = _metric_cache(tmpdir)
+        case = _prompt_case("Test", name="test-1")
+        output = RolloutOutput.from_success("Result")
+        candidate = _instructions_candidate()
+
+        # Simulate a legacy entry: a pickle whose filename is not derivable from
+        # the schema-versioned key shape (which now includes schema, metric
+        # identity, gold and evaluators).
+        legacy_key = hashlib.sha256(b"type:metric|legacy-key-shape").hexdigest()
+        with open(Path(tmpdir) / f"{legacy_key}.pkl", "wb") as f:
+            cloudpickle.dump(MetricResult(score=0.99, feedback="stale"), f)
+
+        assert cache.get_cached_metric_result(case, None, output, candidate) is None
+
+
+@pytest.mark.asyncio
+async def test_optimize_agent_cache_requires_opt_in_before_any_model_call():
+    """enable_cache=True without opt-ins raises before the agent model runs."""
+    model_calls = 0
+
+    async def counting_model(messages: Any, info: Any) -> ModelResponse:
+        nonlocal model_calls
+        model_calls += 1
+        return ModelResponse(parts=[TextPart(content="done")])
+
+    agent = Agent(FunctionModel(counting_model), instructions="seed")
+
+    def metric(case: Any, output: Any) -> MetricResult:
+        return MetricResult(score=1.0)
+
+    with pytest.raises(ValueError, match="would store nothing"):
+        await optimize_agent(
+            agent=agent,
+            trainset=[Case(name="case-1", inputs="input")],
+            metric=metric,
+            enable_cache=True,
+        )
+
+    assert model_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_optimize_agent_cache_invalidation_end_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A changed metric identity re-runs the metric; an unchanged run reuses it."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        labels = ["positive", "negative", "neutral"]
+        trainset = [
+            Case(
+                name=f"case-{i}",
+                inputs=f"Classify: {label}",
+                metadata=LabelMetadata(label=label),
+                expected_output=label,
+            )
+            for i, label in enumerate(labels)
+        ]
+        case_names = {case.name for case in trainset}
+
+        metric_calls: list[str] = []
+        cache_hits: list[str] = []
+
+        original_get_cached_metric_result = CacheManager.get_cached_metric_result
+
+        def tracking_get_cached_metric_result(
+            *args: Any, **kwargs: Any
+        ) -> MetricResult | None:
+            cached_result = original_get_cached_metric_result(*args, **kwargs)
+            if cached_result is not None:
+                case = args[1]
+                cache_hits.append(case.name)
+            return cached_result
+
+        monkeypatch.setattr(
+            CacheManager,
+            "get_cached_metric_result",
+            tracking_get_cached_metric_result,
+        )
+
+        def metric(case, output):
+            metric_calls.append(case.name)
+            predicted = str(output.result).lower() if output.success else ""
+            metadata = case.metadata or LabelMetadata(label="")
+            expected = metadata.label.lower()
+            score = 1.0 if predicted == expected else 0.0
+            return MetricResult(score=score, feedback=f"Score: {score}")
+
+        agent = Agent(
+            TestModel(custom_output_text="positive"),
+            instructions="Classify text as positive, negative, or neutral.",
+        )
+        reflection_output = InstructionProposalOutput(
+            reasoning=_dummy_reasoning(),
+            updated_components=[
+                ComponentUpdate(
+                    component_name="instructions",
+                    optimized_value="Updated",
+                )
+            ],
+        )
+        reflection_model = TestModel(
+            custom_output_args=reflection_output.model_dump(mode="python")
+        )
+
+        async def run(identity: str):
+            return await optimize_agent(
+                agent=agent,
+                trainset=trainset,
+                metric=metric,
+                reflection_config=ReflectionConfig(model=reflection_model),
+                max_metric_calls=15,
+                seed=42,
+                enable_cache=True,
+                cache_dir=tmpdir,
+                cache_verbose=False,
+                cache_metric_identity=identity,
+                cache_metric_results=True,
+                cache_rollouts=True,
+            )
+
+        # First run populates the cache under identity v1.
+        await run("classification-metric-v1")
+        assert metric_calls
+
+        # Second run with the same identity reuses cached metric results.
+        metric_calls.clear()
+        cache_hits.clear()
+        await run("classification-metric-v1")
+        assert set(cache_hits) == case_names
+
+        # Third run with a changed identity calls the metric again for every case.
+        metric_calls.clear()
+        cache_hits.clear()
+        await run("classification-metric-v2")
+        assert set(metric_calls) == case_names
