@@ -397,10 +397,15 @@ def _journal_tail(workspace_root: Path, limit: int) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     rows: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         stripped = line.strip()
         if stripped:
-            rows.append(json.loads(stripped))
+            try:
+                row = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
     return rows[-limit:] if limit > 0 else rows
 
 
@@ -409,6 +414,15 @@ def _append_journal(workspace_root: Path, entry: dict[str, Any]) -> None:
     path = journal_path(workspace_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = (json.dumps(entry, sort_keys=True) + "\n").encode("utf-8")
+    # Terminate a torn append so it cannot swallow the next valid journal row.
+    try:
+        with path.open("rb") as handle:
+            if handle.seek(0, os.SEEK_END):
+                handle.seek(-1, os.SEEK_END)
+                if handle.read(1) != b"\n":
+                    payload = b"\n" + payload
+    except FileNotFoundError:
+        pass
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
     try:
         os.write(fd, payload)

@@ -373,6 +373,7 @@ def run_eval_once(
     dataset_role: Literal["training", "validation"] = "training",
     persist_report: bool = True,
     redact_selection_evidence: bool = False,
+    persist_validation_replay: bool = False,
 ) -> EvalOutcome:
     """Evaluate one baseline/candidate and append the standard run artifacts.
 
@@ -757,6 +758,51 @@ def run_eval_once(
         else [failure.to_dict() for failure in infrastructure_failures]
     )
 
+    # Validation evidence is selection-only. Do not persist a report or trace
+    # that an external reflection agent could inspect.
+    report_path: Path | None = None
+    if persist_report:
+        reports_dir = run_dir(active_run_id, workspace_root) / "reports"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        report_path = reports_dir / f"{iteration:04d}-{eval_id}-{candidate.id}.md"
+        report_path.write_text(
+            _format_failures(
+                records,
+                threshold=threshold,
+                candidate_source=source,
+                redact_scores=cfg.acceptance.mode == "vector",
+            ),
+            encoding="utf-8",
+        )
+        if infrastructure_failures:
+            append_infrastructure_failures_to_report(
+                report_path, infrastructure_failures
+            )
+    trace_path = (
+        _write_trace_file(
+            path=planned_trace_path,
+            records=records,
+            redact_scores=cfg.acceptance.mode == "vector",
+        )
+        if planned_trace_path is not None
+        else None
+    )
+
+    # Paired validation must be replayable without placing case scores in the
+    # reflector ledger. Publish private evidence before its paid row, too.
+    if write_pareto and dataset_role == "validation" and persist_validation_replay:
+        from .validation import write_validation_evidence
+
+        assert cfg.validation_dataset is not None
+        write_validation_evidence(
+            cfg.validation_dataset,
+            project_root=primary_project_root,
+            run_id=f"{active_run_id}:eval:{eval_id}",
+            identity={"candidate_id": candidate.id, "eval_id": eval_id},
+            scores=per_case,
+        )
+
+    # A paid row must only become visible after its training evidence is saved.
     if write_pareto:
         pareto = ParetoLog(active_run_id, workspace_root)
         pareto.append(
@@ -789,36 +835,6 @@ def run_eval_once(
                 },
             )
         )
-
-    # Validation evidence is selection-only. Do not persist a report or trace
-    # that an external reflection agent could inspect.
-    report_path: Path | None = None
-    if persist_report:
-        reports_dir = run_dir(active_run_id, workspace_root) / "reports"
-        reports_dir.mkdir(parents=True, exist_ok=True)
-        report_path = reports_dir / f"{iteration:04d}-{eval_id}-{candidate.id}.md"
-        report_path.write_text(
-            _format_failures(
-                records,
-                threshold=threshold,
-                candidate_source=source,
-                redact_scores=cfg.acceptance.mode == "vector",
-            ),
-            encoding="utf-8",
-        )
-        if infrastructure_failures:
-            append_infrastructure_failures_to_report(
-                report_path, infrastructure_failures
-            )
-    trace_path = (
-        _write_trace_file(
-            path=planned_trace_path,
-            records=records,
-            redact_scores=cfg.acceptance.mode == "vector",
-        )
-        if planned_trace_path is not None
-        else None
-    )
 
     summary: dict[str, Any] = {
         "candidate_id": candidate.id,
