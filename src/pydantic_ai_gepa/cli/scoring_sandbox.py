@@ -246,12 +246,17 @@ class Channel:
         assert self.process.stdout is not None
         deadline = time.monotonic() + RESPONSE_TIMEOUT
         while b"\n" not in self.pending:
+            if self.process.poll() is not None:
+                raise ScoringSandboxError(
+                    "Sandboxed scorer exited before returning a result."
+                )
             remaining = deadline - time.monotonic()
-            if (
-                remaining <= 0
-                or not select.select([self.process.stdout], [], [], remaining)[0]
-            ):
+            if remaining <= 0:
                 raise ScoringSandboxError("Sandboxed scorer response timed out.")
+            # Descendants can retain stdout after the main worker dies. Bound
+            # each wait so that detecting death does not depend on pipe EOF.
+            if not select.select([self.process.stdout], [], [], min(remaining, 0.1))[0]:
+                continue
             block = os.read(self.process.stdout.fileno(), 65536)
             if not block:
                 raise ScoringSandboxError(
@@ -311,6 +316,15 @@ def _result(raw: dict[str, Any], case_id: str, validation: bool) -> EvaluationRe
     return EvaluationRecord(case_id, score, None if validation else feedback, payload)
 
 
+def _process_cleanup(scratch: Path) -> Any:
+    # Load the macOS inspection dependency only on the sandbox scoring path.
+    from .scoring_processes import SandboxProcesses
+
+    outside = scratch.parent / "parent-cleanup-probe"
+    outside.touch(mode=0o600, exist_ok=False)
+    return SandboxProcesses(scratch, outside)
+
+
 def score_cases(
     *,
     config: GepaConfig,
@@ -349,6 +363,7 @@ def score_cases(
         command = sandbox_command(
             profile, [sys.executable, "-I", "-B", "-c", bootstrap]
         )
+        cleanup = _process_cleanup(scratch)
         process = subprocess.Popen(
             command,
             cwd=checkout,
@@ -364,6 +379,7 @@ def score_cases(
             channel.send({"config": asdict(config), "validation": validation})
             if channel.receive() != {"type": "ready"}:
                 raise ScoringSandboxError("Sandboxed scorer could not initialize.")
+            cleanup.verify_worker(process.pid)
 
             async def evaluate() -> list[EvaluationRecord]:
                 records = []
@@ -428,15 +444,30 @@ def score_cases(
 
             return asyncio.run(evaluate())
         finally:
-            # Terminate the worker's process group, including normal evaluator
-            # subprocesses, before retiring the proxy and private directories.
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                # macOS may return EPERM for a process group containing only
-                # zombies. Reap below without masking the scorer's real error.
-                pass
-            process.wait()
-            for stream in (process.stdin, process.stdout):
-                if stream is not None:
-                    stream.close()
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    # macOS can report EPERM for a zombie-only process group.
+                    if process.poll() is None:
+                        process.kill()
+                process.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                raise ScoringSandboxError(
+                    "Cannot terminate the scoring worker; evaluation refused."
+                ) from None
+            finally:
+                # setsid descendants escape killpg but inherit the profile.
+                # Sweep before retiring private paths and the model proxy.
+                try:
+                    survivors = cleanup.sweep()
+                finally:
+                    for stream in (process.stdin, process.stdout):
+                        if stream is not None:
+                            stream.close()
+                if survivors:
+                    raise ScoringSandboxError(
+                        "Scoring sandbox survivors were terminated; evaluation refused."
+                    )

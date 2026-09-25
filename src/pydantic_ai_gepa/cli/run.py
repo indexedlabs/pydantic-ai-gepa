@@ -1553,7 +1553,6 @@ def _current_baseline_candidate_id(
     """Return the candidate id for the current component files or git tree."""
 
     cfg = GepaConfig.load(config_path())
-    insert_repo_root_on_path()
     if candidate_source == "git":
         try:
             state = git_candidate_state(exclude_paths=candidate_identity_exempt_paths())
@@ -1562,6 +1561,7 @@ def _current_baseline_candidate_id(
             raise typer.Exit(code=1) from exc
         return state.candidate_id
 
+    insert_repo_root_on_path()
     agent = resolve_agent(cfg)
     skills_fs = resolve_skills(cfg)
     components = ComponentStore().effective_candidate(agent, skills_fs=skills_fs)

@@ -7,6 +7,7 @@ from pathlib import Path
 import socket
 import socketserver
 import threading
+from types import SimpleNamespace
 
 import pytest
 from pydantic_evals import Case
@@ -64,6 +65,13 @@ def protocol_backend(monkeypatch):
         yield 0
 
     monkeypatch.setattr(sandbox, "connect_proxy", no_network)
+    monkeypatch.setattr(
+        sandbox,
+        "_process_cleanup",
+        lambda scratch: SimpleNamespace(
+            verify_worker=lambda pid: None, sweep=lambda: False
+        ),
+    )
 
 
 @pytest.fixture
@@ -173,6 +181,264 @@ def test_parent_refuses_all_candidate_hooks(private):
 
     with pytest.raises(sandbox.ScoringSandboxError, match="cannot be imported"):
         resolve_module_attr("definitely_not_importable:hook")
+
+
+def test_parent_refuses_import_path_mutations(git_repo, private):
+    import sys
+    from pydantic_ai_gepa.cli.layout import (
+        insert_repo_root_on_path,
+        candidate_import_context,
+    )
+    from pydantic_ai_gepa.cli.run import _current_baseline_candidate_id
+
+    original_path = list(sys.path)
+    original_modules = dict(sys.modules)
+    original_cwd = Path.cwd()
+    assert (
+        _current_baseline_candidate_id("git")
+        == _git(git_repo, "rev-parse", "HEAD")[:12]
+    )
+    with pytest.raises(sandbox.ScoringSandboxError, match="import paths"):
+        insert_repo_root_on_path(git_repo)
+    with pytest.raises(sandbox.ScoringSandboxError, match="import paths"):
+        with candidate_import_context(
+            primary_project_root=git_repo,
+            candidate_project_root=git_repo / "another-checkout",
+            refs=["task_pkg.evaluation:evaluate"],
+        ):
+            pytest.fail("Harness entered a candidate import context")
+    assert sys.path == original_path
+    assert Path.cwd() == original_cwd
+    assert all(
+        sys.modules.get(name) is module for name, module in original_modules.items()
+    )
+
+
+def test_committed_shadow_module_is_not_imported_by_parent(
+    git_repo, private, protocol_backend, monkeypatch
+):
+    import sys
+
+    marker = private.parent / "parent-shadow-imported"
+    (git_repo / "ctypes.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('parent executed candidate')\n"
+        "raise RuntimeError('candidate shadow module')\n"
+    )
+    _git(git_repo, "add", "ctypes.py")
+    _git(git_repo, "commit", "-m", "Shadow a lazy parent dependency")
+    # The fixture models an earlier training invocation by adding the worktree.
+    # Start this harness with only trusted import roots, as a fresh installed CLI.
+    monkeypatch.setattr(
+        sys,
+        "path",
+        [
+            entry
+            for entry in sys.path
+            if entry and not Path(entry).resolve().is_relative_to(git_repo)
+        ],
+    )
+    for name in tuple(sys.modules):
+        if (
+            name == "ctypes"
+            or name.startswith("ctypes.")
+            or name == "pydantic_ai_gepa.cli.scoring_processes"
+        ):
+            monkeypatch.delitem(sys.modules, name)
+    imports = []
+
+    def cleanup(scratch):
+        # This is the production lazy import in _process_cleanup, reached only
+        # after eval's former sys.path insertion. Native inspection is replaced
+        # in this protocol test; importing its real dependency is not replaced.
+        assert "ctypes" not in sys.modules
+        from pydantic_ai_gepa.cli.scoring_processes import SandboxProcesses
+
+        imports.append(SandboxProcesses)
+        return SimpleNamespace(verify_worker=lambda pid: None, sweep=lambda: False)
+
+    monkeypatch.setattr(sandbox, "_process_cleanup", cleanup)
+    result = _run("eval", "--size", "1")
+    assert result.exit_code == 0, (result.output, result.exception)
+    assert imports
+    assert not marker.exists()
+    assert Path(sys.modules["ctypes"].__file__).resolve() != git_repo / "ctypes.py"
+    assert str(git_repo) not in sys.path
+
+
+def test_channel_detects_dead_worker_with_open_pipe():
+    import subprocess
+    import sys
+    import time
+
+    read_fd, write_fd = os.pipe()
+    # Keep the writer open in this process, exactly as an inherited descendant
+    # fd would. There is no EOF even after the worker exits.
+    with os.fdopen(read_fd, "rb") as reader, os.fdopen(write_fd, "wb"):
+        with subprocess.Popen(
+            [sys.executable, "-c", "pass"], stdout=subprocess.PIPE
+        ) as process:
+            assert process.stdout is not None
+            process.stdout.close()
+            process.stdout = reader
+            process.wait()
+            started = time.monotonic()
+            with pytest.raises(sandbox.ScoringSandboxError, match="exited"):
+                sandbox.Channel(process).receive()
+            assert time.monotonic() - started < 1
+
+
+def test_survivor_sweep_excludes_other_processes_and_repeats(monkeypatch):
+    from pydantic_ai_gepa.cli.scoring_processes import SandboxProcesses
+
+    cleanup = SandboxProcesses.__new__(SandboxProcesses)
+    cleanup.scratch, cleanup.outside = b"scratch", b"outside"
+    passes = iter([[101, 102, 103], [102, 103, 104], [102, 103]])
+    cleanup._pids = lambda: next(passes)
+    cleanup._identity = lambda pid: (pid, 0)
+    # 102 is unsandboxed (allows both); 103 is another child (denies both).
+    cleanup._denied = lambda pid, path: pid != 102 and (
+        path == b"outside" or pid == 103
+    )
+    killed = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    assert cleanup.sweep() is True
+    assert killed == [(101, sandbox.signal.SIGKILL), (104, sandbox.signal.SIGKILL)]
+
+
+def test_survivor_sweep_does_not_signal_reused_pid(monkeypatch):
+    from pydantic_ai_gepa.cli.scoring_processes import SandboxProcesses
+
+    cleanup = SandboxProcesses.__new__(SandboxProcesses)
+    passes = iter([[101], []])
+    identities = iter([(1, 0), (2, 0)])
+    cleanup._pids = lambda: next(passes)
+    cleanup._identity = lambda pid: next(identities)
+    cleanup._matches = lambda pid: True
+    monkeypatch.setattr(os, "kill", lambda *args: pytest.fail("Killed a reused PID"))
+    assert cleanup.sweep() is True
+
+
+@pytest.mark.parametrize("failure", ["load", "query", "enumerate", "signal"])
+def test_survivor_inspection_fails_closed(monkeypatch, tmp_path, failure):
+    from pydantic_ai_gepa.cli import scoring_processes as processes
+
+    cleanup = processes.SandboxProcesses.__new__(processes.SandboxProcesses)
+    if failure == "load":
+
+        def unavailable(*args, **kwargs):
+            raise OSError("sensitive diagnostic")
+
+        monkeypatch.setattr(processes.ctypes, "CDLL", unavailable)
+
+        def action():
+            return processes.SandboxProcesses(tmp_path, tmp_path.parent)
+    elif failure == "query":
+        cleanup._check = lambda *args: -1
+
+        def action():
+            return cleanup._denied(101, b"scratch")
+    elif failure == "enumerate":
+        cleanup.uid = os.getuid()
+        cleanup._list = lambda *args: -1
+        action = cleanup._pids
+    else:
+        cleanup._pids = lambda: [101]
+        cleanup._identity = lambda pid: (1, 0)
+        cleanup._matches = lambda pid: True
+
+        def refused(*args):
+            raise PermissionError("sensitive diagnostic")
+
+        monkeypatch.setattr(os, "kill", refused)
+        action = cleanup.sweep
+    with pytest.raises(sandbox.ScoringSandboxError) as error:
+        action()
+    assert "sensitive diagnostic" not in str(error.value)
+
+
+def test_survivor_inspection_resizes_enumeration(monkeypatch):
+    from pydantic_ai_gepa.cli import scoring_processes as processes
+
+    cleanup = processes.SandboxProcesses.__new__(processes.SandboxProcesses)
+    cleanup.uid = os.getuid()
+    sizes = []
+
+    def list_pids(kind, uid, buffer, size):
+        assert kind == 4 and uid == os.getuid()
+        sizes.append(size)
+        if len(sizes) == 1:
+            return size
+        buffer[0] = os.getpid()
+        buffer[1] = 101
+        return 2 * processes.ctypes.sizeof(processes.ctypes.c_int)
+
+    cleanup._list = list_pids
+    assert cleanup._pids() == [os.getpid(), 101]
+    assert sizes[1] == sizes[0] * 2
+
+
+@pytest.mark.parametrize("status,same_uid", [(2, True), (5, True), (2, False)])
+def test_survivor_identity_uses_start_time_and_excludes_zombies(status, same_uid):
+    from pydantic_ai_gepa.cli import scoring_processes as processes
+
+    cleanup = processes.SandboxProcesses.__new__(processes.SandboxProcesses)
+    cleanup.uid = os.getuid()
+    info = processes._BsdInfo()
+    info.pid, info.uid, info.status = 101, cleanup.uid + (not same_uid), status
+    info.start_sec, info.start_usec = 123, 456
+    assert processes.ctypes.sizeof(info) == 136  # Darwin's 64-bit proc_bsdinfo ABI
+
+    def pid_info(pid, flavor, arg, destination, size):
+        assert pid == 101 and flavor == 3 and size == 136
+        processes.ctypes.memmove(destination, processes.ctypes.byref(info), size)
+        return size
+
+    cleanup._info = pid_info
+    assert cleanup._identity(101) == ((123, 456) if same_uid and status != 5 else None)
+
+
+def test_worker_cleanup_failure_does_not_expose_command(
+    git_repo, private, protocol_backend, monkeypatch
+):
+    sha = commit_evaluator(git_repo, "async def evaluate(case): return 'good'\n")
+    original_popen = sandbox.subprocess.Popen
+
+    def popen(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        original_wait = process.wait
+
+        def wait(*args, **kwargs):
+            original_wait(*args, **kwargs)
+            raise sandbox.subprocess.TimeoutExpired("PRIVATE_COMMAND_SENTINEL", 5)
+
+        # Only replace the scoring worker's wait, not Git archive invocations.
+        if kwargs.get("start_new_session"):
+            process.wait = wait
+        return process
+
+    monkeypatch.setattr(sandbox.subprocess, "Popen", popen)
+    with pytest.raises(
+        sandbox.ScoringSandboxError, match="Cannot terminate the scoring worker"
+    ) as error:
+        score(git_repo, sha)
+    assert "PRIVATE_COMMAND_SENTINEL" not in str(error.value)
+
+
+def test_found_survivor_refuses_quality_score(
+    git_repo, private, protocol_backend, monkeypatch
+):
+    monkeypatch.setattr(
+        sandbox,
+        "_process_cleanup",
+        lambda scratch: SimpleNamespace(
+            verify_worker=lambda pid: None,
+            sweep=lambda: True,
+        ),
+    )
+    sha = commit_evaluator(git_repo, "async def evaluate(case): return 'good'\n")
+    with pytest.raises(sandbox.ScoringSandboxError, match="survivors were terminated"):
+        score(git_repo, sha)
+    assert not list((private.parent / ".gepa-heldout/work").iterdir())
 
 
 def test_harness_never_loads_candidate_dotenv(git_repo, private, monkeypatch):
@@ -810,3 +1076,68 @@ def test_harness_child_training_gate_and_confirmation(
     assert "CASE_SENTINEL_4833" not in public
     assert "INPUT_SENTINEL_4833" not in public
     assert str(private.parent) not in public
+
+
+def test_setsid_grandchild_is_swept_and_evaluation_refused(
+    git_repo, private, real_backend, monkeypatch
+):
+    import subprocess
+    import sys
+
+    grandchild = """import os, time
+if os.fork(): os._exit(0)
+os.setsid()
+if os.fork(): os._exit(0)
+print(os.getpid(), flush=True)
+time.sleep(60)
+"""
+    sha = commit_evaluator(
+        git_repo,
+        f"""import os, subprocess, sys
+from pathlib import Path
+async def evaluate(case):
+    child = subprocess.Popen([sys.executable, '-I', '-B', '-c', {grandchild!r}, 'ARGV_SENTINEL_4833'], stdout=subprocess.PIPE)
+    pid = int(child.stdout.readline())
+    child.wait(timeout=5)
+    Path(os.environ['TMPDIR'], 'survivor.pid').write_text(str(pid))
+    return 'good'
+""",
+    )
+    original_cleanup = sandbox._process_cleanup
+    inspections = []
+    survivors = []
+
+    def observe_cleanup(scratch):
+        native = original_cleanup(scratch)
+        inspections.append(native)
+
+        def sweep():
+            pid = int((scratch / "survivor.pid").read_text())
+            assert native._identity(pid) is not None
+            assert native._matches(pid)
+            survivors.append(pid)
+            found = native.sweep()
+            assert native._identity(pid) is None
+            assert not any(
+                native._identity(other) is not None and native._matches(other)
+                for other in native._pids()
+            )
+            return found
+
+        return SimpleNamespace(verify_worker=native.verify_worker, sweep=sweep)
+
+    monkeypatch.setattr(sandbox, "_process_cleanup", observe_cleanup)
+    control = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        with pytest.raises(
+            sandbox.ScoringSandboxError, match="survivors were terminated"
+        ):
+            score(git_repo, sha)
+        assert survivors
+        assert control.poll() is None  # An ordinary same-user process is untouched.
+        assert not list((private.parent / ".gepa-heldout/work").iterdir())
+    finally:
+        control.kill()
+        control.wait()
+        for native in inspections:
+            native.sweep()

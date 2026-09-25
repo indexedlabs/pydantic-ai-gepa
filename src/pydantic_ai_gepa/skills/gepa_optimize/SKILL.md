@@ -200,9 +200,15 @@ checkout**. The parent reads the held-out dataset and sends one case at a time
 over a pipe; the child returns bounded JSON results. Candidate agent, evaluator,
 metric, case-factory and pricing imports happen only in that child. Training
 scoring inside a held-out harness also uses the child; training-only runs retain
-the in-process evaluator. Children and their private checkout/scratch directories
-are removed after every evaluation, including failures. Archives containing
-symlinks or special files are refused.
+the in-process evaluator. The parent never adds candidate import paths while
+running held-out harness commands. After each evaluation it kills the worker's
+process group, then sweeps same-user processes for the child's inherited
+Seatbelt permissions to catch descendants that called `setsid()`. Finding a
+survivor or failing process inspection refuses the evaluation instead of
+returning a quality score. This repeated sweep is not an atomic process
+container: enumeration and PID reuse races remain. Private checkout/scratch
+directories are removed on exit. Archives containing symlinks or special files
+are refused.
 
 The current backend is macOS Seatbelt (`/usr/bin/sandbox-exec`). It denies writes
 outside private scratch, reads of the held-out directory outside the child's own
@@ -234,6 +240,33 @@ accounting. Public spend uses a fixed `sandbox` model bucket to prevent model na
 from carrying held-out text. Arbitrary output/side-info/trace artifacts are not
 copied back; training feedback remains available.
 
+The orchestrator must enforce the reflector's sandbox: the harness cannot
+identify the reflector's profile or refuse an unverified one. Require denial of
+SysV IPC listing and use. Preventing concurrent process-argument disclosure also
+requires that the reflector cannot read other processes' arguments; the two
+Codex profiles below **do not meet that requirement** for same-user scoring.
+A separate scoring UID would close that argv channel; this library does not
+provision one. Unsandboxed reflectors (including Pi used without a sandbox)
+must not be used for code-engine held-out runs. Claude Code's sandbox and
+Pi/Kimi reflectors have not been verified and are not on the verified list.
+
+Host probes on **2026-09-25**, using **macOS 26.6.2** and
+**codex-cli 0.157.0**, produced the following results. “Passed” means the probe
+was denied; “failed” means another same-user process's data was readable.
+These results verify only the listed operations, not complete isolation.
+
+| Reflector profile | `ipcs` listing | SysV use | `/bin/ps` | Raw `KERN_PROCARGS2` |
+| --- | --- | --- | --- | --- |
+| README `gepa-reflector` | Passed | Passed | Passed | **Failed** |
+| Built-in `:workspace` | Passed | Passed | Passed | **Failed** |
+
+SysV use probes covered `shmat`, `msgsnd`, `msgrcv`, and `semctl GETVAL`; all
+were denied under both profiles. Those two profiles close the tested SysV
+channel on the reader side. The `:workspace` results do not replace the
+held-out file-read restrictions described above. Denial of `/bin/ps` does not
+prevent raw `KERN_PROCARGS2` from returning another same-user process's
+arguments and environment.
+
 What this does not cover:
 
 - Scores and numeric usage feed public aggregates, creating low-bandwidth covert
@@ -242,8 +275,20 @@ What this does not cover:
   account. Keep harness credentials out of the reflector, but this is not enough:
   candidate code can also supply its own credentials to an allowed host. CONNECT
   restricts destinations, not accounts, HTTP methods or request contents.
-- Timing, CPU, memory and denial-of-service channels. The sandbox is not a resource
-  limiter (the result reader has a timeout and message-size bound).
+- SysV shared memory, message queues and semaphore sets created by the scoring
+  child can outlive it: Seatbelt does not mediate their creation. The library
+  does not remove them. macOS records no creator PID for queues or semaphore
+  sets, so it cannot distinguish them from objects created by other programs.
+  The cleanup/deployment contract is pending a project decision; reader-side
+  denial is verified only for the two Codex profiles above.
+- Process arguments and environment visible to another same-user process during
+  scoring. Raw `KERN_PROCARGS2` works under both tested reflector profiles, and
+  a process can rewrite its own argument strings to expose case data. No child
+  Seatbelt profile prevents this reader-side channel. Survivor cleanup does not
+  close the during-scoring window; a different scoring UID would.
+- Timing, CPU, memory, `flock` signalling on readable files, and denial-of-service
+  channels. The sandbox is not a resource limiter (the result reader has a
+  timeout and message-size bound).
 - OS/kernel exploits, changes to the trusted harness/runtime, or other private
   datasets outside the configured held-out directory.
 - Evaluators that need a local database or another local service. The child has
@@ -253,10 +298,9 @@ What this does not cover:
   a reflector with write access can still forge them. This needs a separate
   ownership/authentication change.
 
-Process isolation is the barrier, not secrecy of the path: `ps` can expose
-another process's arguments and environment. Run files are shared coordination
-state, not authenticated messages; protection against a reflector forging
-state/results in `GEPA_DIR` requires an additional ownership or IPC boundary.
+Run files are shared coordination state, not authenticated messages; protection
+against a reflector forging state/results in `GEPA_DIR` requires an additional
+ownership or IPC boundary.
 
 In component mode, `gepa init` introspects the agent, writes
 `.gepa/gepa.toml`, and pre-seeds `.gepa/components/<slot>.md` from each slot's

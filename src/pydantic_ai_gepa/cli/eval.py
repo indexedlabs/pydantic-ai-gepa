@@ -676,7 +676,8 @@ def run_eval_once(
         if capture_traces
         else None
     )
-    insert_repo_root_on_path(primary_project_root)
+    if not sandboxed:
+        insert_repo_root_on_path(primary_project_root)
     price_fn = (
         resolve_module_attr(
             cfg.price_fn, kind="price_fn", expected_root=primary_project_root
