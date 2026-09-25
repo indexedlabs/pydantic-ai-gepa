@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import sys
 import textwrap
@@ -827,3 +828,32 @@ def test_paired_config_drives_single_repetition_promotion(
     }
     assert state.validation_evaluations == 2
     assert "held-out-a" not in result.output
+
+
+@pytest.mark.parametrize("remaining", [0, 2])
+def test_reflected_candidate_budget_refusal_records_comparison_and_exits_70(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, remaining: int
+) -> None:
+    from pydantic_ai_gepa.cli import run as run_module
+
+    started = _run("run", "start", "--size", "2", "--max-iterations", "7")
+    assert started.exit_code == 0, (started.output, started.exception)
+    run_id = str(_run_payload(started.output)["run_id"])
+    before = _load_state(run_id)
+    replace(before, max_iterations=before.iterations + remaining).save()
+    rows_before = ParetoLog(run_id).count_rows()
+
+    def no_evaluation(**kwargs):
+        pytest.fail("Insufficient candidate budget must not start an evaluation")
+
+    monkeypatch.setattr(run_module, "run_eval_once", no_evaluation)
+    result = _run("run", "continue", "--run-id", run_id)
+    assert result.exit_code == 70, (result.output, result.exception)
+    after = _load_state(run_id)
+    assert after.last_comparison["verdict"] == "inconclusive"
+    assert after.last_comparison["reason_code"] == "candidate_budget_exhausted"
+    assert after.last_comparison["improved"] is False
+    assert after.best_candidate_id == before.best_candidate_id
+    assert after.iterations == before.iterations
+    assert ParetoLog(run_id).count_rows() == rows_before
+    assert _run_payload(result.output)["last_comparison"] == after.last_comparison

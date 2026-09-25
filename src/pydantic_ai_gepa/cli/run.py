@@ -913,12 +913,6 @@ def _ensure_validation_seed(state: RunState) -> tuple[RunState, list[EvalOutcome
                 last_comparison=comparison,
                 infrastructure_retry_minibatch_id=None,
             ), outcomes
-        if outcome.summary.get("selectable") is False:
-            return _with_timestamp(
-                state,
-                status="done",
-                last_comparison=_inconclusive_comparison("validation_not_selectable"),
-            ), outcomes
     return _mark_best_validation_samples(state, outcomes), outcomes
 
 
@@ -2233,6 +2227,11 @@ def continue_(
     _emit_status(
         state, outcomes=outcomes, final_report=final_path, final_report_text=final_text
     )
+    if (
+        state.last_comparison is not None
+        and state.last_comparison.get("reason_code") == "candidate_budget_exhausted"
+    ):
+        raise typer.Exit(code=70)
 
 
 @app.command("select")

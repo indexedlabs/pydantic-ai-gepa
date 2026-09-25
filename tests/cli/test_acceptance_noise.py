@@ -427,3 +427,34 @@ def test_seeded_managed_confirmation_noise_and_power(
     else:
         # One-sided alpha .05 plus three binomial standard errors.
         assert rate <= 0.05 + 3 * (0.05 * 0.95 / 200) ** 0.5
+
+
+def test_non_selectable_seed_remains_incumbent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(run, "_held_out_validation_enabled", lambda: True)
+    monkeypatch.setattr(run, "_validation_schedule", lambda *args: (3, 5))
+    monkeypatch.setattr(
+        run, "_validation_dataset_identity", lambda: ("validation.jsonl", "digest")
+    )
+    calls = []
+
+    def evaluate(state, **kwargs):
+        calls.append(state.iterations)
+        outcome = _outcome([0.4], iteration=state.iterations + 1, candidate_id="seed")
+        outcome.summary["selectable"] = False
+        return replace(
+            state,
+            iterations=state.iterations + 1,
+            validation_evaluations=state.validation_evaluations + 1,
+        ), outcome
+
+    monkeypatch.setattr(run, "_evaluate_validation_candidate", evaluate)
+    state, outcomes = run._ensure_validation_seed(_state())
+    assert len(calls) == len(outcomes) == 3
+    assert state.status == "running"
+    assert state.validation_seeded
+    assert state.best_candidate_id == "seed"
+    assert state.best_validation_samples == (0.4, 0.4, 0.4)
+    assert state.best_mean_score == pytest.approx(0.4)
+    assert state.last_comparison is None
