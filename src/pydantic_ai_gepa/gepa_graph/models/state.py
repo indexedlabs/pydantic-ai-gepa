@@ -15,6 +15,7 @@ from pydantic import (
     model_validator,
 )
 
+from ...spend import PriceFn, SpendMeter
 from ...types import ReflectionConfig, RolloutOutput
 from pydantic_evals import Case
 from ..datasets import DataLoader, ensure_loader
@@ -79,6 +80,8 @@ class GepaConfig(BaseModel):
     """Immutable configuration for GEPA optimization."""
 
     # Budget
+    max_token_cost: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    price_fn: PriceFn | None = Field(default=None, exclude=True)
     max_evaluations: int = Field(
         default=200,
         description="Maximum number of metric evaluations allowed for the run.",
@@ -289,6 +292,8 @@ class GepaState(BaseModel):
     best_score: float | None = Field(
         default=None, description="Validation score for the current best candidate."
     )
+
+    spend_meter: SpendMeter | None = Field(default=None, exclude=True, repr=False)
 
     config: GepaConfig = Field(
         ..., description="Immutable configuration that governs the optimization run."

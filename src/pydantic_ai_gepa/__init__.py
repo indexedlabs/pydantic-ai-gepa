@@ -18,6 +18,7 @@ from .inspection import (
     InspectionSnapshot,
 )
 from .exceptions import UsageBudgetExceeded
+from .spend import CostBudgetExceeded, ModelSpend, PriceFn, SpendReport
 from .provider_errors import (
     PROVIDER_STOP_ERROR_CODES,
     ProviderStopError,
@@ -84,6 +85,10 @@ from .types import (
 )
 
 __all__ = [
+    "CostBudgetExceeded",
+    "ModelSpend",
+    "PriceFn",
+    "SpendReport",
     "optimize_agent",
     "AcceptanceComparison",
     "compare_candidate_samples",

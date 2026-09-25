@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import random
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from time import perf_counter
 from typing import Any, TypeAlias, cast
 
 from pydantic_evals import Case
@@ -21,8 +22,16 @@ from .base import (
     EngineResult,
     OptimizationTask,
     _aggregate_side_info,
+    check_cost_budget_support,
 )
 from .registry import register_engine
+
+
+@dataclass(slots=True)
+class ProposalUsage:
+    """Optional usage supplied by a proposer; unknown turns remain None."""
+
+    agent_turns: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +43,8 @@ class ReflectionContext:
     report: str
     iteration: int
     side_info: dict[str, Any]
+    usage: ProposalUsage = field(default_factory=ProposalUsage)
+    """The callback may set usage.agent_turns while returning its usual candidate."""
 
 
 Proposer: TypeAlias = Callable[[ReflectionContext], Awaitable[CandidateMap]]
@@ -76,6 +87,7 @@ class CodingAgentEngine:
         budget: BudgetTracker,
     ) -> EngineResult:
         """Run managed baseline/reflection rounds and return the best candidate."""
+        check_cost_budget_support(self, config)
         budget.check()
 
         minibatch_size = self._positive_int_option("minibatch_size", 5)
@@ -99,6 +111,8 @@ class CodingAgentEngine:
         starting_spend = budget.spent
         engine_budget = BudgetTracker(config.max_metric_calls)
         history: list[EngineEvent] = []
+        proposal_wall_times: list[float] = []
+        proposal_agent_turns: list[int | None] = []
         seed = _copy_candidate(await task.seed_candidate())
         seed_evaluation = await self._evaluate_validation(
             task=task,
@@ -115,6 +129,10 @@ class CodingAgentEngine:
                     data={
                         "iterations": 0,
                         "proposals": 0,
+                        "proposal_wall_time_seconds": 0.0,
+                        "proposal_wall_times_seconds": [],
+                        "agent_turns": None,
+                        "proposal_agent_turns": [],
                         "stop_reason": "budget_exhausted",
                         "validation_evaluations": 0,
                     },
@@ -258,7 +276,10 @@ class CodingAgentEngine:
                 iteration=iterations,
                 side_info=_aggregate_side_info(baseline_records),
             )
+            proposal_started = perf_counter()
             proposal = await self._propose(context)
+            proposal_wall_times.append(perf_counter() - proposal_started)
+            proposal_agent_turns.append(context.usage.agent_turns)
             proposals += 1
 
             proposal_samples: list[float] = []
@@ -371,6 +392,17 @@ class CodingAgentEngine:
                 data={
                     "iterations": iterations,
                     "proposals": proposals,
+                    "proposal_wall_time_seconds": sum(proposal_wall_times),
+                    "proposal_wall_times_seconds": proposal_wall_times,
+                    "agent_turns": (
+                        sum(
+                            turns for turns in proposal_agent_turns if turns is not None
+                        )
+                        if proposal_agent_turns
+                        and all(turns is not None for turns in proposal_agent_turns)
+                        else None
+                    ),
+                    "proposal_agent_turns": proposal_agent_turns,
                     "stop_reason": stop_reason,
                     "validation_evaluations": len(pool),
                     "pareto_candidates": sorted(_pareto_indices(pool)),
@@ -652,4 +684,4 @@ def _format_failure_report(
 register_engine(CodingAgentEngine.name, CodingAgentEngine, replace=True)
 
 
-__all__ = ["CodingAgentEngine", "Proposer", "ReflectionContext"]
+__all__ = ["CodingAgentEngine", "Proposer", "ProposalUsage", "ReflectionContext"]

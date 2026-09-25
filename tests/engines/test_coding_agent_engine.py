@@ -449,8 +449,13 @@ def test_coding_agent_engine_requires_a_callable_proposer(propose: object) -> No
 
 
 @pytest.mark.asyncio
-async def test_coding_agent_engine_minibatches_are_deterministic_for_a_seed() -> None:
+async def test_coding_agent_engine_minibatches_are_deterministic_for_a_seed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Equal seeds produce the same sampled minibatch history and metric usage."""
+    monkeypatch.setattr(
+        "pydantic_ai_gepa.engines.coding_agent_engine.perf_counter", lambda: 0.0
+    )
 
     async def propose(context: ReflectionContext) -> CandidateMap:
         return _candidate("still wrong")

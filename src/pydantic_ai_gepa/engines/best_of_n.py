@@ -13,6 +13,7 @@ from .base import (
     EngineEvent,
     EngineResult,
     OptimizationTask,
+    check_cost_budget_support,
 )
 from .registry import register_engine
 
@@ -52,7 +53,7 @@ class BestOfNEngine:
         budget: BudgetTracker,
     ) -> EngineResult:
         """Evaluate the seed and ``n`` derived candidates under ``budget``."""
-        del config  # This engine has no shared options beyond its constructor config.
+        check_cost_budget_support(self, config)
         budget.check()
         starting_spend = budget.spent
         seed = await task.seed_candidate()

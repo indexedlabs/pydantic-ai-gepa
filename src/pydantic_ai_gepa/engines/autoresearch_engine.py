@@ -5,7 +5,13 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import TypeAlias, cast
 
-from .base import BudgetTracker, EngineConfig, EngineResult, OptimizationTask
+from .base import (
+    BudgetTracker,
+    EngineConfig,
+    EngineResult,
+    OptimizationTask,
+    check_cost_budget_support,
+)
 from .registry import register_engine
 
 
@@ -36,6 +42,7 @@ class AutonomousResearchEngine:
     async def run(
         self, task: OptimizationTask, config: EngineConfig, budget: BudgetTracker
     ) -> EngineResult:
+        check_cost_budget_support(self, config)
         before = budget.spent
         result = await self._driver(task, config, budget)
         consumed = budget.spent - before
