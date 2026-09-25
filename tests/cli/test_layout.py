@@ -78,6 +78,24 @@ def test_config_parse_minimal(tmp_path: Path) -> None:
     assert cfg.validation_dataset is None
     assert cfg.defaults == {}
     assert cfg.stall_threshold == 5
+    assert cfg.acceptance.paired_min_cases is None
+
+
+def test_config_paired_acceptance_threshold(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "gepa.toml"
+    cfg_path.write_text(
+        'agent = "pkg.agents:my_agent"\n[acceptance]\npaired_min_cases = 100\n',
+        encoding="utf-8",
+    )
+    assert GepaConfig.load(cfg_path).acceptance.paired_min_cases == 100
+
+
+@pytest.mark.parametrize("value", [True, False, 0, 1, -1, 2.5, "100"])
+def test_config_rejects_invalid_paired_acceptance_threshold(value: object) -> None:
+    with pytest.raises(GepaConfigError, match="acceptance.paired_min_cases"):
+        GepaConfig.from_dict(
+            {"agent": "pkg:agent", "acceptance": {"paired_min_cases": value}}
+        )
 
 
 def test_config_parse_with_defaults(tmp_path: Path) -> None:

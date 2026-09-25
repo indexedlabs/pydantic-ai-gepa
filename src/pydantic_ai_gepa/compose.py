@@ -206,8 +206,8 @@ async def optimize_best_of(
     *,
     max_metric_calls: int,
     comparison_metric_calls: int | None = None,
-    fair_vote_repetitions: int = 1,
-    fair_vote_max_repetitions: int = 1,
+    fair_vote_repetitions: int = 3,
+    fair_vote_max_repetitions: int | None = None,
     selection_mode: Literal[
         "instance", "objective", "hybrid", "cartesian"
     ] = "instance",
@@ -216,6 +216,8 @@ async def optimize_best_of(
     acceptance_min_delta: float = 0.0,
 ) -> PipelineResult:
     """Parallel exploration plus a charged repeated matched comparison."""
+    if fair_vote_max_repetitions is None:
+        fair_vote_max_repetitions = fair_vote_repetitions
     await _require_comparison_budget(
         task,
         candidates=len(configs),
@@ -342,8 +344,8 @@ async def optimize_vote(
     *,
     max_metric_calls: int,
     comparison_metric_calls: int | None = None,
-    fair_vote_repetitions: int = 1,
-    fair_vote_max_repetitions: int = 1,
+    fair_vote_repetitions: int = 3,
+    fair_vote_max_repetitions: int | None = None,
 ) -> PipelineResult:
     """Alias for a repeated, matched, charged cross-engine vote."""
     return await optimize_best_of(
@@ -784,7 +786,12 @@ async def _select_fair_winner(
                 "The frozen fair-vote baseline must be selectable on every matched round."
             )
         acceptance = _acceptance_for_candidate(
-            votes, baseline_index, provisional, confidence, min_delta
+            votes,
+            baseline_index,
+            provisional,
+            confidence,
+            min_delta,
+            max_repetitions - repetitions + 1,
         )
         continue_rounds = (
             provisional != baseline_index and acceptance["verdict"] == "inconclusive"
@@ -805,7 +812,12 @@ async def _select_fair_winner(
                     "The frozen fair-vote baseline must be selectable on every matched round."
                 )
             acceptance = _acceptance_for_candidate(
-                votes, baseline_index, provisional, confidence, min_delta
+                votes,
+                baseline_index,
+                provisional,
+                confidence,
+                min_delta,
+                max_repetitions - repetitions + 1,
             )
             continue_rounds = (
                 provisional != baseline_index
@@ -854,6 +866,7 @@ def _acceptance_for_candidate(
     candidate_index: int,
     confidence: float,
     min_delta: float,
+    max_looks: int = 1,
 ) -> dict[str, Any]:
     """Run the one shared acceptance primitive against the durable baseline."""
     if candidate_index == baseline_index:
@@ -867,6 +880,7 @@ def _acceptance_for_candidate(
         votes[candidate_index].samples,
         confidence=confidence,
         min_delta=min_delta,
+        max_looks=max_looks,
     ).to_dict()
 
 

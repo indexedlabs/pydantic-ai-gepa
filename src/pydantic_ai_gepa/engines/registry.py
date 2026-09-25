@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from .base import EngineConfig, OptimizationEngine
+from .base import EngineConfig, OptimizationEngine, check_cost_budget_support
 
 EngineFactory = Callable[[EngineConfig], OptimizationEngine]
 
@@ -34,7 +34,9 @@ def get_engine(name: str, config: EngineConfig) -> OptimizationEngine:
         raise KeyError(
             f"Unknown optimization engine {name!r}. Registered engines: {registered}."
         ) from exc
-    return factory(config)
+    engine = factory(config)
+    check_cost_budget_support(engine, config)
+    return engine
 
 
 def list_engines() -> tuple[str, ...]:

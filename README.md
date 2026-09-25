@@ -354,6 +354,35 @@ command to fence off stale sessions. Committed proposals are preserved,
 completed comparisons are replayed without scoring again, and interrupted
 comparisons reuse durable samples. Lane runs use `gepa lane reset` / `lane lease`.
 
+Scalar acceptance uses Welch's Student-t confidence interval with a Bonferroni
+alpha split across the configured maximum number of looks. Use
+`--acceptance-repetitions 3 --acceptance-max-repetitions 5` for three repetitions,
+up to five while inconclusive, at the default confidence 0.9. When omitted, the
+maximum equals the configured initial repetitions. Small sets
+require at least three repetitions per side. The failure-selected training
+sample is excluded from the baseline; fresh samples supply the comparison.
+Validation compares fresh candidate samples against repeated incumbent evidence,
+and lane finalists receive a fresh confirmation before promotion. Each additional
+evaluation consumes one budget row; insufficient budget cannot promote a candidate.
+
+For larger sets, `gepa run start --acceptance-paired-min-cases 100` switches to one
+repetition per side when there are at least 100 cases, using a paired Student-t
+interval over matching per-case score differences. The threshold is configurable
+(integer ≥2), and paired mode is disabled by default. It can also be set in
+`.gepa/gepa.toml`; an explicit CLI value takes precedence:
+
+```toml
+[acceptance]
+paired_min_cases = 100
+```
+
+Omit `paired_min_cases` to retain repeated evaluation for every dataset size.
+The incumbent's aggregate validation samples are retained in `state.json` and
+replaced only after an accepted promotion. Paired per-case evidence stays in the
+harness-owned `.gepa-validation-evidence` directory beside the external dataset,
+never in public run artifacts. Missing incumbent evidence prevents promotion until
+it can be collected from the incumbent tree.
+
 Keep the validation dataset outside the repository and all candidate worktrees,
 in both git and component modes. For example:
 
@@ -397,6 +426,12 @@ file-path component IDs. Non-component run metadata belongs in
 
 Key arguments for `optimize_agent`:
 
+`max_token_cost` uses observed mean costs to guard the next step. The first step
+and in-flight requests can overshoot; `result.spend_report` reports actual spend.
+The cap applies per engine run; composition helpers' comparison evaluations are not metered.
+Unknown model prices stop capped runs; pass `price_fn(response) -> float | None`
+to supply custom prices in dollars (`None` falls back to the bundled catalog).
+
 ```python
 from pydantic_ai_gepa import ReflectionConfig
 
@@ -404,6 +439,7 @@ result = await optimize_agent(
     ...,
     # Budget
     max_metric_calls=200,          # Maximum number of evaluations
+    max_token_cost=5.0,            # Optional US dollar cap across reflection + rollouts
 
     # Reflection settings
     reflection_config=ReflectionConfig(

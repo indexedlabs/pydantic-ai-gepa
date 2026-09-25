@@ -34,7 +34,14 @@ class RoundRobinComponentSelector:
         if not component_names:
             raise ValueError("Candidate has no components to select.")
 
-        pointer = self._pointers.get(candidate_idx, 0) % len(component_names)
+        if candidate_idx not in self._pointers:
+            # Reflection advanced the parent's pointer before creating this child.
+            self._pointers[candidate_idx] = (
+                self._pointers.get(candidate.parent_indices[0], 0)
+                if candidate.parent_indices
+                else 0
+            )
+        pointer = self._pointers[candidate_idx] % len(component_names)
         selection = component_names[pointer]
         self._pointers[candidate_idx] = (pointer + 1) % len(component_names)
         return [selection]

@@ -1089,6 +1089,9 @@ def _select_comparison(
             [float(sample.score) for sample in candidate_samples],
             confidence=float(plan["comparison"]["acceptance_confidence"]),
             min_delta=float(plan["comparison"]["acceptance_min_delta"]),
+            max_looks=(plan["comparison"].get("max_repetitions") or repetitions)
+            - repetitions
+            + 1,
         ).to_dict()
         if (
             acceptance["verdict"] == "inconclusive"

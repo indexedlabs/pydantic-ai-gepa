@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from ...exceptions import UsageBudgetExceeded
+from ...spend import SpendCapability, SpendMeter
+
 import asyncio
 import weakref
 from collections import deque
@@ -198,6 +201,7 @@ def create_trace_toolset(
     candidate_idx: int,
     reflection_model: Any = "gpt-4o-mini",
     max_spawned_agents: int = DEFAULT_MAX_SPAWNED_AGENTS,
+    spend_meter: SpendMeter | None = None,
 ) -> FunctionToolset[object]:
     toolset = FunctionToolset[object]()
     base_dir = Path(f".gepa_cache/runs/{run_id}/candidates/{candidate_idx}").resolve()
@@ -706,13 +710,27 @@ def create_trace_toolset(
                 if loop_count > 20:
                     return "Error: Child agent exceeded maximum clear_message_history loops (20)."
                 try:
-                    result = await agent.run(current_prompt, toolsets=[child_toolset])
+                    result = await agent.run(
+                        current_prompt,
+                        toolsets=[child_toolset],
+                        **(
+                            {
+                                "capabilities": [
+                                    SpendCapability(spend_meter, "reflection")
+                                ]
+                            }
+                            if spend_meter is not None
+                            else {}
+                        ),
+                    )
                     return result.output
                 except ClearMessageHistoryException as e:
                     current_prompt = (
                         f"History cleared. You previously left yourself this note to continue:\n\n{e.next_context}\n\n"
                         "Your Python REPL state is intact."
                     )
+                except UsageBudgetExceeded:
+                    raise
                 except Exception as e:
                     return f"Error running sub-agent: {e}"
 

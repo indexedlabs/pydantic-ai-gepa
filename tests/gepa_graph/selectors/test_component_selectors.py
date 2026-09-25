@@ -56,6 +56,23 @@ def test_round_robin_component_selector_raises_for_missing_candidate() -> None:
         selector.select(state, 1)
 
 
+def test_round_robin_child_inherits_advanced_parent_pointer() -> None:
+    state = _make_state(["a", "b", "c"])
+    selector = RoundRobinComponentSelector()
+    assert selector.select(state, 0) == ["a"]
+    child = state.candidates[0].model_copy(
+        update={"idx": 1, "parent_indices": [0], "creation_type": "reflection"}
+    )
+    state.add_candidate(child)
+    assert selector.select(state, 1) == ["b"]
+    # Parent and child advance independently after inheritance.
+    assert selector.select(state, 0) == ["b"]
+    assert selector.select(state, 1) == ["c"]
+    grandchild = child.model_copy(update={"idx": 2, "parent_indices": [1]})
+    state.add_candidate(grandchild)
+    assert selector.select(state, 2) == ["a"]
+
+
 def test_all_component_selector_returns_all_components() -> None:
     state = _make_state(["a", "b"])
     selector = AllComponentSelector()

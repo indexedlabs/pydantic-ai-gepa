@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ...exceptions import UsageBudgetExceeded
+
 import json
 import logfire
 from dataclasses import dataclass
@@ -446,6 +448,8 @@ class InstructionProposalGenerator:
                         ]
                     )
 
+        except UsageBudgetExceeded:
+            raise
         except InspectionAborted:
             raise
         except Exception as error:
