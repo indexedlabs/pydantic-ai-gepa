@@ -2,10 +2,33 @@
 
 from __future__ import annotations
 
+from typing import Mapping, TypeVar
+
 from ..models import CandidateProgram, GepaState, ParetoFrontEntry
 from .evaluator import EvaluationResults
 
 SCORE_EPSILON = 1e-6
+
+Program = TypeVar("Program", int, str)
+
+
+def remove_dominated_programs(
+    fronts: Mapping[str, set[Program]], scores: Mapping[Program, float]
+) -> dict[str, set[Program]]:
+    """Prune redundant case winners, lowest aggregate first, as upstream GEPA does.
+
+    A program can be removed when the remaining programs still cover every
+    case it wins. Unique case winners always survive; ties retain coverage.
+    """
+    remaining = set().union(*fronts.values()) if fronts else set()
+    for program in sorted(remaining, key=lambda p: (scores[p], p)):
+        if all(
+            winners - {program} & remaining
+            for winners in fronts.values()
+            if program in winners
+        ):
+            remaining.remove(program)
+    return {case: winners & remaining for case, winners in fronts.items()}
 
 
 class ParetoFrontManager:
