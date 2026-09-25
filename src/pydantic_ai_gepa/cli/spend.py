@@ -67,6 +67,15 @@ def _read_rows(
     return rows
 
 
+class MissingValidationSpend(ValueError):
+    """A registered validation eval has lost its authoritative spend."""
+
+
+def _validation_owners(directory: Path) -> dict[str, int]:
+    path = directory / "validation-spend-owners.json"
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
 def _rows(
     run_id: str, root: Path | None, warnings: dict[str, Any] | None = None
 ) -> list[dict[str, Any]]:
@@ -74,12 +83,50 @@ def _rows(
     rows = _read_rows(directory / "spend.jsonl", warnings)
     pointer = directory / "validation-spend-path"
     if pointer.exists():
+        from .lanes import _pid_alive
+
         completed = {row["eval_id"] for row in rows if row["kind"] == "validation"}
-        rows.extend(
-            row
-            for row in _read_rows(Path(pointer.read_text()), warnings)
-            if row["eval_id"] not in completed
-        )
+        owners = _validation_owners(directory)
+        private = Path(pointer.read_text())
+        if not private.exists():
+            if warnings is not None:
+                warnings["validation_checkpoint_missing"] = True
+            elif set(owners) - completed or not owners:
+                raise MissingValidationSpend(
+                    "Missing private validation spend checkpoint"
+                )
+        private_rows = _read_rows(private, warnings)
+        live: set[str] = set()
+        if warnings is None:
+            # Admission retains private high-water costs even after publication.
+            highest: dict[str, float] = {}
+            for item in private_rows:
+                key = item["eval_id"]
+                highest[key] = max(highest.get(key, 0.0), item["max_rollout_dollars"])
+            for row in rows:
+                if row["kind"] == "validation":
+                    # If all evals were published before private-file cleanup,
+                    # the aggregate cost is a conservative scheduling bound.
+                    row["max_rollout_dollars"] = highest.get(
+                        row["eval_id"], row["total_dollars"]
+                    )
+        else:
+            live = {
+                key
+                for key, pid in owners.items()
+                if key not in completed and _pid_alive(pid)
+            }
+            if live:
+                warnings["validation_in_progress"] = True
+        for row in private_rows:
+            if row["eval_id"] in completed:
+                continue
+            if warnings is not None:
+                pid = owners.get(row["eval_id"])
+                if pid is None or row["eval_id"] in live:
+                    warnings["validation_in_progress"] = True
+                    continue
+            rows.append(row)
     return rows
 
 
@@ -246,6 +293,7 @@ class EvalSpendMeter(SpendMeter):
         )
         self._persist_lock = RLock()
         self._saved: dict[str, Any] = {}
+        self._finished = False
 
     def flush(self) -> None:
         with self._persist_lock:
@@ -293,18 +341,22 @@ class EvalSpendMeter(SpendMeter):
             self._saved = current
 
     def finish(self) -> None:
+        if self._finished:
+            return
         self.flush()
         if self.private_path is not None:
             # Publish once per validation eval. The private deltas remain the
             # authority until this aggregate exists, including after a crash.
             with _lock(run_dir(self.run_id, self.root) / "spend.lock"):
                 row = dict(self._saved, eval_id=self.eval_id, kind=self.kind)
+                row.pop("max_rollout_dollars")
                 with (run_dir(self.run_id, self.root) / "spend.jsonl").open(
                     "a"
                 ) as handle:
                     handle.write(json.dumps(row) + "\n")
                     handle.flush()
                     os.fsync(handle.fileno())
+        self._finished = True
 
     def callable_completed(self) -> None:
         """Require metering only after both callable and metric succeeded."""
@@ -548,6 +600,19 @@ def evaluation_spend(
                     handle.flush()
                     os.fsync(handle.fileno())
                 os.replace(temporary, pointer)
+            # Register ownership for uncapped evals too. No spend or per-case
+            # progress belongs in this reflector-readable manifest.
+            validation_spend_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if not validation_spend_path.exists():
+                with validation_spend_path.open("a") as handle:
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            owners = _validation_owners(run_dir(run_id, root))
+            if eval_id not in owners:
+                owners[eval_id] = os.getpid()
+                _write_reservations(
+                    run_dir(run_id, root) / "validation-spend-owners.json", owners
+                )
 
     try:
         with _lock(run_dir(run_id, root) / "spend.lock"):
@@ -555,6 +620,8 @@ def evaluation_spend(
                 rows = _rows(run_id, root)
             except json.JSONDecodeError:
                 refuse("Cannot evaluate with a malformed spend ledger")
+            except MissingValidationSpend as exc:
+                refuse(str(exc))
             report = _report(rows, cap)
             if ad_hoc_cap and cap is not None and report["total_dollars"] >= cap:
                 refuse(
@@ -609,10 +676,18 @@ def evaluation_spend(
             yield meter
     except CostBudgetExceeded as exc:
         admitted = True
+        if (
+            managed is not None
+            and managed.max_token_cost is not None
+            and (meter.unmetered or meter.report().unpriced_usage)
+        ):
+            # Missing accounting invalidates the managed cap too, even when
+            # this particular eval requested a tighter one-off limit.
+            own_cap = meter.persist_stop = True
         with _lock(run_dir(run_id, root) / "spend.lock"):
             register_private_path()
         meter.stop_reason = exc.stop_reason
-        meter.flush()
+        meter.finish()
         # Only terminal state/report emission is serialized, never paid work.
         with _lock(run_dir(run_id, root) / "spend-finalize.lock"):
             latest = (

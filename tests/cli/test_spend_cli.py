@@ -25,6 +25,8 @@ from pydantic_ai_gepa.evaluation import (
     evaluate_candidate_dataset,
 )
 from pydantic_ai_gepa.spend import current_rollout_capability
+from pydantic_ai_gepa.types import MetricResult, RolloutOutput
+from pydantic_ai_gepa.evaluation_health import evaluation_infrastructure_failures
 from tests.cli import test_run_cli, test_git_candidate_cli, test_select_cli
 from tests.cli.test_run_cli import _run, _run_payload
 
@@ -33,10 +35,23 @@ git_repo = test_git_candidate_cli.git_repo
 lane_repo = test_select_cli.git_repo
 
 
-@pytest.mark.parametrize("failure", ["agent", "evaluate", "metric", "case_factory"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "agent",
+        "agent_trace",
+        "agent_usage_limit",
+        "agent_usage_limit_trace",
+        "evaluate",
+        "metric",
+        "case_factory",
+        "returned_failure",
+    ],
+)
 def test_failed_rollout_is_recoverable_under_cap(repo: Path, failure: str):
     from pydantic_ai.exceptions import ModelHTTPError
     from pydantic_ai.models.function import FunctionModel
+    from pydantic_ai import UsageLimits
 
     _price(repo)
     started = _start("10")
@@ -45,7 +60,7 @@ def test_failed_rollout_is_recoverable_under_cap(repo: Path, failure: str):
     before = run_state_path(run_id).read_bytes()
 
     def fail(*args):
-        if failure == "agent":
+        if failure.startswith("agent"):
             raise ModelHTTPError(429, "fake", {"error": "rate limited"})
         raise ConnectionError("temporary failure")
 
@@ -58,19 +73,29 @@ def test_failed_rollout_is_recoverable_under_cap(repo: Path, failure: str):
         cap=None,
         price_fn=lambda r: 0.01,
     ):
-        if failure == "agent":
+        if failure.startswith("agent"):
             records = asyncio.run(
                 evaluate_candidate_dataset(
                     agent=Agent(FunctionModel(fail)),
-                    metric=lambda c, o: 1.0,
+                    metric=lambda c, o: MetricResult(score=0.0),
                     dataset=[Case(inputs="?")],
+                    capture_traces=failure.endswith("trace"),
+                    agent_usage_limits=UsageLimits(request_limit=0)
+                    if "usage_limit" in failure
+                    else None,
                 )
             )
         else:
             records = asyncio.run(
                 evaluate_callable_dataset(
-                    evaluate=fail if failure == "evaluate" else lambda c: "ok",
-                    metric=fail if failure == "metric" else lambda c, o: 1.0,
+                    evaluate=fail
+                    if failure == "evaluate"
+                    else lambda c: RolloutOutput.from_error(
+                        ConnectionError("child replay failed"), kind="system"
+                    )
+                    if failure == "returned_failure"
+                    else "ok",
+                    metric=fail if failure == "metric" else lambda c, o: 0.0,
                     case_factory=fail if failure == "case_factory" else None,
                     dataset=[Case(inputs="?")],
                 )
@@ -78,6 +103,7 @@ def test_failed_rollout_is_recoverable_under_cap(repo: Path, failure: str):
     assert records[0].score == 0
     assert not records[0].payload["output"].success
     assert records[0].payload["output"].error_kind == "system"
+    assert len(evaluation_infrastructure_failures(records)) == 1
     report = spend_report(run_id, repo)
     assert report["stop_reason"] is None
     assert report["unmetered_rollouts"] == 0
@@ -185,6 +211,8 @@ def test_one_off_backstop_leaves_managed_run_recoverable(repo: Path):
 
 
 def _private_validation(root: Path, checkpoint: Path, *, crash: bool = False):
+    before = spend_report("private", root)
+
     async def evaluate(case):
         return (await _metered_agent()).output
 
@@ -205,10 +233,10 @@ def _private_validation(root: Path, checkpoint: Path, *, crash: bool = False):
                 dataset=[Case(inputs="first"), Case(inputs="second")],
             )
         )
-        assert not (root / ".gepa/runs/private/spend.jsonl").exists()
-        assert spend_report("private", root)["validation_dollars"] == pytest.approx(
-            0.02
-        )
+        report = spend_report("private", root)
+        assert report["validation_in_progress"] is True
+        assert report["validation_dollars"] == before["validation_dollars"]
+        assert report["by_model"] == before["by_model"]
         public_reservations = root / ".gepa/runs/private/spend-reservations.json"
         assert json.loads(public_reservations.read_text()) == {}
         if crash:
@@ -237,6 +265,11 @@ def test_validation_checkpoints_are_private_and_crash_safe(tmp_path: Path, crash
         assert len(rows) == 1
         assert rows[0]["rollouts_completed"] == 2
         assert rows[0]["total_dollars"] == pytest.approx(0.02)
+        assert "max_rollout_dollars" not in rows[0]
+        from pydantic_ai_gepa.cli.spend import _rows, _kind_costs
+
+        observations, mean, highest = _kind_costs(_rows("private", root), "validation")
+        assert (observations, mean, highest) == pytest.approx((2, 0.01, 0.01))
     # Admission must include private spend, including after a killed process.
     with pytest.raises(typer.Exit) as refused:
         with evaluation_spend(
@@ -264,6 +297,214 @@ def test_validation_checkpoints_are_private_and_crash_safe(tmp_path: Path, crash
             asyncio.run(_metered_agent())
     assert stopped.value.exit_code == 70
     assert spend_report("private", root)["total_dollars"] == pytest.approx(0.04)
+
+
+def _pollable_validation(root, run_id, checkpoint, connection):
+    prices = iter([0.01, 0.02, 0.03])
+
+    async def evaluate(case):
+        return (await _metered_agent()).output
+
+    def metric(case, output):
+        connection.send("paid")
+        assert connection.recv() == "continue"
+        return 1.0
+
+    with evaluation_spend(
+        run_id=run_id,
+        root=root,
+        eval_id="polled",
+        kind="validation",
+        count=3,
+        cap=None,
+        price_fn=lambda r: next(prices),
+        validation_spend_path=checkpoint,
+    ):
+        asyncio.run(
+            evaluate_callable_dataset(
+                evaluate=evaluate,
+                metric=metric,
+                dataset=[Case(inputs=str(i)) for i in range(3)],
+                concurrency=1,
+            )
+        )
+
+
+@pytest.mark.parametrize("capped", [False, True])
+def test_live_validation_status_withholds_each_case_until_eval_finishes(
+    repo: Path, capped: bool
+):
+    _price(repo)
+    started = (
+        _start("10")
+        if capped
+        else _run("run", "start", "--size", "2", "--max-iterations", "20")
+    )
+    assert started.exit_code == 0, started.output
+    run_id = _run_payload(started.output)["run_id"]
+    before = _run_payload(_run("run", "status", "--run-id", run_id).output)["spend"]
+    context = multiprocessing.get_context("fork")
+    parent, child = context.Pipe()
+    process = context.Process(
+        target=_pollable_validation,
+        args=(repo, run_id, repo.parent / f"{repo.name}-poll.jsonl", child),
+    )
+    process.start()
+    try:
+        for _ in range(3):
+            assert parent.poll(20)
+            assert parent.recv() == "paid"
+            for _ in range(2):
+                status = _run("run", "status", "--run-id", run_id)
+                assert status.exit_code == 0, status.output
+                assert _run_payload(status.output)["spend"] == dict(
+                    before, validation_in_progress=True
+                )
+            # Public spend is withheld, but admission must see the private charges.
+            with pytest.raises(typer.Exit) as refused:
+                with evaluation_spend(
+                    run_id=run_id,
+                    root=repo,
+                    eval_id="probe",
+                    kind="probe",
+                    count=1,
+                    cap=before["total_dollars"] + 0.005,
+                    price_fn=lambda r: 0.01,
+                ):
+                    pytest.fail("Admission ignored live private validation spend")
+            assert refused.value.exit_code == 2
+            parent.send("continue")
+        process.join(timeout=20)
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=20)
+        parent.close()
+        child.close()
+    after = _run_payload(_run("run", "status", "--run-id", run_id).output)["spend"]
+    assert not after.get("validation_in_progress")
+    assert after["validation_dollars"] == pytest.approx(0.06)
+    assert after["total_dollars"] == pytest.approx(before["total_dollars"] + 0.06)
+    assert after["by_model"]["student"]["requests"] == 3
+
+
+@pytest.mark.parametrize("previous_aggregate", [False, True])
+def test_missing_private_checkpoint_warns_and_refuses_admission(
+    tmp_path: Path, previous_aggregate: bool, capsys: pytest.CaptureFixture[str]
+):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    checkpoint = tmp_path / "private" / "spend.jsonl"
+    if previous_aggregate:
+        with evaluation_spend(
+            run_id="private",
+            root=root,
+            eval_id="completed",
+            kind="validation",
+            count=1,
+            cap=1,
+            price_fn=lambda r: 0.01,
+            validation_spend_path=checkpoint,
+        ):
+            asyncio.run(_metered_agent())
+    process = multiprocessing.get_context("fork").Process(
+        target=_private_validation,
+        args=(root, checkpoint),
+        kwargs={"crash": True},
+    )
+    process.start()
+    process.join(timeout=20)
+    assert process.exitcode == 0
+    checkpoint.rename(checkpoint.with_suffix(".removed"))
+    report = spend_report("private", root)
+    assert report["validation_checkpoint_missing"] is True
+    ledger = root / ".gepa/runs/private/spend.jsonl"
+    before = ledger.read_bytes() if ledger.exists() else None
+    with pytest.raises(typer.Exit) as refused:
+        with evaluation_spend(
+            run_id="private",
+            root=root,
+            eval_id="new",
+            kind="training",
+            count=1,
+            cap=1,
+            price_fn=lambda r: 0.01,
+        ):
+            pytest.fail("Missing private spend was treated as zero")
+    assert refused.value.exit_code == 2
+    assert "Missing private validation spend checkpoint" in capsys.readouterr().err
+    assert (ledger.read_bytes() if ledger.exists() else None) == before
+    checkpoint.with_suffix(".removed").rename(checkpoint)
+    with evaluation_spend(
+        run_id="private",
+        root=root,
+        eval_id="recovered",
+        kind="training",
+        count=1,
+        cap=1,
+        price_fn=lambda r: 0.01,
+    ):
+        asyncio.run(_metered_agent())
+    assert spend_report("private", root)["total_dollars"] == pytest.approx(
+        0.04 if previous_aggregate else 0.03
+    )
+
+
+def test_published_validation_totals_survive_private_file_cleanup(tmp_path: Path):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    checkpoint = tmp_path / "private" / "spend.jsonl"
+    _private_validation(root, checkpoint)
+    checkpoint.rename(checkpoint.with_suffix(".removed"))
+    report = spend_report("private", root)
+    assert report["validation_checkpoint_missing"]
+    assert report["validation_dollars"] == pytest.approx(0.02)
+    with evaluation_spend(
+        run_id="private",
+        root=root,
+        eval_id="after-cleanup",
+        kind="training",
+        count=1,
+        cap=1,
+        price_fn=lambda r: 0.01,
+    ):
+        asyncio.run(_metered_agent())
+    assert spend_report("private", root)["total_dollars"] == pytest.approx(0.03)
+
+
+@pytest.mark.parametrize("failure", ["unpriced", "unmetered"])
+def test_one_off_missing_accounting_finalizes_managed_cap(repo: Path, failure: str):
+    _price(repo)
+    started = _start("10")
+    run_id = _run_payload(started.output)["run_id"]
+    with pytest.raises(typer.Exit) as stopped:
+        with evaluation_spend(
+            run_id=run_id,
+            root=repo,
+            eval_id="one-off",
+            kind="training",
+            count=1,
+            cap=1,
+            price_fn=None,
+        ):
+            if failure == "unpriced":
+                asyncio.run(_metered_agent("unknown-pricing-model"))
+            else:
+                asyncio.run(
+                    evaluate_callable_dataset(
+                        evaluate=lambda c: "ok",
+                        metric=lambda c, o: 1.0,
+                        dataset=[Case(inputs="?")],
+                    )
+                )
+    assert stopped.value.exit_code == 70
+    final = _run_payload(_run("run", "status", "--run-id", run_id).output)
+    assert final["status"] == "done"
+    assert final["last_comparison"]["reason_code"] == "cost_budget_exhausted"
+    assert final["spend"]["stopped_by_cost"]
+    assert Path(final["final_report_path"]).exists()
+    assert _run("eval", "--run-id", run_id).exit_code == 70
 
 
 def test_torn_tail_status_warns_but_capped_admission_refuses(repo: Path):

@@ -414,12 +414,20 @@ unpriced usage, even without a cap. Reflector subscription/spend is excluded.
 An incompatible cap (prior unmetered/unpriced work or a one-off limit below
 recorded spend) exits 2 without changing the ledger or managed run state. A
 tighter one-off cap stops that eval without finalizing the managed run.
+Unpriced or unmetered work under a one-off cap also invalidates a managed run's
+own cap and finalizes it with the fail-closed reason.
 
 The run's locked `spend.jsonl` ledger checkpoints training-side deltas after each
 response. Validation response checkpoints stay beside the private validation
 evidence outside checkouts; the workspace receives one aggregate row when a
-validation eval ends. Reports and budget checks include unfinished private
-checkpoints, so paid spend survives crashes, resume, and concurrent lanes.
+validation eval ends. Budget checks include all private checkpoints. Public
+reports withhold live validation spend and tokens with `validation_in_progress: true`,
+then include the aggregate when the eval ends or its owner dies. Private
+checkpoints preserve paid spend after crashes. If a checkpoint is missing, status
+warns with `validation_checkpoint_missing: true`; admission refuses when any
+registered eval lacks a published aggregate. Validation's highest rollout cost
+stays private for admission checks.
+For a one-case validation set, the aggregate total inherently reveals that case's cost.
 Status reports a torn final ledger line with `ledger_torn_tail: true`; evaluation
 refuses a malformed ledger rather than assuming the missing spend is zero.
 Batch projections use each evaluation kind's own observed mean. Short file locks
