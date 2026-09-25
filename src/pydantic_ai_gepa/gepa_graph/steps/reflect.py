@@ -121,6 +121,9 @@ async def reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteration
         state.last_accepted = False
         return "continue"
 
+    if not can_evaluate(state, len(minibatch)):
+        return "continue"
+
     reflection_model = _resolve_model(deps)
     components_to_update: Sequence[str] | None
     # The reflector's tool catalog is built here: journal tools (when a

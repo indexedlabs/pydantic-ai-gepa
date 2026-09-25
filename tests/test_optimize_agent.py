@@ -43,6 +43,41 @@ def _fake_reasoning() -> TrajectoryAnalysis:
 
 
 @pytest.mark.asyncio
+async def test_optimize_agent_returns_seed_when_validation_exceeds_budget():
+    agent = Agent(TestModel(custom_output_text="ok"), instructions="Reply with ok.")
+    seed = extract_seed_candidate(agent)
+    trainset = [Case(name="train", inputs="Hello", expected_output="ok")]
+    valset = [
+        Case(name=f"validation-{i}", inputs="Hello", expected_output="ok")
+        for i in range(3)
+    ]
+    metric_calls = 0
+
+    def metric(case: Case[str, str, Any], output: RolloutOutput[Any]) -> MetricResult:
+        nonlocal metric_calls
+        metric_calls += 1
+        return MetricResult(score=1.0)
+
+    result = await optimize_agent(
+        agent=agent,
+        trainset=trainset,
+        valset=valset,
+        metric=metric,
+        reflection_config=ReflectionConfig(model=TestModel()),
+        max_metric_calls=2,
+    )
+
+    assert result.best_candidate == result.original_candidate == seed
+    assert result.original_score is None
+    assert result.num_metric_calls == metric_calls == 0
+    assert result.raw_result is not None
+    assert result.raw_result.stopped
+    assert result.raw_result.stop_reason == (
+        "Max evaluations reached: budget cannot cover the validation set"
+    )
+
+
+@pytest.mark.asyncio
 async def test_optimize_agent_minimal_flow():
     """Run a minimal optimization flow over a tiny categorization dataset.
 

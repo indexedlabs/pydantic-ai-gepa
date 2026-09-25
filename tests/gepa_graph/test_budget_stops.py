@@ -54,7 +54,8 @@ async def test_budget_stops_before_each_unaffordable_batch(
         reflection_config=ReflectionConfig(model="stub"),
     )
     deps = create_deps(make_adapter_stub(), config)
-    deps.proposal_generator = cast(Any, ProposalGeneratorStub())
+    proposal_generator = ProposalGeneratorStub()
+    deps.proposal_generator = cast(Any, proposal_generator)
     state = GepaState(
         config=config,
         training_set=ListDataLoader(make_dataset(2)),
@@ -66,6 +67,9 @@ async def test_budget_stops_before_each_unaffordable_batch(
     assert result.stopped
     assert result.stop_reason.startswith("Max evaluations reached")
     assert result.total_evaluations == observed_calls == spent
+    assert proposal_generator.calls == (1 if budget >= 7 else 0)
+    if budget == 6:
+        assert result.stop_reason == "Max evaluations reached"
     if best_score is None:
         assert result.best_score is None
     else:
