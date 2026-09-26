@@ -47,6 +47,25 @@ def use_rollout_kind(kind: RolloutKind) -> Iterator[None]:
         _rollout_kind.reset(token)
 
 
+def admission_limit(
+    max_concurrent: int, observations: int, remaining: float, highest: float
+) -> int:
+    """In-flight rollout slots a kind may fill under a cap.
+
+    The limit ramps with the kind's observation count: at most
+    ``min(max_concurrent, observations)`` and at least 1, so a cheap first
+    observation cannot start a full concurrent batch reserved at an
+    underestimated cost. Above 1 the limit holds only while the remaining
+    headroom covers the whole ramped batch at the kind's highest observed
+    cost; otherwise rollouts start one at a time and recheck before each
+    start. An unobserved kind always starts one at a time.
+    """
+    limit = max(1, min(max_concurrent, observations))
+    if observations and limit > 1 and remaining < limit * highest:
+        return 1
+    return limit
+
+
 class CostBudgetExceeded(UsageBudgetExceeded):
     """A dollar budget or unknown price stopped further paid work."""
 
@@ -100,15 +119,25 @@ class SpendMeter:
     tracked separately for training and validation rollouts so a batch is
     projected at its own kind's mean instead of a blended one. With both
     ``max_token_cost`` and ``max_concurrent`` set, ``admit_rollout`` gates
-    every rollout start. The bound on a capped run, stated plainly:
+    every rollout start. Admission keeps spent + in-flight reservations + the
+    new reservation within the cap, each reservation at the kind's highest
+    observed cost ``h`` at that rollout's admission time, and a kind's
+    in-flight slots ramp with its observation count ``n``: at most
+    ``min(max_concurrent, n)`` (at least 1), and above 1 only while the
+    remaining headroom covers the ramped slots at ``h``. The bound on a
+    capped run, stated plainly:
 
-    - Each in-flight rollout is reserved at its kind's highest observed cost,
-      so the margin is one rollout per in-flight slot at that high.
+    - After in-flight rollouts settle, overshoot is at most the sum over the
+      rollouts in flight at the stop of ``max(0, c_i - h_i)``: each rollout's
+      actual cost above the high it was reserved at. With ``M`` the kind's
+      true highest rollout cost, that is at most ``min(max_concurrent, n) *
+      (M - h)``; a cheap first case (n = 1) ends the run within one rollout
+      of the cap. An adversarial order (many cheap cases, then expensive
+      ones) can still reach ``max_concurrent * (M - h)``; a declared
+      per-rollout cost ceiling would close that and is a tracked follow-up,
+      not implemented here.
     - The first rollout of a kind runs alone with no projection and can
       overshoot by its own cost.
-    - Up to ``max_concurrent`` in-flight rollouts can each set a new price
-      high for their kind; the run then overshoots by the sum of their
-      excesses over the previous high.
     - Reflection overshoot stays bounded by the reflection projection plus
       the response backstop.
 
@@ -442,13 +471,10 @@ class SpendMeter:
             assert cap is not None
             remaining = cap - self._total() - self._reserved
             concurrency = max(1, self.max_concurrent)
-            # An unobserved kind, or headroom that cannot cover a full
-            # concurrent batch at the observed high, starts one at a time.
-            limit = (
-                concurrency
-                if observations and remaining >= concurrency * highest
-                else 1
-            )
+            # In-flight slots ramp with the kind's observation count, so a
+            # cheap first rollout cannot start a full batch reserved at an
+            # underestimated high.
+            limit = admission_limit(concurrency, observations, remaining, highest)
             if sum(self._active.values()) >= limit:
                 return None
             # Reserve at the observed high so in-flight rollouts cannot each

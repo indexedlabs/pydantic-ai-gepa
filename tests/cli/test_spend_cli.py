@@ -1320,16 +1320,20 @@ def test_adaptive_concurrency_uses_highest_cost_and_preserves_parallelism(
             )
 
     if warmup:
-        costs = iter([0.1, 0.0])
-        batch("seed", 2, 1, lambda r: next(costs), 1)
+        # Three observations ramp the in-flight limit to 3, so the near-cap
+        # rule below is exercised against the ramped limit, not concurrency.
+        costs = iter([0.1, 0.0, 0.0])
+        batch("seed", 3, 1, lambda r: next(costs), 1)
         peak = 0
-        # Mean=.05, highest=.10. Remaining=.25 fits the complete batch's
-        # mean (.20), but is below concurrency * highest (.40): serial starts.
+        # Mean=.033, highest=.10. Remaining=.25 fits the complete batch's
+        # mean (.13), but is below the ramped limit * highest (3 * .10):
+        # serial starts.
         records = batch("near", 4, 0.35, lambda r: 0.05, 4)
         assert len(records) == 4
         assert peak == 1
     else:
-        # First observation is serial; subsequent cases can use all four slots.
+        # The in-flight limit ramps with observations (1, 1, 2, then 4 once
+        # four rollouts have completed); the last four cases overlap fully.
         records = batch("room", 8, cap, lambda r: 0.02, 4)
         assert len(records) == 8
         assert peak == 4
@@ -1448,12 +1452,14 @@ def test_price_jump_drains_all_inflight_paid_responses(tmp_path: Path):
     async def evaluate(case):
         return (await _metered_agent()).output
 
+    # Four cheap observations ramp the kind's in-flight limit to the full
+    # concurrency of 4 before the expensive batch starts.
     with evaluation_spend(
         run_id="burst",
         root=tmp_path,
         eval_id="seed",
         kind="training",
-        count=1,
+        count=4,
         cap=0.1,
         price_fn=lambda r: 0.005,
     ):
@@ -1461,7 +1467,7 @@ def test_price_jump_drains_all_inflight_paid_responses(tmp_path: Path):
             evaluate_callable_dataset(
                 evaluate=evaluate,
                 metric=lambda c, o: 1.0,
-                dataset=[Case(inputs="?")],
+                dataset=[Case(inputs="?") for _ in range(4)],
                 concurrency=1,
             )
         )
@@ -1508,6 +1514,6 @@ def test_price_jump_drains_all_inflight_paid_responses(tmp_path: Path):
         ):
             asyncio.run(expensive_batch())
     report = spend_report("burst", tmp_path)
-    assert report["total_dollars"] == pytest.approx(2.005)
+    assert report["total_dollars"] == pytest.approx(2.02)
     assert report["by_model"]["expensive"]["requests"] == 4
     assert report["stopped_by_cost"]

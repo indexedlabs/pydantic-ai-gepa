@@ -770,14 +770,19 @@ refuses a malformed ledger rather than assuming the missing spend is zero.
 Batch projections use each evaluation kind's own observed mean. Short file locks
 reserve projected batch costs against other processes' outstanding reservations;
 finished evals settle to actual spend, and reservations whose owning PID is gone
-are reclaimed on the next admission/check. Capped rollouts keep configured
-concurrency while remaining headroom covers concurrency × the kind's highest
-observed rollout cost. An unobserved kind, or a batch near the cap, starts one
-rollout at a time and rechecks before each start. Uncapped concurrency is unchanged.
+are reclaimed on the next admission/check. Capped rollouts ramp a kind's in-flight
+count with its observed rollout count, up to the configured concurrency, and
+only while remaining headroom covers the ramped count × the kind's highest
+observed rollout cost; each in-flight rollout is reserved at that high, so a
+cheap first case cannot start a full batch on an underestimated cost. An
+unobserved kind, or a batch near the cap, starts one rollout at a time and
+rechecks before each start. Uncapped concurrency is unchanged.
 
 The margin is **one rollout per concurrent eval process**, provided no rollout
-costs more than the highest observed for its kind. A new price high can add the
-cost of rollouts already in flight at that moment. Response prices are known only
+costs more than the highest observed for its kind. A new price high adds each
+in-flight rollout's excess over that high, and a kind's in-flight count never
+exceeds its observed count, so the worst case is that count (up to the
+concurrency limit) times the excess. Response prices are known only
 after the call; this is not a prepaid guarantee. All received responses, including
 in-flight overshoot, are charged. A cost stop exits 70, preserves the incumbent,
 writes the final report, and never makes a partial eval selectable.
