@@ -22,6 +22,7 @@ from pydantic_evals import Case
 from pydantic_ai_gepa.compose import _engine_task_view, optimize_adaptive_sequential
 from pydantic_ai_gepa.engines import (
     BudgetTracker,
+    CandidateEvaluation,
     EngineConfig,
     GepaEngine,
     OptimizationTask,
@@ -259,13 +260,19 @@ async def test_untrusted_seeded_view_leaks_no_per_case_seed_data() -> None:
     ):
         assert not hasattr(score, name)
 
-    # The stored CandidateEvaluation is reachable only through name-mangled
-    # private state (like the task itself), never via a public or guessed name.
-    assert set(vars(view)) == {
+    # The view stores no CandidateEvaluation at all: its seed-related private
+    # state is the aggregate ValidationScore, and the only other privates are
+    # the task itself and the captured validation context.
+    stored = vars(view)
+    assert set(stored) == {
         "_EngineTaskView__task",
-        "_EngineTaskView__seed_evaluation",
+        "_EngineTaskView__seed_score",
         "_EngineTaskView__validation_context",
     }
+    assert not any(isinstance(value, CandidateEvaluation) for value in stored.values())
+    seed_value = stored["_EngineTaskView__seed_score"]
+    assert isinstance(seed_value, ValidationScore)
+    assert asdict(seed_value) == asdict(score)
     public = {name for name in dir(view) if not name.startswith("_")}
     assert public == {
         "seed_candidate",
@@ -322,10 +329,76 @@ async def test_trusted_seed_evaluation_matches_evaluate_field_for_field() -> Non
     assert reused.side_info == {}
     assert reused.per_case_scores is not evaluation.per_case_scores
 
+    # The view itself stores only reduced values: the scores-only copy (never
+    # the helper's full evaluation) on the trusted side, and just the
+    # aggregate ValidationScore on the base.
+    stored = vars(view)["_TrustedEngineTaskView__seed_evaluation"]
+    assert isinstance(stored, CandidateEvaluation)
+    assert stored is not evaluation
+    assert stored.records == []
+    assert stored.side_info == {}
+    assert isinstance(vars(view)["_EngineTaskView__seed_score"], ValidationScore)
+    # Each accessor call returns a fresh copy that callers cannot use to
+    # tamper with the stored one.
+    reused.per_case_scores["tamper"] = 9.9
+    fresh = await view.seed_evaluation()
+    assert fresh is not None and fresh is not reused
+    assert "tamper" not in fresh.per_case_scores
+    assert "tamper" not in stored.per_case_scores
+
     # The inherited aggregate accessor matches too, and both default to None.
     assert await view.seed_validation_score() is not None
     bare = _engine_task_view(task, engine, seed)
     assert await bare.seed_evaluation() is None
+
+
+@pytest.mark.asyncio
+async def test_proposer_cannot_mutate_the_incumbent_away_from_its_score() -> None:
+    agent = Agent(TestModel(custom_output_text="response"), instructions="candidate-0")
+    seen_seeds: list[str] = []
+
+    def metric(case: Case[str, str, Any], output: RolloutOutput[Any]) -> MetricResult:
+        override = agent._override_instructions.get()
+        active = override.value if override is not None else agent._instructions
+        text = str(active)
+        score = 0.5 if "candidate-0" in text else 0.1 if "worse" in text else 0.0
+        return MetricResult(score=score)
+
+    task = OptimizationTask(
+        agent=agent,
+        trainset=[Case(name="train", inputs="input")],
+        valset=[Case(name="val", inputs="input")],
+        metric=metric,
+    )
+
+    async def propose(seed: CandidateMap) -> CandidateMap:
+        seen_seeds.append(seed["instructions"].text)
+        # In-place attack on the seed the engine handed to the proposer.
+        seed["instructions"].text = "mutated"
+        return _candidate("worse")
+
+    config = EngineConfig(
+        engine="best_of_n",
+        max_metric_calls=2,
+        engine_config={"n": 1, "propose": propose},
+    )
+
+    result = await optimize_adaptive_sequential(
+        task, [config, config], max_metric_calls=4, patience=1
+    )
+
+    # Two slices ran; each slice's proposer received the unmutated incumbent.
+    assert len(result.results) == 2
+    assert seen_seeds == ["candidate-0", "candidate-0"]
+    # Inside each slice the reused seed score still describes the original
+    # incumbent (0.5), while the helper's honest re-evaluation of the mutated
+    # candidate the engine returned scores 0.0 and is never adopted.
+    for item in result.results:
+        assert item.history[-1].data["candidate_scores"][0] == 0.5
+    assert result.fair_scores == [0.0, 0.0]
+    assert result.best.engine == "seed"
+    assert result.best.best_candidate == _candidate("candidate-0")
+    assert result.best.best_score == 0.5
 
 
 @pytest.mark.asyncio
