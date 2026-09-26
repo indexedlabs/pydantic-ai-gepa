@@ -1,12 +1,15 @@
 """Protocol tests run everywhere; adversarial tests require real OS enforcement."""
 
 from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
 import socket
 import socketserver
+import tempfile
 import threading
+import zlib
 from types import SimpleNamespace
 
 import pytest
@@ -32,6 +35,9 @@ def clean_environment(monkeypatch):
         "GEPA_HELDOUT_DATASET",
         "GEPA_HARNESS_ALLOWED_HOSTS",
         "GEPA_HARNESS_PASS_ENV",
+        "GEPA_HARNESS_SCORER_REVISION",
+        "GEPA_HARNESS_FROZEN_FILES",
+        "GEPA_CANDIDATE_COMPONENTS_JSON",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -181,6 +187,341 @@ def test_parent_refuses_all_candidate_hooks(private):
 
     with pytest.raises(sandbox.ScoringSandboxError, match="cannot be imported"):
         resolve_module_attr("definitely_not_importable:hook")
+
+
+def trusted_config(files=("score.txt",)):
+    return GepaConfig(
+        candidate_source="git",
+        evaluate="task_pkg.evaluation:evaluate",
+        acceptance=AcceptanceConfig(
+            pinned_scorer=True, trusted_scorer=True, component_files=files
+        ),
+    )
+
+
+@pytest.mark.parametrize("revision", [None, "", "HEAD", "a" * 41, "a" * 63, "g" * 40])
+def test_trusted_requires_full_harness_revision(monkeypatch, revision):
+    if revision is not None:
+        monkeypatch.setenv("GEPA_HARNESS_SCORER_REVISION", revision)
+    with pytest.raises(sandbox.ScoringSandboxError, match="full commit SHA"):
+        sandbox.require_supported(trusted_config(), "git")
+
+
+@pytest.mark.parametrize("revision", ["A" * 40, "a" * 64])
+def test_trusted_supports_full_harness_revision(monkeypatch, revision):
+    monkeypatch.setenv("GEPA_HARNESS_SCORER_REVISION", revision)
+    sandbox.require_supported(trusted_config(), "git")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "{",
+        "[]",
+        "null",
+        '{"/absolute":"' + "a" * 64 + '"}',
+        json.dumps({"../escape": "a" * 64}),
+        json.dumps({"dir/../escape": "a" * 64}),
+        json.dumps({"": "a" * 64}),
+        json.dumps({"file": "g" * 64}),
+        json.dumps({"file": 1}),
+        json.dumps({"file": "a" * 63}),
+        json.dumps({".git/config": "a" * 64}),
+        json.dumps({"nested/.gIt/config": "a" * 64}),
+    ],
+)
+def test_malformed_frozen_files_refused_before_checkout(
+    git_repo, private, monkeypatch, value
+):
+    monkeypatch.setenv("GEPA_HARNESS_FROZEN_FILES", value)
+    monkeypatch.setattr(
+        sandbox, "private_checkout", lambda *a, **kw: pytest.fail("checkout started")
+    )
+    with pytest.raises(sandbox.ScoringSandboxError, match="GEPA_HARNESS_FROZEN_FILES"):
+        score(git_repo, _git(git_repo, "rev-parse", "HEAD"))
+
+
+@pytest.mark.parametrize("trusted", [False, True])
+@pytest.mark.parametrize(
+    "frozen_path", ["task_pkg/evaluation.py", "missing.py", "task_pkg"]
+)
+def test_frozen_files_refuse_before_import(
+    git_repo, private, protocol_backend, monkeypatch, trusted, frozen_path
+):
+    marker = private.parent / "imported"
+    digest = hashlib.sha256(
+        (git_repo / "task_pkg/evaluation.py").read_bytes()
+    ).hexdigest()
+    sha = commit_evaluator(
+        git_repo,
+        f"from pathlib import Path\nPath({str(marker)!r}).touch()\nraise RuntimeError('imported')\n",
+    )
+    monkeypatch.setenv("GEPA_HARNESS_FROZEN_FILES", json.dumps({frozen_path: digest}))
+    monkeypatch.setenv("GEPA_HARNESS_SCORER_REVISION", sha)
+    with pytest.raises(
+        sandbox.ScoringSandboxError, match="Frozen scorer file verification failed"
+    ):
+        score(git_repo, sha, config=trusted_config() if trusted else None)
+    assert not marker.exists()
+    assert not list((private.parent / ".gepa-heldout/work").iterdir())
+
+
+@pytest.mark.parametrize("kind", ["missing", "directory", "symlink", "binary"])
+def test_candidate_components_refuse_non_text_blobs(
+    git_repo, private, protocol_backend, monkeypatch, kind
+):
+    scorer = _git(git_repo, "rev-parse", "HEAD")
+    path = git_repo / "component"
+    if kind == "directory":
+        path.mkdir()
+        (path / "child").write_text("text")
+    elif kind == "symlink":
+        path.symlink_to("score.txt")
+    elif kind == "binary":
+        path.write_bytes(b"\xff")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "--allow-empty", "-m", "Invalid component")
+    monkeypatch.setenv("GEPA_HARNESS_SCORER_REVISION", scorer)
+    with pytest.raises(
+        sandbox.ScoringSandboxError,
+        match="component UTF-8 blobs|links or special files",
+    ):
+        score(
+            git_repo,
+            _git(git_repo, "rev-parse", "HEAD"),
+            config=trusted_config(("component",)),
+        )
+
+
+def object_repository(tmp_path, object_format, source):
+    repo = tmp_path / "object-repo"
+    repo.mkdir()
+    _git(repo, "init", f"--object-format={object_format}")
+    _git(repo, "config", "user.name", "Test")
+    _git(repo, "config", "user.email", "test@example.com")
+    (repo / "task_pkg").mkdir()
+    (repo / "task_pkg/__init__.py").touch()
+    (repo / "task_pkg/evaluation.py").write_text(source)
+    (repo / "score.txt").write_text("bad")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "Scorer")
+    return repo
+
+
+def overwrite_loose_object(repo, oid, change):
+    path = repo / ".git/objects" / oid[:2] / oid[2:]
+    header, _, data = zlib.decompress(path.read_bytes()).partition(b"\0")
+    kind = header.split(b" ", 1)[0]
+    changed = change(data)
+    assert changed != data
+    path.chmod(0o644)
+    path.write_bytes(
+        zlib.compress(kind + b" " + str(len(changed)).encode() + b"\0" + changed)
+    )
+
+
+@pytest.mark.parametrize("object_format", ["sha1", "sha256"])
+@pytest.mark.parametrize("trusted", [False, True])
+@pytest.mark.parametrize("kind", ["commit", "tree", "subtree", "blob"])
+def test_checkout_object_substitution_refused_before_child(
+    tmp_path, private, protocol_backend, monkeypatch, object_format, trusted, kind
+):
+    marker = private.parent / "import-marker"
+    source = f"from pathlib import Path\nPath({str(marker)!r}).touch()\nasync def evaluate(case): return 'good'\n"
+    repo = object_repository(tmp_path, object_format, source)
+    scorer = _git(repo, "rev-parse", "HEAD")
+    if trusted:
+        (repo / "score.txt").write_text("good")
+        _git(repo, "add", "score.txt")
+        candidate = commit_evaluator(repo, "raise RuntimeError('candidate import')\n")
+        monkeypatch.setenv("GEPA_HARNESS_SCORER_REVISION", scorer)
+    else:
+        candidate = scorer
+    spec = {
+        "commit": scorer,
+        "tree": scorer + "^{tree}",
+        "subtree": scorer + ":task_pkg",
+        "blob": scorer + ":task_pkg/evaluation.py",
+    }[kind]
+    oid = _git(repo, "rev-parse", spec)
+    overwrite_loose_object(
+        repo,
+        oid,
+        lambda data: data.replace(b"evaluation.py", b"xvaluation.py")
+        if kind == "subtree"
+        else data.replace(b"score.txt", b"other.txt")
+        if kind == "tree"
+        else data + b"\n# substituted\n",
+    )
+    monkeypatch.setattr(
+        sandbox, "_process_cleanup", lambda _: pytest.fail("child launch attempted")
+    )
+    with pytest.raises(
+        sandbox.ScoringSandboxError, match="Git object integrity verification failed"
+    ):
+        score(repo, candidate, config=trusted_config() if trusted else None)
+    assert not marker.exists()
+    assert not list((private.parent / ".gepa-heldout/work").iterdir())
+
+
+@pytest.mark.parametrize("object_format", ["sha1", "sha256"])
+@pytest.mark.parametrize("kind", ["commit", "tree", "blob"])
+def test_component_objects_are_hash_verified(
+    tmp_path, private, protocol_backend, monkeypatch, object_format, kind
+):
+    repo = object_repository(
+        tmp_path, object_format, "async def evaluate(case): return 'good'\n"
+    )
+    scorer = _git(repo, "rev-parse", "HEAD")
+    (repo / "score.txt").write_text("good")
+    _git(repo, "add", "score.txt")
+    _git(repo, "commit", "-m", "Candidate")
+    candidate = _git(repo, "rev-parse", "HEAD")
+    assert sandbox.candidate_components(repo, candidate, ("score.txt",)) == {
+        "score.txt": "good"
+    }
+    with sandbox.private_checkout(repo, candidate) as (_, checkout, _):
+        assert (checkout / "score.txt").read_text() == "good"
+    oid = _git(
+        repo,
+        "rev-parse",
+        {
+            "commit": candidate,
+            "tree": candidate + "^{tree}",
+            "blob": candidate + ":score.txt",
+        }[kind],
+    )
+    overwrite_loose_object(
+        repo,
+        oid,
+        lambda data: data.replace(b"score.txt", b"other.txt")
+        if kind == "tree"
+        else data + b"substituted",
+    )
+    monkeypatch.setenv("GEPA_HARNESS_SCORER_REVISION", scorer)
+    monkeypatch.setattr(
+        sandbox, "_process_cleanup", lambda _: pytest.fail("child launch attempted")
+    )
+    with pytest.raises(
+        sandbox.ScoringSandboxError, match="Git object integrity verification failed"
+    ):
+        score(repo, candidate, config=trusted_config())
+    assert not list((private.parent / ".gepa-heldout/work").iterdir())
+
+
+@pytest.mark.parametrize("trusted", [False, True])
+@pytest.mark.parametrize(
+    "shadow",
+    [
+        "task_pkg/__pycache__/payload",
+        "unrelated.pyc",
+        "unrelated.so",
+        "unrelated.pyd",
+        "task_pkg/evaluation/__init__.py",
+        "task_pkg/evaluation.cpython-311-darwin.so",
+        "task_pkg/evaluation.cp311-win_amd64.pyd",
+    ],
+)
+def test_frozen_checkouts_refuse_import_shadows(
+    git_repo, private, protocol_backend, monkeypatch, trusted, shadow
+):
+    marker = private.parent / "shadow-import-marker"
+    target = git_repo / shadow
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n")
+    _git(git_repo, "add", "-f", shadow)
+    _git(git_repo, "commit", "-m", "Import shadow")
+    sha = _git(git_repo, "rev-parse", "HEAD")
+    digest = hashlib.sha256(
+        (git_repo / "task_pkg/evaluation.py").read_bytes()
+    ).hexdigest()
+    monkeypatch.setenv(
+        "GEPA_HARNESS_FROZEN_FILES", json.dumps({"task_pkg/evaluation.py": digest})
+    )
+    monkeypatch.setenv("GEPA_HARNESS_SCORER_REVISION", sha)
+    monkeypatch.setattr(
+        sandbox, "_process_cleanup", lambda _: pytest.fail("child launch attempted")
+    )
+    with pytest.raises(
+        sandbox.ScoringSandboxError, match="bytecode, extensions or module shadows"
+    ):
+        score(git_repo, sha, config=trusted_config() if trusted else None)
+    assert not marker.exists()
+    assert not list((private.parent / ".gepa-heldout/work").iterdir())
+
+
+def test_empty_frozen_mapping_still_refuses_bytecode(
+    git_repo, private, protocol_backend, monkeypatch
+):
+    (git_repo / "module.pyc").write_bytes(b"bytecode")
+    _git(git_repo, "add", "module.pyc")
+    _git(git_repo, "commit", "-m", "Bytecode")
+    sha = _git(git_repo, "rev-parse", "HEAD")
+    # Omission preserves the existing non-frozen checkout behavior.
+    with sandbox.private_checkout(git_repo, sha) as (_, checkout, _):
+        assert (checkout / "module.pyc").read_bytes() == b"bytecode"
+    monkeypatch.setenv("GEPA_HARNESS_FROZEN_FILES", "{}")
+    with pytest.raises(
+        sandbox.ScoringSandboxError, match="bytecode, extensions or module shadows"
+    ):
+        score(git_repo, sha)
+
+
+def test_frozen_file_names_match_verified_tree_exactly(
+    git_repo, private, protocol_backend, monkeypatch
+):
+    sha = _git(git_repo, "rev-parse", "HEAD")
+    digest = hashlib.sha256(
+        (git_repo / "task_pkg/evaluation.py").read_bytes()
+    ).hexdigest()
+    monkeypatch.setenv(
+        "GEPA_HARNESS_FROZEN_FILES", json.dumps({"task_pkg/Evaluation.py": digest})
+    )
+    monkeypatch.setattr(
+        sandbox, "_process_cleanup", lambda _: pytest.fail("child launch attempted")
+    )
+    with pytest.raises(
+        sandbox.ScoringSandboxError, match="Frozen scorer file verification failed"
+    ):
+        score(git_repo, sha)
+    assert not list((private.parent / ".gepa-heldout/work").iterdir())
+
+
+def test_components_and_frozen_files_use_explicit_roots(git_repo, private, monkeypatch):
+    project = git_repo / "nested"
+    project.mkdir()
+    (project / "prompt.txt").write_text("committed π")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "Nested project")
+    sha = _git(git_repo, "rev-parse", "HEAD")
+    (project / "prompt.txt").write_text("uncommitted")
+    components = sandbox.candidate_components(project, sha, ("prompt.txt",))
+    assert components == {"prompt.txt": "committed π"}
+    frozen = {"nested/prompt.txt": hashlib.sha256("committed π".encode()).hexdigest()}
+    with sandbox.private_checkout(project, sha, frozen=frozen) as (_, checkout, _):
+        assert (checkout / "prompt.txt").read_text() == "committed π"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "../score.txt",
+        "/score.txt",
+        "",
+        "dir/../score.txt",
+        ".git/config",
+        "nested/.gIt/config",
+        "git~1/config",
+        ".git:stream",
+        ".g\u200cit/config",
+    ],
+)
+def test_candidate_component_paths_cannot_escape_project(git_repo, path):
+    with pytest.raises(sandbox.ScoringSandboxError, match="project-relative"):
+        sandbox.candidate_components(
+            git_repo, _git(git_repo, "rev-parse", "HEAD"), (path,)
+        )
 
 
 def test_parent_refuses_import_path_mutations(git_repo, private):
@@ -484,6 +825,9 @@ def test_harness_can_pass_named_extra_environment(private, tmp_path, monkeypatch
         "GEPA_HELDOUT_DATASET",
         "GEPA_HARNESS_ALLOWED_HOSTS",
         "GEPA_HARNESS_PASS_ENV",
+        "GEPA_HARNESS_SCORER_REVISION",
+        "GEPA_HARNESS_FROZEN_FILES",
+        "GEPA_CANDIDATE_COMPONENTS_JSON",
         "PYTHONPATH",
         "DYLD_INSERT_LIBRARIES",
         "HOME",
@@ -1008,6 +1352,40 @@ async def evaluate(case):
         assert len(received) == 1
 
 
+@pytest.mark.parametrize("transport", ["unix", "tcp"])
+def test_real_sandbox_cannot_send_cases_to_shared_service(
+    real_backend, git_repo, private, transport
+):
+    family = socket.AF_UNIX if transport == "unix" else socket.AF_INET
+    # macOS Unix socket paths have a small limit; pytest's temp root is too long.
+    with tempfile.TemporaryDirectory(prefix="gepa-socket-", dir="/tmp") as directory:
+        with socket.socket(family, socket.SOCK_STREAM) as listener:
+            listener.bind(
+                str(Path(directory) / "service")
+                if transport == "unix"
+                else ("127.0.0.1", 0)
+            )
+            listener.listen()
+            listener.settimeout(0.1)
+            sha = commit_evaluator(
+                git_repo,
+                f"""import socket
+async def evaluate(case):
+    with socket.socket({int(family)}, socket.SOCK_STREAM) as client:
+        client.settimeout(1)
+        try:
+            client.connect({listener.getsockname()!r})
+            client.sendall((case.name + str(case.inputs)).encode())
+        except OSError:
+            return 'good'
+    return 'leaked'
+""",
+            )
+            assert score(git_repo, sha)[0].score == 1
+            with pytest.raises(TimeoutError):
+                listener.accept()
+
+
 def test_real_scratch_is_private_and_cannot_redirect_writes(
     real_backend, git_repo, private
 ):
@@ -1129,14 +1507,36 @@ async def evaluate(case):
 
 
 @pytest.mark.parametrize("backend", ["protocol_backend", "real_backend"])
+@pytest.mark.parametrize("trusted", [False, True])
 def test_harness_child_training_gate_and_confirmation(
-    request, backend, git_repo, private, monkeypatch
+    request, backend, git_repo, private, monkeypatch, trusted
 ):
     request.getfixturevalue(backend)
-    commit_evaluator(
+    if trusted:
+        config_path = git_repo / ".gepa/gepa.toml"
+        config_path.write_text(
+            config_path.read_text()
+            + '\n[acceptance]\npinned_scorer = true\ntrusted_scorer = true\ncomponent_files = ["score.txt"]\n'
+        )
+        _git(git_repo, "add", ".gepa/gepa.toml")
+    scorer = commit_evaluator(
         git_repo,
-        "from pathlib import Path\nasync def evaluate(case): return Path('score.txt').read_text().strip()\n",
+        "import json, os\ncomponents = json.loads(os.environ['GEPA_CANDIDATE_COMPONENTS_JSON'])\nasync def evaluate(case): return components['score.txt'].strip()\n"
+        if trusted
+        else "from pathlib import Path\nasync def evaluate(case): return Path('score.txt').read_text().strip()\n",
     )
+    if trusted:
+        monkeypatch.setenv("GEPA_HARNESS_SCORER_REVISION", scorer)
+        monkeypatch.setenv(
+            "GEPA_HARNESS_FROZEN_FILES",
+            json.dumps(
+                {
+                    "task_pkg/evaluation.py": hashlib.sha256(
+                        (git_repo / "task_pkg/evaluation.py").read_bytes()
+                    ).hexdigest()
+                }
+            ),
+        )
     started = _run(
         "run",
         "start",
@@ -1155,6 +1555,10 @@ def test_harness_child_training_gate_and_confirmation(
     (git_repo / "score.txt").write_text("good")
     _git(git_repo, "add", "score.txt")
     _git(git_repo, "commit", "-m", "Improved candidate")
+    if trusted:
+        commit_evaluator(
+            git_repo, "raise RuntimeError('candidate scorer must never be imported')\n"
+        )
     queued = _run("run", "continue", "--run-id", run_id, "--wait-secs", "0")
     assert queued.exit_code == 0, queued.output
     monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(private))

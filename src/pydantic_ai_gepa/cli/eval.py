@@ -22,7 +22,16 @@ Pinned-scorer component contract: when ``acceptance.pinned_scorer = true``,
 the candidate component map is keyed by the exact relative file paths listed
 in ``acceptance.component_files``. Downstream agents/evaluators must therefore
 accept file-path component ids; GEPA decodes those candidate files as UTF-8
-and never imports scorer code from the candidate worktree.
+and imports the scorer from the incumbent workspace for training-only runs.
+Held-out runs require scalar git acceptance and ``trusted_scorer = true`` as
+well: the child imports only the harness's ``GEPA_HARNESS_SCORER_REVISION``
+(a full commit SHA). The parent reads component files as raw UTF-8 blobs from
+the nominated commit, keyed by exact project-relative paths; the child sets
+``GEPA_CANDIDATE_COMPONENTS_JSON`` before resolving any scorer imports.
+``GEPA_HARNESS_FROZEN_FILES`` optionally maps repository-relative paths to
+SHA-256 hashes, verified by trusted parent code over the private checkout
+before launching the child in either held-out mode. Neither harness variable
+is forwarded to the child. Component and vector held-out modes remain refused.
 """
 
 from __future__ import annotations
