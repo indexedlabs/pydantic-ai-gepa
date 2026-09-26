@@ -288,16 +288,23 @@ async def optimize_agent(
             and rollouts. A batch is projected at its own kind's observed mean
             (training vs validation rollouts), and each rollout is admitted
             against the cap with in-flight rollouts reserved at their kind's
-            highest observed cost. The margin is one rollout per in-flight slot
-            at that high. The first rollout of a kind runs alone and can
-            overshoot by its own cost. Up to ``max_concurrent_evaluations``
-            in-flight rollouts can each set a new price high for their kind;
-            the run then overshoots by the sum of their excesses. Reflection
-            overshoot stays bounded by the reflection projection plus the
-            response backstop. Near the cap the gate is conservative: with
-            nothing in flight it stops once the kind's highest observed rollout
-            no longer fits, so one outlier rollout can end a run with headroom
-            left. Overshoot is reported honestly in the spend report.
+            highest observed cost. Admission keeps spent plus in-flight
+            reservations plus the new reservation within the cap, and a kind's
+            in-flight rollouts are limited to its observed rollout count (up
+            to ``max_concurrent_evaluations``, which also bounds the total
+            across kinds), so a cheap first case can no longer start a full
+            batch on an underestimated reservation. The residual overshoot is
+            the sum over every in-flight rollout, of any kind, of the amount
+            it exceeds its own kind's observed high at admission: per kind at
+            most ``min(max_concurrent_evaluations, observations)`` rollouts
+            times that kind's excess, so a validation pass (one kind in
+            flight) ends within one rollout of the cap. The first rollout of
+            a kind runs alone and can overshoot by its own cost. Reflection overshoot stays bounded by
+            the reflection projection plus the response backstop. Near the
+            cap the gate is conservative: with nothing in flight it stops
+            once the kind's highest observed rollout no longer fits, so one
+            outlier rollout can end a run with headroom left. Overshoot is
+            reported honestly in the spend report.
         price_fn: Optional response-to-dollars override; None falls back to the
             bundled price catalog. Unknown prices stop capped runs gracefully.
         gepa_usage_limits: Optional UsageLimits applied cumulatively across the entire

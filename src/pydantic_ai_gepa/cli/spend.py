@@ -23,6 +23,7 @@ from ..spend import (
     SpendMeter,
     PriceFn,
     SpendCategory,
+    admission_limit,
     rollout_spend,
 )
 from .layout import repo_root, run_state_path
@@ -309,6 +310,22 @@ class EvalSpendMeter(SpendMeter):
 
     Validation deltas stay private until an eval aggregate is published.
     Checkpointing each response preserves received usage after a process dies.
+
+    Under a cap, ``_admit_rollout`` reserves every start in the shared ledger
+    so spent plus all live reservations plus the new reservation stay within
+    the cap, and this process's in-flight rollouts of a kind are limited to
+    the kind's observed count (up to ``concurrency``) — a cheap first case
+    cannot start a full batch on an underestimated reservation. Every start
+    is covered at the kind's highest observed cost, except the first rollout
+    of an unobserved kind, which runs alone and can overshoot by its own
+    cost; near the cap the gate stops once the observed high no longer fits,
+    even with headroom left, like the Python gate. The margin is per
+    evaluation process and per eval kind: overshoot past the cap is at most
+    the excess over that high of the rollouts this process has in flight for
+    the kind, at most ``min(concurrency, observations)`` of them, plus that
+    first unobserved rollout. The ramp reads validation observations through
+    the private ledger exactly as the gate already did; no per-case
+    validation cost is published anywhere new.
     """
 
     def __init__(
@@ -483,21 +500,20 @@ class EvalSpendMeter(SpendMeter):
                 self.run_cap - spent - _reserved_other(reservations, rows, self.eval_id)
             )
             observations, mean, highest = _kind_costs(rows, self.kind)
-            limit = (
-                self.concurrency
-                if observations and remaining >= self.concurrency * highest
-                else 1
-            )
+            # In-flight slots ramp with the kind's observation count (shared
+            # across processes via the ledger), so a cheap first rollout
+            # cannot start a full batch reserved at an underestimated high.
+            limit = admission_limit(self.concurrency, observations, remaining, highest)
             if self._active >= limit:
                 return False
             # The batch mean reserves future work; a highest-cost floor also
             # covers in-flight slots so concurrent processes cannot each spend
             # the same apparently free headroom using an underestimated mean.
+            # A lone start near the cap must still cover the kind's full
+            # observed high: if it cannot, the eval stops with headroom left,
+            # like the Python gate. Only an unobserved kind's first rollout
+            # (highest == 0) starts without an observed-high reservation.
             inflight = (self._active + 1) * highest
-            # Near the cap a single rollout may use the last projected budget;
-            # its actual cost is guarded by the response backstop.
-            if limit == 1 and not self._active:
-                inflight = min(inflight, remaining)
             reservation = max(mean * (self.count - self.completed), inflight)
             if remaining <= 0 or reservation > remaining:
                 if self._active:

@@ -24,7 +24,11 @@ from pydantic_ai_gepa.evaluation import (
     evaluate_callable_dataset,
     evaluate_candidate_dataset,
 )
-from pydantic_ai_gepa.spend import current_rollout_capability, report_cached_rollout
+from pydantic_ai_gepa.spend import (
+    COST_STOP_REASON,
+    current_rollout_capability,
+    report_cached_rollout,
+)
 from pydantic_ai_gepa.types import MetricResult, RolloutOutput
 from pydantic_ai_gepa.evaluation_health import evaluation_infrastructure_failures
 from tests.cli import test_run_cli, test_git_candidate_cli, test_select_cli
@@ -934,6 +938,131 @@ def test_expensive_validation_uses_own_projection_and_stays_within_one_rollout(
     assert report["by_model"]["student"]["requests"] == 7
 
 
+def test_cheap_first_validation_case_does_not_admit_a_full_batch(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """OTTO-4840: a cheap first validation case must not start a full batch.
+
+    Same shape as the Python-API probe through the managed CLI spend path:
+    the first validation rollout runs alone at $0.01, the rest cost $0.50.
+    The gate ramps the in-flight limit with the kind's observation count, so
+    only one more rollout is admitted; its $0.50 sets the kind's high and the
+    eval stops within one rollout of the $0.60 cap.
+    """
+    checkpoint = _checkpoint(tmp_path, "ramp", monkeypatch)
+
+    from pydantic_ai.messages import ModelResponse, TextPart
+    from pydantic_ai.models.function import FunctionModel
+
+    async def model(messages, info):
+        # Fake latency so every admitted in-flight rollout issues its request
+        # before the first priced response can stop the eval.
+        await asyncio.sleep(0.02)
+        return ModelResponse(parts=[TextPart("ok")])
+
+    agent = Agent(FunctionModel(model, model_name="student"))
+
+    async def slow_evaluate(case):
+        return (
+            await agent.run("?", capabilities=[current_rollout_capability()])
+        ).output
+
+    async def evaluate(case):
+        return (await _metered_agent()).output
+
+    def batch(eval_id, kind, count, price, concurrency, slow=False):
+        with evaluation_spend(
+            run_id="ramp",
+            root=tmp_path,
+            eval_id=eval_id,
+            kind=kind,
+            count=count,
+            cap=0.60,
+            price_fn=price,
+            concurrency=concurrency,
+            validation_spend_path=checkpoint if kind == "validation" else None,
+        ):
+            return asyncio.run(
+                evaluate_callable_dataset(
+                    evaluate=slow_evaluate if slow else evaluate,
+                    metric=lambda c, o: 1.0,
+                    dataset=[Case(inputs="?") for _ in range(count)],
+                    concurrency=concurrency,
+                )
+            )
+
+    batch("training", "training", 6, lambda r: 0.005, 1)
+    # The unobserved validation kind runs its first rollout alone, so the
+    # cheap case is priced first deterministically.
+    costs = iter([0.01, 0.5, 0.5, 0.5])
+    with pytest.raises(typer.Exit):
+        batch("validation", "validation", 4, lambda r: next(costs), 4, slow=True)
+    report = spend_report("ramp", tmp_path)
+    assert report["total_dollars"] == pytest.approx(0.54)
+    assert report["validation_dollars"] == pytest.approx(0.51)
+    assert report["total_dollars"] <= 0.60 + 0.50
+    assert report["by_model"]["student"]["requests"] == 8
+
+
+def test_near_cap_start_reserves_the_full_observed_high(repo: Path):
+    """A lone start near the cap must cover the kind's full observed high.
+
+    Training history: one $0.50 rollout, then four $0.125 rollouts (observed
+    high $0.50, mean $0.083), on top of the managed run's own $0.08. The next
+    one-rollout eval has $0.40 headroom: its $0.083 mean projection admits the
+    eval, but the per-rollout reservation is the full $0.50 high, so the
+    rollout never starts — the run stops with spend unchanged and the
+    incumbent preserved, exactly like the Python gate.
+    """
+    _price(repo)
+    started = _start("1.48")
+    assert started.exit_code == 0, started.output
+    run_id = _run_payload(started.output)["run_id"]
+    incumbent = _run_payload(started.output)["best_candidate_id"]
+
+    async def evaluate(case):
+        return (await _metered_agent()).output
+
+    def batch(eval_id, price):
+        with evaluation_spend(
+            run_id=run_id,
+            root=repo,
+            eval_id=eval_id,
+            kind="training",
+            count=1,
+            cap=None,
+            price_fn=lambda r: price,
+        ):
+            return asyncio.run(
+                evaluate_callable_dataset(
+                    evaluate=evaluate,
+                    metric=lambda c, o: 1.0,
+                    dataset=[Case(inputs="?")],
+                    concurrency=1,
+                )
+            )
+
+    batch("high", 0.50)
+    for index in range(4):
+        batch(f"settle-{index}", 0.125)
+    before = spend_report(run_id, repo)
+    assert before["total_dollars"] == pytest.approx(1.08)
+
+    with pytest.raises(typer.Exit) as stopped:
+        batch("near-cap", 0.50)
+    assert stopped.value.exit_code == 70
+    report = spend_report(run_id, repo)
+    # The $0.50 rollout was never started: spend and usage are unchanged.
+    assert report["total_dollars"] == before["total_dollars"]
+    assert report["by_model"] == before["by_model"]
+    assert report["stopped_by_cost"]
+    assert report["stop_reason"] == COST_STOP_REASON
+    final = RunState.from_dict(json.loads(run_state_path(run_id).read_text()))
+    assert final.status == "done"
+    assert final.best_candidate_id == incumbent
+
+
 def test_select_validation_refuses_projected_batch_and_preserves_incumbent(
     repo: Path, monkeypatch
 ):
@@ -1253,16 +1382,20 @@ def test_adaptive_concurrency_uses_highest_cost_and_preserves_parallelism(
             )
 
     if warmup:
-        costs = iter([0.1, 0.0])
-        batch("seed", 2, 1, lambda r: next(costs), 1)
+        # Three observations ramp the in-flight limit to 3, so the near-cap
+        # rule below is exercised against the ramped limit, not concurrency.
+        costs = iter([0.1, 0.0, 0.0])
+        batch("seed", 3, 1, lambda r: next(costs), 1)
         peak = 0
-        # Mean=.05, highest=.10. Remaining=.25 fits the complete batch's
-        # mean (.20), but is below concurrency * highest (.40): serial starts.
-        records = batch("near", 4, 0.35, lambda r: 0.05, 4)
+        # Mean=.033, highest=.10. Remaining=.26 fits the complete batch's
+        # mean (.13), but is below the ramped limit * highest (3 * .10):
+        # serial starts, each reserving the full observed high.
+        records = batch("near", 4, 0.36, lambda r: 0.05, 4)
         assert len(records) == 4
         assert peak == 1
     else:
-        # First observation is serial; subsequent cases can use all four slots.
+        # The in-flight limit ramps with observations (1, 1, 2, then 4 once
+        # four rollouts have completed); the last four cases overlap fully.
         records = batch("room", 8, cap, lambda r: 0.02, 4)
         assert len(records) == 8
         assert peak == 4
@@ -1381,12 +1514,14 @@ def test_price_jump_drains_all_inflight_paid_responses(tmp_path: Path):
     async def evaluate(case):
         return (await _metered_agent()).output
 
+    # Four cheap observations ramp the kind's in-flight limit to the full
+    # concurrency of 4 before the expensive batch starts.
     with evaluation_spend(
         run_id="burst",
         root=tmp_path,
         eval_id="seed",
         kind="training",
-        count=1,
+        count=4,
         cap=0.1,
         price_fn=lambda r: 0.005,
     ):
@@ -1394,7 +1529,7 @@ def test_price_jump_drains_all_inflight_paid_responses(tmp_path: Path):
             evaluate_callable_dataset(
                 evaluate=evaluate,
                 metric=lambda c, o: 1.0,
-                dataset=[Case(inputs="?")],
+                dataset=[Case(inputs="?") for _ in range(4)],
                 concurrency=1,
             )
         )
@@ -1441,6 +1576,6 @@ def test_price_jump_drains_all_inflight_paid_responses(tmp_path: Path):
         ):
             asyncio.run(expensive_batch())
     report = spend_report("burst", tmp_path)
-    assert report["total_dollars"] == pytest.approx(2.005)
+    assert report["total_dollars"] == pytest.approx(2.02)
     assert report["by_model"]["expensive"]["requests"] == 4
     assert report["stopped_by_cost"]
