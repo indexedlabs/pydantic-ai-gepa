@@ -259,9 +259,19 @@ def _format_failures(
 ) -> str:
     lines = ["# Eval report", ""]
     failures = [r for r in records if r.score < threshold]
+    training_successes = [
+        r
+        for r in records
+        if r.score >= threshold
+        and (
+            "sandbox_material" in r.payload or r.payload.get("sandbox_material_refused")
+        )
+    ]
     if not failures:
         lines.append("Every case in this minibatch passed; nothing to act on.")
-        return "\n".join(lines)
+        if not training_successes:
+            return "\n".join(lines)
+        lines.append("")
     next_step = (
         "Review per-case feedback and traces, edit the working-tree code or "
         "artifacts, then commit the candidate."
@@ -269,16 +279,16 @@ def _format_failures(
         else "Review per-case feedback and edit slots in `.gepa/components/` "
         "or change the agent's source."
     )
-    if redact_scores:
+    if failures and redact_scores:
         lines.append(
             f"{len(failures)} of {len(records)} case(s) need attention. {next_step}\n"
         )
-    else:
+    elif failures:
         lines.append(
             f"{len(failures)} of {len(records)} case(s) underperformed "
             f"(score < {threshold}). {next_step}\n"
         )
-    for record in failures:
+    for record in [*failures, *training_successes]:
         lines.append(
             f"## {record.case_id}"
             if redact_scores
@@ -287,6 +297,13 @@ def _format_failures(
         if record.feedback:
             lines.append("")
             lines.append(record.feedback.rstrip())
+        material = record.payload.get("sandbox_material")
+        if material is not None:
+            lines.extend(["", "```json", json.dumps(material, sort_keys=True), "```"])
+        if record.payload.get("sandbox_material_refused"):
+            from .scoring_material import REFUSAL_NOTE
+
+            lines.extend(["", REFUSAL_NOTE])
         lines.append("")
     return "\n".join(lines)
 
@@ -929,6 +946,12 @@ def run_eval_once(
         if not write_text(report_path, report_text, root=primary_project_root):
             reports_dir.mkdir(parents=True, exist_ok=True)
             report_path.write_text(report_text, encoding="utf-8")
+    if sandboxed and dataset_role != "validation" and planned_trace_path is not None:
+        from .scoring_material import publish_files
+
+        publish_files(
+            root=primary_project_root, path=planned_trace_path, records=records
+        )
     trace_path = (
         _write_trace_file(
             path=planned_trace_path,

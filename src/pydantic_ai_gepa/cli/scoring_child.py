@@ -25,6 +25,7 @@ from .layout import (
     resolve_skills,
 )
 from .metrics import default_substring_metric
+from .scoring_material import structured_payload
 
 
 def main() -> None:
@@ -36,7 +37,14 @@ def main() -> None:
         os.dup2(sink.fileno(), 2)
 
     def send(value: Any) -> None:
-        protocol.write(json.dumps(value, allow_nan=False) + "\n")
+        data = json.dumps(value, allow_nan=False) + "\n"
+        # Escaped feedback and material can each fit their own limits but
+        # together exceed the protocol envelope. Keep the score/feedback;
+        # None asks the parent to emit the fixed material-refusal note.
+        if value.get("type") == "result" and len(data.encode()) > 1024 * 1024:
+            value["material"] = None
+            data = json.dumps(value, allow_nan=False) + "\n"
+        protocol.write(data)
         protocol.flush()
 
     def receive() -> Any:
@@ -51,9 +59,6 @@ def main() -> None:
         )
     root = Path.cwd()
     insert_repo_root_on_path(root)
-    # This file stays private even for training; the parent only accepts the
-    # structured feedback field. Never copy arbitrary child-created artifacts.
-    os.environ["GEPA_TRACE_FILE"] = str(Path(os.environ["TMPDIR"]) / "trace.jsonl")
     evaluate = resolve_evaluate(config, expected_root=root)
     agent = resolve_agent(config, expected_root=root) if config.agent else None
     metric = resolve_metric(config, expected_root=root) or default_substring_metric
@@ -90,7 +95,10 @@ def main() -> None:
 
     send({"type": "ready"})
     while True:
-        case = Case(**receive())
+        request = receive()
+        case = Case(**request["case"])
+        trace_path = Path(request["output_dir"]) / "trace.jsonl"
+        os.environ["GEPA_TRACE_FILE"] = str(trace_path)
         meter = Meter(price_fn=price)
         with rollout_spend(meter):
             if evaluate is not None:
@@ -114,9 +122,37 @@ def main() -> None:
                         concurrency=1,
                         case_factory=case_factory,
                         skills_fs=skills,
+                        capture_traces=not validation,
                     )
                 )
         record = records[0]
+        material = None
+        if not validation:
+            # Conversion happens only in the untrusted child. The parent accepts
+            # JSON, never objects, serializers or exception metadata.
+            from .eval import _json_default, _write_trace_file
+            from ..types import RolloutOutput
+
+            try:
+                _write_trace_file(path=trace_path, records=records)
+                output = record.payload.get("output")
+                if isinstance(output, RolloutOutput):
+                    output = output.result if output.success else None
+                trajectory = record.payload.get("trajectory")
+                value = {
+                    "output": output,
+                    "side_info": record.payload.get("side_info"),
+                    "metric_side_info": getattr(trajectory, "metric_side_info", None),
+                }
+                material = structured_payload(
+                    json.loads(
+                        json.dumps(value, default=_json_default, allow_nan=False)
+                    )
+                )
+            except Exception:
+                # A missing/invalid material payload is a fixed parent note,
+                # never a failed rollout or child exception text.
+                pass
         send(
             {
                 "type": "result",
@@ -124,6 +160,7 @@ def main() -> None:
                 "feedback": None if validation else record.feedback,
                 "failed": bool(evaluation_infrastructure_failures(records)),
                 "cached": meter.cached,
+                "material": material,
             }
         )
 

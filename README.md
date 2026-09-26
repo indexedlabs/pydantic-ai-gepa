@@ -794,8 +794,10 @@ trusted-scorer settings and harness revision described above.
 
 Sandbox rollouts run serially; the parent retains cost admission and response-level
 accounting. Public spend uses a fixed `sandbox` model bucket to prevent model names
-from carrying held-out text. Arbitrary output/side-info/trace artifacts are not
-copied back; training feedback remains available.
+from carrying held-out text. Training traces, UTF-8 sibling artifacts and JSON
+output/side-info return through a checked channel (1 MiB/file, 4 MiB/case,
+32 MiB/eval; structured output/side-info: 256 KiB), with artifact links in the
+trace and case-specific sibling directories. Validation phases return only aggregates.
 
 The orchestrator must enforce the reflector's sandbox: the harness cannot
 identify the reflector's profile or refuse an unverified one. Require denial of
