@@ -10,6 +10,7 @@ import asyncio
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict
+import hashlib
 import json
 import math
 import os
@@ -17,6 +18,7 @@ from pathlib import Path
 import re
 import select
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -53,15 +55,131 @@ def required() -> bool:
 
 
 def require_supported(config: GepaConfig, source: str) -> None:
+    acceptance = config.acceptance
     if (
         source != "git"
-        or config.acceptance.mode != "scalar"
-        or config.acceptance.pinned_scorer
+        or acceptance.mode != "scalar"
+        or (acceptance.pinned_scorer and not acceptance.trusted_scorer)
     ):
         raise ScoringSandboxError(
-            "Held-out sandbox scoring currently requires git candidates with scalar, "
-            "unpinned acceptance. Unsupported modes are refused before importing candidate code."
+            "Held-out sandbox scoring requires git candidates with scalar acceptance, "
+            "either unpinned or pinned with trusted_scorer. "
+            "Unsupported modes are refused before importing candidate code."
         )
+    if acceptance.trusted_scorer:
+        if not acceptance.pinned_scorer or not acceptance.component_files:
+            raise ScoringSandboxError(
+                "acceptance.trusted_scorer requires pinned_scorer = true and non-empty component_files."
+            )
+        scorer_revision()
+
+
+def scorer_revision() -> str:
+    revision = os.environ.get("GEPA_HARNESS_SCORER_REVISION", "")
+    if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", revision):
+        raise ScoringSandboxError(
+            "Trusted scoring requires GEPA_HARNESS_SCORER_REVISION to be a full commit SHA."
+        )
+    return revision.lower()
+
+
+def _relative_file(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and not Path(value).is_absolute()
+        and "\0" not in value
+        and all(part not in ("", ".", "..") for part in value.split("/"))
+    )
+
+
+def frozen_files() -> dict[str, str]:
+    """Harness-owned SHA-256 hashes, with paths relative to the Git root."""
+    try:
+        files = json.loads(os.environ.get("GEPA_HARNESS_FROZEN_FILES", "{}"))
+    except ValueError:
+        files = None
+    if not isinstance(files, dict) or any(
+        not _relative_file(path)
+        or not isinstance(digest, str)
+        or not re.fullmatch(r"[0-9a-fA-F]{64}", digest)
+        for path, digest in files.items()
+    ):
+        raise ScoringSandboxError(
+            "GEPA_HARNESS_FROZEN_FILES must map repository-relative file paths to SHA-256 hashes."
+        )
+    return files
+
+
+def _verify_frozen_files(checkout: Path, files: dict[str, str]) -> None:
+    for relative, digest in files.items():
+        try:
+            path = checkout / relative
+            if not stat.S_ISREG(path.lstat().st_mode):
+                raise ValueError
+            if hashlib.sha256(path.read_bytes()).hexdigest() != digest.lower():
+                raise ValueError
+        except (OSError, ValueError):
+            raise ScoringSandboxError(
+                "Frozen scorer file verification failed."
+            ) from None
+
+
+def _git_objects(repository: Path) -> tuple[list[str], dict[str, str]]:
+    return ["git", "--no-replace-objects", "-C", str(repository)], {
+        "PATH": "/usr/bin:/bin",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+    }
+
+
+def candidate_components(
+    project: Path, sha: str, files: tuple[str, ...]
+) -> dict[str, str]:
+    """Read only nominated raw blobs; candidate trees never become scorer code."""
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
+        raise ScoringSandboxError("Scoring requires a committed candidate.")
+    if not all(_relative_file(path) for path in files):
+        raise ScoringSandboxError(
+            "Candidate components require project-relative file paths."
+        )
+    repository = git_root(project)
+    prefix = project.resolve().relative_to(repository)
+    command, env = _git_objects(repository)
+    try:
+        kind = subprocess.run(
+            [*command, "cat-file", "-t", sha], env=env, capture_output=True
+        )
+        if kind.returncode or kind.stdout != b"commit\n":
+            raise ValueError
+        listing = subprocess.run(
+            [*command, "ls-tree", "-r", "-z", "--full-tree", sha],
+            env=env,
+            capture_output=True,
+        )
+        if listing.returncode:
+            raise ValueError
+        entries = {}
+        for record in listing.stdout.split(b"\0")[:-1]:
+            metadata, name = record.split(b"\t", 1)
+            entries[os.fsdecode(name)] = metadata.split(b" ")
+        components = {}
+        for relative in files:
+            mode, kind, oid = entries[(prefix / relative).as_posix()]
+            if mode not in (b"100644", b"100755") or kind != b"blob":
+                raise ValueError
+            blob = subprocess.run(
+                [*command, "cat-file", "blob", oid.decode("ascii")],
+                env=env,
+                capture_output=True,
+            )
+            if blob.returncode:
+                raise ValueError
+            components[relative] = blob.stdout.decode("utf-8")
+        return components
+    except (OSError, ValueError, KeyError):
+        raise ScoringSandboxError(
+            "Cannot read candidate component UTF-8 blobs."
+        ) from None
 
 
 def seatbelt_profile(private: Path, checkout: Path, scratch: Path, port: int) -> str:
@@ -134,6 +252,9 @@ def child_environment(scratch: Path, port: int) -> dict[str, str]:
         "GEPA_HELDOUT_DATASET",
         "GEPA_HARNESS_ALLOWED_HOSTS",
         "GEPA_HARNESS_PASS_ENV",
+        "GEPA_HARNESS_SCORER_REVISION",
+        "GEPA_HARNESS_FROZEN_FILES",
+        "GEPA_CANDIDATE_COMPONENTS_JSON",
     }
     for item in os.environ.get("GEPA_HARNESS_PASS_ENV", "").split(","):
         name = item.strip()
@@ -165,9 +286,11 @@ def child_environment(scratch: Path, port: int) -> dict[str, str]:
 
 
 @contextmanager
-def private_checkout(project: Path, sha: str) -> Iterator[tuple[Path, Path, Path]]:
+def private_checkout(
+    project: Path, sha: str, *, frozen: dict[str, str] | None = None
+) -> Iterator[tuple[Path, Path, Path]]:
     """Read Git objects only. Never register a worktree or touch shared refs/index."""
-    if not re.fullmatch(r"[0-9a-f]{40,64}", sha):
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
         raise ScoringSandboxError("Scoring requires a committed candidate.")
     private = Path(str(heldout_dataset())).resolve().parent
     storage = private / ".gepa-heldout" / "work"
@@ -183,13 +306,13 @@ def private_checkout(project: Path, sha: str) -> Iterator[tuple[Path, Path, Path
         scratch.mkdir(mode=0o700)
         # Read raw objects, never worktree conversions. In particular, do not
         # use archive, checkout, or cat-file's --filters/--textconv options.
-        command = ["git", "--no-replace-objects", "-C", str(repository)]
-        env = {
-            "PATH": "/usr/bin:/bin",
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": "/dev/null",
-        }
+        command, env = _git_objects(repository)
         try:
+            kind = subprocess.run(
+                [*command, "cat-file", "-t", sha], env=env, capture_output=True
+            )
+            if kind.returncode or kind.stdout != b"commit\n":
+                raise ScoringSandboxError("Scoring requires a committed candidate.")
             result = subprocess.run(
                 [*command, "ls-tree", "-r", "-t", "-z", "--full-tree", sha],
                 env=env,
@@ -199,6 +322,7 @@ def private_checkout(project: Path, sha: str) -> Iterator[tuple[Path, Path, Path
                 raise ScoringSandboxError("Cannot read candidate tree.")
             entries = _checkout_entries(checkout, result.stdout)
             _write_checkout_blobs(command, env, entries)
+            _verify_frozen_files(checkout, frozen or {})
         except OSError:
             raise ScoringSandboxError(
                 "Cannot create private candidate checkout."
@@ -400,9 +524,16 @@ def score_cases(
     nomination = nominated_commit.get()
     if nomination is not None and nomination != sha:
         raise ScoringSandboxError("Candidate commit changed during scoring.")
+    frozen = frozen_files()
+    revision = scorer_revision() if config.acceptance.trusted_scorer else sha
     # Fail before opening the proxy or creating candidate storage on hosts
     # without a backend. There is deliberately no environment override.
     sandbox_command("", [])
+    components = (
+        candidate_components(project, sha, config.acceptance.component_files)
+        if config.acceptance.trusted_scorer
+        else None
+    )
     try:
         addresses = allowed_addresses(os.environ.get("GEPA_HARNESS_ALLOWED_HOSTS", ""))
     except ValueError:
@@ -410,7 +541,11 @@ def score_cases(
             "Invalid GEPA_HARNESS_ALLOWED_HOSTS; use host:port pairs."
         ) from None
     with (
-        private_checkout(project, sha) as (private, checkout, scratch),
+        private_checkout(project, revision, frozen=frozen) as (
+            private,
+            checkout,
+            scratch,
+        ),
         connect_proxy(addresses) as port,
     ):
         # -I excludes cwd, PYTHONPATH and the user site from interpreter startup.
@@ -433,7 +568,13 @@ def score_cases(
         )
         try:
             channel = Channel(process)
-            channel.send({"config": asdict(config), "validation": validation})
+            channel.send(
+                {
+                    "config": asdict(config),
+                    "validation": validation,
+                    "components": components,
+                }
+            )
             if channel.receive() != {"type": "ready"}:
                 raise ScoringSandboxError("Sandboxed scorer could not initialize.")
             cleanup.verify_worker(process.pid)
