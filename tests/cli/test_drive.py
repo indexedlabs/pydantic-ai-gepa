@@ -369,6 +369,122 @@ def test_timeout_retries_then_pauses(git_repo):
         os.kill(saved["step"]["pid"], 0)
 
 
+@pytest.mark.parametrize("fallback", [False, True], ids=["retry", "fallback"])
+@pytest.mark.parametrize("attack", ["fsmonitor", "hook"])
+def test_lane_git_rebuilt_between_reflector_launches(git_repo, fallback, attack):
+    run_id = start_lanes()
+    path = config(git_repo)
+    script = path.parent / "reflect.py"
+    normal = script.read_text()
+    marker = path.parent / "executed"
+    payload = path.parent / "payload.py"
+    payload.write_text(
+        f"#!{sys.executable}\nfrom pathlib import Path\nPath({str(marker)!r}).touch()\n"
+    )
+    payload.chmod(0o700)
+    script.write_text(
+        f"""import subprocess, sys
+from pathlib import Path
+flag = Path(__file__).with_name("planted")
+metadata = Path.cwd() / ".git"
+if not flag.exists():
+    flag.touch()
+    if {attack!r} == "fsmonitor":
+        with (metadata / "config").open("a") as handle:
+            handle.write("\\n[core]\\nfsmonitor = " + {str(payload)!r} + "\\n")
+    else:
+        (metadata / "hooks").mkdir(exist_ok=True)
+        hook = metadata / "hooks/pre-commit"
+        hook.write_bytes(Path({str(payload)!r}).read_bytes())
+        hook.chmod(0o700)
+    Path("score.txt").write_text("discard this interrupted edit\\n")
+    raise SystemExit(9)
+assert "fsmonitor" not in (metadata / "config").read_text()
+assert not (metadata / "hooks/pre-commit").exists()
+assert Path("score.txt").read_text() == "bad\\n"
+# Model the launcher's unsandboxed Git read before the reflector tools run.
+subprocess.run(["git", "status", "--porcelain"], check=True)
+"""
+        + normal
+    )
+    if fallback:
+        entries = json.loads(path.read_text())
+        entries[0]["usage_limit"] = {"exit_codes": [9]}
+        entries.append(dict(entries[0], label="fallback"))
+        path.write_text(json.dumps(entries))
+    result = invoke(run_id, path)
+    assert result.exit_code == 0, (result.output, result.exception)
+    saved = driver_state(git_repo, run_id)
+    assert saved["sequence"] == 2
+    assert saved["lane_git"][0]["outcome"] == "rebuilt"
+    assert saved["lane_git"][0]["lane"] == "lane-1"
+    assert saved["reflector_index"] == int(fallback)
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "still_unsafe"])
+def test_unsafe_lane_pauses_without_launch_if_rebuild_fails(
+    git_repo, monkeypatch, failure
+):
+    from pydantic_ai_gepa.cli import lane_repositories
+
+    run_id = start_lanes()
+    lane = lane_repositories.lane_path(git_repo, run_id, "lane-1")
+    (lane / ".git/hooks").mkdir()
+    (lane / ".git/hooks/pre-commit").write_text("planted")
+
+    def rebuild(*args, **kwargs):
+        if failure == "unavailable":
+            raise OSError("store unavailable")
+        return lane
+
+    original = lane_repositories.Repositories.create_lane
+    monkeypatch.setattr(lane_repositories.Repositories, "create_lane", rebuild)
+    path = config(git_repo)
+    result = invoke(run_id, path)
+    assert result.exit_code == drive.EXIT_PAUSED, (result.output, result.exception)
+    saved = driver_state(git_repo, run_id)
+    assert saved["pause_reason"] == "unsafe_lane_git"
+    assert saved["lane_git"][0]["outcome"] == "rebuild_failed"
+    assert "pid" not in saved["step"]
+    monkeypatch.setattr(lane_repositories.Repositories, "create_lane", original)
+    resumed = invoke(run_id, path)
+    assert resumed.exit_code == 0, (resumed.output, resumed.exception)
+    assert driver_state(git_repo, run_id)["lane_git"][-1]["outcome"] == "rebuilt"
+
+
+def test_single_checkout_unsafe_git_pauses_without_modification(
+    git_repo, heldout, monkeypatch
+):
+    dataset, run_id, _ = heldout
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(dataset))
+    hook = git_repo / ".git/hooks/pre-commit"
+    marker = git_repo.parent / (git_repo.name + "-launched")
+    hook.write_text("#!/bin/sh\nexit 1\n")
+    hook.chmod(0o700)
+    before = {
+        str(p.relative_to(git_repo)): p.read_bytes()
+        for p in git_repo.rglob("*")
+        if p.is_file() and ".gepa" not in p.parts
+    }
+    path = config(
+        git_repo, f"from pathlib import Path\nPath({str(marker)!r}).touch()\n"
+    )
+    result = invoke(run_id, path)
+    assert result.exit_code == drive.EXIT_PAUSED, (result.output, result.exception)
+    saved = driver_state(git_repo, run_id)
+    assert saved["pause_reason"] == "unsafe_project_git"
+    assert saved["lane_git"][0]["outcome"] == "refused"
+    assert "pid" not in saved["step"]
+    assert not marker.exists()
+    after = {
+        str(p.relative_to(git_repo)): p.read_bytes()
+        for p in git_repo.rglob("*")
+        if p.is_file() and ".gepa" not in p.parts
+    }
+    assert after == before
+
+
 def test_usage_limit_fallback_and_exhaustion_restart(git_repo):
     run_id = start_lanes()
     path = config(git_repo)

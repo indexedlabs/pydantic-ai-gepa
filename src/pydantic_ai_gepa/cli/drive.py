@@ -22,6 +22,7 @@ from . import events, harness, harness_record, lanes, reflector
 from .layout import gepa_dir, repo_root, run_dir, set_gepa_dirname
 from .process_guard import DarwinProcesses, GuardError, ProcessGuard
 from .run import _load_state
+from .safe_git import SafeGitError, refuse_executable_lane_git
 from .scoring_sandbox import PROVIDER_KEYS
 from .validation import _pin_path, check_heldout_pin, harness_environment
 
@@ -406,6 +407,51 @@ class Driver:
             except ProcessLookupError:
                 continue
 
+    def check_checkout(self, lane: str | None, checkout: Path) -> None:
+        from . import lane_repositories
+
+        def check() -> None:
+            root = refuse_executable_lane_git(checkout)
+            if lane and root != lane_repositories.lane_path(
+                repo_root(), self.run_id, lane
+            ):
+                raise SafeGitError("Reflector project is outside its lane repository.")
+
+        try:
+            check()
+            return
+        except OSError as error:
+            entry = {
+                "lane": lane,
+                "sequence": self.state["sequence"],
+                "outcome": "refused",
+                "reason": str(error),
+            }
+            self.state.setdefault("lane_git", []).append(entry)
+            self.save()
+        if lane is None:
+            self.pause("unsafe_project_git")
+        try:
+            run = _load_state(self.run_id)
+            base = run.reflection_baseline_commit_sha
+            if not base:
+                raise SafeGitError("Lane base commit is unavailable.")
+            current = lanes.load_lane_state(repo_root(), self.run_id, lane)
+            repositories = lane_repositories.load(repo_root(), self.run_id)
+            repositories.create_lane(lane, base, str(current.branch), replace=True)
+            check()
+        except (
+            OSError,
+            ValueError,
+            typer.BadParameter,
+            subprocess.SubprocessError,
+        ) as error:
+            entry.update(outcome="rebuild_failed", rebuild_error=str(error))
+            self.save()
+            self.pause("unsafe_lane_git")
+        entry["outcome"] = "rebuilt"
+        self.save()
+
     def step(self, lane: str | None) -> None:
         if self.max_steps is not None and self.steps >= self.max_steps:
             self.pause("max_steps")
@@ -453,7 +499,6 @@ class Driver:
         }
         self.phase("leased", step=step, sequence=sequence)
         guard = ProcessGuard(self.backend, step["guard"], self.save)
-        guard.begin()
         argv = [
             arg.format(
                 checkout=str(checkout.resolve()),
@@ -467,6 +512,8 @@ class Driver:
             (logs / "stdout.log").open("wb") as stdout,
             (logs / "stderr.log").open("wb") as stderr,
         ):
+            self.check_checkout(lane, checkout)
+            guard.begin()
             process = subprocess.Popen(
                 argv,
                 cwd=checkout,
