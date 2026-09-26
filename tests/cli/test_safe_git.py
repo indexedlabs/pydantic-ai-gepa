@@ -523,7 +523,14 @@ def test_heldout_lane_start_uses_owned_repositories(
     result = _run("-G", str(git_repo / ".gepa"), "run", "select", "--run-id", run_id)
     assert result.exit_code == 0, (result.output, result.exception)
     assert _run_payload(result.output)["best_commit_sha"] == candidate_sha
-    assert _run_payload(result.output)["status"] == "done"
+    # Reflector-written training rows cannot exhaust the private harness budget.
+    assert _run_payload(result.output)["status"] == "running"
+    from pydantic_ai_gepa.cli.run import _load_state
+    from pydantic_ai_gepa.cli.select import _phase_finalize
+
+    with harness_environment(), record.route():
+        state, _, _ = _phase_finalize(git_repo, _load_state(run_id), {})
+        assert state.status == "done"
     assert _git(record.repository, "rev-parse", "HEAD") == candidate_sha
     assert _git(git_repo, "rev-parse", "HEAD") == source_sha
     for lane in ("lane-1", "lane-2"):

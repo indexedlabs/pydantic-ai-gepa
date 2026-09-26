@@ -111,9 +111,9 @@ def lane_branch(run_id: str, lane: str, iteration: int) -> str:
 def _resolve_workspace_root(run_id: str | None = None) -> Path:
     """Resolve the primary workspace root from the explicit gepa dir.
 
-    Lane processes are invoked with an absolute ``--gepa-dir`` (or the
-    ``GEPA_DIR`` env fallback), so the workspace root is the absolute
-    workspace's parent — never a directory walked up from cwd (dec-780).
+    Reflector lane processes use an absolute public workspace and its project
+    view without reading the scorer. A harness uses its trusted current project
+    to locate the private record; public JSON cannot choose that authority.
     """
     dirname = current_gepa_dirname()
     path = Path(dirname)
@@ -441,7 +441,10 @@ def create_lane_worktree(
     from .lane_repositories import load
 
     branch = lane_branch(run_id, lane, iteration)
-    path = load(workspace_root, run_id).create_lane(lane, base_sha, branch)
+    repositories = load(workspace_root, run_id)
+    path = repositories.create_lane(lane, base_sha, branch)
+    if GepaConfig.load(config_path(workspace_root)).acceptance.pinned_scorer:
+        repositories.ensure_scorer(lane, base_sha)
     return path, branch
 
 

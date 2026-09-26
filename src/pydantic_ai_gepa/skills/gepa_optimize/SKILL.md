@@ -326,6 +326,8 @@ only the seeded incumbent and its ancestry, with no unrelated refs. When seeded
 from a history-free export, no source checkout history is introduced. The controller
 creates it at fan-out; no original scorer-checkout
 read is required by the reflector. Held-out scoring still uses the private trusted scorer.
+Snapshots are created only for pinned runs, repaired on re-fan after an interruption,
+and removed when the run finalizes.
 
 Seed trees containing symlinks or gitlinks anywhere are refused. Exporters must drop
 or materialize those entries before starting lanes. Each lane needs its own

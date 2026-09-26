@@ -663,7 +663,7 @@ def _phase_promote(
         raise typer.Exit(code=1)
 
     lane_states = load_all_lane_states(workspace_root, run_id)
-    from .lane_repositories import CandidateAncestryError, load
+    from .lane_repositories import CandidateAncestryError, LaneSourceError, load
 
     repositories = load(workspace_root, run_id)
 
@@ -678,12 +678,7 @@ def _phase_promote(
                 )
             except CandidateAncestryError:
                 unrelated[proposal.lane] = None
-            except (
-                OSError,
-                ValueError,
-                typer.BadParameter,
-                subprocess.CalledProcessError,
-            ) as error:
+            except LaneSourceError as error:
                 unrelated[proposal.lane] = (
                     f"Candidate import/checkout refused ({type(error).__name__}); never compared or promoted"
                 )
@@ -1561,6 +1556,10 @@ def _refan_lane(
         worktree = repositories.create_lane(
             lane_state.lane, new_best, new_branch, replace=True
         )
+    # A crash can publish the lane before its scorer snapshot. Resume must
+    # repair the snapshot even when the lane already has the expected branch.
+    if GepaConfig.load(config_path(workspace_root)).acceptance.pinned_scorer:
+        repositories.ensure_scorer(lane_state.lane, new_best)
     return LaneState(
         **{
             **lane_state.to_dict(),
@@ -1852,6 +1851,7 @@ def _phase_finalize(
         ):
             _terminate_eval_pid(lane_state.eval_pid, lane=lane_state.lane)
         repositories.remove_lane(lane_state.lane)
+    repositories.remove_scorers()
 
     final_path, final_text = _write_final_report(
         state, overshoot=overshoot, root=workspace_root
@@ -1988,6 +1988,9 @@ def _run_select_locked(workspace_root: Path, run_state: Any) -> Any:
         )
         raise typer.Exit(code=1)
 
+    if getattr(run_state, "lane_repository_version", 0) != 1:
+        raise typer.BadParameter("Linked lane runs cannot resume; start a new run.")
+
     from .validation import heldout_dataset
 
     if heldout_dataset(required=False):
@@ -2005,9 +2008,6 @@ def _run_select_locked(workspace_root: Path, run_state: Any) -> Any:
             scoring_sandbox.require_supported(
                 GepaConfig.load(config_path(workspace_root)), run_state.candidate_source
             )
-
-    if getattr(run_state, "lane_repository_version", 0) != 1:
-        raise typer.BadParameter("Linked lane runs cannot resume; start a new run.")
 
     state = run_state
     if state.select_phase is None:

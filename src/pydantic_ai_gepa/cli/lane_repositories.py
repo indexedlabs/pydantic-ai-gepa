@@ -8,7 +8,7 @@ the run-state persistence layer.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 import hashlib
@@ -34,7 +34,11 @@ from .safe_git import (
 )
 
 
-class CandidateAncestryError(typer.BadParameter):
+class LaneSourceError(typer.BadParameter):
+    """Invalid lane input; controller storage failures must remain retryable."""
+
+
+class CandidateAncestryError(LaneSourceError):
     """The proposal is unrelated to the privately recorded seed."""
 
 
@@ -157,38 +161,101 @@ def _init(root: Path, object_format: str) -> None:
     _command(root, "config", "user.email", "gepa@localhost")
 
 
-def _copy_objects(source: Path, destination: Path) -> None:
+@contextmanager
+def _source_read(lane: bool) -> Iterator[None]:
+    """Classify only reads/validation of lane-owned bytes, never target writes."""
+    try:
+        yield
+    except (OSError, typer.BadParameter) as error:
+        if lane:
+            raise LaneSourceError(
+                "Lane metadata or objects are unreadable or invalid."
+            ) from error
+        raise
+
+
+def _validate_lane_snapshot(snapshot: Path, sha: str) -> None:
+    """Git validates untrusted bytes; infrastructure failures remain retryable."""
+    try:
+        kind = _command(
+            snapshot, "cat-file", "--batch-check", input=(sha + "\n").encode()
+        ).split()
+        if len(kind) != 3 or kind[1] != b"commit":
+            raise LaneSourceError("Candidate object is missing or is not a commit.")
+        _command(snapshot, "fsck", "--strict", "--no-reflogs", sha)
+    except subprocess.CalledProcessError as error:
+        diagnostic = (error.stderr or b"").lower()
+        # Never turn storage/resource faults in this controller-owned copy into
+        # permanent lane invalidation. Unknown Git failures also propagate.
+        infrastructure = (
+            b"permission denied",
+            b"no space left",
+            b"input/output error",
+            b"read-only file system",
+            b"too many open files",
+            b"cannot allocate memory",
+        )
+        invalid_objects = (
+            b"bad object",
+            b"invalid object",
+            b"not a valid object",
+            b"missing",
+            b"corrupt",
+            b"hash mismatch",
+            b"broken link",
+            b"error in",
+        )
+        if not any(item in diagnostic for item in infrastructure) and any(
+            item in diagnostic for item in invalid_objects
+        ):
+            raise LaneSourceError(
+                "Lane objects failed Git integrity validation."
+            ) from error
+        raise
+
+
+def _copy_objects(source: Path, destination: Path, *, lane: bool = False) -> None:
     """Snapshot bytes through directory descriptors, rejecting links/special files."""
 
     def copy(fd: int, target: Path) -> None:
-        for name in os.listdir(fd):
-            if name in {"alternates", "http-alternates"}:
-                raise typer.BadParameter("Lane object alternates are forbidden.")
-            child = os.open(
-                name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd
-            )
+        with _source_read(lane):
+            names = os.listdir(fd)
+        for name in names:
+            with _source_read(lane):
+                if name in {"alternates", "http-alternates"}:
+                    raise typer.BadParameter("Lane object alternates are forbidden.")
+                child = os.open(
+                    name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd
+                )
             try:
-                info = os.fstat(child)
+                with _source_read(lane):
+                    info = os.fstat(child)
                 mode = info.st_mode
                 if stat.S_ISDIR(mode):
                     (target / name).mkdir(exist_ok=True)
                     copy(child, target / name)
                 elif stat.S_ISREG(mode):
-                    if info.st_nlink != 1:
-                        raise typer.BadParameter(
-                            "Hard-linked Git objects are forbidden."
-                        )
-                    with (
-                        os.fdopen(os.dup(child), "rb") as reader,
-                        (target / name).open("wb") as writer,
-                    ):
-                        shutil.copyfileobj(reader, writer)
+                    with _source_read(lane):
+                        if info.st_nlink != 1:
+                            raise typer.BadParameter(
+                                "Hard-linked Git objects are forbidden."
+                            )
+                    with (target / name).open("wb") as writer:
+                        while True:
+                            with _source_read(lane):
+                                chunk = os.read(child, 1024 * 1024)
+                            if not chunk:
+                                break
+                            writer.write(chunk)
                 else:
-                    raise typer.BadParameter("Unsupported Git object storage.")
+                    with _source_read(lane):
+                        raise typer.BadParameter("Unsupported Git object storage.")
             finally:
                 os.close(child)
 
-    with _directory_fd(source) as fd:
+    with ExitStack() as stack:
+        with _source_read(lane):
+            fd = stack.enter_context(_directory_fd(source))
         copy(fd, destination)
 
 
@@ -196,28 +263,33 @@ def import_commit(
     source: Path, sha: str, destination: Path, *, lane: bool = True
 ) -> None:
     """Retain a nominated commit without executing source hooks/config/transports."""
-    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
-        raise typer.BadParameter("A full candidate commit SHA is required.")
+    with _source_read(lane):
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
+            raise typer.BadParameter("A full candidate commit SHA is required.")
     if lane:
         # Independent lanes have exactly one conventional metadata directory.
         # Do not discover through attacker-supplied gitdir/commondir pointers,
         # even to subsequently reject them: discovery would read their targets.
         metadata = source.absolute() / ".git"
-        with _directory_fd(metadata) as fd:
-            if "commondir" in os.listdir(fd):
-                raise typer.BadParameter(
-                    "Linked lane repositories are unsupported; start a new run."
-                )
+        with _source_read(True):
+            with _directory_fd(metadata) as fd:
+                if "commondir" in os.listdir(fd):
+                    raise typer.BadParameter(
+                        "Linked lane repositories are unsupported; start a new run."
+                    )
         repo = Repository(source, metadata, metadata)
     else:
         repo = Repository.discover(source)
     with tempfile.TemporaryDirectory(dir=destination.parent, prefix="objects-") as temp:
         snapshot = Path(temp) / "snapshot"
         _init(snapshot, "sha256" if len(sha) == 64 else "sha1")
-        _copy_objects(repo.common_dir / "objects", snapshot / ".git/objects")
+        _copy_objects(repo.common_dir / "objects", snapshot / ".git/objects", lane=lane)
         # This config-free, owned GIT_DIR sees only the copied source bytes.
-        if _command(snapshot, "cat-file", "-t", sha) != b"commit\n":
-            raise typer.BadParameter("Candidate object is not a commit.")
+        if lane:
+            _validate_lane_snapshot(snapshot, sha)
+        else:
+            if _command(snapshot, "cat-file", "-t", sha) != b"commit\n":
+                raise typer.BadParameter("Candidate object is not a commit.")
         with (Path(temp) / "transfer.pack").open("w+b") as pack:
             _command(
                 snapshot,
@@ -251,7 +323,12 @@ def checkout(source: Path, sha: str, destination: Path, branch: str) -> None:
                 check=True,
                 capture_output=True,
             ).stdout
-            entries = _checkout_entries(destination, listing)
+            try:
+                entries = _checkout_entries(destination, listing)
+            except typer.BadParameter as error:
+                raise LaneSourceError(
+                    "Candidate tree contains refused paths, links or special files."
+                ) from error
             _write_checkout_blobs(git, entries)
         _command(destination, "check-ref-format", "refs/heads/" + branch)
         _command(destination, "update-ref", "refs/heads/" + branch, sha)
@@ -328,13 +405,24 @@ class Repositories:
             stage.rename(path)
             if previous.exists():
                 shutil.rmtree(previous)
+        return path
+
+    def ensure_scorer(self, lane: str, sha: str) -> None:
         _atomic_checkout(
             self.repository,
             sha,
             scorer_path(self.root, self.run_id, lane, sha),
             "gepa-scorer",
         )
-        return path
+
+    def remove_scorers(self) -> None:
+        # The parent is trusted; never follow redirected run/lane snapshots.
+        run = scorer_path(self.root, self.run_id, "lane-1", self.seed).parent.parent
+        if run.is_symlink():
+            raise typer.BadParameter("Refusing redirected scorer directory.")
+        if run.exists():
+            with _directory_fd(run.parent):
+                shutil.rmtree(run)
 
     def remove_lane(self, lane: str) -> None:
         path = lane_path(self.root, self.run_id, lane)

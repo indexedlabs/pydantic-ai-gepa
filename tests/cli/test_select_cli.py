@@ -167,6 +167,8 @@ def _drive_lane(repo: Path, run_id: str, lane: str, files: dict[str, str]) -> La
     for name, content in files.items():
         (worktree / name).write_text(content, encoding="utf-8")
     old_cwd = Path.cwd()
+    # A reflector's training process never receives the harness capability.
+    dataset = os.environ.pop("GEPA_HELDOUT_DATASET", None)
     os.chdir(worktree)
     try:
         result = _run(
@@ -181,6 +183,8 @@ def _drive_lane(repo: Path, run_id: str, lane: str, files: dict[str, str]) -> La
         )
     finally:
         os.chdir(old_cwd)
+        if dataset is not None:
+            os.environ["GEPA_HELDOUT_DATASET"] = dataset
     assert result.exit_code == 0, result.output
     return load_lane_state(repo, run_id, lane)
 
@@ -1559,3 +1563,116 @@ def test_packet_explains_missing_lane_interpreter(git_repo: Path, monkeypatch) -
     data = json.loads(packet.read_text())
     assert str(Path(str(lane.worktree_path)) / ".venv") in data["runtime_setup"]
     assert "uv sync" in data["runtime_setup"]
+
+
+def test_refan_repairs_scorer_after_lane_publish_crash(git_repo, monkeypatch):
+    from pydantic_ai_gepa.cli import lane_repositories, select
+    from pydantic_ai_gepa.cli.lanes import lane_branch
+
+    with (git_repo / ".gepa/gepa.toml").open("a") as handle:
+        handle.write("\n[acceptance]\npinned_scorer = true\n")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "Pinned scorer")
+    started = _start_lane_run(git_repo, 1, "--max-iterations", "20")
+    run_id = str(started["run_id"])
+    lane = _drive_lane(git_repo, run_id, "lane-1", {"out_case-2.txt": "b\n"})
+    sha = str(lane.candidate_sha)
+    repositories = lane_repositories.load(git_repo, run_id)
+    repositories.import_lane("lane-1", sha)
+    snapshot = lane_repositories.scorer_path(git_repo, run_id, "lane-1", sha)
+    branch = lane_branch(run_id, "lane-1", lane.iteration + 1)
+    with monkeypatch.context() as patch:
+
+        def crash(*args):
+            raise OSError("interrupted after lane publish")
+
+        patch.setattr(lane_repositories.Repositories, "ensure_scorer", crash)
+        with pytest.raises(OSError, match="interrupted"):
+            select._refan_lane(
+                git_repo,
+                _state(git_repo, run_id),
+                lane,
+                new_branch=branch,
+                new_iteration=lane.iteration + 1,
+                new_best=sha,
+            )
+    assert not snapshot.exists()
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            lane_repositories.Repositories,
+            "create_lane",
+            lambda *args, **kwargs: pytest.fail("lane already published"),
+        )
+        select._refan_lane(
+            git_repo,
+            _state(git_repo, run_id),
+            lane,
+            new_branch=branch,
+            new_iteration=lane.iteration + 1,
+            new_best=sha,
+        )
+    assert _git(snapshot, "rev-parse", "HEAD") == sha
+
+
+@pytest.mark.parametrize(
+    "operation", ["import_lane", "candidate", "snapshot_validation"]
+)
+def test_controller_storage_failure_preserves_proposal_for_retry(
+    git_repo, monkeypatch, operation
+):
+    from pydantic_ai_gepa.cli import lane_repositories
+
+    started = _start_lane_run(git_repo, 1, "--max-iterations", "20")
+    run_id = str(started["run_id"])
+    lane = _drive_lane(git_repo, run_id, "lane-1", {"out_case-2.txt": "b\n"})
+    with monkeypatch.context() as patch:
+
+        def fail(*args):
+            raise OSError("controller disk full")
+
+        if operation == "snapshot_validation":
+            command = lane_repositories._command
+
+            def full_disk(root, *args, **kwargs):
+                if args[0] == "fsck":
+                    raise subprocess.CalledProcessError(
+                        128, args, stderr=b"No space left on device"
+                    )
+                return command(root, *args, **kwargs)
+
+            patch.setattr(lane_repositories, "_command", full_disk)
+        else:
+            patch.setattr(lane_repositories.Repositories, operation, fail)
+        result = _select(git_repo, run_id)
+    assert isinstance(result.exception, (OSError, subprocess.CalledProcessError))
+    assert load_lane_state(git_repo, run_id, "lane-1").status == "awaiting_selection"
+    assert not _journal_outcomes(git_repo, run_id, lane="lane-1", outcome="invalidated")
+    resumed = _select(git_repo, run_id)
+    assert resumed.exit_code == 0, resumed.output
+    assert _state(git_repo, run_id).best_commit_sha == lane.candidate_sha
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+def test_only_pinned_runs_create_scorers_and_finalize_cleans_them(
+    git_repo, tmp_path_factory, pinned
+):
+    from pydantic_ai_gepa.cli import lane_repositories, select
+
+    if pinned:
+        with (git_repo / ".gepa/gepa.toml").open("a") as handle:
+            handle.write("\n[acceptance]\npinned_scorer = true\n")
+        _git(git_repo, "add", ".")
+        _git(git_repo, "commit", "-m", "Pinned scorer")
+    started = _start_lane_run(git_repo, 1, "--max-iterations", "20")
+    run_id = str(started["run_id"])
+    snapshot = lane_repositories.scorer_path(
+        git_repo, run_id, "lane-1", str(started["reflection_baseline_commit_sha"])
+    )
+    assert snapshot.exists() == pinned
+    victim = tmp_path_factory.mktemp("scorer-cleanup-victim")
+    (victim / "keep").write_text("unchanged")
+    if pinned:
+        (snapshot / "redirect").symlink_to(victim, target_is_directory=True)
+    select._phase_finalize(git_repo, _state(git_repo, run_id), {})
+    assert not snapshot.parent.parent.exists()
+    assert (victim / "keep").read_text() == "unchanged"
