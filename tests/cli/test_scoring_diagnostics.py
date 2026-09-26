@@ -113,7 +113,7 @@ def test_child_diagnostic_shape_is_untrusted(value):
         sandbox._result(raw, "case", True)
 
 
-def test_scrub_before_bound_and_cap(git_repo, private, private_run):
+def test_scrub_before_bound_and_cap(git_repo, private, private_run, monkeypatch):
     case = Case(
         name="PRIVATE_CASE",
         inputs="a" * 1000,
@@ -125,8 +125,21 @@ def test_scrub_before_bound_and_cap(git_repo, private, private_run):
         "message": "a" * 1000 + " SECRET METADATA " + "tail " * 1000,
     }
     meter = SimpleNamespace(run_id="sandbox-test", root=git_repo)
+    writes = []
+    write = harness_record.Record.write
+
+    def tracked_write(self, key, *args, **kwargs):
+        writes.append(key)
+        return write(self, key, *args, **kwargs)
+
+    monkeypatch.setattr(harness_record.Record, "write", tracked_write)
+    collector = diagnostics.FailureDiagnostics(meter)
     for _ in range(55):
-        diagnostics.record_failure(value, case, True, meter)
+        collector.record_failure(value, case, True)
+    assert writes == ["@scoring-diagnostics"] * 50
+    collector.flush()
+    collector.flush()
+    assert writes == ["@scoring-diagnostics"] * 50 + ["@scoring-diagnostics-dropped"]
     record = harness_record.for_run(meter.run_id, meter.root)
     assert record is not None
     content = record.read("@scoring-diagnostics")
@@ -147,9 +160,120 @@ def test_diagnostics_unavailable_are_dropped(monkeypatch, missing):
         raise OSError("private storage unavailable")
 
     monkeypatch.setattr(harness_record, "for_run", unavailable)
-    diagnostics.record_failure(
+    collector = diagnostics.FailureDiagnostics(
+        SimpleNamespace(run_id="missing", root=None)
+    )
+    collector.record_failure(
         {"class": "ConnectionError", "message": "TLS failed"},
         Case(inputs="secret"),
         True,
-        SimpleNamespace(run_id="missing", root=None),
     )
+    collector.dropped = 5
+    collector.flush()
+
+
+@pytest.mark.parametrize(
+    "value, expression",
+    [
+        (12345, "repr(case.inputs)"),
+        (12.345, "repr(case.inputs)"),
+        ("Line one\nline two", "repr(case.inputs)"),
+        ('a "quoted" order ☃', "json.dumps(case.inputs)"),
+        ('a "quoted" order ☃', "json.dumps(case.inputs, ensure_ascii=False)"),
+    ],
+)
+def test_scrub_numeric_and_escaped_values(
+    git_repo, private, private_run, protocol_backend, value, expression
+):
+    sha = commit_evaluator(
+        git_repo,
+        f"""import json
+def evaluate(case):
+    raise ValueError("bad input " + {expression})
+""",
+    )
+    case = Case(name="hidden-case", inputs={"order": value}, expected_output="expected")
+    score(git_repo, sha, cases=[case])
+    record = harness_record.for_run("sandbox-test", git_repo)
+    assert record is not None
+    content = record.read("@scoring-diagnostics")
+    assert content is not None
+    entry = json.loads(content)
+    assert entry["class"] == "ValueError"
+    assert "case_id" not in entry
+    assert entry["message"].startswith("bad input ")
+    for secret in {
+        str(value),
+        repr(value)[1:-1] if isinstance(value, str) else str(value),
+        json.dumps(value)[1:-1] if isinstance(value, str) else str(value),
+        json.dumps(value, ensure_ascii=False)[1:-1]
+        if isinstance(value, str)
+        else str(value),
+    }:
+        assert secret not in entry["message"]
+    assert "order" not in entry["message"]
+
+
+def test_scrub_does_not_collect_booleans():
+    assert diagnostics._strings([True, False]) == set()
+
+
+def test_escaping_evaluator_exception_aborts(
+    git_repo, private, private_run, protocol_backend, monkeypatch
+):
+    from pydantic_ai_gepa.cli.spend import EvalSpendMeter
+
+    sha = commit_evaluator(
+        git_repo,
+        """from pydantic_ai_gepa.exceptions import UsageBudgetExceeded
+def evaluate(case):
+    if case.name == "abort":
+        raise UsageBudgetExceeded("escaping evaluator failure")
+    return "good"
+""",
+    )
+    started = []
+    rollout = EvalSpendMeter.rollout
+
+    def tracked_rollout(self):
+        started.append(True)
+        return rollout(self)
+
+    monkeypatch.setattr(EvalSpendMeter, "rollout", tracked_rollout)
+    with pytest.raises(sandbox.ScoringSandboxError, match="exited"):
+        score(
+            git_repo,
+            sha,
+            cases=[
+                Case(name="abort", inputs="first"),
+                Case(name="never-start", inputs="second"),
+            ],
+        )
+    assert len(started) == 1
+
+
+def test_drop_count_flushed_when_eval_aborts(
+    git_repo, private, private_run, protocol_backend, monkeypatch
+):
+    monkeypatch.setattr(diagnostics, "MAX_ENTRIES", 1)
+    sha = commit_evaluator(
+        git_repo,
+        """from pydantic_ai_gepa.exceptions import UsageBudgetExceeded
+def evaluate(case):
+    if case.name == "abort":
+        raise UsageBudgetExceeded("escaping failure")
+    raise ValueError("failure")
+""",
+    )
+    with pytest.raises(sandbox.ScoringSandboxError, match="exited"):
+        score(
+            git_repo,
+            sha,
+            cases=[
+                Case(name=name, inputs="secret")
+                for name in ["first", "second", "abort"]
+            ],
+        )
+    record = harness_record.for_run("sandbox-test", git_repo)
+    assert record is not None
+    assert record.read("@scoring-diagnostics-dropped") == "1"

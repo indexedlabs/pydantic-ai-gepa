@@ -26,7 +26,14 @@ def valid_diagnostic(value: Any) -> bool:
 
 def _strings(value: Any) -> set[str]:
     if isinstance(value, str):
-        return {value} if value else set()
+        return {
+            value,
+            repr(value)[1:-1],
+            json.dumps(value)[1:-1],
+            json.dumps(value, ensure_ascii=False)[1:-1],
+        } - {""}
+    if type(value) in (int, float):
+        return {str(value)}
     if isinstance(value, dict):
         return set().union(*(_strings(item) for pair in value.items() for item in pair))
     if isinstance(value, (list, tuple)):
@@ -34,11 +41,7 @@ def _strings(value: Any) -> set[str]:
     return set()
 
 
-def record_failure(value: Any, case: Any, validation: bool, meter: Any) -> None:
-    from .harness_record import for_run
-
-    if value is None or not valid_diagnostic(value):
-        return
+def _entry(value: Any, case: Any, validation: bool) -> dict[str, str]:
     message = value["message"]
     exception_class = value["class"]
     if validation:
@@ -60,19 +63,59 @@ def record_failure(value: Any, case: Any, validation: bool, meter: Any) -> None:
     }
     if not validation:
         entry["case_id"] = str(case.name or "")[:128]
-    try:
-        record = for_run(meter.run_id, meter.root)
-        if record is None:
+    return entry
+
+
+class FailureDiagnostics:
+    """Keep the first failures and flush an eval's overflow count only once."""
+
+    def __init__(self, meter: Any):
+        self.meter = meter
+        self.full = False
+        self.dropped = 0
+
+    def record_failure(self, value: Any, case: Any, validation: bool) -> None:
+        from .harness_record import for_run
+
+        if value is None or not valid_diagnostic(value):
             return
-        with record.locked():
-            content = record.read("@scoring-diagnostics") or ""
-            if len(content.splitlines()) >= MAX_ENTRIES:
+        if self.full:
+            self.dropped += 1
+            return
+        try:
+            record = for_run(self.meter.run_id, self.meter.root)
+            if record is None:
+                return
+            with record.locked():
+                content = record.read("@scoring-diagnostics") or ""
+                if len(content.splitlines()) >= MAX_ENTRIES:
+                    self.full = True
+                    self.dropped += 1
+                else:
+                    record.write(
+                        "@scoring-diagnostics",
+                        json.dumps(_entry(value, case, validation)) + "\n",
+                        append=True,
+                    )
+        except (OSError, ValueError, typer.BadParameter):
+            # Diagnostics are best effort, with no public fallback or scoring impact.
+            return
+
+    def flush(self) -> None:
+        from .harness_record import for_run
+
+        if not self.dropped:
+            return
+        try:
+            record = for_run(self.meter.run_id, self.meter.root)
+            if record is None:
+                return
+            with record.locked():
                 dropped = int(record.read("@scoring-diagnostics-dropped") or "0")
-                record.write("@scoring-diagnostics-dropped", str(dropped + 1))
-            else:
                 record.write(
-                    "@scoring-diagnostics", json.dumps(entry) + "\n", append=True
+                    "@scoring-diagnostics-dropped", str(dropped + self.dropped)
                 )
-    except (OSError, ValueError, typer.BadParameter):
-        # Diagnostics are best effort, with no public fallback or scoring impact.
-        return
+        except (OSError, ValueError, typer.BadParameter):
+            pass
+        finally:
+            self.dropped = 0

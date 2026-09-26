@@ -36,7 +36,7 @@ from ..evaluation import EvaluationRecord
 from ..types import RolloutOutput
 from .layout import GepaConfig, git_root
 from .scoring_proxy import allowed_addresses, connect_proxy
-from .scoring_diagnostics import record_failure, valid_diagnostic
+from .scoring_diagnostics import FailureDiagnostics, valid_diagnostic
 from .scoring_material import (
     MaterialBudget,
     checked_json,
@@ -296,7 +296,16 @@ def check_tls(profile: str, scratch: Path, port: int, env: dict[str, str]) -> No
     addresses = allowed_addresses(hosts)
     if not addresses:
         return
-    first = next(item.strip() for item in hosts.split(",") if item.strip())
+    first = next(
+        (
+            item.strip()
+            for item in hosts.split(",")
+            if item.strip() and next(iter(allowed_addresses(item)))[1] == 443
+        ),
+        None,
+    )
+    if first is None:
+        return
     key = (os.getpid(), first, env["SSL_CERT_FILE"], env["REQUESTS_CA_BUNDLE"])
     if key in _tls_checked:
         return
@@ -335,6 +344,13 @@ def check_tls(profile: str, scratch: Path, port: int, env: dict[str, str]) -> No
         error_class = type(error).__name__
     except (ValueError, UnicodeError):
         pass
+    if error_class != "SSLCertVerificationError":
+        _tls_checked.add(key)
+        typer.echo(
+            f"Warning: sandbox TLS check could not complete ({error_class}); continuing scoring.",
+            err=True,
+        )
+        return
     raise ScoringSandboxError(
         f"Sandbox TLS smoke check failed ({error_class}); scoring refused before rollouts. "
         "The system trust store is blocked in the sandbox. Use a certifi CA bundle "
@@ -801,6 +817,7 @@ def score_cases(
             close_fds=True,
             start_new_session=True,
         )
+        diagnostics = FailureDiagnostics(meter)
         try:
             channel = Channel(process)
             channel.send(
@@ -839,8 +856,8 @@ def score_cases(
                                 if raw.get("type") != "usage":
                                     record = _result(raw, case.name, validation)
                                     if raw["failed"]:
-                                        record_failure(
-                                            raw["diagnostic"], case, validation, meter
+                                        diagnostics.record_failure(
+                                            raw["diagnostic"], case, validation
                                         )
                                     if not validation:
                                         assert output_fd is not None
@@ -896,6 +913,7 @@ def score_cases(
 
             return asyncio.run(evaluate())
         finally:
+            diagnostics.flush()
             try:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)

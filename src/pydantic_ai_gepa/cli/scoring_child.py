@@ -12,7 +12,6 @@ from typing import Any
 from pydantic_evals import Case
 
 from ..evaluation import (
-    EvaluationRecord,
     evaluate_callable_dataset,
     evaluate_candidate_dataset,
 )
@@ -143,15 +142,6 @@ def main() -> None:
                             capture_traces=not validation,
                         )
                     )
-        except Exception as error:
-            records = [
-                EvaluationRecord(
-                    case.name or "case-0",
-                    0.0,
-                    None,
-                    {"output": RolloutOutput.from_error(error, kind="system")},
-                )
-            ]
         finally:
             _rollout_error_observer.reset(token)
         record = records[0]

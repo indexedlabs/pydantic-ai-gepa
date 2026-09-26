@@ -740,22 +740,28 @@ that bypass the environment (for example `trust_env=False`) should explicitly us
 `ssl.create_default_context(cafile=certifi.where())` and configure the CONNECT proxy.
 
 Before the first sandboxed rollout, a separate sandboxed child checks one TLS
-handshake to the first allowlisted host, using the same profile, environment and
-proxy, with no candidate or case material. It uses httpx2's default SSL context
-when importable, otherwise OpenSSL's default context. Success is cached for the
-harness process and TLS environment; an empty allowlist skips the check. Failure
-refuses scoring before rollouts with the exception class and guidance to check
-the CA bundle, allowlist and proxy. There is no separate truststore warning probe.
+handshake to the first allowlisted host on port 443, using the same profile,
+environment and proxy, with no candidate or case material. It uses httpx2's default
+SSL context when importable, otherwise OpenSSL's default context. Success and
+non-verification failures are cached for the
+harness process and TLS environment. If no port-443 host is listed, the check is
+skipped, preserving plaintext model endpoints. Certificate verification failure
+refuses scoring before rollouts with the exception class and CA-bundle guidance.
+Other probe failures (including timeouts and proxy refusal) warn once on stderr
+and continue scoring. There is no separate truststore warning probe.
 
 Operators can inspect rollout exception classes and messages in the
 `@scoring-diagnostics` JSONL entry inside
 `<heldout dataset parent>/.gepa-heldout/<run pin hash>.record.json`. These entries
 are never published to the reflector, run status, packets, reports or traces.
-Messages are limited to 512 characters; validation entries redact case string
-values and omit case IDs, while training entries retain case IDs. Each entry has
-an ISO timestamp and phase. The first 50 failures are retained, with further
-failures counted in `@scoring-diagnostics-dropped`. Unavailable private diagnostics
-storage drops diagnostics without failing scoring or writing a public fallback.
+Messages are limited to 512 characters after scrubbing; validation entries redact
+case strings (including repr/JSON escapes) and numeric values, and omit case IDs,
+while training entries retain case IDs. Each entry has an ISO timestamp and phase.
+The first 50 failures are retained, with further
+failures counted in `@scoring-diagnostics-dropped`, flushed once at eval end.
+Exceptions escaping the dataset evaluator still abort the eval immediately.
+Unavailable private diagnostics storage drops diagnostics without failing scoring
+or writing a public fallback.
 
 Held-out harness commands skip candidate-owned `.env` files. Install the harness and its Python dependencies
 in storage the reflector cannot modify, and keep provider credentials out of the

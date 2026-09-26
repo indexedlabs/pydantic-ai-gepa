@@ -1353,6 +1353,29 @@ async def evaluate(case):
     assert not list((private.parent / ".gepa-heldout/work").iterdir())
 
 
+def test_real_sandbox_allows_only_proxy_model_endpoint(
+    real_backend, git_repo, private, private_run, monkeypatch
+):
+    with endpoint() as (port, received):
+        monkeypatch.setenv("GEPA_HARNESS_ALLOWED_HOSTS", f"127.0.0.1:{port}")
+        sha = commit_evaluator(
+            git_repo,
+            f"""import os, socket
+from urllib.parse import urlparse
+async def evaluate(case):
+    proxy = urlparse(os.environ['HTTPS_PROXY'])
+    with socket.create_connection((proxy.hostname, proxy.port), timeout=3) as s:
+        s.sendall(b'CONNECT 127.0.0.1:{port} HTTP/1.1\\r\\n\\r\\n')
+        assert b'200 Connection Established' in s.recv(4096)
+        s.sendall(b'GET / HTTP/1.1\\r\\nHost: model\\r\\n\\r\\n')
+        assert b'200 OK' in s.recv(4096)
+    return 'good'
+""",
+        )
+        assert score(git_repo, sha)[0].score == 1
+        assert len(received) == 1
+
+
 @pytest.mark.parametrize("transport", ["unix", "tcp"])
 def test_real_sandbox_cannot_send_cases_to_shared_service(
     real_backend, git_repo, private, private_run, transport

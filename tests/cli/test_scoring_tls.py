@@ -235,19 +235,32 @@ asyncio.run(run())
 
 
 def test_real_seatbelt_smoke_success_once(
-    real_backend, tls_server, tmp_path, monkeypatch
+    real_backend, tls_server, tmp_path, monkeypatch, capsys
 ):
     ca, target_port = tls_server
     monkeypatch.setattr(sandbox.certifi, "where", lambda: str(ca))
     monkeypatch.setenv(
-        "GEPA_HARNESS_ALLOWED_HOSTS", f"localhost:{target_port},unreachable.invalid:443"
+        "GEPA_HARNESS_ALLOWED_HOSTS",
+        "localhost:11434,localhost:443,unreachable.invalid:443",
     )
+    # Keep the real CONNECT/probe path while mapping port 443 to an unprivileged
+    # local test server in the parent proxy only.
+    from pydantic_ai_gepa.cli import scoring_proxy
+
+    connect = scoring_proxy.socket.create_connection
+
+    def local_tls(address, *args, **kwargs):
+        assert address == ("localhost", 443)
+        return connect(("localhost", target_port), *args, **kwargs)
+
+    monkeypatch.setattr(scoring_proxy.socket, "create_connection", local_tls)
     monkeypatch.setattr(sandbox, "_tls_checked", set())
     private, checkout, scratch = probe_paths(tmp_path)
-    with connect_proxy(frozenset({("localhost", target_port)})) as port:
+    with connect_proxy(frozenset({("localhost", 443)})) as port:
         profile = sandbox.seatbelt_profile(private, checkout, scratch, port)
         env = sandbox.child_environment(scratch, port)
         sandbox.check_tls(profile, scratch, port, env)
+        assert capsys.readouterr().err == ""
         monkeypatch.setattr(
             sandbox.subprocess, "run", lambda *a, **kw: pytest.fail("second probe")
         )
@@ -284,7 +297,8 @@ def test_smoke_refusal_and_empty_allowlist(tmp_path, monkeypatch):
     sandbox.check_tls("profile", tmp_path, 1234, env)
     assert not calls
     monkeypatch.setenv(
-        "GEPA_HARNESS_ALLOWED_HOSTS", "first.example:443,second.example:443"
+        "GEPA_HARNESS_ALLOWED_HOSTS",
+        "localhost:11434,first.example:443,second.example:443",
     )
     with pytest.raises(sandbox.ScoringSandboxError) as error:
         sandbox.check_tls("profile", tmp_path, 1234, env)
@@ -297,3 +311,48 @@ def test_smoke_refusal_and_empty_allowlist(tmp_path, monkeypatch):
     assert calls[0][0][0][-3:] == ["first.example", "443", "1234"]
     assert calls[0][1]["env"] == env
     assert not sandbox._tls_checked
+
+
+def test_non_tls_allowlist_skips_probe(tmp_path, monkeypatch):
+    monkeypatch.setenv("GEPA_HARNESS_ALLOWED_HOSTS", "127.0.0.1:8080,localhost:11434")
+    monkeypatch.setattr(
+        sandbox.subprocess, "run", lambda *a, **kw: pytest.fail("TLS probe ran")
+    )
+    sandbox.check_tls(
+        "profile", tmp_path, 1234, sandbox.child_environment(tmp_path, 1234)
+    )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["SSLError", "ConnectionError", "TimeoutExpired", "OSError", "TLSProbeError"],
+)
+def test_non_verification_failure_warns_once(tmp_path, monkeypatch, capsys, failure):
+    monkeypatch.setenv("GEPA_HARNESS_ALLOWED_HOSTS", "first.example:443")
+    monkeypatch.setattr(sandbox, "_tls_checked", set())
+    monkeypatch.setattr(sandbox, "sandbox_command", lambda profile, command: command)
+
+    def fail(*args, **kwargs):
+        if failure == "TimeoutExpired":
+            raise subprocess.TimeoutExpired("probe", 15)
+        if failure == "OSError":
+            raise OSError("private detail")
+        stdout = (
+            b"not json"
+            if failure == "TLSProbeError"
+            else json.dumps({"error_class": failure}).encode()
+        )
+        return subprocess.CompletedProcess([], 1, stdout, b"private detail")
+
+    monkeypatch.setattr(sandbox.subprocess, "run", fail)
+    env = sandbox.child_environment(tmp_path, 1234)
+    sandbox.check_tls("profile", tmp_path, 1234, env)
+    assert (
+        capsys.readouterr().err
+        == f"Warning: sandbox TLS check could not complete ({failure}); continuing scoring.\n"
+    )
+    monkeypatch.setattr(
+        sandbox.subprocess, "run", lambda *a, **kw: pytest.fail("second probe")
+    )
+    sandbox.check_tls("profile", tmp_path, 1234, env)
+    assert capsys.readouterr().err == ""

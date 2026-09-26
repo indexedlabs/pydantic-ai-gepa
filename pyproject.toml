@@ -22,6 +22,7 @@ description = "GEPA optimization integration for pydantic-ai"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "certifi>=2025.8.3",
     "cloudpickle>=3.0.0",
     "pydantic-ai-slim[openai,anthropic,logfire,retries]>=2.48.0,<3",
     "pydantic-graph>=2.34.0,<3",
