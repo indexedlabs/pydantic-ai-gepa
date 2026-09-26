@@ -45,6 +45,12 @@ variable names such as `OPENAI_API_KEY`, never patterns. Do not pass scoring key
 components and trace variables cannot be allowlisted. Subscription configuration
 is retained; keep other harness secrets out of the launch environment. Git config
 appends `gc.autoDetach=false` and `maintenance.autoDetach=false` to existing entries.
+
+Before an unattended held-out run, set a provider-side spend limit on each
+training-only reflector key passed through `pass_env`. This backs up the harness
+spend cap because the reflector's own model calls, including training evaluations
+run in its environment, are outside that cap.
+
 Public step directories hold training-only prompts and logs. Held-out state lives
 beside the pin. Training-only state lives under
 `${XDG_STATE_HOME:-~/.local/state}/pydantic-ai-gepa/drive/<key>/drive.json`, keyed by

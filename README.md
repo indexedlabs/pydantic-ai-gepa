@@ -420,6 +420,11 @@ harness-only secrets out of the launch environment. Git's `gc.autoDetach=false`
 and `maintenance.autoDetach=false` are appended through `GIT_CONFIG_COUNT` so
 routine Git maintenance stays in the observed process tree.
 
+Before an unattended held-out run, set a provider-side spend limit on each
+training-only reflector key passed through `pass_env`. This backs up the harness
+spend cap because the reflector's own model calls, including training evaluations
+run in its environment, are outside that cap.
+
 Logs and the fixed training-only prompt are in `runs/RUN/drive/step-NNNNNN/`.
 All driver state is private: held-out state is beside the dataset pin; training-only
 state is `${XDG_STATE_HOME:-~/.local/state}/pydantic-ai-gepa/drive/<key>/drive.json`,
