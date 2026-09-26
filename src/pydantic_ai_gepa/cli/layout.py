@@ -29,7 +29,6 @@ from __future__ import annotations
 import importlib
 import os
 import re
-import subprocess
 import sys
 import tomllib
 import uuid
@@ -417,23 +416,14 @@ def git_root(start: Path | None = None) -> Path:
     """
 
     cursor = (start or repo_root()).resolve()
+    from .safe_git import Repository
+
     try:
-        value = subprocess.run(
-            ["git", "-C", str(cursor), "rev-parse", "--show-toplevel"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
-        detail = (
-            exc.stderr.strip()
-            if isinstance(exc, subprocess.CalledProcessError)
-            else str(exc)
-        )
+        return Repository.discover(cursor).root
+    except OSError as exc:
         raise GepaConfigError(
-            f"Could not resolve Git top-level from {cursor}: {detail}"
+            f"Could not resolve Git top-level from {cursor}: {exc}"
         ) from exc
-    return Path(value).resolve()
 
 
 def project_root_for_workspace(workspace: Path) -> Path:
