@@ -558,7 +558,9 @@ def initialize(root: Path, run_id: str) -> None:
 def _view(path: Path, root: Path | None = None) -> tuple[Record, str] | None:
     from .layout import repo_root, runs_dir
 
-    active = _active.get() if heldout_dataset(required=False) else None
+    if not heldout_dataset(required=False):
+        return None
+    active = _active.get()
     workspace = root or repo_root()
     if (
         root is None

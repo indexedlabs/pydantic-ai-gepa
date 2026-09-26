@@ -53,6 +53,25 @@ def authority_bytes(record):
     return {p.name: p.read_bytes() for p in record.path.parent.glob("*.json")}
 
 
+def test_lane_repository_metadata_comes_from_private_run(lane_run):
+    record, _, _ = lane_run
+    expected = json.loads(record.read("state.json"))
+    view = record.directory / "state.json"
+    forged = dict(
+        expected,
+        candidate_prefix="../../outside",
+        lane_repository_version=0,
+        project_root="/forged/scorer",
+    )
+    view.write_text(json.dumps(forged))
+    root, state = lanes._resolve_lane_run(record.run_id)
+    assert root == record.root
+    assert state.candidate_prefix == expected["candidate_prefix"]
+    assert state.lane_repository_version == 1
+    assert state.project_root == expected["project_root"]
+    assert json.loads(view.read_text()) == expected
+
+
 @pytest.mark.parametrize(
     "attack",
     [
@@ -110,7 +129,16 @@ def test_heldout_select_refuses_or_matches_control(lane_run, attack, tmp_path):
     result = flows._select(record.root, record.run_id)
     assert keep.read_text() == "PRECIOUS"
     assert list(victim.iterdir()) == [keep]
-    if attack in {"control", "diffstat-leaf"}:
+    if attack.startswith("winner-"):
+        # An unsafe independent candidate is discarded without resetting the
+        # scorer; the other valid lane may still win.
+        assert result.exit_code == 0, (result.output, result.exception)
+        state = json.loads(record.read("state.json"))
+        assert state["best_commit_sha"] == second.candidate_sha
+        assert flows._journal_outcomes(
+            record.root, record.run_id, lane="lane-1", outcome="invalidated"
+        )
+    elif attack in {"control", "diffstat-leaf"}:
         assert result.exit_code == 0, (result.output, result.exception)
         state = json.loads(record.read("state.json"))
         # Both untampered and repaired-leaf cases choose the same tied winner.
@@ -241,20 +269,23 @@ def test_lane_lock_and_sentinel_never_follow_links(record):
     assert not (record.path.parent / "planted").exists()
 
 
-def test_reset_does_not_read_or_write_back_redirected_journal(record):
-    sha = flows._git(record.root, "rev-parse", "HEAD")
+def test_promotion_does_not_touch_redirected_source_journal(record):
+    from pydantic_ai_gepa.cli import lane_repositories
+
+    repositories = lane_repositories.initialize(record.root, record.run_id, record.root)
     journal = record.root / ".gepa/journal.jsonl"
-    expected = journal.read_bytes()
     journal.unlink()
     journal.symlink_to(record.path)
     before = authority_bytes(record)
-    select._reset_primary_to(record.root, sha)
+    repositories.promote(repositories.seed)
     assert authority_bytes(record) == before
-    assert journal.read_bytes() == expected
-    assert not journal.is_symlink()
+    assert journal.is_symlink()
+    assert journal.resolve() == record.path
 
 
 def test_winner_gitlink_under_gepa_is_refused(record):
+    from pydantic_ai_gepa.cli import lane_repositories
+
     sha = flows._git(record.root, "rev-parse", "HEAD")
     flows._git(
         record.root,
@@ -266,8 +297,10 @@ def test_winner_gitlink_under_gepa_is_refused(record):
     flows._git(record.root, "commit", "-m", "Plant workspace gitlink")
     candidate = flows._git(record.root, "rev-parse", "HEAD")
     before = authority_bytes(record)
-    with pytest.raises(typer.BadParameter, match="unsafe GEPA_DIR path"):
-        select._check_winner_views(record.root, candidate)
+    with pytest.raises(typer.BadParameter, match="links or special files"):
+        lane_repositories.checkout(
+            record.root, candidate, record.root.parent / "refused-checkout", "candidate"
+        )
     assert authority_bytes(record) == before
 
 
@@ -346,5 +379,8 @@ def test_lane_comparison_cannot_name_a_private_file(record):
 
 
 def test_winner_check_refuses_mutable_git_names(record):
-    with pytest.raises(typer.BadParameter, match="immutable full commit ID"):
-        select._check_winner_views(record.root, "HEAD")
+    from pydantic_ai_gepa.cli import lane_repositories
+
+    repositories = lane_repositories.initialize(record.root, record.run_id, record.root)
+    with pytest.raises(typer.BadParameter, match="Invalid retained candidate SHA"):
+        repositories.candidate("HEAD")

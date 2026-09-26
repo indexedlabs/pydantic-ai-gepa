@@ -673,7 +673,9 @@ component_files = ["prompts/planner.md"]
 The orchestrator must set `GEPA_HARNESS_SCORER_REVISION` to the trusted scorer's
 full commit SHA (40 or 64 hexadecimal characters) in the harness environment,
 including `run start`, `harness serve` and `run select`. The revision must exist
-in the same repository. Missing, malformed or non-commit revisions are refused.
+in the original scorer project repository. With `--candidate-root`, component
+blobs come from the separate candidate repository; scorer history stays in the
+original repository. Missing, malformed or non-commit revisions are refused.
 The private checkout contains only that revision. The parent reads the nominated
 commit's component files as raw UTF-8 Git blobs, with no filters or candidate
 imports, and sends their text in the initialization message. The child sets
@@ -753,10 +755,42 @@ Public candidate retention refs are written as data through directory handles
 that refuse symlinks, without invoking source Git hooks; ordinary branch resets
 and garbage collection preserve the retained commits.
 
-Held-out lane start/select and all lane Git mutations (including worktree
-creation/removal, reset, checkout and branch updates) currently fail closed when
-`GEPA_HELDOUT_DATASET` is configured. Use a single-checkout run (`--lanes 0`) for
-held-out scoring; safe lane mutations require a separate design.
+Lane runs use independent repositories, including supported held-out scalar
+runs. `run start --lanes N --candidate-root /absolute/export/project` seeds them
+from a separate candidate project; omitting `--candidate-root` uses the current
+project. The caller must supply a history-free, training-only export when the
+original history contains private data. The library does not filter datasets.
+
+Repositories live at `<GEPA_DIR>.lanes/<run-id>/<lane>/` and have no shared refs,
+objects, alternates or remotes. Grant each reflector access only to its own lane,
+the public GEPA workspace and required runtimes; keep the source/export, other
+lanes and the controller's repository store outside every grant. Use an external
+absolute GEPA_DIR for that boundary. Unpinned training imports from its lane.
+Pinned `lane continue` loads evaluator, metric and scorer code from the controller-owned
+incumbent checkout at `<GEPA_DIR>.scorers/<run-id>/<lane>/<incumbent-sha>/<prefix>`.
+Grant that lane read-only access to this snapshot, never write access. It contains
+only the seeded incumbent and its ancestry, with no unrelated refs. When seeded
+from a history-free export, no source checkout history is introduced. The controller
+creates it at fan-out; no original scorer-checkout
+read is required by the reflector. Held-out scoring still uses the private trusted scorer.
+Snapshots are created only for pinned runs, repaired on re-fan after an interruption,
+and removed when the run finalizes.
+
+Seed trees containing symlinks or gitlinks anywhere are refused. Exporters must drop
+or materialize those entries before starting lanes. Each lane needs its own
+`<prefix>/.venv` when the packet uses a workspace-local interpreter; provision it
+(e.g. `uv sync` from that lane's project) before executing the packet command.
+The packet's `runtime_setup` message identifies a missing interpreter.
+
+The controller copies nominated objects without using lane config/hooks, keeps
+only their reachable closure in its own durable repository, and scores retained
+commits. Held-out stores live under the private dataset sibling's
+`.gepa-heldout/repositories/`; training-only stores live at
+`<GEPA_DIR>.repositories/<run-id>/`. Keep these stores for replay/adoption after
+lane cleanup. The original project is never reset to a winning candidate.
+Later iterations start from the retained winner. Old linked-worktree runs must
+restart; no migration is attempted. Pinned-scorer held-out runs require the
+trusted-scorer settings and harness revision described above.
 
 Sandbox rollouts run serially; the parent retains cost admission and response-level
 accounting. Public spend uses a fixed `sandbox` model bucket to prevent model names
@@ -844,8 +878,15 @@ tighter one-off cap stops that eval without finalizing the managed run.
 Unpriced or unmetered work under a one-off cap also invalidates a managed run's
 own cap and finalizes it with the fail-closed reason.
 
-The run's locked `spend.jsonl` ledger checkpoints training-side deltas after each
-response. Validation response checkpoints stay beside the private validation
+In held-out lane runs, `max_iterations` and `max_token_cost` bound only harness-side
+baseline, rebaseline, validation and confirmation evaluations. Reflector training
+spend is outside the run's cap. Its Pareto, vector and spend ledgers live under
+`runs/<run>/lanes/<lane>/`, so selecting a candidate preserves that evidence and
+does not mistake it for a forged harness record. The main run ledgers remain
+harness-owned; edits to those public views still trigger refusal and restoration.
+
+The run's locked `spend.jsonl` ledger checkpoints harness-side training deltas
+after each response. Validation response checkpoints stay beside the private validation
 evidence outside checkouts; the workspace receives one aggregate row when a
 validation eval ends. Budget checks include all private checkpoints. Public
 reports withhold live validation spend and tokens with `validation_in_progress: true`,

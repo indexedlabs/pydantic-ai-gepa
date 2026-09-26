@@ -167,6 +167,8 @@ class RunState:
     last_reflector_comparison: dict[str, Any] | None = None
     continuation: dict[str, Any] | None = None
     project_root: str | None = None
+    lane_repository_version: int = 0
+    candidate_prefix: str = "."
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -174,6 +176,8 @@ class RunState:
             "last_reflector_comparison": self.last_reflector_comparison,
             "continuation": self.continuation,
             "project_root": self.project_root,
+            "lane_repository_version": self.lane_repository_version,
+            "candidate_prefix": self.candidate_prefix,
             "run_id": self.run_id,
             "status": self.status,
             "max_iterations": self.max_iterations,
@@ -258,6 +262,8 @@ class RunState:
             last_reflector_comparison=data.get("last_reflector_comparison"),
             continuation=data.get("continuation"),
             project_root=data.get("project_root"),
+            lane_repository_version=int(data.get("lane_repository_version", 0)),
+            candidate_prefix=str(data.get("candidate_prefix", ".")),
             run_id=str(data["run_id"]),
             status=str(data["status"]),  # type: ignore[arg-type]
             max_iterations=int(data["max_iterations"]),
@@ -2017,6 +2023,11 @@ def start(
         "--candidate-source",
         help="Override gepa.toml candidate_source for this run: components or git.",
     ),
+    candidate_root: Path | None = typer.Option(
+        None,
+        "--candidate-root",
+        help="Seed project for independent git lanes; defaults to the current project.",
+    ),
     lanes: int = typer.Option(
         0,
         "--lanes",
@@ -2083,10 +2094,6 @@ def start(
         raise typer.BadParameter("--acceptance-paired-min-cases must be >= 2.")
     heldout_required = heldout_required or _held_out_validation_enabled()
     if heldout_required:
-        if lanes:
-            from .safe_git import refuse_heldout_git_mutations
-
-            refuse_heldout_git_mutations()
         _validation_dataset_identity()
         from . import scoring_sandbox
 
@@ -2119,7 +2126,11 @@ def start(
         CandidateSource, candidate_source or cfg.candidate_source
     )
     workspace_root = repo_root()
-    from .lanes import ensure_worktrees_ignored
+    from . import lane_repositories
+
+    if candidate_root is not None and lanes == 0:
+        raise typer.BadParameter("--candidate-root requires --lanes greater than zero.")
+    seed_project = (candidate_root or workspace_root).resolve()
 
     if lanes > 0:
         if active_candidate_source != "git":
@@ -2133,11 +2144,13 @@ def start(
         # tree is rejected (spec-1do constraint). The journal is tracked
         # bookkeeping the CLI itself appends to — exclude it like select does
         # (one dirtiness definition across verbs).
+        from .lanes import ensure_worktrees_ignored
+
         ensure_worktrees_ignored(workspace_root)
         try:
             primary_state = git_candidate_state(
-                workspace_root,
-                exclude_paths=candidate_identity_exempt_paths(workspace_root),
+                seed_project,
+                exclude_paths=candidate_identity_exempt_paths(seed_project),
             )
         except GitCandidateError as exc:
             public_echo(str(exc), err=True)
@@ -2193,7 +2206,14 @@ def start(
         from .harness_record import initialize
 
         initialize(workspace_root, run_id)
+    repositories = (
+        lane_repositories.initialize(workspace_root, run_id, seed_project)
+        if lanes
+        else None
+    )
     state = RunState(
+        lane_repository_version=1 if repositories else 0,
+        candidate_prefix=str(repositories.prefix) if repositories else ".",
         heldout_required=heldout_required,
         run_id=run_id,
         status="running",
@@ -2223,9 +2243,12 @@ def start(
         project_root=str(workspace_root.resolve()),
     )
     state.save()
-    state, outcomes = _advance_to_reflection_or_done(state)
-    state.save()
-    state, outcomes = _fan_out_lane_run_if_ready(state, outcomes)
+    from contextlib import nullcontext
+
+    with repositories.route() if repositories else nullcontext():
+        state, outcomes = _advance_to_reflection_or_done(state)
+        state.save()
+        state, outcomes = _fan_out_lane_run_if_ready(state, outcomes)
 
     final_path: Path | None = None
     final_text: str | None = None
@@ -2326,8 +2349,13 @@ def _continue_impl(run_id: str | None, gate_case: list[str]) -> None:
         )
         return
     if state.lanes > 0:
-        state, outcomes = _advance_to_reflection_or_done(state)
-        state, outcomes = _fan_out_lane_run_if_ready(state, outcomes)
+        from .lane_repositories import load
+
+        if state.lane_repository_version != 1:
+            raise typer.BadParameter("Linked lane runs cannot resume; start a new run.")
+        with load(repo_root(), state.run_id).route():
+            state, outcomes = _advance_to_reflection_or_done(state)
+            state, outcomes = _fan_out_lane_run_if_ready(state, outcomes)
         state.save()
         final_path = None
         final_text = None

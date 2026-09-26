@@ -10,7 +10,7 @@ import ast
 from collections import Counter
 from pathlib import Path
 
-MODULES = "harness eval select run runs spend lanes reflector events front pareto notes reflector_recovery".split()
+MODULES = "harness eval select run runs spend lanes lane_ledger reflector events front pareto notes reflector_recovery".split()
 OPERATIONS = {
     "write_text",
     "write_bytes",
@@ -93,6 +93,10 @@ class Inventory(ast.NodeVisitor):
 # Each reason describes the branch containing precisely these call counts.
 # Moving/removing a guard still requires review; adding raw calls fails this test.
 ALLOWLIST = {
+    "lane_ledger.lane_training_evaluation.wrapped": (
+        "Reflector-only public state lookup after refusing any held-out capability; cannot read as the harness.",
+        {"state.read_text": 1},
+    ),
     "reflector_recovery.cleanup_continuation": (
         "Deletes private replay evidence outside GEPA_DIR, never public artifacts.",
         {"path.unlink": 1},
@@ -133,10 +137,6 @@ ALLOWLIST = {
     "select._append_journal_once": (
         "Non-held-out fallback after SafeDir/record publication returns or an explicit held-out branch.",
         {"path.parent.mkdir": 1, "path.open": 1},
-    ),
-    "select._reset_primary_to": (
-        "Held-out branch resets without reading/writing the public journal, then returns.",
-        {"journal_file.read_bytes": 1, "journal_file.write_bytes": 1},
     ),
     "select._emit_merge_opportunities": (
         "Non-held-out fallback after SafeDir/record publication returns or an explicit held-out branch.",
@@ -214,12 +214,8 @@ ALLOWLIST = {
         },
     ),
     "lanes.ensure_worktrees_ignored": (
-        "Git common-dir info/exclude, outside GEPA_DIR; lane Git lifecycle is separately refused with held-out access.",
-        {"info_dir.mkdir": 1, "exclude.read_text": 1, "exclude.open": 1},
-    ),
-    "lanes.create_lane_worktree": (
-        "Lane worktree parent outside GEPA_DIR; Git lifecycle is separately refused with held-out access.",
-        {"path.parent.mkdir": 1},
+        "Controller Git common-dir info/exclude, outside GEPA_DIR; independent lane storage is owned by lane_repositories.",
+        {"info.mkdir": 1, "exclude.read_text": 1, "exclude.open": 1},
     ),
     "lanes._append_journal": (
         "Non-held-out fallback after SafeDir/record publication returns or an explicit held-out branch.",

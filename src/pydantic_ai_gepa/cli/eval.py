@@ -109,6 +109,7 @@ from .runs import (
     utc_now_iso,
 )
 from .store import ComponentStore
+from .lane_ledger import lane_training_evaluation
 from .spend import evaluation_spend, spend_report, validate_cap
 from ..vector_acceptance import (
     VectorRecord,
@@ -308,7 +309,9 @@ def current_trace_path() -> Path | None:
 
 
 @contextmanager
-def _expose_trace_path(path: Path | None) -> Iterator[None]:
+def _expose_trace_path(
+    path: Path | None, *, root: Path | None = None
+) -> Iterator[None]:
     previous = os.environ.get(GEPA_TRACE_FILE_ENV)
     if path is None:
         os.environ.pop(GEPA_TRACE_FILE_ENV, None)
@@ -316,7 +319,7 @@ def _expose_trace_path(path: Path | None) -> Iterator[None]:
         if heldout_dataset(required=False):
             from .harness_record import SafeDir
 
-            with SafeDir.open(repo_root(), path.parent, create=True):
+            with SafeDir.open(root or repo_root(), path.parent, create=True):
                 pass
         else:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -395,6 +398,7 @@ def _write_trace_file(
 
 @private_evaluation
 @serialized_eval
+@lane_training_evaluation
 def run_eval_once(
     *,
     candidate_file: Path | None,
@@ -449,7 +453,11 @@ def run_eval_once(
         redact_selection_evidence = True
 
     primary_project_root = (workspace_root or repo_root()).resolve()
-    active_candidate_project = (candidate_root or primary_project_root).resolve()
+    from .lane_repositories import candidate_root as routed_candidate
+
+    active_candidate_project = routed_candidate(
+        candidate_root or primary_project_root
+    ).resolve()
     from .harness_record import for_run
 
     active_run_id = _resolve_run_id(run_id, root=workspace_root)
@@ -784,6 +792,7 @@ def run_eval_once(
             records = scoring_sandbox.score_cases(
                 config=cfg,
                 project=active_candidate_project,
+                scorer_project=primary_project_root,
                 sha=git_state.commit_sha,
                 cases=subset,
                 validation=dataset_role == "validation",
@@ -833,7 +842,7 @@ def run_eval_once(
                 )
                 case_factory = resolve_case_factory(cfg, expected_root=scorer_root)
                 skills_fs = resolve_skills(cfg, root=scorer_root)
-                with _expose_trace_path(planned_trace_path):
+                with _expose_trace_path(planned_trace_path, root=primary_project_root):
                     if evaluate is not None:
                         records = asyncio.run(
                             evaluate_callable_dataset(
@@ -867,7 +876,7 @@ def run_eval_once(
                 os.environ[GEPA_CANDIDATE_COMPONENTS_ENV] = previous_payload
         else:
             assert metric is not None
-            with _expose_trace_path(planned_trace_path):
+            with _expose_trace_path(planned_trace_path, root=primary_project_root):
                 assert agent is not None
                 records = asyncio.run(
                     evaluate_candidate_dataset(

@@ -333,7 +333,11 @@ def test_private_helpers_require_harness_environment_even_with_cached_evidence(h
         lambda: run_module._confirm_validation_candidate(state),
         lambda: state.restore_validation_evidence(),
         lambda: _row_outcome(state, row, 1, state.threshold),
-        lambda: _run_select_locked(Path(state.project_root), state),
+        # Reach the capability guard with a current lane-layout state; this
+        # fixture otherwise represents a single-checkout run.
+        lambda: _run_select_locked(
+            Path(state.project_root), replace(state, lane_repository_version=1)
+        ),
     ):
         with pytest.raises(typer.BadParameter, match="GEPA_HELDOUT_DATASET"):
             call()

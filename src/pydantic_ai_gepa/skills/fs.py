@@ -166,8 +166,11 @@ class SkillsFS:
                     f"Symlink escape detected: {path} points outside of skills root {root}"
                 )
 
-            rel = path.relative_to(root).as_posix()
-            if not include_hidden and any(part.startswith(".") for part in path.parts):
+            relative_path = path.relative_to(root)
+            rel = relative_path.as_posix()
+            if not include_hidden and any(
+                part.startswith(".") for part in relative_path.parts
+            ):
                 continue
 
             file_count += 1

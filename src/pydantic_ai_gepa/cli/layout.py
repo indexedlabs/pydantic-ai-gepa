@@ -414,6 +414,10 @@ def repo_root(start: Path | None = None) -> Path:
             return candidate
         if (candidate / "pyproject.toml").is_file():
             return candidate
+        # A workspace in the user's home must not capture an unrelated checkout
+        # (including temporary projects nested inside that checkout).
+        if (candidate / ".git").exists():
+            break
     return Path.cwd().resolve()
 
 
@@ -469,7 +473,9 @@ def candidate_project_root(
 ) -> Path:
     """Map a primary monorepo project into a candidate Git worktree."""
 
-    prefix = project_prefix(primary_project_root)
+    from .lane_repositories import candidate_root
+
+    prefix = project_prefix(candidate_root(primary_project_root))
     candidate = (candidate_git_root.resolve() / prefix).resolve()
     if not candidate.is_dir():
         raise GepaConfigError(
@@ -555,12 +561,16 @@ def traces_dir(run_id: str, case_id: str, root: Path | None = None) -> Path:
 
 
 def pareto_log_path(run_id: str, root: Path | None = None) -> Path:
-    return run_dir(run_id, root) / "pareto.jsonl"
+    from .lane_ledger import directory
+
+    return directory(run_id, root) / "pareto.jsonl"
 
 
 def vector_records_path(run_id: str, root: Path | None = None) -> Path:
     """Append-only assertion-vector rollout records for a managed run."""
-    return run_dir(run_id, root) / "vectors.jsonl"
+    from .lane_ledger import directory
+
+    return directory(run_id, root) / "vectors.jsonl"
 
 
 def probe_receipts_dir(run_id: str, root: Path | None = None) -> Path:
@@ -808,7 +818,9 @@ def _module_source_paths(module: Any) -> tuple[Path, ...]:
     resolved: list[Path] = []
     for raw in raw_paths:
         try:
-            path = Path(raw).resolve()
+            # Import provenance is already a path; inspecting loaded modules
+            # must not stat an earlier, now inaccessible scorer checkout.
+            path = Path(os.path.abspath(raw))
         except (OSError, RuntimeError, TypeError):
             continue
         if path not in resolved:
@@ -894,6 +906,15 @@ def candidate_import_context(
     primary_repository = git_root(primary)
     candidate_repository = git_root(candidate)
     configured_roots = {ref.split(":", 1)[0].split(".", 1)[0] for ref in refs if ref}
+    # A reflector may have evaluated a different repository earlier in this
+    # interpreter. Evict local dependency names too, without inspecting that
+    # now-inaccessible checkout to discover its package roots.
+    for directory in (candidate, candidate / "src"):
+        if directory.is_dir():
+            for child in directory.iterdir():
+                name = child.stem if child.suffix == ".py" else child.name
+                if name.isidentifier() and (child.suffix == ".py" or child.is_dir()):
+                    configured_roots.add(name)
     interpreter_roots = _interpreter_roots()
     removed: dict[str, Any] = {}
     repositories = (primary_repository, candidate_repository)
@@ -911,7 +932,7 @@ def candidate_import_context(
     external_paths: list[str] = []
     for entry in sys.path:
         try:
-            resolved_entry = Path(entry or original_cwd).resolve()
+            resolved_entry = Path(os.path.abspath(entry or original_cwd))
             if any(_is_below(resolved_entry, root) for root in interpreter_roots):
                 external_paths.append(entry)
                 continue

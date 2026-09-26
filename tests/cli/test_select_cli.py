@@ -20,6 +20,8 @@ from click.testing import Result
 from typer.testing import CliRunner
 
 from pydantic_ai_gepa.cli import app as gepa_app
+from pydantic_ai_gepa.cli.lanes import worktrees_root
+from pydantic_ai_gepa.cli.lane_repositories import load as load_repositories
 from pydantic_ai_gepa.cli.lanes import LaneState, load_lane_state
 from pydantic_ai_gepa.cli.run import RunState
 from pydantic_ai_gepa.cli.runs import ParetoLog, utc_now_iso
@@ -161,10 +163,12 @@ def _start_lane_run(repo: Path, lanes: int = 3, *extra: str) -> dict[str, object
 
 def _drive_lane(repo: Path, run_id: str, lane: str, files: dict[str, str]) -> LaneState:
     """Reflector flow: edit the lane worktree, foreground `lane continue`."""
-    worktree = repo / "worktrees" / run_id / lane
+    worktree = worktrees_root(repo) / run_id / lane
     for name, content in files.items():
         (worktree / name).write_text(content, encoding="utf-8")
     old_cwd = Path.cwd()
+    # A reflector's training process never receives the harness capability.
+    dataset = os.environ.pop("GEPA_HELDOUT_DATASET", None)
     os.chdir(worktree)
     try:
         result = _run(
@@ -179,6 +183,8 @@ def _drive_lane(repo: Path, run_id: str, lane: str, files: dict[str, str]) -> La
         )
     finally:
         os.chdir(old_cwd)
+        if dataset is not None:
+            os.environ["GEPA_HELDOUT_DATASET"] = dataset
     assert result.exit_code == 0, result.output
     return load_lane_state(repo, run_id, lane)
 
@@ -232,8 +238,13 @@ def _events(repo: Path, run_id: str, type_: str | None = None) -> list[dict[str,
 
 
 def _lane_branches(repo: Path) -> list[str]:
-    out = _git(repo, "branch", "--format=%(refname:short)", "--list", "gepa/lane/*")
-    return sorted(line for line in out.splitlines() if line)
+    assert (
+        _git(repo, "branch", "--format=%(refname:short)", "--list", "gepa/lane/*") == ""
+    )
+    return sorted(
+        _git(path.parent, "symbolic-ref", "--short", "HEAD")
+        for path in worktrees_root(repo).glob("*/*/.git")
+    )
 
 
 def _run_id(run: dict[str, object]) -> str:
@@ -268,8 +279,13 @@ def test_select_promotes_winner_journals_losers_and_refans(git_repo: Path) -> No
     assert state.status == "running"
     assert state.best_commit_sha == lane_2.candidate_sha
     assert state.best_mean_score == pytest.approx(1.0)
-    assert _git(git_repo, "rev-parse", "HEAD") == lane_2.candidate_sha
-    assert (git_repo / "out_case-3.txt").read_text(encoding="utf-8") == "c\n"
+    assert (
+        _git(load_repositories(git_repo, run_id).repository, "rev-parse", "HEAD")
+        == lane_2.candidate_sha
+    )
+    assert (load_repositories(git_repo, run_id).project / "out_case-3.txt").read_text(
+        encoding="utf-8"
+    ) == "c\n"
 
     # Journal write-back: two loser entries + the promoted entry, each with
     # diff summary, verdict, delta, and confidence.
@@ -302,7 +318,7 @@ def test_select_promotes_winner_journals_losers_and_refans(git_repo: Path) -> No
         assert lane_state.lease_epoch >= 1
         assert lane_state.candidate_sha is None
         assert lane_state.verdict is None
-        worktree = git_repo / "worktrees" / run_id / lane
+        worktree = worktrees_root(git_repo) / run_id / lane
         assert _git(worktree, "rev-parse", "HEAD") == lane_2.candidate_sha
         assert Path(str(lane_state.packet_path)).exists()
         packet = json.loads(Path(str(lane_state.packet_path)).read_text())
@@ -692,7 +708,7 @@ def test_straggler_terminated_journaled_and_refanned(git_repo: Path) -> None:
 
     # Simulate an in-flight eval on lane-2: committed partial work, an
     # uncommitted scratch file, partial samples, live pid, fresh heartbeat.
-    worktree = git_repo / "worktrees" / run_id / "lane-2"
+    worktree = worktrees_root(git_repo) / run_id / "lane-2"
     (worktree / "out_case-2.txt").write_text("b\n", encoding="utf-8")
     (worktree / "notes.txt").write_text("scratch\n", encoding="utf-8")
     _git(worktree, "add", "out_case-2.txt")
@@ -761,7 +777,7 @@ def test_cross_branch_point_lane_invalidated(git_repo: Path) -> None:
     winner = _drive_lane(git_repo, run_id, "lane-1", {"out_case-2.txt": "b\n"})
 
     # lane-2's "candidate" is an orphan root commit (different branch point).
-    worktree = git_repo / "worktrees" / run_id / "lane-2"
+    worktree = worktrees_root(git_repo) / run_id / "lane-2"
     _git(worktree, "checkout", "--orphan", "lane-2-orphan")
     _git(
         worktree,
@@ -891,7 +907,10 @@ def test_select_killed_after_promotion_resumes_exactly_once(
     assert state.select_phase is None
     assert state.select_context is None
     assert state.best_commit_sha == lane_2.candidate_sha
-    assert _git(git_repo, "rev-parse", "HEAD") == lane_2.candidate_sha
+    assert (
+        _git(load_repositories(git_repo, run_id).repository, "rev-parse", "HEAD")
+        == lane_2.candidate_sha
+    )
 
 
 def test_merge_opportunity_for_disjoint_accepted_lanes(git_repo: Path) -> None:
@@ -923,9 +942,12 @@ def test_merge_opportunity_for_disjoint_accepted_lanes(git_repo: Path) -> None:
     # the promoted tree.
     state = _state(git_repo, run_id)
     assert state.best_commit_sha == lane_1.candidate_sha
-    assert _git(git_repo, "rev-parse", "HEAD") == lane_1.candidate_sha
-    assert (git_repo / "out_case-2.txt").exists()
-    assert not (git_repo / "out_case-3.txt").exists()
+    assert (
+        _git(load_repositories(git_repo, run_id).repository, "rev-parse", "HEAD")
+        == lane_1.candidate_sha
+    )
+    assert (load_repositories(git_repo, run_id).project / "out_case-2.txt").exists()
+    assert not (load_repositories(git_repo, run_id).project / "out_case-3.txt").exists()
 
 
 def test_budget_exhausted_marks_done_with_overshoot(git_repo: Path) -> None:
@@ -955,16 +977,19 @@ def test_budget_exhausted_marks_done_with_overshoot(git_repo: Path) -> None:
     assert "budget_overshoot: 1" in report
 
     # Lanes are removed when the run completes: no re-fan happened.
-    assert not (git_repo / "worktrees" / run_id / "lane-1").exists()
-    assert not (git_repo / "worktrees" / run_id / "lane-2").exists()
+    assert not (worktrees_root(git_repo) / run_id / "lane-1").exists()
+    assert not (worktrees_root(git_repo) / run_id / "lane-2").exists()
     # Both lanes were accepted with disjoint diffs, so their branches form a
     # merge pair and SURVIVE finalize — the merge_opportunity event names
     # branches for the orchestrator to merge, so deleting them in the same
     # select would make the event unactionable.
-    assert _lane_branches(git_repo) == [
-        f"gepa/lane/{run_id}/lane-1/4",
-        f"gepa/lane/{run_id}/lane-2/4",
-    ]
+    assert _lane_branches(git_repo) == []
+    retained = load_repositories(git_repo, run_id).repository
+    for event in _events(git_repo, run_id, "merge_opportunity"):
+        for key in ("commit_a", "commit_b"):
+            assert (
+                _git(retained, "cat-file", "-t", str(event["payload"][key])) == "commit"
+            )
     assert len(_events(git_repo, run_id, "lane_ready")) == 2  # fan-out only
 
     # A done run has nothing to select.
@@ -1005,7 +1030,11 @@ def test_select_dirty_primary_promotes_in_run_state_only(git_repo: Path) -> None
     (git_repo / "untracked-note.txt").write_text("user work\n", encoding="utf-8")
     result = _select(git_repo, run_id)
     assert result.exit_code == 0, result.output
-    assert "primary checkout is dirty" in result.output
+    assert "primary checkout is dirty" not in result.output
+    assert (
+        _git(load_repositories(git_repo, run_id).repository, "rev-parse", "HEAD")
+        == lane_1.candidate_sha
+    )
 
     state = _state(git_repo, run_id)
     assert state.best_commit_sha == lane_1.candidate_sha
@@ -1016,7 +1045,6 @@ def test_select_dirty_primary_promotes_in_run_state_only(git_repo: Path) -> None
     # Winner branch kept so the promoted commit stays reachable; the fresh
     # re-fan branch exists alongside it.
     assert _lane_branches(git_repo) == [
-        f"gepa/lane/{run_id}/lane-1/4",
         f"gepa/lane/{run_id}/lane-1/5",
     ]
     # The shared baseline was still re-measured at the new best (via the
@@ -1356,7 +1384,7 @@ def test_external_validation_leaves_only_aggregate_artifacts(
     assert payload["validation_evaluations"] == 3
     assert not (git_repo / ".gepa" / "validation.jsonl").exists()
     if lanes:
-        worktree = git_repo / "worktrees" / run_id / "lane-1"
+        worktree = worktrees_root(git_repo) / run_id / "lane-1"
         assert worktree.is_dir()
         assert not (worktree / ".gepa" / "validation.jsonl").exists()
         assert "validation.jsonl" not in _git(worktree, "ls-files")
@@ -1387,3 +1415,264 @@ def test_external_validation_leaves_only_aggregate_artifacts(
     assert len(rows) == 3
     assert all(row.mean_score == 0.0 for row in rows)
     assert all(row.per_case_scores == {} for row in rows)
+
+
+def test_pinned_lane_uses_controller_incumbent_scorer(git_repo: Path) -> None:
+    config = git_repo / ".gepa/gepa.toml"
+    with config.open("a") as handle:
+        handle.write("\n[acceptance]\npinned_scorer = true\n")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "Pin scorer")
+    run = _start_lane_run(git_repo, 1, "--max-iterations", "20")
+    run_id = str(run["run_id"])
+    lane = _drive_lane(
+        git_repo,
+        run_id,
+        "lane-1",
+        {
+            "task_pkg/evaluation.py": "async def evaluate(case):\n    return case.expected_output\n"
+        },
+    )
+    assert lane.verdict == "equivalent"
+    from pydantic_ai_gepa.cli.lane_repositories import scorer_path
+
+    snapshot = scorer_path(
+        git_repo, run_id, "lane-1", str(run["reflection_baseline_commit_sha"])
+    )
+    assert (snapshot / "task_pkg/evaluation.py").read_text() == EVALUATE_MODULE_SOURCE
+    assert not (snapshot / ".git/objects/info/alternates").exists()
+    result = _select(git_repo, run_id)
+    assert result.exit_code == 0, result.output
+    assert _state(git_repo, run_id).best_commit_sha == run["best_commit_sha"]
+
+
+def test_select_older_lane_run_after_new_single_run(git_repo: Path) -> None:
+    run = _start_lane_run(git_repo, 1, "--max-iterations", "20")
+    run_id = str(run["run_id"])
+    lane = _drive_lane(git_repo, run_id, "lane-1", {"out_case-2.txt": "b\n"})
+    later = _run("run", "start", "--size", "3", "--max-iterations", "20")
+    assert later.exit_code == 0, later.output
+    result = _select(git_repo, run_id)
+    assert result.exit_code == 0, result.output
+    assert _state(git_repo, run_id).best_commit_sha == lane.candidate_sha
+
+
+@pytest.mark.parametrize(
+    "damage", ["missing_git", "alternate", "missing_sha", "symlink", "gitlink"]
+)
+def test_broken_lane_does_not_wedge_other_selection(
+    git_repo: Path, damage: str
+) -> None:
+    import shutil
+    from dataclasses import replace
+
+    run = _start_lane_run(git_repo, 2, "--max-iterations", "20")
+    run_id = str(run["run_id"])
+    good = _drive_lane(git_repo, run_id, "lane-1", {"out_case-2.txt": "b\n"})
+    bad = _drive_lane(
+        git_repo, run_id, "lane-2", {"out_case-2.txt": "b\n", "out_case-3.txt": "c\n"}
+    )
+    lane = worktrees_root(git_repo) / run_id / "lane-2"
+    if damage == "missing_git":
+        shutil.rmtree(lane / ".git")
+    elif damage == "alternate":
+        (lane / ".git/objects/info/alternates").write_text("/not-permitted\n")
+    elif damage == "missing_sha":
+        bad = replace(bad, candidate_sha="a" * 40)
+    else:
+        if damage == "symlink":
+            (lane / "link").symlink_to("out_case-1.txt")
+            _git(lane, "add", ".")
+        else:
+            _git(
+                lane,
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000," + str(bad.candidate_sha) + ",submodule",
+            )
+        _git(lane, "commit", "-m", "Unsupported tree entry")
+        bad = replace(bad, candidate_sha=_git(lane, "rev-parse", "HEAD"))
+    bad.save(git_repo, run_id)
+    result = _select(git_repo, run_id)
+    assert result.exit_code == 0, result.output
+    assert _state(git_repo, run_id).best_commit_sha == good.candidate_sha
+    assert _journal_outcomes(git_repo, run_id, lane="lane-2", outcome="invalidated")
+
+
+def test_finalize_does_not_signal_stale_pid_on_resolved_lane(
+    git_repo: Path, monkeypatch
+) -> None:
+    from dataclasses import replace
+    import importlib
+
+    select = importlib.import_module("pydantic_ai_gepa.cli.select")
+    run = _start_lane_run(git_repo, 1, "--max-iterations", "20")
+    run_id = str(run["run_id"])
+    lane = load_lane_state(git_repo, run_id, "lane-1")
+    replace(lane, eval_pid=os.getpid(), status="awaiting_selection").save(
+        git_repo, run_id
+    )
+    monkeypatch.setattr(
+        select,
+        "_terminate_eval_pid",
+        lambda *args, **kwargs: pytest.fail("signaled a stale pid"),
+    )
+    select._phase_finalize(git_repo, _state(git_repo, run_id), {})
+
+
+def test_straggler_ignores_forged_worktree_path(git_repo: Path, monkeypatch) -> None:
+    from dataclasses import replace
+    import importlib
+
+    select = importlib.import_module("pydantic_ai_gepa.cli.select")
+    run = _start_lane_run(git_repo, 1)
+    run_id = str(run["run_id"])
+    lane = load_lane_state(git_repo, run_id, "lane-1")
+    forged = replace(lane, worktree_path=str(git_repo))
+    seen = []
+
+    def read(root, *args):
+        seen.append(root)
+        return ""
+
+    monkeypatch.setattr(select, "_git", read)
+    select._invalidate_straggler(
+        git_repo, _state(git_repo, run_id), forged, reason="test"
+    )
+    assert seen and all(
+        path == worktrees_root(git_repo) / run_id / "lane-1" for path in seen
+    )
+
+
+def test_packet_explains_missing_lane_interpreter(git_repo: Path, monkeypatch) -> None:
+    from pydantic_ai_gepa.cli.lanes import write_packet
+
+    run = _start_lane_run(git_repo, 1)
+    run_id = str(run["run_id"])
+    lane = load_lane_state(git_repo, run_id, "lane-1")
+    monkeypatch.setattr(sys, "executable", str(git_repo / ".venv/bin/python"))
+    packet = write_packet(
+        git_repo,
+        _state(git_repo, run_id),
+        "lane-1",
+        lane.iteration,
+        Path(str(lane.worktree_path)),
+        str(lane.branch),
+    )
+    data = json.loads(packet.read_text())
+    assert str(Path(str(lane.worktree_path)) / ".venv") in data["runtime_setup"]
+    assert "uv sync" in data["runtime_setup"]
+
+
+def test_refan_repairs_scorer_after_lane_publish_crash(git_repo, monkeypatch):
+    from pydantic_ai_gepa.cli import lane_repositories, select
+    from pydantic_ai_gepa.cli.lanes import lane_branch
+
+    with (git_repo / ".gepa/gepa.toml").open("a") as handle:
+        handle.write("\n[acceptance]\npinned_scorer = true\n")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "Pinned scorer")
+    started = _start_lane_run(git_repo, 1, "--max-iterations", "20")
+    run_id = str(started["run_id"])
+    lane = _drive_lane(git_repo, run_id, "lane-1", {"out_case-2.txt": "b\n"})
+    sha = str(lane.candidate_sha)
+    repositories = lane_repositories.load(git_repo, run_id)
+    repositories.import_lane("lane-1", sha)
+    snapshot = lane_repositories.scorer_path(git_repo, run_id, "lane-1", sha)
+    branch = lane_branch(run_id, "lane-1", lane.iteration + 1)
+    with monkeypatch.context() as patch:
+
+        def crash(*args):
+            raise OSError("interrupted after lane publish")
+
+        patch.setattr(lane_repositories.Repositories, "ensure_scorer", crash)
+        with pytest.raises(OSError, match="interrupted"):
+            select._refan_lane(
+                git_repo,
+                _state(git_repo, run_id),
+                lane,
+                new_branch=branch,
+                new_iteration=lane.iteration + 1,
+                new_best=sha,
+            )
+    assert not snapshot.exists()
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            lane_repositories.Repositories,
+            "create_lane",
+            lambda *args, **kwargs: pytest.fail("lane already published"),
+        )
+        select._refan_lane(
+            git_repo,
+            _state(git_repo, run_id),
+            lane,
+            new_branch=branch,
+            new_iteration=lane.iteration + 1,
+            new_best=sha,
+        )
+    assert _git(snapshot, "rev-parse", "HEAD") == sha
+
+
+@pytest.mark.parametrize(
+    "operation", ["import_lane", "candidate", "snapshot_validation"]
+)
+def test_controller_storage_failure_preserves_proposal_for_retry(
+    git_repo, monkeypatch, operation
+):
+    from pydantic_ai_gepa.cli import lane_repositories
+
+    started = _start_lane_run(git_repo, 1, "--max-iterations", "20")
+    run_id = str(started["run_id"])
+    lane = _drive_lane(git_repo, run_id, "lane-1", {"out_case-2.txt": "b\n"})
+    with monkeypatch.context() as patch:
+
+        def fail(*args):
+            raise OSError("controller disk full")
+
+        if operation == "snapshot_validation":
+            command = lane_repositories._command
+
+            def full_disk(root, *args, **kwargs):
+                if args[0] == "fsck":
+                    raise subprocess.CalledProcessError(
+                        128, args, stderr=b"No space left on device"
+                    )
+                return command(root, *args, **kwargs)
+
+            patch.setattr(lane_repositories, "_command", full_disk)
+        else:
+            patch.setattr(lane_repositories.Repositories, operation, fail)
+        result = _select(git_repo, run_id)
+    assert isinstance(result.exception, (OSError, subprocess.CalledProcessError))
+    assert load_lane_state(git_repo, run_id, "lane-1").status == "awaiting_selection"
+    assert not _journal_outcomes(git_repo, run_id, lane="lane-1", outcome="invalidated")
+    resumed = _select(git_repo, run_id)
+    assert resumed.exit_code == 0, resumed.output
+    assert _state(git_repo, run_id).best_commit_sha == lane.candidate_sha
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+def test_only_pinned_runs_create_scorers_and_finalize_cleans_them(
+    git_repo, tmp_path_factory, pinned
+):
+    from pydantic_ai_gepa.cli import lane_repositories, select
+
+    if pinned:
+        with (git_repo / ".gepa/gepa.toml").open("a") as handle:
+            handle.write("\n[acceptance]\npinned_scorer = true\n")
+        _git(git_repo, "add", ".")
+        _git(git_repo, "commit", "-m", "Pinned scorer")
+    started = _start_lane_run(git_repo, 1, "--max-iterations", "20")
+    run_id = str(started["run_id"])
+    snapshot = lane_repositories.scorer_path(
+        git_repo, run_id, "lane-1", str(started["reflection_baseline_commit_sha"])
+    )
+    assert snapshot.exists() == pinned
+    victim = tmp_path_factory.mktemp("scorer-cleanup-victim")
+    (victim / "keep").write_text("unchanged")
+    if pinned:
+        (snapshot / "redirect").symlink_to(victim, target_is_directory=True)
+    select._phase_finalize(git_repo, _state(git_repo, run_id), {})
+    assert not snapshot.parent.parent.exists()
+    assert (victim / "keep").read_text() == "unchanged"
