@@ -423,6 +423,11 @@ They support unpinned code scoring or the trusted-scorer mode described below.
 Component candidates, vector comparators and pinned scoring without
 `trusted_scorer` fail closed before candidate imports. A dirty-tree refusal asks you to commit
 before nominating. Keep the nominated tree unchanged until the result arrives.
+Git-mode identity ignores global/user excludes (`core.excludesFile` and
+`~/.config/git/ignore`); move those patterns to `.gitignore` or a regular
+`.git/info/exclude` file. Git LFS and other filter-based repositories are not
+supported: filters never run, so materialized filter-based files look dirty
+and cannot be nominated.
 The harness checks the shared checkout for stale nominations, but scores a
 private checkout of raw Git objects (the nominated commit for unpinned scoring,
 or the harness-pinned scorer revision for trusted scoring). No worktree registration,
@@ -580,13 +585,33 @@ Held-out harness commands skip candidate-owned `.env` files. Install the harness
 in storage the reflector cannot modify, and keep provider credentials out of the
 reflector environment.
 
-The reflector must not be able to write the shared repository's `.git/config`,
-`.git/info/attributes`, or the file named by `core.attributesFile`. Other harness
-Git commands inherited from #62 still use local configuration and attributes,
-which can select executable filters or helpers. Hardening those commands is a
-separate follow-up. The README profile grants worktree writes, so in a
-single-checkout layout it does not by itself protect `.git/` inside that tree;
-the orchestrator must enforce this additional restriction.
+Harness Git commands read reflector objects through a harness-owned repository,
+without loading reflector repository, global or system configuration, executable
+attribute drivers, hooks, fsmonitor, filters, textconv, external diff or lazy fetch.
+The harness pins an absolute Git executable once per process, requiring root
+ownership and no group/other write permissions on the executable and every
+ancestor directory. On macOS it appends `usr/bin/git` to the developer directory
+named by the root-owned `/var/db/xcode_select_link`, or falls back to
+`/Library/Developer/CommandLineTools/usr/bin/git`;
+it never executes the `/usr/bin/git` xcrun shim or honors `DEVELOPER_DIR`.
+Xcode under `/Applications` does not qualify while that directory is
+admin-group-writable (the default); such hosts need the Command Line Tools installed.
+On other systems it checks `/usr/bin/git`, then `/bin/git`. No qualifying binary
+means refusal. Git retains its compiled helper location; `GIT_EXEC_PATH` is not set.
+Reflector metadata reads refuse symlinks, hard links and special files, except
+that these `info/exclude` entries are treated as empty. Oversized metadata,
+including `info/exclude`, fails closed. Worktree
+attributes can still apply Git's built-in data conversions. Harness Git storage
+lives beside the held-out set and must be outside the reflector's writable roots,
+just like the private scoring checkout.
+Public candidate retention refs are written as data through directory handles
+that refuse symlinks, without invoking source Git hooks; ordinary branch resets
+and garbage collection preserve the retained commits.
+
+Held-out lane start/select and all lane Git mutations (including worktree
+creation/removal, reset, checkout and branch updates) currently fail closed when
+`GEPA_HELDOUT_DATASET` is configured. Use a single-checkout run (`--lanes 0`) for
+held-out scoring; safe lane mutations require a separate design.
 
 Sandbox rollouts run serially; the parent retains cost admission and response-level
 accounting. Public spend uses a fixed `sandbox` model bucket to prevent model names

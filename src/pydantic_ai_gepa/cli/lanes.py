@@ -369,6 +369,17 @@ def ensure_worktrees_ignored(workspace_root: Path) -> None:
 
 
 def _git(root: Path, *args: str) -> str:
+    from .safe_git import refuse_heldout_git_mutations, run_git
+
+    if args[0] in {"rev-parse", "diff", "status", "ls-files", "merge-base"}:
+        if args == ("rev-parse", "--git-common-dir"):
+            from .safe_git import Repository
+
+            return str(Repository.discover(root).common_dir)
+        return run_git(
+            root, *args, check=True, capture_output=True, text=True
+        ).stdout.strip()
+    refuse_heldout_git_mutations()
     return subprocess.run(
         ["git", "-C", str(root), *args],
         check=True,
@@ -923,9 +934,12 @@ def _review_rejection(
 def _candidate_changed_paths(worktree: Path, baseline: str) -> set[str]:
     """Return changed paths, including both sides of renames and untracked files."""
 
+    from .safe_git import run_git
+
     def raw_git(*args: str) -> str:
-        return subprocess.run(
-            ["git", "-C", str(worktree), *args],
+        return run_git(
+            worktree,
+            *args,
             check=True,
             capture_output=True,
             text=True,
@@ -958,8 +972,14 @@ def _candidate_diff(worktree: Path, baseline: str, paths: list[str]) -> str:
     """Return actual offending hunks, including untracked files where possible."""
     if not paths:
         return ""
-    tracked = subprocess.run(
-        ["git", "-C", str(worktree), "diff", "--no-ext-diff", baseline, "--", *paths],
+    from .safe_git import run_git
+
+    tracked = run_git(
+        worktree,
+        "diff",
+        baseline,
+        "--",
+        *paths,
         check=True,
         capture_output=True,
         text=True,
@@ -969,15 +989,24 @@ def _candidate_diff(worktree: Path, baseline: str, paths: list[str]) -> str:
         path = worktree / relative
         if not path.is_file():
             continue
-        known = subprocess.run(
-            ["git", "-C", str(worktree), "ls-files", "--error-unmatch", "--", relative],
+        known = run_git(
+            worktree,
+            "ls-files",
+            "--error-unmatch",
+            "--",
+            relative,
             capture_output=True,
             text=True,
         )
         if known.returncode == 0:
             continue
-        created = subprocess.run(
-            ["git", "diff", "--no-index", "--", "/dev/null", str(path)],
+        created = run_git(
+            worktree,
+            "diff",
+            "--no-index",
+            "--",
+            "/dev/null",
+            str(path),
             capture_output=True,
             text=True,
         ).stdout

@@ -35,16 +35,19 @@ from .layout import (
 
 def current_commit_sha(root: Path | None = None) -> str | None:
     """Return the short commit sha at HEAD, or None if not in a git repo."""
-    cwd = str(root) if root is not None else None
+    from .safe_git import run_git
+
     try:
-        completed = subprocess.run(
-            ["git", "rev-parse", "--short=10", "HEAD"],
-            cwd=cwd,
+        completed = run_git(
+            root or Path.cwd(),
+            "rev-parse",
+            "--short=10",
+            "HEAD",
             check=True,
             capture_output=True,
             text=True,
         )
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except (subprocess.CalledProcessError, OSError):
         return None
     return completed.stdout.strip() or None
 

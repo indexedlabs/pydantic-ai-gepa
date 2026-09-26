@@ -35,6 +35,8 @@ from .layout import GepaConfig, git_root
 from .scoring_proxy import allowed_addresses, connect_proxy
 from .validation import heldout_dataset
 
+from .safe_git import SafeGit, safe_repository, unsafe_checkout_component
+
 MAX_MESSAGE = 1024 * 1024
 RESPONSE_TIMEOUT = 300
 PROVIDER_KEYS = (
@@ -88,7 +90,11 @@ def _relative_file(value: Any) -> bool:
         isinstance(value, str)
         and not Path(value).is_absolute()
         and "\0" not in value
-        and all(part not in ("", ".", "..") for part in value.split("/"))
+        and all(
+            part not in ("", ".", "..")
+            and not unsafe_checkout_component(os.fsencode(part))
+            for part in value.split("/")
+        )
     )
 
 
@@ -124,14 +130,6 @@ def _verify_frozen_files(checkout: Path, files: dict[str, str]) -> None:
             ) from None
 
 
-def _git_objects(repository: Path) -> tuple[list[str], dict[str, str]]:
-    return ["git", "--no-replace-objects", "-C", str(repository)], {
-        "PATH": "/usr/bin:/bin",
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": "/dev/null",
-    }
-
-
 def candidate_components(
     project: Path, sha: str, files: tuple[str, ...]
 ) -> dict[str, str]:
@@ -142,40 +140,35 @@ def candidate_components(
         raise ScoringSandboxError(
             "Candidate components require project-relative file paths."
         )
-    repository = git_root(project)
-    prefix = project.resolve().relative_to(repository)
-    command, env = _git_objects(repository)
     try:
-        kind = subprocess.run(
-            [*command, "cat-file", "-t", sha], env=env, capture_output=True
-        )
-        if kind.returncode or kind.stdout != b"commit\n":
-            raise ValueError
-        listing = subprocess.run(
-            [*command, "ls-tree", "-r", "-z", "--full-tree", sha],
-            env=env,
-            capture_output=True,
-        )
-        if listing.returncode:
-            raise ValueError
-        entries = {}
-        for record in listing.stdout.split(b"\0")[:-1]:
-            metadata, name = record.split(b"\t", 1)
-            entries[os.fsdecode(name)] = metadata.split(b" ")
-        components = {}
-        for relative in files:
-            mode, kind, oid = entries[(prefix / relative).as_posix()]
-            if mode not in (b"100644", b"100755") or kind != b"blob":
+        with safe_repository(project) as git:
+            prefix = project.resolve().relative_to(git.repository.root)
+            if not all(_relative_file((prefix / path).as_posix()) for path in files):
                 raise ValueError
-            blob = subprocess.run(
-                [*command, "cat-file", "blob", oid.decode("ascii")],
-                env=env,
-                capture_output=True,
+            kind = git.run("cat-file", "-t", sha, capture_output=True)
+            if kind.returncode or kind.stdout != b"commit\n":
+                raise ValueError
+            listing = git.run(
+                "ls-tree", "-r", "-z", "--full-tree", sha, capture_output=True
             )
-            if blob.returncode:
+            if listing.returncode:
                 raise ValueError
-            components[relative] = blob.stdout.decode("utf-8")
-        return components
+            entries = {}
+            for record in listing.stdout.split(b"\0")[:-1]:
+                metadata, name = record.split(b"\t", 1)
+                entries[os.fsdecode(name)] = metadata.split(b" ")
+            components = {}
+            for relative in files:
+                mode, kind, oid = entries[(prefix / relative).as_posix()]
+                if mode not in (b"100644", b"100755") or kind != b"blob":
+                    raise ValueError
+                blob = git.run(
+                    "cat-file", "blob", oid.decode("ascii"), capture_output=True
+                )
+                if blob.returncode:
+                    raise ValueError
+                components[relative] = blob.stdout.decode("utf-8")
+            return components
     except (OSError, ValueError, KeyError):
         raise ScoringSandboxError(
             "Cannot read candidate component UTF-8 blobs."
@@ -306,22 +299,18 @@ def private_checkout(
         scratch.mkdir(mode=0o700)
         # Read raw objects, never worktree conversions. In particular, do not
         # use archive, checkout, or cat-file's --filters/--textconv options.
-        command, env = _git_objects(repository)
         try:
-            kind = subprocess.run(
-                [*command, "cat-file", "-t", sha], env=env, capture_output=True
-            )
-            if kind.returncode or kind.stdout != b"commit\n":
-                raise ScoringSandboxError("Scoring requires a committed candidate.")
-            result = subprocess.run(
-                [*command, "ls-tree", "-r", "-t", "-z", "--full-tree", sha],
-                env=env,
-                capture_output=True,
-            )
-            if result.returncode:
-                raise ScoringSandboxError("Cannot read candidate tree.")
-            entries = _checkout_entries(checkout, result.stdout)
-            _write_checkout_blobs(command, env, entries)
+            with safe_repository(repository) as git:
+                kind = git.run("cat-file", "-t", sha, capture_output=True)
+                if kind.returncode or kind.stdout != b"commit\n":
+                    raise ScoringSandboxError("Scoring requires a committed candidate.")
+                result = git.run(
+                    "ls-tree", "-r", "-t", "-z", "--full-tree", sha, capture_output=True
+                )
+                if result.returncode:
+                    raise ScoringSandboxError("Cannot read candidate tree.")
+                entries = _checkout_entries(checkout, result.stdout)
+                _write_checkout_blobs(git, entries)
             _verify_frozen_files(checkout, frozen or {})
         except OSError:
             raise ScoringSandboxError(
@@ -353,7 +342,10 @@ def _checkout_entries(
         target = checkout / os.fsdecode(name)
         if (
             not re.fullmatch(rb"[0-9a-f]{40}|[0-9a-f]{64}", oid)
-            or any(part in (b"", b".", b"..") for part in name.split(b"/"))
+            or any(
+                part in (b"", b".", b"..") or unsafe_checkout_component(part)
+                for part in name.split(b"/")
+            )
             or Path(os.fsdecode(name)).is_absolute()
             or not target.resolve().is_relative_to(checkout)
         ):
@@ -363,11 +355,11 @@ def _checkout_entries(
 
 
 def _write_checkout_blobs(
-    command: list[str], env: dict[str, str], entries: list[tuple[Path, bytes, bytes]]
+    git: SafeGit, entries: list[tuple[Path, bytes, bytes]]
 ) -> None:
-    with subprocess.Popen(
-        [*command, "cat-file", "--batch"],
-        env=env,
+    with git.popen(
+        "cat-file",
+        "--batch",
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,

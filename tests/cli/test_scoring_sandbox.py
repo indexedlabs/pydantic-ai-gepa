@@ -226,6 +226,8 @@ def test_trusted_supports_full_harness_revision(monkeypatch, revision):
         json.dumps({"file": "g" * 64}),
         json.dumps({"file": 1}),
         json.dumps({"file": "a" * 63}),
+        json.dumps({".git/config": "a" * 64}),
+        json.dumps({"nested/.gIt/config": "a" * 64}),
     ],
 )
 def test_malformed_frozen_files_refused_before_checkout(
@@ -303,7 +305,20 @@ def test_components_and_frozen_files_use_explicit_roots(git_repo, private, monke
         assert (checkout / "prompt.txt").read_text() == "committed π"
 
 
-@pytest.mark.parametrize("path", ["../score.txt", "/score.txt", "", "dir/../score.txt"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "../score.txt",
+        "/score.txt",
+        "",
+        "dir/../score.txt",
+        ".git/config",
+        "nested/.gIt/config",
+        "git~1/config",
+        ".git:stream",
+        ".g\u200cit/config",
+    ],
+)
 def test_candidate_component_paths_cannot_escape_project(git_repo, path):
     with pytest.raises(sandbox.ScoringSandboxError, match="project-relative"):
         sandbox.candidate_components(
