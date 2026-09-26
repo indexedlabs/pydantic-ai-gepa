@@ -35,6 +35,8 @@ from typing import Any, Literal
 
 import typer
 
+from . import harness_record
+
 from .layout import latest_run_id, run_dir
 from .runs import utc_now_iso
 
@@ -218,7 +220,7 @@ def cursor_path(run_id: str, root: Path | None = None) -> Path:
     return run_dir(run_id, root) / CURSOR_FILENAME
 
 
-def _read_event(path: Path) -> Event | None:
+def _read_event(path: Path, *, root: Path | None = None) -> Event | None:
     """Read one event file; unparseable files quarantine as ``None``.
 
     The filename *is* the event id (spec-fmc Interface block) — an embedded
@@ -229,7 +231,7 @@ def _read_event(path: Path) -> Event | None:
     if not _EVENT_ID_RE.match(path.name):
         return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(harness_record.read_text(path, root=root))
     except (json.JSONDecodeError, UnicodeDecodeError, OSError):
         print(
             f"warning: ignoring unparseable event file {path.name} "
@@ -257,11 +259,11 @@ def _read_event(path: Path) -> Event | None:
 def list_events(run_id: str, root: Path | None = None) -> list[Event]:
     """Return every event on the run's bus in lexicographic id (delivery) order."""
     base = events_dir(run_id, root)
-    if not base.is_dir():
-        return []
     events = []
-    for path in sorted(base.iterdir(), key=lambda p: p.name):
-        event = _read_event(path)
+    for path in sorted(
+        harness_record.list_paths(base, root=root), key=lambda p: p.name
+    ):
+        event = _read_event(path, root=root)
         if event is not None:
             events.append(event)
     events.sort(key=lambda event: event.id)
@@ -282,7 +284,7 @@ def load_cursor(run_id: str, root: Path | None = None) -> str | None:
     if not path.exists():
         return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(harness_record.read_text(path, root=root))
     except (json.JSONDecodeError, UnicodeDecodeError, OSError):
         print(
             f"warning: cursor file {path} is unreadable; resetting to "
@@ -383,7 +385,13 @@ def emit(
             f"{_PRODUCER_ID_RE.pattern!r} (filename-safe)."
         )
     path = events_dir(run_id, root)
-    path.mkdir(parents=True, exist_ok=True)
+    from .harness_record import SafeDir
+    from .validation import heldout_dataset
+    from .layout import repo_root
+
+    private = heldout_dataset(required=False)
+    if not private:
+        path.mkdir(parents=True, exist_ok=True)
     ts_ms = f"{_now_ms():0{_TIMESTAMP_WIDTH}d}"
     body = {
         "type": draft.type,
@@ -391,6 +399,29 @@ def emit(
         "lane": draft.lane,
         "payload": dict(draft.payload),
     }
+    if private:
+        with SafeDir.open(root or repo_root(), path, create=True) as directory:
+            seq = max(
+                (
+                    int(match.group(3)) + 1
+                    for name in directory.names()
+                    if (match := _EVENT_ID_RE.match(name))
+                    and match.group(2) == producer_id
+                ),
+                default=0,
+            )
+            while True:
+                event_id = f"{ts_ms}-{producer_id}-{seq:0{_SEQ_WIDTH}d}"
+                try:
+                    directory.write_text(
+                        event_id,
+                        json.dumps({"id": event_id, **body}, indent=2, allow_nan=False)
+                        + "\n",
+                        exclusive=True,
+                    )
+                    return event_id
+                except FileExistsError:
+                    seq += 1
     while True:
         seq = _next_seq(path, producer_id)
         event_id = f"{ts_ms}-{producer_id}-{seq:0{_SEQ_WIDTH}d}"
@@ -429,10 +460,10 @@ def next_event(run_id: str, root: Path | None = None) -> Event | None:
         return None
     # Filenames are ids (spec-fmc), so acked events are skipped by name
     # without parsing — the poll path stays O(pending), not O(total).
-    for name in sorted(p.name for p in base.iterdir()):
+    for name in sorted(p.name for p in harness_record.list_paths(base, root=root)):
         if cursor is not None and name <= cursor:
             continue
-        event = _read_event(base / name)
+        event = _read_event(base / name, root=root)
         if event is not None:
             return event
     return None
@@ -522,7 +553,7 @@ def scan_lanes(run_id: str, root: Path | None = None) -> LaneScan:
     return scan if scan is not None else LaneScan()
 
 
-def _claim_reaper_key(events_path: Path, key: str) -> bool:
+def _claim_reaper_key(events_path: Path, key: str, *, root: Path | None = None) -> bool:
     """Atomically claim a reaper dedupe key; False when already claimed.
 
     The dedupe key is a filesystem fact, not a read: exclusive-creating a
@@ -532,6 +563,18 @@ def _claim_reaper_key(events_path: Path, key: str) -> bool:
     (lane, lease epoch) "no matter how many passes run").
     """
     sentinels = events_path / ".reaped"
+    from .validation import heldout_dataset
+    from .layout import repo_root
+
+    if heldout_dataset(required=False):
+        with harness_record.SafeDir.open(
+            root or repo_root(), sentinels, create=True
+        ) as directory:
+            try:
+                directory.write_text(key, "", exclusive=True)
+            except FileExistsError:
+                return False
+        return True
     sentinels.mkdir(parents=True, exist_ok=True)
     try:
         fd = os.open(sentinels / key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
@@ -558,13 +601,20 @@ def run_reaper_pass(
     if scan is None:
         scan = scan_lanes(run_id, root)
     events_path = events_dir(run_id, root)
-    events_path.mkdir(parents=True, exist_ok=True)
+    from .validation import heldout_dataset
+    from .layout import repo_root
+
+    if heldout_dataset(required=False):
+        with harness_record.SafeDir.open(root or repo_root(), events_path, create=True):
+            pass
+    else:
+        events_path.mkdir(parents=True, exist_ok=True)
     emitted: list[str] = []
     for lane in scan.lanes:
         if lane.stalled_reason is None:
             continue
         key = f"lane_stalled-{lane.lane}-e{lane.lease_epoch}"
-        if not _claim_reaper_key(events_path, key):
+        if not _claim_reaper_key(events_path, key, root=root):
             continue
         emitted.append(
             emit(
@@ -584,7 +634,7 @@ def run_reaper_pass(
     if scan.selection_due is not None:
         signal = scan.selection_due
         key = f"selection_due-i{signal.iteration}"
-        if _claim_reaper_key(events_path, key):
+        if _claim_reaper_key(events_path, key, root=root):
             emitted.append(
                 emit(
                     run_id,

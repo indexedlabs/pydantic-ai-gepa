@@ -67,9 +67,15 @@ def append_infrastructure_failures_to_report(
 ) -> None:
     """Append concrete managed-run failure diagnostics to an eval report."""
 
+    with report_path.open("a", encoding="utf-8") as handle:
+        handle.write(format_infrastructure_failures(failures))
+
+
+def format_infrastructure_failures(
+    failures: Sequence[EvaluationInfrastructureFailure],
+) -> str:
     lines = ["", "## Evaluation infrastructure failure", ""]
     for failure in failures:
         kind = failure.error_kind or "unknown"
         lines.append(f"- `{failure.case_id}` ({kind}): {failure.error_message}")
-    with report_path.open("a", encoding="utf-8") as handle:
-        handle.write("\n".join(lines) + "\n")
+    return "\n".join(lines) + "\n"

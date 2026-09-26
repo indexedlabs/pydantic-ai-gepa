@@ -61,6 +61,21 @@ def private(git_repo, monkeypatch):
     return dataset
 
 
+def initialize_private_run(repo, run_id):
+    """Give synthetic scoring tests the same private authority as run start."""
+    from pydantic_ai_gepa.cli.harness_record import initialize
+    from pydantic_ai_gepa.cli.validation import harness_environment, pin_heldout
+
+    with harness_environment():
+        pin_heldout(repo, run_id)
+        initialize(repo, run_id)
+
+
+@pytest.fixture
+def private_run(git_repo, private):
+    initialize_private_run(git_repo, "sandbox-test")
+
+
 @pytest.fixture
 def protocol_backend(monkeypatch):
     """Exec boundary without OS enforcement, for non-adversarial fake data only."""
@@ -1046,7 +1061,9 @@ def test_missing_blob_reaps_reader_and_removes_checkout(git_repo, private, monke
     assert not list((private.parent / ".gepa-heldout/work").iterdir())
 
 
-def test_child_scores_and_keeps_training_feedback(git_repo, private, protocol_backend):
+def test_child_scores_and_keeps_training_feedback(
+    git_repo, private, private_run, protocol_backend
+):
     sha = commit_evaluator(
         git_repo,
         """from pydantic_ai_gepa.types import MetricResult
@@ -1069,7 +1086,7 @@ def metric(case, output):
 
 
 def test_child_receives_harness_named_environment(
-    git_repo, private, protocol_backend, monkeypatch
+    git_repo, private, private_run, protocol_backend, monkeypatch
 ):
     monkeypatch.setenv("GEPA_HARNESS_PASS_ENV", "TYPESAFE_API_KEY")
     monkeypatch.setenv("TYPESAFE_API_KEY", "fake-typesafe-key")
@@ -1087,7 +1104,7 @@ async def evaluate(case):
 
 
 def test_private_checkout_uses_sha_and_changes_no_shared_git(
-    git_repo, private, protocol_backend, monkeypatch
+    git_repo, private, private_run, protocol_backend, monkeypatch
 ):
     sha = commit_evaluator(
         git_repo,
@@ -1126,7 +1143,7 @@ def test_private_checkout_uses_sha_and_changes_no_shared_git(
 
 
 def test_child_sys_exit_does_not_exit_harness(
-    git_repo, private, protocol_backend, monkeypatch
+    git_repo, private, private_run, protocol_backend, monkeypatch
 ):
     sha = commit_evaluator(
         git_repo, "import sys\nasync def evaluate(case): sys.exit(42)\n"
@@ -1330,7 +1347,7 @@ async def evaluate(case):
 
 
 def test_real_sandbox_allows_only_proxy_model_endpoint(
-    real_backend, git_repo, private, monkeypatch
+    real_backend, git_repo, private, private_run, monkeypatch
 ):
     with endpoint() as (port, received):
         monkeypatch.setenv("GEPA_HARNESS_ALLOWED_HOSTS", f"127.0.0.1:{port}")
@@ -1354,7 +1371,7 @@ async def evaluate(case):
 
 @pytest.mark.parametrize("transport", ["unix", "tcp"])
 def test_real_sandbox_cannot_send_cases_to_shared_service(
-    real_backend, git_repo, private, transport
+    real_backend, git_repo, private, private_run, transport
 ):
     family = socket.AF_UNIX if transport == "unix" else socket.AF_INET
     # macOS Unix socket paths have a small limit; pytest's temp root is too long.
@@ -1387,7 +1404,7 @@ async def evaluate(case):
 
 
 def test_real_scratch_is_private_and_cannot_redirect_writes(
-    real_backend, git_repo, private
+    real_backend, git_repo, private, private_run
 ):
     target = git_repo / "scratch-symlink-leak.txt"
     sha = commit_evaluator(
@@ -1412,7 +1429,7 @@ async def evaluate(case):
 
 
 def test_real_proxy_port_does_not_allow_udp(
-    real_backend, git_repo, private, monkeypatch
+    real_backend, git_repo, private, private_run, monkeypatch
 ):
     original = sandbox.connect_proxy
 
@@ -1449,7 +1466,7 @@ async def evaluate(case):
 
 
 def test_real_grandchild_inherits_filesystem_and_network_denials(
-    real_backend, git_repo, private, monkeypatch
+    real_backend, git_repo, private, private_run, monkeypatch
 ):
     fake_home = git_repo.parent / (git_repo.name + "-home")
     fake_home.mkdir()
@@ -1588,7 +1605,7 @@ def test_harness_child_training_gate_and_confirmation(
 
 
 def test_setsid_grandchild_is_swept_and_evaluation_refused(
-    git_repo, private, real_backend, monkeypatch
+    git_repo, private, private_run, real_backend, monkeypatch
 ):
     import subprocess
     import sys

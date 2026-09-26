@@ -440,8 +440,8 @@ lock; either a lock timeout or a result timeout exits **75**. Run the same comma
 again to reattach without duplicating the nomination. A different pending candidate or
 gate selection is refused. `harness serve --once` processes one current
 nomination (and retires old epochs), then returns. Interrupted scoring resumes
-from the existing paid evaluation ledger. Normal `run resume` still issues a
-new epoch and packet without reading validation.
+from the existing paid evaluation ledger. Harness-side `run resume` issues a
+new epoch and packet without evaluating validation.
 
 Results contain explicit controller messages only; candidate/evaluator stdout,
 stderr, and logging streams are never relayed to the reflector. Unexpected
@@ -454,10 +454,10 @@ its original output and exit code. Lane runs immediately direct callers to
 `lane continue` and `run select` without queuing a nomination.
 
 Harness commands are held-out `run start`, `harness serve`, lane `run select`,
-`eval --dataset-role validation`, and held-out `run resume --abandon-continuation`
-when private recovery evidence must be retired. They fail closed without the
-harness environment. Reflector commands are `run continue`, `run status`, normal
-`run resume`, and reading `reflector_packet.json`. `lane continue` evaluates only
+`eval --dataset-role validation`, and held-out `run resume` (including
+`--abandon-continuation`). They fail closed without the harness environment.
+Reflector commands are `run continue`, `run status`, and reading
+`reflector_packet.json`. `lane continue` evaluates only
 training; the orchestrator's `run select` performs held-out selection. Runs
 started without the variable or `--heldout-required` retain in-process,
 training-only continuation.
@@ -682,13 +682,17 @@ What this does not cover:
 - Evaluators that need a local database or another local service. The child has
   no direct local-service ports; only the allowlisted model proxy is reachable.
 - Parallel rollouts within a scoring child; scoring is serial.
-- Authentication of shared results/state and other `GEPA_DIR` coordination files;
-  a reflector with write access can still forge them. This needs a separate
-  ownership/authentication change.
+- Separate OS ownership of the harness and reflector. A reflector that can write
+  beside the held-out dataset can defeat the private record; filesystem isolation
+  of that directory remains required.
 
-Run files are shared coordination state, not authenticated messages; protection
-against a reflector forging state/results in `GEPA_DIR` requires an additional
-ownership or IPC boundary.
+For held-out runs, harness-written files in `GEPA_DIR` are views: the harness acts
+only on its private record beside the held-out dataset, refusing and restoring
+changed views. A missing private record fails closed; legacy held-out runs must
+be restarted. Runs without held-out validation keep their existing behavior.
+Held-out epoch changes and `run resume` require the harness or orchestrator with
+`GEPA_HELDOUT_DATASET`; reflector-side resume is refused. Harness `run status` on
+a finished held-out run rewrites `final_report.md` from the private record.
 
 ### CLI rollout spend caps
 

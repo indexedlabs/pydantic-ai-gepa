@@ -16,6 +16,8 @@ from typing import Any, Literal, Sequence, cast
 
 import typer
 
+from . import harness_record
+
 from ..acceptance import AcceptanceComparison, compare_candidate_samples
 from ..evaluation_health import (
     EvaluationInfrastructureFailure,
@@ -446,24 +448,26 @@ class RunState:
                 identity=self._validation_evidence_identity(),
                 scores=self.best_validation_per_case_scores,
             )
+
         path = run_state_path(self.run_id, root)
-        path.parent.mkdir(parents=True, exist_ok=True)
         # Atomic (tmpfile + os.replace): lane evals, select checkpoints, and
         # operator verbs all write this file; a kill mid-write must never
         # leave torn JSON for the resume logic to trip over.
         import tempfile
 
-        fd, tmp_name = tempfile.mkstemp(
-            dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(state_for_save(self).to_dict(), handle, indent=2)
-                handle.write("\n")
-            os.replace(tmp_name, path)
-        except BaseException:
-            os.unlink(tmp_name)
-            raise
+        serialized = json.dumps(state_for_save(self).to_dict(), indent=2) + "\n"
+        if not harness_record.write_text(path, serialized, root=root):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(serialized)
+                os.replace(tmp_name, path)
+            except BaseException:
+                os.unlink(tmp_name)
+                raise
         after_state_save(root)
         if self.lanes == 0 and self.status != "running":
             try:
@@ -488,14 +492,15 @@ def _load_state(run_id: str | None) -> RunState:
     if active_run_id is None:
         public_echo("No run found. Start one with `gepa run start`.", err=True)
         raise typer.Exit(code=1)
+
     path = run_state_path(active_run_id)
-    if not path.exists():
+    if not harness_record.exists(path):
         public_echo(
             f"No managed run state at {path}. Start one with `gepa run start`.",
             err=True,
         )
         raise typer.Exit(code=1)
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw = json.loads(harness_record.read_text(path))
     if not isinstance(raw, dict):
         public_echo(f"Run state at {path} is not a JSON object.", err=True)
         raise typer.Exit(code=1)
@@ -503,13 +508,15 @@ def _load_state(run_id: str | None) -> RunState:
 
 
 def _latest_managed_run_id() -> str | None:
+    from .harness_record import exists
+
     base = runs_dir()
     if not base.is_dir():
         return None
     for candidate in sorted(
-        (p.name for p in base.iterdir() if p.is_dir()), reverse=True
+        (p.name for p in harness_record.list_paths(base) if p.is_dir()), reverse=True
     ):
-        if run_state_path(candidate).exists():
+        if exists(run_state_path(candidate)):
             return candidate
     return None
 
@@ -1634,7 +1641,6 @@ def _write_final_report(
     validation_rows = pareto.validation_rows()
     selectable_rows = validation_rows or pareto.selectable_rows()
     path = final_report_path(state.run_id, root)
-    path.parent.mkdir(parents=True, exist_ok=True)
 
     lines = [
         "# GEPA Run Final Report",
@@ -1726,7 +1732,10 @@ def _write_final_report(
         ]
     )
     text = "\n".join(lines) + "\n"
-    path.write_text(text, encoding="utf-8")
+
+    if not harness_record.write_text(path, text, root=root):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
     return path, text
 
 
@@ -2145,15 +2154,20 @@ def start(
         # that never reached `done` still owns its lane refs and events.
         from .layout import is_run_id
 
-        for entry in sorted(runs_dir(workspace_root).iterdir()):
+        for entry in sorted(
+            harness_record.list_paths(runs_dir(workspace_root), root=workspace_root)
+        ):
             if not (entry.is_dir() and is_run_id(entry.name)):
                 continue
+
             prior_state_path = entry / "state.json"
-            if not prior_state_path.exists():
+            if not harness_record.exists(prior_state_path, root=workspace_root):
                 continue
             try:
                 prior = RunState.from_dict(
-                    json.loads(prior_state_path.read_text(encoding="utf-8"))
+                    json.loads(
+                        harness_record.read_text(prior_state_path, root=workspace_root)
+                    )
                 )
             except (json.JSONDecodeError, KeyError, ValueError):
                 continue
@@ -2166,10 +2180,19 @@ def start(
                 )
                 raise typer.Exit(code=1)
     run_id = new_run_id()
-    run_dir(run_id).mkdir(parents=True, exist_ok=True)
+    if heldout_required:
+        from .harness_record import SafeDir
+
+        with SafeDir.open(workspace_root, run_dir(run_id), create=True):
+            pass
+    else:
+        run_dir(run_id).mkdir(parents=True, exist_ok=True)
     now = utc_now_iso()
     if heldout_required:
         pin_heldout(workspace_root, run_id)
+        from .harness_record import initialize
+
+        initialize(workspace_root, run_id)
     state = RunState(
         heldout_required=heldout_required,
         run_id=run_id,
@@ -2483,6 +2506,7 @@ def _continue_impl(run_id: str | None, gate_case: list[str]) -> None:
 
 
 @app.command("resume")
+@harness_environment()
 def resume(
     run_id: str | None = typer.Option(None, "--run-id"),
     reason: str | None = typer.Option(None, "--reason"),
@@ -2537,6 +2561,7 @@ def select(
 
 
 @app.command("status")
+@harness_environment()
 def status(
     run_id: str | None = typer.Option(
         None,
@@ -2547,6 +2572,8 @@ def status(
     """Print the managed run state as JSON (lane runs include the lane board)."""
     state = _load_state(run_id)
     final_path = final_report_path(state.run_id) if state.status == "done" else None
+    if state.status == "done" and heldout_dataset(required=False):
+        final_path, _ = _write_final_report(state)
     payload: dict[str, Any] = {
         "run": _public_state(state, outcomes=[], final_report=final_path)
     }
