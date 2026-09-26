@@ -21,10 +21,10 @@ class NoteSummary:
 def notes_index(notes_dir: Path) -> list[NoteSummary]:
     """Return note metadata only; note bodies are intentionally lazy."""
 
-    if not notes_dir.is_dir():
-        return []
+    from .harness_record import list_paths
+
     notes: list[NoteSummary] = []
-    for path in sorted(notes_dir.glob("*.md")):
+    for path in sorted(p for p in list_paths(notes_dir) if p.suffix == ".md"):
         try:
             frontmatter, _ = _parse_note(path)
             name = frontmatter["name"]
@@ -49,7 +49,9 @@ def load_note(notes_dir: Path, name: str) -> str:
 
 
 def _parse_note(path: Path) -> tuple[dict[str, object], str]:
-    text = path.read_text(encoding="utf-8")
+    from .harness_record import read_text
+
+    text = read_text(path)
     if not text.startswith("---\n"):
         raise ValueError("missing YAML frontmatter")
     _, frontmatter_text, body = text.split("---\n", 2)

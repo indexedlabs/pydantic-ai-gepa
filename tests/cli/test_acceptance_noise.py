@@ -150,6 +150,11 @@ def test_paired_validation_evidence_roundtrips_with_case_ids(
     dataset.write_text('{"name": "private-case"}\n')
     monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(dataset))
     pin_heldout(workspace, state.run_id)
+    from pydantic_ai_gepa.cli.harness_record import initialize
+
+    (workspace / ".gepa").mkdir()
+    (workspace / ".gepa/gepa.toml").write_text('agent = "fixture:agent"\n')
+    initialize(workspace, state.run_id)
     state = replace(
         state,
         heldout_required=True,

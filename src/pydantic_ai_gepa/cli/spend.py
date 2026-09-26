@@ -26,6 +26,7 @@ from ..spend import (
     rollout_spend,
 )
 from .layout import repo_root, run_dir, run_state_path
+from . import harness_record
 from .validation import public_echo
 
 if TYPE_CHECKING:
@@ -41,8 +42,16 @@ def validate_cap(value: float | None) -> None:
 
 @contextmanager
 def _lock(path: Path) -> Iterator[None]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as handle:
+    from .validation import heldout_dataset
+
+    if not heldout_dataset(required=False):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    context = (
+        harness_record.view_file(path)
+        if heldout_dataset(required=False)
+        else path.open("a")
+    )
+    with harness_record.before_spend_lock(path), context as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         try:
             yield
@@ -53,9 +62,9 @@ def _lock(path: Path) -> Iterator[None]:
 def _read_rows(
     path: Path, warnings: dict[str, Any] | None = None
 ) -> list[dict[str, Any]]:
-    if not path.exists():
+    if not harness_record.exists(path):
         return []
-    contents = path.read_text()
+    contents = harness_record.read_text(path)
     lines = contents.splitlines()
     rows = []
     for index, line in enumerate(lines):
@@ -74,7 +83,11 @@ class MissingValidationSpend(ValueError):
 
 def _validation_owners(directory: Path) -> dict[str, int]:
     path = directory / "validation-spend-owners.json"
-    return json.loads(path.read_text()) if path.exists() else {}
+    return (
+        json.loads(harness_record.read_text(path))
+        if harness_record.exists(path)
+        else {}
+    )
 
 
 def _rows(
@@ -83,7 +96,7 @@ def _rows(
     directory = run_dir(run_id, root)
     rows = _read_rows(directory / "spend.jsonl", warnings)
     pointer = directory / "validation-spend-registered"
-    if pointer.exists():
+    if harness_record.exists(pointer, root=root):
         from .lanes import _pid_alive
 
         completed = {row["eval_id"] for row in rows if row["kind"] == "validation"}
@@ -204,7 +217,11 @@ def _reservations(run_id: str, root: Path | None) -> dict[str, Any]:
     from .lanes import _pid_alive
 
     path = run_dir(run_id, root) / "spend-reservations.json"
-    reservations = json.loads(path.read_text()) if path.exists() else {}
+    reservations = (
+        json.loads(harness_record.read_text(path))
+        if harness_record.exists(path)
+        else {}
+    )
     private = _private_reservations_path(run_id, root)
     if private is not None and private.exists():
         reservations.update(json.loads(private.read_text()))
@@ -230,6 +247,8 @@ def _private_reservations_path(run_id: str, root: Path | None) -> Path | None:
 
 
 def _write_reservations(path: Path, reservations: dict[str, Any]) -> None:
+    if harness_record.write_text(path, json.dumps(reservations)):
+        return
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
     with temporary.open("w") as handle:
@@ -360,11 +379,14 @@ class EvalSpendMeter(SpendMeter):
             directory = run_dir(self.run_id, self.root)
             with _lock(directory / "spend.lock"):
                 path = self.private_path or directory / "spend.jsonl"
-                path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                with path.open("a") as handle:
-                    handle.write(json.dumps(row) + "\n")
-                    handle.flush()
-                    os.fsync(handle.fileno())
+                if not harness_record.write_text(
+                    path, json.dumps(row) + "\n", root=self.root, append=True
+                ):
+                    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    with path.open("a") as handle:
+                        handle.write(json.dumps(row) + "\n")
+                        handle.flush()
+                        os.fsync(handle.fileno())
             self._saved = current
 
     def finish(self) -> None:
@@ -377,12 +399,14 @@ class EvalSpendMeter(SpendMeter):
             with _lock(run_dir(self.run_id, self.root) / "spend.lock"):
                 row = dict(self._saved, eval_id=self.eval_id, kind=self.kind)
                 row.pop("max_rollout_dollars")
-                with (run_dir(self.run_id, self.root) / "spend.jsonl").open(
-                    "a"
-                ) as handle:
-                    handle.write(json.dumps(row) + "\n")
-                    handle.flush()
-                    os.fsync(handle.fileno())
+                path = run_dir(self.run_id, self.root) / "spend.jsonl"
+                if not harness_record.write_text(
+                    path, json.dumps(row) + "\n", root=self.root, append=True
+                ):
+                    with path.open("a") as handle:
+                        handle.write(json.dumps(row) + "\n")
+                        handle.flush()
+                        os.fsync(handle.fileno())
         self._finished = True
 
     def declare_cached_rollout(self) -> None:
@@ -522,14 +546,14 @@ def _finish_cost_stop(
     from .runs import ParetoLog, utc_now_iso
 
     path = run_state_path(run_id, root)
-    if not path.exists():
+    if not harness_record.exists(path):
         public_echo(
             json.dumps(
                 {"spend": spend_report(run_id, root, cap), "stop_reason": reason}
             )
         )
         return
-    state = state or RunState.from_dict(json.loads(path.read_text()))
+    state = state or RunState.from_dict(json.loads(harness_record.read_text(path)))
     state = replace(
         state,
         status="done",
@@ -582,7 +606,9 @@ def evaluation_spend(
 
     path = run_state_path(run_id, root)
     managed = (
-        RunState.from_dict(json.loads(path.read_text())) if path.exists() else None
+        RunState.from_dict(json.loads(harness_record.read_text(path)))
+        if harness_record.exists(path)
+        else None
     )
     if managed and managed.max_token_cost is not None:
         cap = (
@@ -627,13 +653,14 @@ def evaluation_spend(
     def register_private_path() -> None:
         if validation_spend_path is not None:
             pointer = run_dir(run_id, root) / "validation-spend-registered"
-            if not pointer.exists():
-                temporary = pointer.with_suffix(".tmp")
-                with temporary.open("w") as handle:
-                    handle.write("registered\n")
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temporary, pointer)
+            if not harness_record.exists(pointer, root=root):
+                if not harness_record.write_text(pointer, "registered\n", root=root):
+                    temporary = pointer.with_suffix(".tmp")
+                    with temporary.open("w") as handle:
+                        handle.write("registered\n")
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temporary, pointer)
             # Register ownership for uncapped evals too. No spend or per-case
             # progress belongs in this reflector-readable manifest.
             validation_spend_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -723,8 +750,8 @@ def evaluation_spend(
         # Only terminal state/report emission is serialized, never paid work.
         with _lock(run_dir(run_id, root) / "spend-finalize.lock"):
             latest = (
-                RunState.from_dict(json.loads(path.read_text()))
-                if path.exists()
+                RunState.from_dict(json.loads(harness_record.read_text(path)))
+                if harness_record.exists(path)
                 else None
             )
             terminal = latest if latest and latest.status == "done" else state or latest

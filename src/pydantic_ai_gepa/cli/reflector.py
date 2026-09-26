@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from dataclasses import replace
 import fcntl
 import json
@@ -61,10 +61,66 @@ def run_lock(
     timeout: float | None = None,
 ) -> Iterator[None]:
     """Serialize continuation and handoff; kernel releases the lock on death."""
-    path = run_dir(run_id, root) / "run.lock"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as handle:
-        deadline = time.monotonic() + timeout if timeout is not None else None
+    from .harness_record import _locks, private_lock_path, check_view_path
+    from .validation import heldout_dataset
+
+    key = str(run_dir(run_id, (root or repo_root()).resolve()))
+    public = run_dir(run_id, root) / "run.lock"
+    if heldout_dataset(required=False):
+        check_view_path(root or repo_root(), public)
+    if heldout_dataset(required=False) and key in _locks.get():
+        yield
+        return
+    private = private_lock_path(root, run_id)
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    with ExitStack() as locks:
+        # Harness serialization always comes first. The public inode only
+        # coordinates cooperative reflector commands; it is not authority.
+        for path in [private, public] if private is not None else [public]:
+            if path == public and private is not None:
+                check_view_path(root or repo_root(), public)
+            locks.enter_context(
+                _file_lock(
+                    path,
+                    run_id,
+                    wait=wait,
+                    deadline=deadline,
+                    private=path == private,
+                    public_root=(root or repo_root())
+                    if path == public and heldout_dataset(required=False)
+                    else None,
+                )
+            )
+        token = _locks.set(_locks.get() | {key}) if private is not None else None
+        try:
+            yield
+        finally:
+            if token is not None:
+                _locks.reset(token)
+
+
+@contextmanager
+def _file_lock(
+    path: Path,
+    run_id: str,
+    *,
+    wait: bool,
+    deadline: float | None,
+    private: bool,
+    public_root: Path | None = None,
+) -> Iterator[None]:
+    from .harness_record import view_file
+
+    if public_root is None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    context = (
+        view_file(path, root=public_root)
+        if public_root is not None
+        else path.open("a+", encoding="utf-8")
+    )
+    with context as handle:
+        if private:
+            os.chmod(path, 0o600)
         while True:
             try:
                 nonblocking = not wait or deadline is not None
@@ -80,19 +136,22 @@ def run_lock(
                         raise TimeoutError("Run lock acquisition timed out") from exc
                     time.sleep(min(0.05, remaining))
                     continue
-                handle.seek(0)
-                pid = handle.read().strip() or "unknown"
+                pid = "unknown"
+                if public_root is None:
+                    handle.seek(0)
+                    pid = handle.read().strip() or "unknown"
                 typer.echo(
                     f"Run {run_id} is locked by live process {pid}; retry after it finishes.",
                     err=True,
                 )
                 raise typer.Exit(code=1) from exc
         try:
-            handle.seek(0)
-            handle.truncate()
-            handle.write(str(os.getpid()))
-            handle.flush()
-            os.fsync(handle.fileno())
+            if public_root is None:
+                handle.seek(0)
+                handle.truncate()
+                handle.write(str(os.getpid()))
+                handle.flush()
+                os.fsync(handle.fileno())
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -314,8 +373,12 @@ def write_packet(run_id: str, root: Path | None = None) -> Path:
     from .run import RunState
 
     workspace_root = (root or repo_root()).resolve()
+    from .harness_record import read_text
+
     state = RunState.from_dict(
-        json.loads(run_state_path(run_id, workspace_root).read_text(encoding="utf-8"))
+        json.loads(
+            read_text(run_state_path(run_id, workspace_root), root=workspace_root)
+        )
     )
     project = (
         Path(state.project_root).resolve() if state.project_root else workspace_root
@@ -401,6 +464,10 @@ def write_packet(run_id: str, root: Path | None = None) -> Path:
             "iterations_since_acceptance": state.iterations_since_acceptance,
         }
     path = run_dir(run_id, workspace_root) / "reflector_packet.json"
+    from .harness_record import write_text
+
+    if write_text(path, json.dumps(packet, indent=2) + "\n", root=workspace_root):
+        return path
     fd, tmp_name = tempfile.mkstemp(
         dir=path.parent, prefix=path.name + ".", suffix=".tmp"
     )
@@ -426,6 +493,13 @@ def resume(
     from .run import _load_state
 
     state = _load_state(run_id)
+    from .validation import heldout_dataset
+
+    if state.heldout_required and not heldout_dataset(required=False):
+        raise typer.BadParameter(
+            "Held-out epoch or resume changes require the harness or orchestrator "
+            "with GEPA_HELDOUT_DATASET."
+        )
     if state.lanes > 0:
         typer.echo(
             "Lane runs use `gepa lane reset` / `gepa lane lease`; single-path resume is unavailable.",
@@ -470,7 +544,9 @@ def resume(
         state = replace(state, reflector=issued, updated_at=now)
         state.save()
         path = write_packet(state.run_id)
-        packet = json.loads(path.read_text(encoding="utf-8"))
+        from .harness_record import read_text
+
+        packet = json.loads(read_text(path))
         typer.echo(packet["instructions"])
         if packet["next_command"]:
             typer.echo(packet["next_command"]["shell"])

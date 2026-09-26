@@ -56,16 +56,19 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import signal
 import subprocess
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from itertools import combinations
 from pathlib import Path
 from typing import Any, Iterator
 
 import typer
+
+from . import harness_record
 
 from .candidates import GitCandidateError, git_candidate_state
 from .eval import run_eval_once
@@ -74,7 +77,6 @@ from ..evaluation_health import evaluation_infrastructure_failures
 from ..vector_acceptance import (
     VectorComparisonRequest,
     VectorRecord,
-    VectorRecordStore,
     compare_vectors,
     resolve_vector_comparator,
 )
@@ -105,6 +107,7 @@ from .layout import (
     run_state_path,
     vector_records_path,
 )
+from .harness_record import VectorRecordStore
 from .runs import ParetoLog, utc_now_iso
 
 SELECT_PRODUCER_ID = "select"
@@ -163,7 +166,15 @@ def _chdir(path: Path) -> Iterator[None]:
 
 def _load_comparison(lane_state: LaneState) -> dict[str, Any]:
     if lane_state.comparison_path and Path(lane_state.comparison_path).exists():
-        data = json.loads(Path(lane_state.comparison_path).read_text(encoding="utf-8"))
+        from .validation import heldout_dataset
+
+        path = Path(lane_state.comparison_path)
+        if (
+            heldout_dataset(required=False)
+            and harness_record._public_workspace(path) is None
+        ):
+            raise harness_record._unavailable()
+        data = json.loads(harness_record.read_text(path))
         if isinstance(data, dict):
             return data
     return {}
@@ -176,7 +187,7 @@ def _lane_outcome_journaled(
     path = journal_path(workspace_root)
     if not path.exists():
         return False
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in harness_record.read_text(path, root=workspace_root).splitlines():
         stripped = line.strip()
         if not stripped:
             continue
@@ -201,6 +212,12 @@ def _journal_lane_outcome(workspace_root: Path, entry: dict[str, Any]) -> None:
     ):
         return
     path = journal_path(workspace_root)
+    from .harness_record import write_text
+
+    if write_text(
+        path, json.dumps(entry, sort_keys=True) + "\n", root=workspace_root, append=True
+    ):
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(entry, sort_keys=True) + "\n")
@@ -208,11 +225,19 @@ def _journal_lane_outcome(workspace_root: Path, entry: dict[str, Any]) -> None:
 
 def _journal_rows(workspace_root: Path, run_id: str, kind: str) -> list[dict[str, Any]]:
     """Read this run's journal rows of one kind in append order."""
+    from .harness_record import for_run
+
+    record = for_run(run_id, workspace_root)
     path = journal_path(workspace_root)
-    if not path.exists():
-        return []
+    content = (
+        (record.read("@select-journal") or "")
+        if record
+        else (
+            harness_record.read_text(path, root=workspace_root) if path.exists() else ""
+        )
+    )
     rows: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in content.splitlines():
         if not line.strip():
             continue
         raw = json.loads(line)
@@ -232,12 +257,25 @@ def _append_journal_once(
     identity: dict[str, Any],
 ) -> dict[str, Any]:
     """Append one durable run-journal record, deduplicated for select resume."""
+    from .harness_record import for_run
+
     kind = str(entry["kind"])
     run_id = str(entry["run_id"])
     for existing in _journal_rows(workspace_root, run_id, kind):
         if all(existing.get(key) == value for key, value in identity.items()):
             return existing
+    record = for_run(run_id, workspace_root)
+    if record:
+        record.write(
+            "@select-journal", json.dumps(entry, sort_keys=True) + "\n", append=True
+        )
     path = journal_path(workspace_root)
+    from .harness_record import write_text
+
+    if write_text(
+        path, json.dumps(entry, sort_keys=True) + "\n", root=workspace_root, append=True
+    ):
+        return entry
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(entry, sort_keys=True) + "\n")
@@ -489,6 +527,40 @@ def _primary_checkout_state(workspace_root: Path) -> tuple[str, bool]:
     return head, dirty
 
 
+def _check_winner_views(workspace_root: Path, commit_sha: str) -> None:
+    """A winner cannot materialize links/gitlinks in the harness workspace."""
+    from .layout import gepa_dir
+    from .safe_git import run_git
+    from .validation import heldout_dataset
+
+    if not heldout_dataset(required=False):
+        return
+    if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", commit_sha):
+        raise typer.BadParameter("Winner must name an immutable full commit ID.")
+    repository = git_root(workspace_root)
+    public = Path(os.path.abspath(gepa_dir(workspace_root)))
+    if not public.is_relative_to(repository):
+        return  # An external GEPA_DIR is not materialized by this reset.
+    relative = public.relative_to(repository)
+    tree = run_git(
+        repository, "ls-tree", "-rz", commit_sha, check=True, capture_output=True
+    ).stdout
+    for entry in tree.split(b"\0"):
+        if not entry:
+            continue
+        metadata, name = entry.split(b"\t", 1)
+        path = Path(os.fsdecode(name))
+        # Also reject a symlink in an ancestor of a nested GEPA_DIR.
+        if (
+            path == relative
+            or path.is_relative_to(relative)
+            or relative.is_relative_to(path)
+        ) and metadata.split()[0] not in {b"100644", b"100755"}:
+            raise typer.BadParameter(
+                "Winner commit contains an unsafe GEPA_DIR path; refusing promotion."
+            )
+
+
 def _reset_primary_to(workspace_root: Path, commit_sha: str) -> None:
     """Fast-forward the primary checkout to ``commit_sha``.
 
@@ -498,6 +570,14 @@ def _reset_primary_to(workspace_root: Path, commit_sha: str) -> None:
     select just performed (and every uncommitted entry before it). The
     journal content is preserved across the reset.
     """
+    from .validation import heldout_dataset
+
+    if heldout_dataset(required=False):
+        _check_winner_views(workspace_root, commit_sha)
+        # The private select-journal is authority. Do not read or restore the
+        # reflector's pre-reset bytes after materializing a winner's tree.
+        _git(workspace_root, "reset", "--hard", commit_sha)
+        return
     journal_file = journal_path(workspace_root)
     journal_bytes = journal_file.read_bytes() if journal_file.exists() else None
     _git(workspace_root, "reset", "--hard", commit_sha)
@@ -535,16 +615,17 @@ def _emit_merge_opportunities(
         if not files_a or not files_b or not files_a.isdisjoint(files_b):
             continue
         merge_dir = run_dir(run_id, workspace_root) / "merge_opportunities"
-        merge_dir.mkdir(parents=True, exist_ok=True)
         stat_path = merge_dir / f"{first.lane}--{second.lane}.diffstat"
-        stat_path.write_text(
+        contents = (
             f"# {first.lane} ({first.branch}) vs baseline {baseline_sha}\n"
             + _diff_stat(workspace_root, baseline_sha, str(first.candidate_sha))
             + f"\n\n# {second.lane} ({second.branch}) vs baseline {baseline_sha}\n"
             + _diff_stat(workspace_root, baseline_sha, str(second.candidate_sha))
-            + "\n",
-            encoding="utf-8",
+            + "\n"
         )
+        if not harness_record.write_text(stat_path, contents, root=workspace_root):
+            merge_dir.mkdir(parents=True, exist_ok=True)
+            stat_path.write_text(contents, encoding="utf-8")
         duplicate = any(
             event.type == "merge_opportunity"
             and event.payload.get("lane_a") == first.lane
@@ -721,9 +802,18 @@ def _phase_promote(
     #    or vectors, so its evidence never enters a reflection packet.
     accepted = [lane_state for lane_state in valid if lane_state.verdict == "accepted"]
     config = GepaConfig.load(config_path(workspace_root))
-    validation_enabled = state.heldout_required
+    from .harness_record import for_run
+
+    validation_enabled = for_run(run_id, workspace_root) is not None
+    if state.heldout_required and not validation_enabled:
+        raise typer.BadParameter("Held-out selection requires harness access.")
     vector_validation = validation_enabled and config.acceptance.mode == "vector"
-    validation_results = dict(ctx.get("validation_results") or {})
+    validation_results = {
+        lane.lane: result
+        for lane in accepted
+        if (result := (ctx.get("validation_results") or {}).get(lane.lane))
+        and result.get("commit_sha") == lane.candidate_sha
+    }
     state = replace(
         state,
         iterations=max(
@@ -822,8 +912,10 @@ def _phase_promote(
             ctx.pop("validation_infrastructure_failures", None)
 
     for lane_state in accepted if validation_enabled else []:
-        if lane_state.lane in validation_results:
+        prior = validation_results.get(lane_state.lane)
+        if prior and prior.get("commit_sha") == lane_state.candidate_sha:
             continue
+        validation_results.pop(lane_state.lane, None)
         validation_lane = f"{lane_state.lane}:validation"
         recovered_row = (
             next(
@@ -891,6 +983,11 @@ def _phase_promote(
                         else None
                     ),
                     vector_repetition=(repetition if vector_validation else None),
+                )
+            if validation_outcome.summary.get("commit_sha") != lane_state.candidate_sha:
+                raise typer.BadParameter(
+                    "Lane proposal differs from the commit scored by the harness; "
+                    "refusing promotion."
                 )
             validation_outcomes.append(validation_outcome)
         failures = tuple(
@@ -1144,9 +1241,12 @@ def _phase_promote(
         float(winner_mean) if winner_mean is not None else state.best_mean_score
     )
     winner_candidate_id = (
-        comparison.get("candidate_id") or str(winner.candidate_sha)[:12]
+        validation_results[winner.lane]["candidate_id"]
+        if validation_enabled
+        else comparison.get("candidate_id") or str(winner.candidate_sha)[:12]
     )
     winner_sha = str(winner.candidate_sha)
+    _check_winner_views(workspace_root, winner_sha)
 
     _journal_lane_outcome(
         workspace_root,
@@ -1983,6 +2083,17 @@ def _select_lock(workspace_root: Path, run_id: str) -> Iterator[None]:
     import fcntl
 
     lock_path = run_dir(run_id, workspace_root) / "select.lock"
+    from .harness_record import view_file
+    from .validation import heldout_dataset
+
+    if heldout_dataset(required=False):
+        with view_file(lock_path, root=workspace_root) as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+        return
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
     try:
@@ -1996,14 +2107,30 @@ def _select_lock(workspace_root: Path, run_id: str) -> Iterator[None]:
 def run_select(run_id: str | None) -> Any:
     """Execute `gepa run select` (see module docstring for the phase model)."""
     workspace_root, run_state = _resolve_lane_run(run_id)
-    with _select_lock(workspace_root, run_state.run_id):
+    from .reflector import run_lock
+    from .harness_record import for_run
+
+    record = for_run(run_state.run_id, workspace_root)
+
+    with (
+        (
+            run_lock(run_state.run_id, workspace_root, wait=True)
+            if record is not None
+            else nullcontext()
+        ),
+        _select_lock(workspace_root, run_state.run_id),
+    ):
         # Resolve before taking the lock only to locate the run. A second
         # selector may have waited while the first completed every phase, so
         # its pre-lock snapshot must never drive a second selection.
         from .run import RunState
 
+        from .harness_record import read_text
+
         raw = json.loads(
-            run_state_path(run_state.run_id, workspace_root).read_text(encoding="utf-8")
+            read_text(
+                run_state_path(run_state.run_id, workspace_root), root=workspace_root
+            )
         )
         if not isinstance(raw, dict):
             raise typer.BadParameter("Managed run state must be a JSON object.")
@@ -2024,6 +2151,18 @@ def _run_select_locked(workspace_root: Path, run_state: Any) -> Any:
     from .safe_git import refuse_heldout_git_mutations
 
     refuse_heldout_git_mutations()
+
+    from .validation import heldout_dataset
+
+    if heldout_dataset(required=False):
+        # Refuse planted directories/committed workspace links before any
+        # scoring or checkpoint writes. Actual I/O still uses SafeDir.
+        directory = run_dir(run_state.run_id, workspace_root)
+        for path in (directory / "merge_opportunities", directory / "events/.reaped"):
+            harness_record.check_view_path(workspace_root, path)
+        for lane in load_all_lane_states(workspace_root, run_state.run_id):
+            if lane.candidate_sha:
+                _check_winner_views(workspace_root, lane.candidate_sha)
 
     if run_state.heldout_required:
         from .run import _assert_validation_dataset_unchanged

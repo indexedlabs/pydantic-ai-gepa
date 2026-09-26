@@ -809,8 +809,11 @@ def test_paired_validation_recovers_private_evidence_and_incumbent(
         if (
             not killed
             and death_phase == "final_save"
-            and Path(destination).name == "state.json"
-            and json.loads(Path(source).read_text())["status"] == "done"
+            and Path(destination).name.endswith(".record.json")
+            and json.loads(
+                json.loads(Path(source).read_text())["files"].get("state.json", "{}")
+            ).get("status")
+            == "done"
         ):
             killed = True
             raise RuntimeError("died after replacing private incumbent evidence")

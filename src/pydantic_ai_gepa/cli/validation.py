@@ -25,6 +25,7 @@ def validation_dataset_path(
     project_root: Path,
     candidate_root: Path | None = None,
     allow_missing: bool = False,
+    check_history: bool = True,
 ) -> Path:
     """Resolve a harness-owned dataset, refusing checkout and historical copies."""
     lexical_path = Path(os.path.abspath(project_root / configured_path))
@@ -71,7 +72,7 @@ def validation_dataset_path(
         raise typer.BadParameter(
             "Held-out validation must be outside the reflector checkout. " + fix
         )
-    if allow_missing and not path.exists():
+    if not check_history or (allow_missing and not path.exists()):
         return path
     try:
         contents = path.read_bytes()
@@ -126,6 +127,7 @@ def validation_evidence_path(dataset: str, *, project_root: Path, run_id: str) -
         str(dataset_path.parent / ".gepa-validation-evidence" / f"{key}.json"),
         project_root=project_root,
         allow_missing=True,
+        check_history=False,
     )
 
 
@@ -215,8 +217,11 @@ def harness_environment() -> Iterator[None]:
     dataset = heldout_dataset(required=False)
     original = os.environ.pop("GEPA_HELDOUT_DATASET", None)
     token = _harness_dataset.set(dataset)
+    from .harness_record import session
+
     try:
-        yield
+        with session():
+            yield
     finally:
         _harness_dataset.reset(token)
         if original is not None:
@@ -236,21 +241,29 @@ def heldout_identity(root: Path) -> tuple[str, str]:
 def _pin_path(dataset: str, root: Path, run_id: str) -> Path:
     from .layout import gepa_dir
 
-    key = hashlib.sha256(f"{gepa_dir(root).resolve()}\0{run_id}".encode()).hexdigest()
+    key = hashlib.sha256(
+        f"{os.path.abspath(gepa_dir(root.resolve()))}\0{run_id}".encode()
+    ).hexdigest()
     return validation_dataset_path(
         str(Path(dataset).parent / ".gepa-heldout" / f"{key}.json"),
         project_root=root,
         allow_missing=True,
+        check_history=False,
     )
 
 
 def pin_heldout(root: Path, run_id: str) -> None:
+    from .harness_record import check_view_path, register_run
+    from .layout import run_dir
+
+    check_view_path(root, run_dir(run_id, root))
     dataset, digest = heldout_identity(root)
     path = _pin_path(dataset, root, run_id)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with path.open("x", encoding="utf-8") as handle:
         os.chmod(path, 0o600)
         json.dump({"dataset": dataset, "digest": digest}, handle)
+    register_run(root, run_id, path)
 
 
 def check_heldout_pin(root: Path, run_id: str) -> tuple[str, str]:

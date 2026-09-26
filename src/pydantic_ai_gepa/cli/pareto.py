@@ -8,6 +8,7 @@ import typer
 
 from .layout import latest_run_id
 from .runs import ParetoLog, ParetoRow
+from .validation import harness_environment
 
 
 _TSV_HEADER = (
@@ -51,6 +52,7 @@ def _format_tsv(rows: list[ParetoRow]) -> str:
     return "\n".join(lines)
 
 
+@harness_environment()
 def pareto(
     run_id: str | None = typer.Option(None, "--run-id"),
     format_: str = typer.Option(

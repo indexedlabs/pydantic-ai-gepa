@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Any, Callable
 
 import typer
 
+from . import harness_record
+
 from .validation import public_echo, private_evaluation
 
 from ..evaluation import EvaluationRecord
@@ -112,11 +114,21 @@ def _row_outcome(
     if eval_id and not validation:
         if not report.exists():
             report = next(
-                report.parent.glob(f"*-{eval_id}-{row.candidate_id}.md"), report
+                (
+                    path
+                    for path in harness_record.list_paths(report.parent)
+                    if path.match(f"*-{eval_id}-{row.candidate_id}.md")
+                ),
+                report,
             )
         if not trace.exists():
             trace = next(
-                trace.parent.glob(f"*-{eval_id}-{row.candidate_id}.jsonl"), trace
+                (
+                    path
+                    for path in harness_record.list_paths(trace.parent)
+                    if path.match(f"*-{eval_id}-{row.candidate_id}.jsonl")
+                ),
+                trace,
             )
     # The paid row may precede artifact writes when the process is killed.
     # Preserve existing artifacts and expose only paths which actually exist.
