@@ -27,6 +27,7 @@ import typer
 from .safe_git import (
     Repository,
     _directory_fd,
+    _git_executable,
     _OPTIONS,
     run_git,
     safe_repository,
@@ -101,7 +102,7 @@ def _command(
         "GIT_DIR": str(root / ".git"),
         "GIT_WORK_TREE": str(root),
     }
-    command = ["git", "--no-pager"]
+    command = [_git_executable(os.getpid()), "--no-pager"]
     for option in _OPTIONS:
         command.extend(("-c", option))
     return (
@@ -138,11 +139,16 @@ def _copy_objects(source: Path, destination: Path) -> None:
                 name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd
             )
             try:
-                mode = os.fstat(child).st_mode
+                info = os.fstat(child)
+                mode = info.st_mode
                 if stat.S_ISDIR(mode):
                     (target / name).mkdir(exist_ok=True)
                     copy(child, target / name)
                 elif stat.S_ISREG(mode):
+                    if info.st_nlink != 1:
+                        raise typer.BadParameter(
+                            "Hard-linked Git objects are forbidden."
+                        )
                     with (
                         os.fdopen(os.dup(child), "rb") as reader,
                         (target / name).open("wb") as writer,

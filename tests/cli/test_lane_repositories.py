@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 import subprocess
 
@@ -128,7 +129,15 @@ def test_import_never_executes_source_configuration(seed: Path, tmp_path: Path) 
 
 @pytest.mark.parametrize(
     "attack",
-    ["objects", "alternates", "gitdir", "commondir", "lane", "loose-object"],
+    [
+        "objects",
+        "alternates",
+        "gitdir",
+        "commondir",
+        "lane",
+        "loose-object",
+        "hardlink-object",
+    ],
 )
 def test_import_refuses_redirected_metadata(
     seed: Path, tmp_path: Path, attack: str
@@ -152,7 +161,11 @@ def test_import_refuses_redirected_metadata(
         lane.symlink_to(seed)
     else:
         (lane / ".git/objects/aa").mkdir()
-        (lane / (".git/objects/aa/" + "a" * 38)).symlink_to(seed / "api/prompt.txt")
+        target = lane / (".git/objects/aa/" + "a" * 38)
+        if attack == "hardlink-object":
+            os.link(seed / "api/prompt.txt", target)
+        else:
+            target.symlink_to(seed / "api/prompt.txt")
     before = digest_tree(seed / ".git")
     with pytest.raises((OSError, typer.BadParameter)):
         record.import_lane("lane-1", record.seed)

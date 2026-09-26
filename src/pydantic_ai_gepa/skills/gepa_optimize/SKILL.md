@@ -239,7 +239,19 @@ reflector environment.
 Harness Git commands read reflector objects through a harness-owned repository,
 without loading reflector repository, global or system configuration, executable
 attribute drivers, hooks, fsmonitor, filters, textconv, external diff or lazy fetch.
-The harness trusts its own Git binary and fixed `/usr/bin:/bin` PATH; worktree
+The harness pins an absolute Git executable once per process, requiring root
+ownership and no group/other write permissions on the executable and every
+ancestor directory. On macOS it appends `usr/bin/git` to the developer directory
+named by the root-owned `/var/db/xcode_select_link`, or falls back to
+`/Library/Developer/CommandLineTools/usr/bin/git`;
+it never executes the `/usr/bin/git` xcrun shim or honors `DEVELOPER_DIR`.
+Xcode under `/Applications` does not qualify while that directory is
+admin-group-writable (the default); such hosts need the Command Line Tools installed.
+On other systems it checks `/usr/bin/git`, then `/bin/git`. No qualifying binary
+means refusal. Git retains its compiled helper location; `GIT_EXEC_PATH` is not set.
+Reflector metadata reads refuse symlinks, hard links and special files, except
+that these `info/exclude` entries are treated as empty. Oversized metadata,
+including `info/exclude`, fails closed. Worktree
 attributes can still apply Git's built-in data conversions. Harness Git storage
 lives beside the held-out set and must be outside the reflector's writable roots,
 just like the private scoring checkout.
@@ -397,6 +409,12 @@ source, so later `gepa run continue` calls use the same mode.
 The CLI records the tree identity immediately before evaluation. CLI-owned
 artifacts for the active run are excluded from the dirty hash; repositories
 should still ignore generated run directories.
+
+Git-mode identity ignores global/user excludes (`core.excludesFile` and
+`~/.config/git/ignore`); move those patterns to `.gitignore` or a regular
+`.git/info/exclude` file. Git LFS and other filter-based repositories are not
+supported: filters never run, so materialized filter-based files look dirty
+and cannot be nominated.
 
 ### Reflector contract
 
