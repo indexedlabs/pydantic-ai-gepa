@@ -37,12 +37,30 @@ sys.addaudithook(_guard_real_workspace)
 
 
 @pytest.fixture(autouse=True)
-def isolated_user_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def isolated_user_environment(
+    tmp_path: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("GEPA_DIR", raising=False)
     monkeypatch.chdir(tmp_path)
+    from pydantic_ai_gepa.cli.safe_git import Repository
+
+    discover = Repository.discover
+    boundary = tmp_path_factory.getbasetemp().resolve()
+
+    def discover_test_repository(cls: type[Repository], start: Path) -> Repository:
+        repository = discover(start)
+        # --basetemp may be nested in a developer checkout. Tests that model
+        # non-Git projects must not inherit that unrelated repository.
+        if not repository.root.is_relative_to(boundary):
+            raise FileNotFoundError("not a git repository")
+        return repository
+
+    monkeypatch.setattr(Repository, "discover", classmethod(discover_test_repository))
 
 
 @pytest.fixture(scope="session")
