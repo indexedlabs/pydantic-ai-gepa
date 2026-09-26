@@ -290,8 +290,9 @@ def test_checkout_refuses_git_equivalent_paths_before_writing(tmp_path, name):
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize("redirect_refs", [False, True])
 def test_harness_once_scores_with_hostile_git_config(
-    git_repo, private, protocol_backend, monkeypatch, tmp_path
+    git_repo, private, protocol_backend, monkeypatch, tmp_path, redirect_refs
 ):
     attributes(git_repo)
     commit_evaluator(
@@ -323,11 +324,26 @@ def test_harness_once_scores_with_hostile_git_config(
     poison(git_repo, sentinel)
     queued = _run("run", "continue", "--run-id", run_id, "--wait-secs", "0")
     assert queued.exit_code == 0, (queued.output, queued.exception)
+    if redirect_refs:
+        redirected = private.parent / "redirected-refs"
+        redirected.mkdir()
+        (redirected / "untouched").write_text("private data")
+        refs = git_repo / ".git/refs/gepa"
+        refs.rename(git_repo / ".git/original-gepa-refs")
+        refs.symlink_to(redirected, target_is_directory=True)
     monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(private))
     served = _run("harness", "serve", "--run-id", run_id, "--once")
     assert served.exit_code == 0, (served.output, served.exception)
     monkeypatch.delenv("GEPA_HELDOUT_DATASET")
     delivered = _run("run", "continue", "--run-id", run_id, "--wait-secs", "0")
+    if redirect_refs:
+        assert delivered.exit_code == 2, delivered.output
+        assert "Could not retain the validated candidate commit" in delivered.output
+        assert str(private) not in delivered.output
+        assert list(redirected.iterdir()) == [redirected / "untouched"]
+        assert (redirected / "untouched").read_text() == "private data"
+        assert not sentinel.exists()
+        return
     assert delivered.exit_code == 0, (delivered.output, delivered.exception)
     assert _run_payload(delivered.output)["best_mean_score"] == 1
     assert _run_payload(delivered.output)["last_reflector_comparison"][
@@ -616,3 +632,131 @@ def test_harness_private_storage_failure_has_no_temp_fallback(
     monkeypatch.setattr(tempfile, "mkdtemp", unexpected)
     with pytest.raises(GitCandidateError):
         git_candidate_state(git_repo)
+
+
+@pytest.mark.parametrize("object_format", ["sha1", "sha256"])
+@pytest.mark.parametrize("linked", [False, True])
+def test_retention_survives_gc_without_running_reference_hook(
+    tmp_path, monkeypatch, object_format, linked
+):
+    from pydantic_ai_gepa.cli.front import _pin_git_candidate
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", f"--object-format={object_format}")
+    _git(repo, "config", "gc.auto", "0")
+    _git(repo, "config", "maintenance.auto", "false")
+    _git(repo, "config", "user.name", "Test")
+    _git(repo, "config", "user.email", "test@example.com")
+    (repo / "file").write_text("seed\n")
+    _git(repo, "add", "file")
+    _git(repo, "commit", "-m", "Seed")
+    seed = _git(repo, "rev-parse", "HEAD")
+    root = repo
+    if linked:
+        root = tmp_path / "linked"
+        _git(repo, "worktree", "add", "-b", "candidate", str(root))
+    (root / "file").write_text("candidate\n")
+    _git(root, "commit", "-am", "Candidate")
+    sha = _git(root, "rev-parse", "HEAD")
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    sentinel = tmp_path / "executed"
+    hook = hooks / "reference-transaction"
+    hook.write_text(f"#!/bin/sh\ntouch {shlex.quote(str(sentinel))}\n")
+    hook.chmod(0o755)
+    _git(root, "config", "core.hooksPath", str(hooks))
+    _git(root, "update-ref", "refs/control", sha)
+    assert sentinel.exists(), "Ordinary update-ref must execute the hostile hook"
+    _git(root, "update-ref", "-d", "refs/control")
+    sentinel.unlink()
+    dataset = tmp_path / "private/heldout.jsonl"
+    dataset.parent.mkdir()
+    dataset.write_text("{}\n")
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(dataset))
+    _pin_git_candidate(root, "public-run", sha[:12], sha)
+    assert not sentinel.exists()
+    ref = f"refs/gepa/public-run/{sha[:12]}"
+    assert _git(root, "show-ref", "--verify", ref).split()[0] == sha
+    # Exercise both packed refs and an already existing retention pin.
+    _git(root, "-c", "core.hooksPath=/dev/null", "pack-refs", "--all")
+    _pin_git_candidate(root, "public-run", sha[:12], sha)
+    _pin_git_candidate(root, "public-run", sha[:12], sha)
+    assert not sentinel.exists()
+    _git(root, "-c", "core.hooksPath=/dev/null", "reset", "--hard", seed)
+    _git(root, "reflog", "expire", "--expire=now", "--all")
+    _git(root, "-c", "core.hooksPath=/dev/null", "gc", "--prune=now")
+    assert _git(root, "cat-file", "-t", sha) == "commit"
+    assert _git(root, "show", f"{sha}:file") == "candidate"
+
+
+@pytest.mark.parametrize(
+    "redirect",
+    [
+        "refs",
+        "refs/gepa",
+        "refs/gepa/run",
+        "refs/gepa/run/candidate",
+        "refs/gepa/run/candidate.lock",
+    ],
+)
+def test_retention_refuses_symlink_components(git_repo, private, redirect):
+    from pydantic_ai_gepa.cli.front import _pin_git_candidate
+
+    sha = _git(git_repo, "rev-parse", "HEAD")
+    metadata = git_repo / ".git"
+    path = metadata / redirect
+    target = private.parent / "redirect"
+    target.mkdir()
+    (target / "untouched").write_text("private")
+    if path.exists():
+        path.rename(metadata / "original-refs")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.symlink_to(target, target_is_directory=True)
+    with pytest.raises(typer.BadParameter, match="Could not retain") as error:
+        _pin_git_candidate(git_repo, "run", "candidate", sha)
+    assert str(private) not in str(error.value)
+    assert list(target.iterdir()) == [target / "untouched"]
+    assert (target / "untouched").read_text() == "private"
+
+
+@pytest.mark.parametrize("layout", ["reftable", "gitdir-redirect", "gitdir-symlink"])
+def test_retention_refuses_unsupported_layout(git_repo, private, layout):
+    from pydantic_ai_gepa.cli.front import _pin_git_candidate
+
+    sha = _git(git_repo, "rev-parse", "HEAD")
+    marker = git_repo / ".git"
+    common = marker
+    if layout == "reftable":
+        (marker / "reftable").mkdir()
+    else:
+        moved = private.parent / "redirected-git"
+        marker.rename(moved)
+        common = moved
+        if layout == "gitdir-redirect":
+            marker.write_text(f"gitdir: {moved}\n")
+        else:
+            marker.symlink_to(moved, target_is_directory=True)
+    with pytest.raises(typer.BadParameter, match="Could not retain"):
+        _pin_git_candidate(git_repo, "run", "candidate", sha)
+    assert not (common / "refs/gepa").exists()
+
+
+@pytest.mark.parametrize("kind", ["missing", "blob", "locked"])
+def test_retention_refuses_invalid_objects_and_lock_conflicts(git_repo, private, kind):
+    from pydantic_ai_gepa.cli.front import _pin_git_candidate
+
+    sha = _git(git_repo, "rev-parse", "HEAD")
+    ref = git_repo / ".git/refs/gepa/run/candidate"
+    if kind == "missing":
+        sha = "0" * 40
+    elif kind == "blob":
+        sha = _git(git_repo, "rev-parse", "HEAD:score.txt")
+    else:
+        ref.parent.mkdir(parents=True)
+        ref.with_suffix(".lock").write_text("another writer")
+    with pytest.raises(typer.BadParameter, match="Could not retain"):
+        _pin_git_candidate(git_repo, "run", "candidate", sha)
+    assert not ref.exists()
+    if kind == "locked":
+        assert ref.with_suffix(".lock").read_text() == "another writer"

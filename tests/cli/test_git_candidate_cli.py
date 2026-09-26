@@ -97,6 +97,9 @@ def git_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     )
 
     _git(tmp_path, "init")
+    # Missing-object tests remove loose blobs; host auto-GC must not pack them.
+    _git(tmp_path, "config", "gc.auto", "0")
+    _git(tmp_path, "config", "maintenance.auto", "false")
     _git(tmp_path, "config", "user.email", "tests@example.com")
     _git(tmp_path, "config", "user.name", "GEPA Tests")
     _git(tmp_path, "add", ".")

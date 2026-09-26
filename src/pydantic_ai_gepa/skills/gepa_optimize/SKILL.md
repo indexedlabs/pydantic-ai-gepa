@@ -243,6 +243,9 @@ The harness trusts its own Git binary and fixed `/usr/bin:/bin` PATH; worktree
 attributes can still apply Git's built-in data conversions. Harness Git storage
 lives beside the held-out set and must be outside the reflector's writable roots,
 just like the private scoring checkout.
+Public candidate retention refs are written as data through directory handles
+that refuse symlinks, without invoking source Git hooks; ordinary branch resets
+and garbage collection preserve the retained commits.
 
 Held-out lane start/select and all lane Git mutations (including worktree
 creation/removal, reset, checkout and branch updates) currently fail closed when

@@ -3,6 +3,7 @@
 Only the listed plumbing/read commands are supported. Repository discovery and
 HEAD resolution read files, never invoke Git in the source repository. In
 particular, neither config.worktree nor config includes enter the private repo.
+Public retention refs are published as data using no-follow directory handles.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -434,6 +436,105 @@ def safe_repository(root: Path) -> Iterator[SafeGit]:
 def run_git(root: Path, *args: str, **kwargs: Any) -> subprocess.CompletedProcess[Any]:
     with safe_repository(root) as git:
         return git.run(*args, **kwargs)
+
+
+@contextmanager
+def _directory_fd(path: Path) -> Iterator[int]:
+    """Open an absolute directory without following any symlink component."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(path.anchor, flags)
+    try:
+        for part in path.parts[1:]:
+            child = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def pin_commit(root: Path, ref: str, sha: str) -> None:
+    """Publish a public retention ref as data, never invoke source Git hooks.
+
+    Git's files backend recognizes loose refs during GC. Directory descriptors
+    and no-follow opens confine the write even if source paths are replaced.
+    Only the refs/gepa namespace is supported; no symbolic ref is followed.
+    """
+    if not re.fullmatch(
+        r"refs/gepa/[A-Za-z0-9][A-Za-z0-9_-]*/[A-Za-z0-9][A-Za-z0-9_-]*", ref
+    ) or not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", sha):
+        raise SafeGitError("Invalid retention ref.")
+    sha = sha.lower()
+    with safe_repository(root) as git:
+        repository = git.repository
+        marker = repository.root / ".git"
+        marker_mode = marker.lstat().st_mode
+        if stat.S_ISDIR(marker_mode):
+            supported = repository.git_dir == repository.common_dir == marker
+        elif stat.S_ISREG(marker_mode):
+            # Accept only Git's conventional linked-worktree layout, including
+            # its backlink. Arbitrary gitdir/commondir redirects are read-only.
+            backlink = repository.git_dir / "gitdir"
+            supported = (
+                repository.git_dir.parent.name == "worktrees"
+                and repository.git_dir.parent.parent == repository.common_dir
+                and not backlink.is_symlink()
+                and backlink.read_text().strip() == str(marker)
+            )
+        else:
+            supported = False
+        if not supported:
+            raise SafeGitError("Unsupported retention repository layout.")
+        if (
+            len(sha) != (64 if git.object_format == "sha256" else 40)
+            or git.run("cat-file", "-t", sha, check=True, capture_output=True).stdout
+            != b"commit\n"
+        ):
+            raise SafeGitError("Retention requires a commit object.")
+        with _directory_fd(git.repository.common_dir) as common:
+            fd = os.dup(common)
+            try:
+                parts = ref.split("/")
+                for part in parts[:-1]:
+                    try:
+                        os.mkdir(part, mode=0o700, dir_fd=fd)
+                    except FileExistsError:
+                        pass
+                    child = os.open(
+                        part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd
+                    )
+                    os.close(fd)
+                    fd = child
+                name = parts[-1]
+                try:
+                    existing = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    if not stat.S_ISREG(existing.st_mode):
+                        raise SafeGitError("Unsupported retention ref layout.")
+                lock = name + ".lock"
+                handle = os.open(
+                    lock,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=fd,
+                )
+                try:
+                    with os.fdopen(handle, "wb") as file:
+                        file.write((sha + "\n").encode("ascii"))
+                        file.flush()
+                        os.fsync(file.fileno())
+                    os.replace(lock, name, src_dir_fd=fd, dst_dir_fd=fd)
+                except BaseException:
+                    try:
+                        os.unlink(lock, dir_fd=fd)
+                    except FileNotFoundError:
+                        pass
+                    raise
+                os.fsync(fd)
+            finally:
+                os.close(fd)
 
 
 def unsafe_checkout_component(name: bytes) -> bool:
