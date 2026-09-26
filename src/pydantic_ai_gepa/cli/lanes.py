@@ -70,7 +70,6 @@ from .layout import (
     git_root,
     journal_path,
     notes_dir,
-    project_prefix,
     project_root_for_workspace,
     repo_root,
     resolve_module_attr,
@@ -109,12 +108,12 @@ def lane_branch(run_id: str, lane: str, iteration: int) -> str:
 # ----------------------------- workspace resolution ---------------------
 
 
-def _resolve_workspace_root() -> Path:
+def _resolve_workspace_root(run_id: str | None = None) -> Path:
     """Resolve the primary workspace root from the explicit gepa dir.
 
-    Lane processes are invoked with an absolute ``--gepa-dir`` (or the
-    ``GEPA_DIR`` env fallback), so the workspace root is the absolute
-    workspace's parent — never a directory walked up from cwd (dec-780).
+    Reflector lane processes use an absolute public workspace and its project
+    view without reading the scorer. A harness uses its trusted current project
+    to locate the private record; public JSON cannot choose that authority.
     """
     dirname = current_gepa_dirname()
     path = Path(dirname)
@@ -124,6 +123,20 @@ def _resolve_workspace_root() -> Path:
             "`gepa --gepa-dir /abs/path/to/.gepa ...` or export GEPA_DIR. "
             "No workspace path is derived from the current directory."
         )
+    from .validation import heldout_dataset
+
+    if heldout_dataset(required=False):
+        # The harness starts in its trusted project. Public state must never
+        # redirect the workspace used to locate the private run authority.
+        return repo_root()
+    # Resolve external workspaces without reading the scorer checkout.
+    from .layout import latest_run_id
+
+    run_id = run_id or latest_run_id(path.parent)
+    if run_id:
+        state = _load_run_state(path.parent, run_id)
+        if state.project_root:
+            return Path(state.project_root)
     return project_root_for_workspace(path)
 
 
@@ -361,40 +374,48 @@ def load_all_lane_states(workspace_root: Path, run_id: str) -> list[LaneState]:
 
 
 def worktrees_root(workspace_root: Path) -> Path:
-    return git_root(workspace_root) / WORKTREES_DIRNAME
+    from .lane_repositories import lanes_root
+
+    return lanes_root(workspace_root)
 
 
 def lane_worktree_path(workspace_root: Path, run_id: str, lane: str) -> Path:
-    """Run-scoped worktree path (dec-jh6)."""
-    return worktrees_root(workspace_root) / run_id / lane
+    from .lane_repositories import lane_path
+
+    return lane_path(workspace_root, run_id, lane)
 
 
 def ensure_worktrees_ignored(workspace_root: Path) -> None:
-    """Gitignore the worktrees dir via the common Git dir's info/exclude.
+    """Ignore owned sibling directories when GEPA_DIR is inside the source repo."""
+    from .safe_git import Repository
+    from .lane_repositories import lanes_root
 
-    Adding to .gitignore would dirty the primary tree; info/exclude is local
-    and untracked, so `git ls-files --others --exclude-standard` (used by git
-    candidate identity) skips lane worktrees automatically.
-    """
-    repository = git_root(workspace_root)
-    common_raw = _git(repository, "rev-parse", "--git-common-dir")
-    common_dir = Path(common_raw)
-    if not common_dir.is_absolute():
-        common_dir = (repository / common_dir).resolve()
-    info_dir = common_dir / "info"
-    info_dir.mkdir(parents=True, exist_ok=True)
-    exclude = info_dir / "exclude"
-    entry = f"/{WORKTREES_DIRNAME}/"
-    existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
-    if entry not in existing.splitlines():
-        with exclude.open("a", encoding="utf-8") as fh:
-            if existing and not existing.endswith("\n"):
-                fh.write("\n")
-            fh.write(f"{entry}\n")
+    repository = Repository.discover(workspace_root)
+    public = gepa_dir(workspace_root).resolve()
+    entries = []
+    for path in (
+        lanes_root(workspace_root),
+        public.with_name(public.name + ".repositories"),
+        public.with_name(public.name + ".scorers"),
+    ):
+        if path.is_relative_to(repository.root):
+            entries.append("/" + path.relative_to(repository.root).as_posix() + "/")
+    if entries:
+        info = repository.common_dir / "info"
+        info.mkdir(exist_ok=True)
+        exclude = info / "exclude"
+        existing = exclude.read_text() if exclude.exists() else ""
+        missing = [entry for entry in entries if entry not in existing.splitlines()]
+        if missing:
+            with exclude.open("a") as handle:
+                handle.write("\n" + "\n".join(missing) + "\n")
 
 
 def _git(root: Path, *args: str) -> str:
     from .safe_git import refuse_heldout_git_mutations, run_git
+    from .lane_repositories import candidate_root
+
+    root = candidate_root(root)
 
     if args[0] in {"rev-parse", "diff", "status", "ls-files", "merge-base"}:
         if args == ("rev-parse", "--git-common-dir"):
@@ -417,10 +438,13 @@ def create_lane_worktree(
     workspace_root: Path, run_id: str, lane: str, iteration: int, base_sha: str
 ) -> tuple[Path, str]:
     """Create the lane worktree + branch cut from ``base_sha`` (the run's best)."""
+    from .lane_repositories import load
+
     branch = lane_branch(run_id, lane, iteration)
-    path = lane_worktree_path(workspace_root, run_id, lane)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _git(git_root(workspace_root), "worktree", "add", str(path), "-b", branch, base_sha)
+    repositories = load(workspace_root, run_id)
+    path = repositories.create_lane(lane, base_sha, branch)
+    if GepaConfig.load(config_path(workspace_root)).acceptance.pinned_scorer:
+        repositories.ensure_scorer(lane, base_sha)
     return path, branch
 
 
@@ -568,6 +592,11 @@ def write_packet(
         gepa_abs=gepa_abs,
         lane=lane,
         run_id=run_state.run_id,
+        executable=(
+            str(candidate_project / ".venv/bin/python")
+            if Path(sys.executable).is_relative_to(workspace_root)
+            else sys.executable
+        ),
     )
     invocation = (
         f"cd {shlex.quote(str(candidate_project))} && {shlex.join(continue_argv)}"
@@ -588,7 +617,7 @@ def write_packet(
         "worktree_path": str(worktree_path),
         "git_root": str(repository),
         "project_root": str(workspace_root.resolve()),
-        "project_prefix": project_prefix(workspace_root, repository).as_posix(),
+        "project_prefix": run_state.candidate_prefix,
         "candidate_project_root": str(candidate_project),
         "gepa_workspace": gepa_abs,
         "branch": branch,
@@ -607,6 +636,11 @@ def write_packet(
         "continue_cwd": str(candidate_project),
         "continue_argv": continue_argv,
         "continue_invocation": invocation,
+        "runtime_setup": (
+            f"Provision this lane's own virtualenv at {candidate_project / '.venv'} (for example, run uv sync in {candidate_project}) before running continue; the packet interpreter is missing."
+            if not Path(continue_argv[0]).exists()
+            else None
+        ),
     }
     if cfg.acceptance.mode != "vector":
         packet["baseline"]["mean_score"] = run_state.reflection_baseline_mean_score
@@ -634,11 +668,12 @@ def _lane_continue_argv(
     foreground: bool = False,
     handoff_lease_epoch: int | None = None,
     gate_cases: tuple[str, ...] = (),
+    executable: str | None = None,
 ) -> list[str]:
     """Build a launcher independent of the caller's PATH or active venv."""
 
     argv = [
-        sys.executable,
+        executable or sys.executable,
         "-I",
         "-c",
         "from pydantic_ai_gepa.cli import app; app()",
@@ -1443,7 +1478,21 @@ def _run_lane_eval_loop(
                     )
                 current = VectorRecord.from_dict(raw_record)
                 store = VectorRecordStore(vector_records_path(run_id, workspace_root))
-                candidate_records = tuple(store.matching(current.key))
+                # Baseline vectors are harness-written; the candidate's vectors
+                # live in its public lane ledger in held-out runs.
+                from .lane_ledger import training_directory
+                from .validation import heldout_dataset
+
+                candidate_store = (
+                    VectorRecordStore(
+                        training_directory(run_id, lane, workspace_root)
+                        / "vectors.jsonl"
+                    )
+                    if run_state.heldout_required
+                    and not heldout_dataset(required=False)
+                    else store
+                )
+                candidate_records = tuple(candidate_store.matching(current.key))
                 from dataclasses import replace
 
                 incumbent_records = tuple(
@@ -1619,7 +1668,7 @@ def _load_run_state(workspace_root: Path, run_id: str) -> Any:
 
 def _resolve_lane_run(run_id: str | None) -> tuple[Path, Any]:
     """Resolve (workspace_root, RunState) explicitly; reject non-lane runs."""
-    workspace_root = _resolve_workspace_root()
+    workspace_root = _resolve_workspace_root(run_id)
     if run_id is None:
         from .layout import latest_run_id
 
@@ -1642,6 +1691,8 @@ def _resolve_lane_run(run_id: str | None) -> tuple[Path, Any]:
             err=True,
         )
         raise typer.Exit(code=1)
+    if run_state.lane_repository_version != 1:
+        raise typer.BadParameter("Linked lane runs cannot resume; start a new run.")
     return workspace_root, run_state
 
 
@@ -1755,6 +1806,29 @@ def lane_continue(
     """
     _validate_lane_id(lane)
     workspace_root, run_state = _resolve_lane_run(run_id)
+    expected_lane = lane_worktree_path(workspace_root, run_state.run_id, lane)
+    prefix = Path(run_state.candidate_prefix)
+    if prefix.is_absolute() or ".." in prefix.parts:
+        raise typer.BadParameter("Invalid candidate project prefix.")
+    candidate_project = expected_lane / prefix
+    workspace_root = candidate_project
+    cfg = GepaConfig.load(config_path(workspace_root))
+    if cfg.acceptance.pinned_scorer:
+        from .lane_repositories import scorer_path
+
+        workspace_root = (
+            scorer_path(
+                workspace_root,
+                run_state.run_id,
+                lane,
+                str(run_state.reflection_baseline_commit_sha),
+            )
+            / prefix
+        )
+        if not workspace_root.is_dir():
+            raise typer.BadParameter(
+                "Pinned training scorer snapshot missing; ask the controller to re-fan this lane."
+            )
     if gate_case:
         from .run import _validate_gate_cases
 
@@ -1763,6 +1837,15 @@ def lane_continue(
 
     with _lane_lock(workspace_root, run_state.run_id, lane):
         state = load_lane_state(workspace_root, run_state.run_id, lane)
+        if (
+            Path(str(state.worktree_path)) != expected_lane
+            or Path(str(state.candidate_project_path)) != candidate_project
+            or not (expected_lane / ".git").is_dir()
+            or (expected_lane / ".git").is_symlink()
+        ):
+            raise typer.BadParameter(
+                "Lane repository redirected or linked; start a new run."
+            )
         claimed_handoff = False
 
         if foreground and handoff_lease_epoch is not None:
@@ -1920,9 +2003,16 @@ def lane_continue(
         # the gate. Only the fenced child skips it because its parent already
         # gated the exact unchanged worktree before spawning the child.
         if not (foreground and handoff_lease_epoch is not None):
-            rejected = _candidate_gate(
-                workspace_root=workspace_root, run_state=run_state, state=state
-            )
+            from .layout import candidate_import_context
+
+            with candidate_import_context(
+                primary_project_root=workspace_root,
+                candidate_project_root=workspace_root,
+                refs=(),
+            ):
+                rejected = _candidate_gate(
+                    workspace_root=workspace_root, run_state=run_state, state=state
+                )
             if rejected is not None:
                 typer.echo(
                     f"Lane {lane} candidate review failed; no paired evaluation was spent. "
@@ -1992,12 +2082,21 @@ def lane_continue(
             state.save(workspace_root, run_state.run_id)
 
     if foreground:
-        _run_lane_eval_loop(
-            workspace_root=workspace_root,
-            run_state=run_state,
-            lane_state=state,
-            gate_cases=tuple(gate_case),
-        )
+        from .layout import candidate_import_context
+
+        # Pricing and comparison happen outside run_eval_once's inner import
+        # context. Pinned runs use the controller snapshot for all scorer imports.
+        with candidate_import_context(
+            primary_project_root=workspace_root,
+            candidate_project_root=workspace_root,
+            refs=(),
+        ):
+            _run_lane_eval_loop(
+                workspace_root=workspace_root,
+                run_state=run_state,
+                lane_state=state,
+                gate_cases=tuple(gate_case),
+            )
         return
 
     # Detached background eval: the child re-invokes this verb with
@@ -2290,20 +2389,9 @@ def fan_out_lanes(run_state: Any, workspace_root: Path) -> None:
             typer.echo(f"Lane {lane} ready: worktree {path}, packet {packet_path}.")
     except Exception:
         for path, branch, lane in reversed(created):
-            try:
-                _git(
-                    git_root(workspace_root),
-                    "worktree",
-                    "remove",
-                    "--force",
-                    str(path),
-                )
-            except Exception:
-                pass
-            try:
-                _git(git_root(workspace_root), "branch", "-D", branch)
-            except Exception:
-                pass
+            from .lane_repositories import load
+
+            load(workspace_root, run_state.run_id).remove_lane(lane)
             lane_dir = lanes_dir(workspace_root, run_state.run_id) / lane
             if lane_dir.exists():
                 import shutil

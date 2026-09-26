@@ -127,7 +127,9 @@ def git_candidate_state(
     a distinct id.
     """
 
-    repository = (root or Path.cwd()).resolve()
+    from .lane_repositories import candidate_root
+
+    repository = candidate_root((root or Path.cwd()).resolve())
     excluded = _relative_exclusions(repository, exclude_paths)
     pathspecs = [".", *(f":(exclude){path}" for path in excluded)]
     try:

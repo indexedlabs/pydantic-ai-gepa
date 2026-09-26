@@ -309,6 +309,24 @@ def test_repo_root_falls_back_to_pyproject(tmp_path: Path) -> None:
     assert repo_root(nested) == tmp_path.resolve()
 
 
+def test_repo_root_does_not_use_a_workspace_above_its_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pydantic_ai_gepa.cli import layout
+
+    monkeypatch.setattr(layout, "_explicit_gepa_dirname", None)
+    (tmp_path / ".gepa").mkdir()
+    checkout = tmp_path / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    project = checkout / "temporary-project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    assert repo_root() == project
+    ensure_layout()
+    assert (project / ".gepa").is_dir()
+    assert not list((tmp_path / ".gepa").iterdir())
+
+
 def test_nested_workspace_distinguishes_git_and_project_roots(tmp_path: Path) -> None:
     import subprocess
 

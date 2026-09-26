@@ -1,6 +1,7 @@
 """Executable Git configuration must never cross the held-out boundary."""
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import shlex
@@ -96,6 +97,7 @@ def poison(repo: Path, sentinel: Path, *, worktree: bool = False) -> None:
             file.write("[extensions]\n worktreeConfig = true\n")
     if worktree:
         (metadata.git_dir / "config.worktree").write_bytes(included.read_bytes())
+    (metadata.common_dir / "info").mkdir(exist_ok=True)
     (metadata.common_dir / "info/attributes").write_text("* filter=x diff=x\n")
 
 
@@ -469,22 +471,147 @@ def test_heldout_lane_mutations_refused_before_git(
     assert str(git_repo) not in str(error.value)
 
 
-def test_heldout_lane_start_refused_before_scoring(git_repo, private):
-    result = _run("run", "start", "--lanes", "2")
-    assert result.exit_code == 2, (result.output, result.exception)
-    assert "single-checkout" in result.output
+def test_heldout_lane_start_uses_owned_repositories(
+    git_repo, private, protocol_backend, monkeypatch
+):
+    from pydantic_ai_gepa.cli.lane_repositories import load, lane_path
+
+    result = _run(
+        "run",
+        "start",
+        "--lanes",
+        "2",
+        "--size",
+        "1",
+        "--max-iterations",
+        "20",
+        "--acceptance-repetitions",
+        "1",
+    )
+    assert result.exit_code == 0, (result.output, result.exception)
+    run_id = str(_run_payload(result.output)["run_id"])
+    from pydantic_ai_gepa.cli.validation import harness_environment
+
+    with harness_environment():
+        record = load(git_repo, run_id)
+        assert record.directory.is_relative_to(private.parent)
+    source_sha = _git(git_repo, "rev-parse", "HEAD")
+    candidate_sha = None
+    for lane in ("lane-1", "lane-2"):
+        path = lane_path(git_repo, run_id, lane)
+        assert (path / ".git").is_dir()
+        assert not (path / ".git/objects/info/alternates").exists()
+        if lane == "lane-1":
+            (path / "score.txt").write_text("good\n")
+            _git(path, "add", "score.txt")
+            _git(path, "commit", "-m", "Improve candidate")
+            candidate_sha = _git(path, "rev-parse", "HEAD")
+        with monkeypatch.context() as patch:
+            patch.delenv("GEPA_HELDOUT_DATASET")
+            patch.chdir(path)
+            result = _run(
+                "-G",
+                str(git_repo / ".gepa"),
+                "lane",
+                "continue",
+                lane,
+                "--run-id",
+                run_id,
+                "--foreground",
+            )
+        assert result.exit_code == 0, (result.output, result.exception)
+        poison(path, git_repo.parent / (git_repo.name + "-" + lane + "-hook"))
+    # Reflector evidence is outside the harness-owned ledgers and survives select.
+    lane_ledgers = {
+        lane: git_repo / ".gepa/runs" / run_id / "lanes" / lane / "pareto.jsonl"
+        for lane in ("lane-1", "lane-2")
+    }
+    before = {lane: path.read_bytes() for lane, path in lane_ledgers.items()}
+    assert all(len(raw.splitlines()) == 3 for raw in before.values())
+    harness_rows = (git_repo / ".gepa/runs" / run_id / "pareto.jsonl").read_text()
+    assert all(json.loads(row)["lane"] is None for row in harness_rows.splitlines())
+    result = _run("-G", str(git_repo / ".gepa"), "run", "select", "--run-id", run_id)
+    assert result.exit_code == 0, (result.output, result.exception)
+    assert "restored from the harness record" not in result.output
+    assert {lane: path.read_bytes() for lane, path in lane_ledgers.items()} == before
+    assert _run_payload(result.output)["best_commit_sha"] == candidate_sha
+    # Reflector-written training rows cannot exhaust the private harness budget.
+    assert _run_payload(result.output)["status"] == "running"
+    from pydantic_ai_gepa.cli.run import _load_state
+    from pydantic_ai_gepa.cli.select import _phase_finalize
+
+    with harness_environment(), record.route():
+        state, _, _ = _phase_finalize(git_repo, _load_state(run_id), {})
+        assert state.status == "done"
+    assert _git(record.repository, "rev-parse", "HEAD") == candidate_sha
+    assert _git(git_repo, "rev-parse", "HEAD") == source_sha
+    for lane in ("lane-1", "lane-2"):
+        assert not (git_repo.parent / (git_repo.name + "-" + lane + "-hook")).exists()
+        assert not lane_path(git_repo, run_id, lane).exists()
     assert str(private) not in result.output
-    assert not (git_repo / "worktrees").exists()
 
 
-def test_heldout_select_refused_before_state_changes(git_repo, private, monkeypatch):
+def test_trusted_scorer_uses_original_repository_with_independent_seed(
+    git_repo, private, protocol_backend, monkeypatch
+):
+    from pydantic_ai_gepa.cli.lane_repositories import lane_path
+
+    config = git_repo / ".gepa/gepa.toml"
+    config.write_text(
+        config.read_text()
+        + '\n[acceptance]\npinned_scorer = true\ntrusted_scorer = true\ncomponent_files = ["score.txt"]\n'
+    )
+    (git_repo / "task_pkg/evaluation.py").write_text(
+        "import json, os\n"
+        "async def evaluate(case):\n"
+        "    return json.loads(os.environ['GEPA_CANDIDATE_COMPONENTS_JSON'])['score.txt']\n"
+    )
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "Trusted scorer")
+    revision = _git(git_repo, "rev-parse", "HEAD")
+    monkeypatch.setenv("GEPA_HARNESS_SCORER_REVISION", revision)
+    export = git_repo.parent / (git_repo.name + "-export")
+    (export / "api").mkdir(parents=True)
+    (export / "api/score.txt").write_text("bad")
+    (export / "api/pyproject.toml").write_text(
+        '[project]\nname="export"\nversion="0.0.0"\n'
+    )
+    _git(export, "init")
+    _git(export, "config", "user.name", "Tests")
+    _git(export, "config", "user.email", "tests@example.com")
+    _git(export, "add", ".")
+    _git(export, "commit", "-m", "History-free candidate")
+    result = _run(
+        "run",
+        "start",
+        "--candidate-root",
+        str(export / "api"),
+        "--lanes",
+        "1",
+        "--size",
+        "1",
+        "--max-iterations",
+        "20",
+        "--acceptance-repetitions",
+        "1",
+    )
+    assert result.exit_code == 0, (result.output, result.exception)
+    state = _run_payload(result.output)
+    assert state["best_commit_sha"] == _git(export, "rev-parse", "HEAD")
+    lane = lane_path(git_repo, str(state["run_id"]), "lane-1")
+    assert not (lane / "task_pkg").exists()
+    with pytest.raises(subprocess.CalledProcessError):
+        _git(lane, "cat-file", "-e", revision)
+    assert _git(git_repo, "rev-parse", "HEAD") == revision
+    assert str(private) not in result.output
+
+
+def test_heldout_select_refuses_legacy_state(git_repo, private, monkeypatch):
     from types import SimpleNamespace
     from pydantic_ai_gepa.cli.select import _run_select_locked
 
-    # This also refuses a training lane run if held-out access is introduced
-    # later, rather than only checking its persisted heldout_required flag.
     state = SimpleNamespace(status="paused_for_reflection", heldout_required=False)
-    with pytest.raises(typer.BadParameter, match="single-checkout") as error:
+    with pytest.raises(typer.BadParameter, match="start a new run") as error:
         _run_select_locked(git_repo, state)
     assert str(private) not in str(error.value)
 

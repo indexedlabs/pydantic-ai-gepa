@@ -590,6 +590,7 @@ def score_cases(
     cases: list[Any],
     validation: bool,
     meter: Any,
+    scorer_project: Path | None = None,
 ) -> list[EvaluationRecord]:
     """Serial rollouts keep admission and durable spend in the trusted parent.
 
@@ -617,7 +618,13 @@ def score_cases(
             "Invalid GEPA_HARNESS_ALLOWED_HOSTS; use host:port pairs."
         ) from None
     with (
-        private_checkout(project, revision, frozen=frozen) as (
+        private_checkout(
+            (scorer_project or project)
+            if config.acceptance.trusted_scorer
+            else project,
+            revision,
+            frozen=frozen,
+        ) as (
             private,
             checkout,
             scratch,

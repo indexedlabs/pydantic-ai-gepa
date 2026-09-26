@@ -88,6 +88,8 @@ Use this skill when working with PDFs.
 
 
 def test_skills_fs_from_disk(tmp_path: Path) -> None:
+    # Hidden ancestors of the requested root must not hide the entire pack.
+    tmp_path = tmp_path / ".hidden-parent"
     (tmp_path / "pack" / "a").mkdir(parents=True)
     (tmp_path / "pack" / "a" / "SKILL.md").write_text(
         "---\nname: a\ndescription: d\n---\n# A\n", encoding="utf-8"
@@ -96,10 +98,15 @@ def test_skills_fs_from_disk(tmp_path: Path) -> None:
     (tmp_path / "pack" / "a" / "references" / "REF.md").write_text(
         "ref", encoding="utf-8"
     )
+    (tmp_path / "pack" / "a" / ".hidden.txt").write_text("hidden", encoding="utf-8")
 
     fs = SkillsFS.from_disk(tmp_path / "pack")
     assert fs.is_file("a/SKILL.md")
     assert fs.is_file("a/references/REF.md")
+    assert not fs.is_file("a/.hidden.txt")
+    assert SkillsFS.from_disk(tmp_path / "pack", include_hidden=True).is_file(
+        "a/.hidden.txt"
+    )
 
 
 def test_parse_skill_md_validation_errors() -> None:

@@ -242,6 +242,8 @@ def _continue_vector_lane(repo: Path, run_id: str, lane: str, value: str) -> Lan
     worktree = Path(str(state.worktree_path))
     (worktree / "score.txt").write_text(value, encoding="utf-8")
     previous_cwd = Path.cwd()
+    # Match the real reflector launcher: training never receives this capability.
+    dataset = os.environ.pop("GEPA_HELDOUT_DATASET", None)
     try:
         os.chdir(worktree)
         continued = _run(
@@ -256,6 +258,8 @@ def _continue_vector_lane(repo: Path, run_id: str, lane: str, value: str) -> Lan
         )
     finally:
         os.chdir(previous_cwd)
+        if dataset is not None:
+            os.environ["GEPA_HELDOUT_DATASET"] = dataset
     assert continued.exit_code == 0, continued.output
     return load_lane_state(repo, run_id, lane)
 
@@ -374,6 +378,13 @@ def test_vector_validation_uses_comparator_ranking_without_persisting_detail(
     )
 
     assert selected.exit_code == 0, selected.output
+    assert "restored from the harness record" not in selected.output
+    assert all(
+        (
+            vector_repo / ".gepa/runs" / run_id / "lanes" / lane / "vectors.jsonl"
+        ).read_text()
+        for lane in resolved
+    )
     final = RunState.from_dict(
         json.loads((vector_repo / ".gepa" / "runs" / run_id / "state.json").read_text())
     )
@@ -962,7 +973,7 @@ def test_periodic_rebaseline_is_paired_journaled_and_never_reverts_incumbent(
 def test_promotion_counter_is_not_doubled_when_select_resumes_after_a_crash(
     vector_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import pydantic_ai_gepa.cli.select as select_module
+    from pydantic_ai_gepa.cli.lane_repositories import Repositories
 
     config = vector_repo / ".gepa" / "gepa.toml"
     config.write_text(_config(pinned_scorer=True), encoding="utf-8")
@@ -990,13 +1001,13 @@ def test_promotion_counter_is_not_doubled_when_select_resumes_after_a_crash(
         os.chdir(previous_cwd)
     assert continued.exit_code == 0, continued.output
 
-    original_reset = select_module._reset_primary_to
+    original_reset = Repositories.promote
 
-    def crash_after_reset(root: Path, commit_sha: str) -> None:
+    def crash_after_reset(root: Repositories, commit_sha: str) -> None:
         original_reset(root, commit_sha)
         raise RuntimeError("simulated crash after durable promotion journal")
 
-    monkeypatch.setattr(select_module, "_reset_primary_to", crash_after_reset)
+    monkeypatch.setattr(Repositories, "promote", crash_after_reset)
     crashed = CliRunner().invoke(
         gepa_app,
         [
@@ -1025,7 +1036,7 @@ def test_promotion_counter_is_not_doubled_when_select_resumes_after_a_crash(
         if row.get("kind") == "run_start_rebaseline" and row.get("run_id") == run_id
     ]
 
-    monkeypatch.setattr(select_module, "_reset_primary_to", original_reset)
+    monkeypatch.setattr(Repositories, "promote", original_reset)
     resumed = _run(
         "--gepa-dir", str(vector_repo / ".gepa"), "run", "select", "--run-id", run_id
     )
