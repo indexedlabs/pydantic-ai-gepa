@@ -48,13 +48,15 @@ from typing import TYPE_CHECKING, Any, Iterator, Literal, Sequence, cast
 
 import typer
 
+from . import harness_record
+
 from ..evaluation import (
     EvaluationRecord,
     evaluate_callable_dataset,
     evaluate_candidate_dataset,
 )
 from ..evaluation_health import (
-    append_infrastructure_failures_to_report,
+    format_infrastructure_failures,
     evaluation_infrastructure_failures,
 )
 from ._io import write_content_file
@@ -96,6 +98,7 @@ from .validation import (
     private_evaluation,
     validation_spend_path,
 )
+from .harness_record import VectorRecordStore, serialized_eval
 from .runs import (
     Minibatch,
     MinibatchStore,
@@ -110,7 +113,6 @@ from .spend import evaluation_spend, spend_report, validate_cap
 from ..vector_acceptance import (
     VectorRecord,
     VectorRecordKey,
-    VectorRecordStore,
     inventory_hash,
     scorer_identity,
     side_info_vector,
@@ -142,7 +144,9 @@ def _candidate_component_hashes(
     for relative in component_files:
         path = candidate_root / relative
         if path.is_file():
-            hashes[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+            hashes[relative] = hashlib.sha256(
+                harness_record.read_bytes(path)
+            ).hexdigest()
     return hashes
 
 
@@ -162,10 +166,11 @@ def _count_evals_in_run(run_id: str, root: Path | None = None) -> int:
     # stops repeated reflect -> gate-reject cycles.
     from .layout import run_state_path
     from .run import RunState
+    from .harness_record import read_text
 
     path = run_state_path(run_id, root)
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(read_text(path, root=root))
         if isinstance(data, dict):
             return rows + RunState.from_dict(data).gate_consumed_iterations
     except (OSError, ValueError, TypeError):
@@ -303,12 +308,20 @@ def current_trace_path() -> Path | None:
 
 
 @contextmanager
-def _expose_trace_path(path: Path | None) -> Iterator[None]:
+def _expose_trace_path(
+    path: Path | None, *, root: Path | None = None
+) -> Iterator[None]:
     previous = os.environ.get(GEPA_TRACE_FILE_ENV)
     if path is None:
         os.environ.pop(GEPA_TRACE_FILE_ENV, None)
     else:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        if heldout_dataset(required=False):
+            from .harness_record import SafeDir
+
+            with SafeDir.open(root or repo_root(), path.parent, create=True):
+                pass
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
         os.environ[GEPA_TRACE_FILE_ENV] = str(path)
     try:
         yield
@@ -361,6 +374,19 @@ def _write_trace_file(
             trace_record["metric_side_info"] = metric_side_info
         trace_rows.append(trace_record)
 
+    if heldout_dataset(required=False):
+        from .harness_record import exists, read_text, write_text
+
+        if trace_rows:
+            write_text(
+                path,
+                "".join(
+                    json.dumps(row, default=_json_default, sort_keys=True) + "\n"
+                    for row in trace_rows
+                ),
+                append=True,
+            )
+        return path if exists(path) and read_text(path) else None
     if trace_rows:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
@@ -370,6 +396,7 @@ def _write_trace_file(
 
 
 @private_evaluation
+@serialized_eval
 def run_eval_once(
     *,
     candidate_file: Path | None,
@@ -429,6 +456,16 @@ def run_eval_once(
     active_candidate_project = routed_candidate(
         candidate_root or primary_project_root
     ).resolve()
+    from .harness_record import for_run
+
+    active_run_id = _resolve_run_id(run_id, root=workspace_root)
+    record = for_run(active_run_id, primary_project_root)
+    if record is not None:
+        managed_text = record.read("state.json")
+        if managed_text is not None:
+            max_iterations = min(
+                max_iterations, int(json.loads(managed_text)["max_iterations"])
+            )
     cfg = GepaConfig.load(config_path(primary_project_root))
     source = candidate_source or cfg.candidate_source
     from . import scoring_sandbox
@@ -475,7 +512,8 @@ def run_eval_once(
                 and held_out_path.is_file()
                 and (
                     dataset_path.samefile(held_out_path)
-                    or dataset_path.read_bytes() == held_out_path.read_bytes()
+                    or harness_record.read_bytes(dataset_path)
+                    == harness_record.read_bytes(held_out_path)
                 )
             ):
                 raise typer.BadParameter(
@@ -564,7 +602,6 @@ def run_eval_once(
             candidate_overrides_id = str(candidate_file)
             status = "evaluated"
 
-    active_run_id = _resolve_run_id(run_id, root=workspace_root)
     prior_count = _count_evals_in_run(active_run_id, root=workspace_root)
     if prior_count >= max_iterations:
         if not lane:  # None (single path) or empty: hard cap; lane str: advisory
@@ -585,7 +622,19 @@ def run_eval_once(
     iteration = prior_count + 1
     eval_id = new_eval_id()
 
-    run_dir(active_run_id, workspace_root).mkdir(parents=True, exist_ok=True)
+    if heldout_dataset(required=False):
+        from .harness_record import SafeDir, initialize
+        from .validation import pin_heldout
+
+        if record is None:
+            pin_heldout(primary_project_root, active_run_id)
+            initialize(primary_project_root, active_run_id)
+        with SafeDir.open(
+            primary_project_root, run_dir(active_run_id, workspace_root), create=True
+        ):
+            pass
+    else:
+        run_dir(active_run_id, workspace_root).mkdir(parents=True, exist_ok=True)
     minibatch_store = MinibatchStore(active_run_id, workspace_root)
     if dataset_role == "validation":
         if (
@@ -763,9 +812,9 @@ def run_eval_once(
                             f"Declared candidate component file is missing: {relative}"
                         )
                     try:
-                        candidate_components[relative] = path.read_bytes().decode(
-                            "utf-8"
-                        )
+                        candidate_components[relative] = harness_record.read_bytes(
+                            path
+                        ).decode("utf-8")
                     except UnicodeDecodeError as exc:
                         raise typer.BadParameter(
                             f"Declared component file {relative} must be UTF-8 text."
@@ -791,7 +840,7 @@ def run_eval_once(
                 )
                 case_factory = resolve_case_factory(cfg, expected_root=scorer_root)
                 skills_fs = resolve_skills(cfg, root=scorer_root)
-                with _expose_trace_path(planned_trace_path):
+                with _expose_trace_path(planned_trace_path, root=primary_project_root):
                     if evaluate is not None:
                         records = asyncio.run(
                             evaluate_callable_dataset(
@@ -825,7 +874,7 @@ def run_eval_once(
                 os.environ[GEPA_CANDIDATE_COMPONENTS_ENV] = previous_payload
         else:
             assert metric is not None
-            with _expose_trace_path(planned_trace_path):
+            with _expose_trace_path(planned_trace_path, root=primary_project_root):
                 assert agent is not None
                 records = asyncio.run(
                     evaluate_candidate_dataset(
@@ -864,21 +913,20 @@ def run_eval_once(
     report_path: Path | None = None
     if persist_report:
         reports_dir = run_dir(active_run_id, workspace_root) / "reports"
-        reports_dir.mkdir(parents=True, exist_ok=True)
         report_path = reports_dir / f"{iteration:04d}-{eval_id}-{candidate.id}.md"
-        report_path.write_text(
-            _format_failures(
-                records,
-                threshold=threshold,
-                candidate_source=source,
-                redact_scores=cfg.acceptance.mode == "vector",
-            ),
-            encoding="utf-8",
+        report_text = _format_failures(
+            records,
+            threshold=threshold,
+            candidate_source=source,
+            redact_scores=cfg.acceptance.mode == "vector",
         )
         if infrastructure_failures:
-            append_infrastructure_failures_to_report(
-                report_path, infrastructure_failures
-            )
+            report_text += format_infrastructure_failures(infrastructure_failures)
+        from .harness_record import write_text
+
+        if not write_text(report_path, report_text, root=primary_project_root):
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(report_text, encoding="utf-8")
     trace_path = (
         _write_trace_file(
             path=planned_trace_path,

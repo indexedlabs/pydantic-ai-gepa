@@ -604,6 +604,17 @@ def test_validation_eval_never_emits_per_case_output(
     assert outcome.report_path is outcome.trace_path is None
     assert "withheld-eval-case" not in _format_output_lines(outcome)
     run_path = repo / ".gepa" / "runs" / outcome.summary["run_id"]
+    from pydantic_ai_gepa.cli import harness_record
+    from pydantic_ai_gepa.cli.validation import _pin_path
+
+    with harness_record.session():
+        record = harness_record.for_run(run_path.name, repo)
+        assert record is not None
+        assert record.path.exists()
+        assert _pin_path(str(validation_path), repo, run_path.name).exists()
+        assert harness_record._index_path(
+            str(validation_path), repo, run_path.name
+        ).exists()
     assert not list(run_path.rglob("*.md"))
     assert not list((run_path / "traces").rglob("*"))
     assert not list((run_path / "minibatches").rglob("*"))

@@ -47,6 +47,11 @@ def _state(**overrides):
 
 @pytest.fixture
 def selection(monkeypatch, tmp_path):
+    from pydantic_ai_gepa.cli import harness_record
+
+    # These unit tests inject held-out scoring and its private authority; real
+    # index/record lookup is covered by harness and lane CLI integration tests.
+    monkeypatch.setattr(harness_record, "for_run", lambda *_: object())
     lanes = [
         LaneState(
             lane=f"lane-{index}",
@@ -162,6 +167,18 @@ def test_lane_promotion_stores_confirmation_evidence(selection):
     assert len(calls) == 5
 
 
+def test_private_authority_enables_validation_even_if_state_flag_is_false(selection):
+    root, calls, scores = selection
+    scores["lane-1:confirmation"] = 0.8
+    state, ctx, _ = select._phase_promote(root, _state(heldout_required=False), {})
+    assert (
+        calls
+        == ["lane-1:validation", "lane-2:validation"] + ["lane-1:confirmation"] * 3
+    )
+    assert state.best_candidate_id == "candidate-1"
+    assert ctx["validation_confirmation"]["verdict"] == "accepted"
+
+
 def test_lane_confirmation_budget_fails_closed(selection):
     root, calls, _ = selection
     state, ctx, _ = select._phase_promote(root, _state(max_iterations=7), {})
@@ -273,3 +290,36 @@ def test_lane_confirmation_seeded_noise(selection, effect):
     assert (
         rate <= 0.05 + 3 * (0.05 * 0.95 / trials) ** 0.5 if effect == 0 else rate >= 0.8
     )
+
+
+def test_changed_lane_identity_cannot_reuse_private_validation(selection):
+    root, calls, scores = selection
+    scores["lane-1:confirmation"] = 0.5
+    forged_prior = {
+        "validation_results": {
+            "lane-1": {
+                "candidate_id": "another-candidate",
+                "commit_sha": "another-commit",
+                "mean_score": 999.0,
+                "selectable": True,
+            }
+        }
+    }
+    state, _, _ = select._phase_promote(root, _state(), forged_prior)
+    assert "lane-1:validation" in calls
+    assert state.best_candidate_id == "incumbent"
+
+
+def test_lane_proposal_must_match_the_scored_commit(selection, monkeypatch):
+    root, calls, _ = selection
+    original = run._evaluate_validation_candidate
+
+    def mismatched(state, **kwargs):
+        state, outcome = original(state, **kwargs)
+        outcome.summary["commit_sha"] = "different-commit"
+        return state, outcome
+
+    monkeypatch.setattr(run, "_evaluate_validation_candidate", mismatched)
+    with pytest.raises(typer.BadParameter, match="differs from the commit scored"):
+        select._phase_promote(root, _state(), {})
+    assert calls == ["lane-1:validation"]

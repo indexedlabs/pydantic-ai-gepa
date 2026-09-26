@@ -382,6 +382,11 @@ class GepaConfig:
 
     @staticmethod
     def load(path: Path) -> GepaConfig:
+        from .harness_record import config_text
+
+        pinned = config_text(path)
+        if pinned is not None:
+            return GepaConfig.from_dict(tomllib.loads(pinned))
         if not path.exists():
             raise GepaConfigError(
                 f"No gepa.toml at {path}. Run `gepa init --agent module:attr` first."
@@ -602,11 +607,17 @@ def is_run_id(value: str) -> bool:
 
 
 def latest_run_id(root: Path | None = None) -> str | None:
+    from .harness_record import list_paths
+
     base = runs_dir(root)
     if not base.is_dir():
         return None
     candidates = sorted(
-        (p.name for p in base.iterdir() if p.is_dir() and is_run_id(p.name)),
+        (
+            p.name
+            for p in list_paths(base, root=root)
+            if p.is_dir() and is_run_id(p.name)
+        ),
         reverse=True,
     )
     return candidates[0] if candidates else None

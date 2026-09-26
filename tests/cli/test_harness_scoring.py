@@ -171,7 +171,9 @@ def test_only_harness_scores_and_results_preserve_continue_contract(
     assert saved["exit_code"] == result.exit_code
     status = _run("run", "status", "--run-id", run_id)
     resume = _run("run", "resume", "--run-id", run_id)
-    assert status.exit_code == resume.exit_code == 0
+    assert status.exit_code == 0
+    assert resume.exit_code == 2
+    assert "GEPA_HELDOUT_DATASET" in resume.output
     _sweep(
         git_repo,
         path,
@@ -196,7 +198,10 @@ def test_stale_nomination_is_rejected_without_scoring(
     elif change == "dirty":
         (git_repo / "score.txt").write_text("dirty")
     else:
-        assert _run("run", "resume", "--run-id", run_id).exit_code == 0
+        # Epoch changes are harness-owned; public resume cannot revoke a nomination.
+        with monkeypatch.context() as env:
+            env.setenv("GEPA_HELDOUT_DATASET", str(path))
+            assert _run("run", "resume", "--run-id", run_id).exit_code == 0
     monkeypatch.setattr(
         run_module,
         "run_eval_once",
@@ -349,7 +354,9 @@ def test_invalid_heldout_file_never_appears_in_error_output(
 def test_harness_replays_budget_exit_code(git_repo, heldout, monkeypatch):
     path, run_id, _ = heldout
     state = run_module._load_state(run_id)
-    replace(state, max_iterations=state.iterations + 1).save()
+    with monkeypatch.context() as env:
+        env.setenv("GEPA_HELDOUT_DATASET", str(path))
+        replace(state, max_iterations=state.iterations + 1).save()
     _commit(git_repo)
     assert _continue(run_id).exit_code == 0
     served = _serve(run_id, path, monkeypatch)
