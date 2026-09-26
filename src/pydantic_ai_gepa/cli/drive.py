@@ -160,9 +160,13 @@ def reflector_environment(pass_env: list[str] | None = None) -> dict[str, str]:
         raise typer.BadParameter(
             "GIT_CONFIG_COUNT must be a nonnegative integer."
         ) from exc
-    for key in ("gc.autoDetach", "maintenance.autoDetach"):
+    for key, value in (
+        ("gc.autoDetach", "false"),
+        ("maintenance.autoDetach", "false"),
+        ("safe.bareRepository", "explicit"),
+    ):
         environment[f"GIT_CONFIG_KEY_{count}"] = key
-        environment[f"GIT_CONFIG_VALUE_{count}"] = "false"
+        environment[f"GIT_CONFIG_VALUE_{count}"] = value
         count += 1
     environment["GIT_CONFIG_COUNT"] = str(count)
     return environment

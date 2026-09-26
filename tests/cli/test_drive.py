@@ -849,11 +849,14 @@ def test_training_credentials_explicit_passthrough(git_repo, monkeypatch):
     _, _, names = drive.load_reflectors(path)
     env = drive.reflector_environment(names)
     assert env["OPENAI_API_KEY"] == "training-only"
-    assert env["GIT_CONFIG_COUNT"] == "3"
+    assert env["GIT_CONFIG_COUNT"] == "4"
     assert env["GIT_CONFIG_KEY_0"] == "user.name"
+    assert env["GIT_CONFIG_VALUE_0"] == "Test"
     assert env["GIT_CONFIG_KEY_1"] == "gc.autoDetach"
     assert env["GIT_CONFIG_KEY_2"] == "maintenance.autoDetach"
     assert env["GIT_CONFIG_VALUE_1"] == env["GIT_CONFIG_VALUE_2"] == "false"
+    assert env["GIT_CONFIG_KEY_3"] == "safe.bareRepository"
+    assert env["GIT_CONFIG_VALUE_3"] == "explicit"
     assert "OPENAI_API_KEY" not in drive.reflector_environment()
     script = path.parent / "reflect.py"
     script.write_text(

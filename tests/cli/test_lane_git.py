@@ -87,7 +87,7 @@ def test_config_must_be_regular_unlinked_file(lane, kind):
         safe_git.refuse_executable_lane_git(lane)
 
 
-@pytest.mark.parametrize("name", ["hooks", "info", "objects", "objects/info"])
+@pytest.mark.parametrize("name", ["hooks", "info", "objects", "objects/info", "refs"])
 def test_metadata_directory_links_refused(lane, name):
     path = lane / ".git" / name
     if path.exists():
@@ -147,3 +147,28 @@ def test_git_markers_refused(lane, nested, kind):
         path.symlink_to(lane / "missing")
     with pytest.raises(OSError):
         safe_git.refuse_executable_lane_git(lane)
+
+
+@pytest.mark.parametrize(
+    "location,checkout",
+    [(".", "api"), ("api", "api"), ("api", "api/sub"), ("api/deeper", "api")],
+)
+@pytest.mark.parametrize("linked", [None, "HEAD", "objects", "refs", "dangling-HEAD"])
+def test_bare_layout_refused(lane, location, checkout, linked):
+    project = lane / checkout
+    project.mkdir(parents=True, exist_ok=True)
+    bare = lane / location
+    bare.mkdir(parents=True, exist_ok=True)
+    (bare / "HEAD").write_text("ref: refs/heads/main\n")
+    (bare / "objects").mkdir()
+    (bare / "refs").mkdir()
+    if linked == "dangling-HEAD":
+        (bare / "HEAD").unlink()
+        (bare / "HEAD").symlink_to("refs/heads/main")
+    elif linked is not None:
+        path = bare / linked
+        target = bare / f"saved-{linked}"
+        path.rename(target)
+        path.symlink_to(target, target_is_directory=linked != "HEAD")
+    with pytest.raises(safe_git.SafeGitError, match="bare Git repository layout"):
+        safe_git.refuse_executable_lane_git(project)

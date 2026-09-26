@@ -211,6 +211,17 @@ def _check_lane_config(raw: bytes) -> None:
             raise SafeGitError(f"Lane .git/config has unsupported key or value: {key}.")
 
 
+def _refuse_bare_layout(directory: Path) -> None:
+    # Git follows objects/refs links and accepts symbolic HEAD links, even dangling.
+    head = directory / "HEAD"
+    if (
+        (head.is_file() or head.is_symlink())
+        and (directory / "objects").is_dir()
+        and (directory / "refs").is_dir()
+    ):
+        raise SafeGitError(f"Lane contains a bare Git repository layout: {directory}.")
+
+
 def refuse_executable_lane_git(project: Path) -> Path:
     """Check a project's repository before an unsandboxed reflector launch.
 
@@ -219,6 +230,7 @@ def refuse_executable_lane_git(project: Path) -> Path:
     """
     start = project.absolute()
     for root in (start, *start.parents):
+        _refuse_bare_layout(root)
         with _directory_fd(root) as directory:
             try:
                 marker = os.stat(".git", dir_fd=directory, follow_symlinks=False)
@@ -234,7 +246,7 @@ def refuse_executable_lane_git(project: Path) -> Path:
     metadata = root / ".git"
     _check_lane_config(_read_metadata(metadata, "config") or b"")
     with _directory_fd(metadata) as directory:
-        for name in ("hooks", "info", "objects", "objects/info"):
+        for name in ("hooks", "info", "objects", "objects/info", "refs"):
             try:
                 info = os.stat(name, dir_fd=directory, follow_symlinks=False)
             except FileNotFoundError:
@@ -259,6 +271,7 @@ def refuse_executable_lane_git(project: Path) -> Path:
         raise error
 
     for directory, directories, files in os.walk(root, onerror=unreadable):
+        _refuse_bare_layout(Path(directory))
         if Path(directory) == root:
             directories.remove(".git")
         if ".git" in directories or ".git" in files:
