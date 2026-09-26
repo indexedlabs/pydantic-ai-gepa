@@ -23,7 +23,7 @@ def prepared(git_repo, monkeypatch, tmp_path):
     training = git_repo / ".gepa/dataset.jsonl"
     row = json.loads(training.read_text())
     training.write_text(
-        json.dumps(row) + "\n" + json.dumps(dict(row, name="case-2")) + "\n"
+        "".join(json.dumps(dict(row, name=f"case-{i}")) + "\n" for i in range(10))
     )
     _git(git_repo, "add", "task_pkg", ".gepa/dataset.jsonl")
     _git(git_repo, "commit", "-m", "Fake evaluator")
@@ -40,7 +40,7 @@ def prepared(git_repo, monkeypatch, tmp_path):
                 }
             )
             + "\n"
-            for i in range(2)
+            for i in range(10)
         )
     )
     with monkeypatch.context() as env:
@@ -49,7 +49,7 @@ def prepared(git_repo, monkeypatch, tmp_path):
             "run",
             "start",
             "--size",
-            "2",
+            "10",
             "--max-iterations",
             "5",
             "--acceptance-paired-min-cases",
