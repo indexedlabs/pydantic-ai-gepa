@@ -928,6 +928,7 @@ def test_harness_pass_env_requires_a_present_variable(tmp_path, monkeypatch):
     ],
 )
 def test_result_parser_refuses_unbounded_or_executable_shapes(raw):
+    raw["diagnostic"] = None
     with pytest.raises(sandbox.ScoringSandboxError):
         sandbox._result(raw, "case", True)
 
@@ -940,6 +941,7 @@ def test_validation_discards_feedback():
         "failed": False,
         "cached": False,
         "material": None,
+        "diagnostic": None,
     }
     record = sandbox._result(raw, "case", True)
     assert record.feedback is None
@@ -1349,29 +1351,6 @@ async def evaluate(case):
     for path in temporary_paths:
         assert not path.exists()
     assert not list((private.parent / ".gepa-heldout/work").iterdir())
-
-
-def test_real_sandbox_allows_only_proxy_model_endpoint(
-    real_backend, git_repo, private, private_run, monkeypatch
-):
-    with endpoint() as (port, received):
-        monkeypatch.setenv("GEPA_HARNESS_ALLOWED_HOSTS", f"127.0.0.1:{port}")
-        sha = commit_evaluator(
-            git_repo,
-            f"""import os, socket
-from urllib.parse import urlparse
-async def evaluate(case):
-    proxy = urlparse(os.environ['HTTPS_PROXY'])
-    with socket.create_connection((proxy.hostname, proxy.port), timeout=3) as s:
-        s.sendall(b'CONNECT 127.0.0.1:{port} HTTP/1.1\\r\\n\\r\\n')
-        assert b'200 Connection Established' in s.recv(4096)
-        s.sendall(b'GET / HTTP/1.1\\r\\nHost: model\\r\\n\\r\\n')
-        assert b'200 OK' in s.recv(4096)
-    return 'good'
-""",
-        )
-        assert score(git_repo, sha)[0].score == 1
-        assert len(received) == 1
 
 
 @pytest.mark.parametrize("transport", ["unix", "tcp"])

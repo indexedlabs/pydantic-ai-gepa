@@ -11,9 +11,14 @@ from typing import Any
 
 from pydantic_evals import Case
 
-from ..evaluation import evaluate_callable_dataset, evaluate_candidate_dataset
+from ..evaluation import (
+    EvaluationRecord,
+    evaluate_callable_dataset,
+    evaluate_candidate_dataset,
+)
 from ..evaluation_health import evaluation_infrastructure_failures
 from ..spend import SpendMeter, rollout_spend
+from ..types import RolloutOutput, _rollout_error_observer
 from .layout import (
     GepaConfig,
     insert_repo_root_on_path,
@@ -44,6 +49,11 @@ def main() -> None:
         if value.get("type") == "result" and len(data.encode()) > 1024 * 1024:
             value["material"] = None
             data = json.dumps(value, allow_nan=False) + "\n"
+            if len(data.encode()) > 1024 * 1024 and value.get("diagnostic"):
+                value["diagnostic"]["message"] = (
+                    "Exception message exceeds protocol limit"
+                )
+                data = json.dumps(value, allow_nan=False) + "\n"
         protocol.write(data)
         protocol.flush()
 
@@ -100,38 +110,64 @@ def main() -> None:
         trace_path = Path(request["output_dir"]) / "trace.jsonl"
         os.environ["GEPA_TRACE_FILE"] = str(trace_path)
         meter = Meter(price_fn=price)
-        with rollout_spend(meter):
-            if evaluate is not None:
-                records = asyncio.run(
-                    evaluate_callable_dataset(
-                        evaluate=evaluate,
-                        metric=metric,
-                        dataset=[case],
-                        concurrency=1,
-                        case_factory=case_factory,
+        diagnostic = None
+
+        def observe(error: Exception) -> None:
+            nonlocal diagnostic
+            diagnostic = {"class": type(error).__name__, "message": str(error)}
+
+        token = _rollout_error_observer.set(observe)
+        try:
+            with rollout_spend(meter):
+                if evaluate is not None:
+                    records = asyncio.run(
+                        evaluate_callable_dataset(
+                            evaluate=evaluate,
+                            metric=metric,
+                            dataset=[case],
+                            concurrency=1,
+                            case_factory=case_factory,
+                        )
                     )
-                )
-            else:
-                if agent is None:
-                    raise RuntimeError("Missing agent")
-                records = asyncio.run(
-                    evaluate_candidate_dataset(
-                        agent=agent,
-                        metric=metric,
-                        dataset=[case],
-                        concurrency=1,
-                        case_factory=case_factory,
-                        skills_fs=skills,
-                        capture_traces=not validation,
+                else:
+                    if agent is None:
+                        raise RuntimeError("Missing agent")
+                    records = asyncio.run(
+                        evaluate_candidate_dataset(
+                            agent=agent,
+                            metric=metric,
+                            dataset=[case],
+                            concurrency=1,
+                            case_factory=case_factory,
+                            skills_fs=skills,
+                            capture_traces=not validation,
+                        )
                     )
+        except Exception as error:
+            records = [
+                EvaluationRecord(
+                    case.name or "case-0",
+                    0.0,
+                    None,
+                    {"output": RolloutOutput.from_error(error, kind="system")},
                 )
+            ]
+        finally:
+            _rollout_error_observer.reset(token)
         record = records[0]
+        failed = bool(evaluation_infrastructure_failures(records))
+        if failed and diagnostic is None:
+            output = record.payload.get("output")
+            diagnostic = {
+                "class": "EvaluationError",
+                "message": getattr(output, "error_message", None)
+                or "Unknown evaluation error",
+            }
         material = None
         if not validation:
             # Conversion happens only in the untrusted child. The parent accepts
             # JSON, never objects, serializers or exception metadata.
             from .eval import _json_default, _write_trace_file
-            from ..types import RolloutOutput
 
             try:
                 _write_trace_file(path=trace_path, records=records)
@@ -158,7 +194,8 @@ def main() -> None:
                 "type": "result",
                 "score": record.score,
                 "feedback": None if validation else record.feedback,
-                "failed": bool(evaluation_infrastructure_failures(records)),
+                "failed": failed,
+                "diagnostic": diagnostic if failed else None,
                 "cached": meter.cached,
                 "material": material,
             }

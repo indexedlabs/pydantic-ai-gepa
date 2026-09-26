@@ -1,7 +1,8 @@
 """Harness-owned candidate checkouts and a fail-closed scoring subprocess.
 
-The parent treats every child byte as untrusted. No candidate callable, pickle,
-exception text, validation feedback, or candidate-selected path crosses back.
+The parent treats every child byte as untrusted. Exception diagnostics stay in
+private storage; no candidate callable, pickle, validation feedback, or
+candidate-selected path crosses back.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from typing import Any, Iterator
 from uuid import uuid4
 
 import typer
+import certifi
 from pydantic_ai.messages import ModelResponse
 from pydantic_ai.usage import RequestUsage
 
@@ -34,6 +36,7 @@ from ..evaluation import EvaluationRecord
 from ..types import RolloutOutput
 from .layout import GepaConfig, git_root
 from .scoring_proxy import allowed_addresses, connect_proxy
+from .scoring_diagnostics import record_failure, valid_diagnostic
 from .scoring_material import (
     MaterialBudget,
     checked_json,
@@ -53,6 +56,7 @@ PROVIDER_KEYS = (
     "GEMINI_API_KEY",
 )
 nominated_commit: ContextVar[str | None] = ContextVar("scoring_commit", default=None)
+_tls_checked: set[tuple[int, str, str, str]] = set()
 
 
 class ScoringSandboxError(typer.BadParameter):
@@ -281,7 +285,62 @@ def child_environment(scratch: Path, port: int) -> dict[str, str]:
                 "Refusing an environment value containing the held-out path."
             )
         env[name] = value
+    env.setdefault("SSL_CERT_FILE", certifi.where())
+    env.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
     return env
+
+
+def check_tls(profile: str, scratch: Path, port: int, env: dict[str, str]) -> None:
+    """Probe once per harness process/environment, before importing scorer code."""
+    hosts = os.environ.get("GEPA_HARNESS_ALLOWED_HOSTS", "")
+    addresses = allowed_addresses(hosts)
+    if not addresses:
+        return
+    first = next(item.strip() for item in hosts.split(",") if item.strip())
+    key = (os.getpid(), first, env["SSL_CERT_FILE"], env["REQUESTS_CA_BUNDLE"])
+    if key in _tls_checked:
+        return
+    host, target_port = next(iter(allowed_addresses(first)))
+    library = str(Path(__file__).resolve().parents[2])
+    bootstrap = f"import sys; sys.path.insert(0, {library!r}); from pydantic_ai_gepa.cli.scoring_tls import main; main()"
+    command = sandbox_command(
+        profile,
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            bootstrap,
+            host,
+            str(target_port),
+            str(port),
+        ],
+    )
+    error_class = "TLSProbeError"
+    try:
+        result = subprocess.run(
+            command, cwd=scratch, env=env, capture_output=True, timeout=15
+        )
+        raw = json.loads(result.stdout)
+        if result.returncode == 0 and raw == {"error_class": None}:
+            _tls_checked.add(key)
+            return
+        if (
+            isinstance(raw, dict)
+            and isinstance(raw.get("error_class"), str)
+            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", raw["error_class"])
+        ):
+            error_class = raw["error_class"]
+    except (OSError, subprocess.TimeoutExpired) as error:
+        error_class = type(error).__name__
+    except (ValueError, UnicodeError):
+        pass
+    raise ScoringSandboxError(
+        f"Sandbox TLS smoke check failed ({error_class}); scoring refused before rollouts. "
+        "The system trust store is blocked in the sandbox. Use a certifi CA bundle "
+        "via SSL_CERT_FILE or ssl.create_default_context(cafile=certifi.where()). "
+        "Also check the allowed host, CONNECT proxy and CA bundle."
+    )
 
 
 @contextmanager
@@ -594,13 +653,18 @@ def _number(value: Any, *, integer: bool = False) -> float:
 
 def _result(raw: dict[str, Any], case_id: str, validation: bool) -> EvaluationRecord:
     if (
-        set(raw) != {"type", "score", "feedback", "failed", "cached", "material"}
+        set(raw)
+        != {"type", "score", "feedback", "failed", "cached", "material", "diagnostic"}
         or raw["type"] != "result"
     ):
         raise ScoringSandboxError("Invalid scoring result shape.")
     score = _number(raw["score"])
     if type(raw["failed"]) is not bool or type(raw["cached"]) is not bool:
         raise ScoringSandboxError("Invalid scoring result flags.")
+    if not valid_diagnostic(raw["diagnostic"]) or (
+        not raw["failed"] and raw["diagnostic"] is not None
+    ):
+        raise ScoringSandboxError("Invalid scoring diagnostic.")
     feedback = raw["feedback"]
     if feedback is not None and (
         not isinstance(feedback, str) or len(feedback) > 65536
@@ -721,6 +785,8 @@ def score_cases(
         library = str(Path(__file__).resolve().parents[2])
         bootstrap = f"import sys; sys.path.insert(0, {library!r}); from pydantic_ai_gepa.cli.scoring_child import main; main()"
         profile = seatbelt_profile(private, checkout, scratch, port)
+        env = child_environment(scratch, port)
+        check_tls(profile, scratch, port, env)
         command = sandbox_command(
             profile, [sys.executable, "-I", "-B", "-c", bootstrap]
         )
@@ -728,7 +794,7 @@ def score_cases(
         process = subprocess.Popen(
             command,
             cwd=checkout,
-            env=child_environment(scratch, port),
+            env=env,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -772,6 +838,10 @@ def score_cases(
                                 raw = channel.receive()
                                 if raw.get("type") != "usage":
                                     record = _result(raw, case.name, validation)
+                                    if raw["failed"]:
+                                        record_failure(
+                                            raw["diagnostic"], case, validation, meter
+                                        )
                                     if not validation:
                                         assert output_fd is not None
                                         _training_material(record, output_fd, budget)
