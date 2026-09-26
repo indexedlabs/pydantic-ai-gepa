@@ -2148,6 +2148,10 @@ def _run_select_locked(workspace_root: Path, run_state: Any) -> Any:
         )
         raise typer.Exit(code=1)
 
+    from .safe_git import refuse_heldout_git_mutations
+
+    refuse_heldout_git_mutations()
+
     from .validation import heldout_dataset
 
     if heldout_dataset(required=False):
@@ -2159,10 +2163,6 @@ def _run_select_locked(workspace_root: Path, run_state: Any) -> Any:
         for lane in load_all_lane_states(workspace_root, run_state.run_id):
             if lane.candidate_sha:
                 _check_winner_views(workspace_root, lane.candidate_sha)
-
-    from .safe_git import refuse_heldout_git_mutations
-
-    refuse_heldout_git_mutations()
 
     if run_state.heldout_required:
         from .run import _assert_validation_dataset_unchanged
