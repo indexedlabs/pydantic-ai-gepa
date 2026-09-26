@@ -114,14 +114,21 @@ class CodingAgentEngine:
         proposal_wall_times: list[float] = []
         proposal_agent_turns: list[int | None] = []
         seed = _copy_candidate(await task.seed_candidate())
-        seed_evaluation = await self._evaluate_validation(
-            task=task,
-            candidate=seed,
-            budget=budget,
-            engine_budget=engine_budget,
-            history=history,
-            stage="seed_validation",
-        )
+        # A composition helper may already have paid for the seed's validation;
+        # reuse those scores for harness-side selection instead of spending
+        # both budgets on an identical evaluation.
+        seed_scorer = getattr(task, "seed_evaluation", None)
+        seed_evaluation = await seed_scorer() if seed_scorer is not None else None
+        seed_reused = seed_evaluation is not None
+        if seed_evaluation is None:
+            seed_evaluation = await self._evaluate_validation(
+                task=task,
+                candidate=seed,
+                budget=budget,
+                engine_budget=engine_budget,
+                history=history,
+                stage="seed_validation",
+            )
         if seed_evaluation is None:
             history.append(
                 EngineEvent(
@@ -151,7 +158,10 @@ class CodingAgentEngine:
         history.append(
             EngineEvent(
                 kind="validation_evaluated",
-                data=_validation_event_data(best_entry, stage="seed"),
+                data={
+                    **_validation_event_data(best_entry, stage="seed"),
+                    "reused": seed_reused,
+                },
             )
         )
         train_loader = await task.train_loader()

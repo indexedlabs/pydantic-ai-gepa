@@ -61,11 +61,22 @@ class BestOfNEngine:
         for _ in range(self._n):
             candidates.append(await self._propose(seed))
 
+        # A composition helper may already have scored the seed; reuse that
+        # aggregate instead of spending this slice's budget on it again.
+        seed_scorer = getattr(task, "seed_validation_score", None)
+        pre_scored_seed = await seed_scorer() if seed_scorer is not None else None
+
         best_candidate = seed
         best_score: float | None = None
         scores: list[float | None] = []
         history: list[EngineEvent] = []
         for index, candidate in enumerate(candidates):
+            if index == 0 and pre_scored_seed is not None:
+                scores.append(pre_scored_seed.score)
+                if best_score is None or pre_scored_seed.score > best_score:
+                    best_candidate = candidate
+                    best_score = pre_scored_seed.score
+                continue
             try:
                 evaluation = await task.evaluate(candidate, budget=budget)
             except BudgetExhausted:

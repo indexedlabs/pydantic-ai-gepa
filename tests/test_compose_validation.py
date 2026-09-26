@@ -159,6 +159,7 @@ async def test_engine_public_surface_withholds_validation(
             "train_loader",
             "validation_case_count",
             "score_validation",
+            "seed_validation_score",
             "evaluate",
             "concurrency",
             "test_set",
@@ -171,6 +172,10 @@ async def test_engine_public_surface_withholds_validation(
                 kwargs = {"capture_traces": True} if name == "evaluate" else {}
                 value = await value(seed, budget=budget, **kwargs)
                 assert_aggregate(value)
+            elif name == "seed_validation_score":
+                value = await value()
+                if value is not None:
+                    assert_aggregate(value)
             elif name in {"seed_candidate", "validation_case_count"}:
                 value = await value()
             elif name == "train_loader":
@@ -294,7 +299,11 @@ async def test_every_builtin_composes_with_restricted_driver(helper):
         ["autoresearch"] if helper == "omni" else []
     )
     assert all(result.best_score == 0.5 for result in results)
-    assert [result.num_metric_calls for result in results[:4]] == [1, 1, 2, 1]
+    # Adaptive slices reuse the incumbent's helper-paid seed score: each
+    # built-in engine drops its one-case seed validation pass. The custom
+    # autoresearch driver still scores the seed itself.
+    expected_calls = [0, 0, 1, 1] if helper == "adaptive" else [1, 1, 2, 1]
+    assert [result.num_metric_calls for result in results[:4]] == expected_calls
 
 
 @pytest.mark.asyncio
