@@ -1,9 +1,13 @@
 """Executable Git configuration must never cross the held-out boundary."""
 
 import hashlib
+import os
 from pathlib import Path
 import shlex
+import stat
 import subprocess
+import sys
+from types import SimpleNamespace
 
 import pytest
 import typer
@@ -760,3 +764,269 @@ def test_retention_refuses_invalid_objects_and_lock_conflicts(git_repo, private,
     assert not ref.exists()
     if kind == "locked":
         assert ref.with_suffix(".lock").read_text() == "another writer"
+
+
+@pytest.fixture
+def fake_git_filesystem(monkeypatch):
+    from pydantic_ai_gepa.cli import safe_git
+
+    candidate = Path("/trusted/bin/git")
+    entries = {candidate: SimpleNamespace(st_uid=0, st_mode=stat.S_IFREG | 0o755)}
+    aliases = {}
+    candidates = [candidate]
+    locations = safe_git._git_locations
+    safe_git._git_executable.cache_clear()
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "resolve", lambda path, **_: aliases.get(path, path))
+        patch.setattr(
+            Path,
+            "stat",
+            lambda path, **_: entries.get(
+                path, SimpleNamespace(st_uid=0, st_mode=stat.S_IFDIR | 0o755)
+            ),
+        )
+        patch.setattr(Path, "lstat", lambda path: path.stat())
+        patch.setattr(os, "access", lambda *_: True)
+        patch.setattr(safe_git, "_git_locations", lambda: candidates)
+        patch.setattr(safe_git.sys, "platform", "darwin")
+        try:
+            yield safe_git, entries, aliases, candidates, locations
+        finally:
+            safe_git._git_executable.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        "user",
+        "group",
+        "other",
+        "parent-user",
+        "parent-group",
+        "directory",
+        "not-executable",
+        "symlink",
+        "shim",
+        "shim-symlink",
+    ],
+)
+def test_git_executable_refuses_unsafe_installations(fake_git_filesystem, unsafe):
+    safe_git, entries, aliases, candidates, _ = fake_git_filesystem
+    candidate = candidates[0]
+    if unsafe == "user":
+        entries[candidate].st_uid = 501
+    elif unsafe in {"group", "other"}:
+        entries[candidate].st_mode |= 0o020 if unsafe == "group" else 0o002
+    elif unsafe.startswith("parent-"):
+        entries[candidate.parent] = SimpleNamespace(
+            st_uid=501 if unsafe == "parent-user" else 0,
+            st_mode=stat.S_IFDIR | (0o775 if unsafe == "parent-group" else 0o755),
+        )
+    elif unsafe == "directory":
+        entries[candidate].st_mode = stat.S_IFDIR | 0o755
+    elif unsafe == "not-executable":
+        entries[candidate].st_mode = stat.S_IFREG | 0o644
+    elif unsafe == "symlink":
+        target = Path("/user/bin/git")
+        aliases[candidate] = target
+        entries[target] = SimpleNamespace(st_uid=501, st_mode=stat.S_IFREG | 0o755)
+    elif unsafe == "shim":
+        candidates[0] = Path("/usr/bin/git")
+        entries[candidates[0]] = entries[candidate]
+    else:
+        aliases[candidate] = Path("/usr/bin/git")
+        entries[aliases[candidate]] = entries[candidate]
+    with pytest.raises(safe_git.GitExecutableError, match="No trusted Git") as error:
+        safe_git._git_executable(123)
+    assert str(candidate) not in str(error.value)
+
+
+def test_git_executable_is_pinned_once_per_process(fake_git_filesystem):
+    safe_git, entries, _, candidates, _ = fake_git_filesystem
+    assert safe_git._git_executable(123) == str(candidates[0])
+    entries[candidates[0]].st_uid = 501
+    assert safe_git._git_executable(123) == str(candidates[0])
+    with pytest.raises(safe_git.GitExecutableError):
+        safe_git._git_executable(124)
+
+
+def test_git_executable_falls_back_to_a_trusted_installation(fake_git_filesystem):
+    safe_git, entries, _, candidates, _ = fake_git_filesystem
+    entries[candidates[0]].st_mode |= 0o020
+    fallback = Path("/fallback/bin/git")
+    candidates.append(fallback)
+    entries[fallback] = SimpleNamespace(st_uid=0, st_mode=stat.S_IFREG | 0o755)
+    assert safe_git._git_executable(123) == str(fallback)
+
+
+def test_git_locations_ignore_user_tool_selection(fake_git_filesystem, monkeypatch):
+    safe_git, entries, _, _, locations = fake_git_filesystem
+    monkeypatch.setenv("DEVELOPER_DIR", "/user/developer")
+    monkeypatch.setenv("PATH", "/user/bin")
+    monkeypatch.setattr(os, "readlink", lambda path: "/root-developer")
+    selection = Path("/var/db/xcode_select_link")
+    entries[selection] = SimpleNamespace(st_uid=0, st_mode=stat.S_IFLNK | 0o777)
+    fallback = Path("/Library/Developer/CommandLineTools/usr/bin/git")
+    assert locations() == [Path("/root-developer/usr/bin/git"), fallback]
+    entries[selection].st_uid = 501
+    assert locations() == [fallback]
+    monkeypatch.setattr(safe_git.sys, "platform", "linux")
+    assert locations() == [Path("/usr/bin/git"), Path("/bin/git")]
+
+
+def test_real_git_binary_is_pinned_and_not_the_macos_shim(git_repo):
+    from pydantic_ai_gepa.cli.safe_git import _git_executable, _root_owned_path
+
+    path = Path(_git_executable(os.getpid()))
+    assert path.is_absolute()
+    assert _root_owned_path(path, executable=True) == path
+    if sys.platform == "darwin":
+        assert path != Path("/usr/bin/git")
+    with safe_repository(git_repo) as git:
+        assert git.command[0] == str(path)
+        assert "GIT_EXEC_PATH" not in git.env
+
+
+@pytest.mark.parametrize("kind", ["symlink", "directory-symlink", "fifo"])
+def test_unsafe_exclude_is_empty_and_never_reads_heldout(
+    git_repo, private, monkeypatch, kind
+):
+    (git_repo / "guess-row-17").write_text("guess")
+    baseline = git_candidate_state(git_repo)
+    assert baseline.dirty
+    exclude = git_repo / ".git/info/exclude"
+    secret = private.parent / "exclude"
+    secret.write_text("guess-row-17\n")
+    exclude.unlink()
+    if kind == "symlink":
+        exclude.symlink_to(secret)
+    elif kind == "directory-symlink":
+        exclude.parent.rename(git_repo / ".git/original-info")
+        exclude.parent.symlink_to(private.parent, target_is_directory=True)
+    else:
+        os.mkfifo(exclude)
+    forbidden = secret.stat()
+    original = os.read
+
+    def read(fd, size):
+        info = os.fstat(fd)
+        assert (info.st_dev, info.st_ino) != (forbidden.st_dev, forbidden.st_ino)
+        return original(fd, size)
+
+    monkeypatch.setattr(os, "read", read)
+    assert git_candidate_state(git_repo) == baseline
+    secret.write_text("different-heldout-line\n")
+    assert git_candidate_state(git_repo) == baseline
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    ["HEAD", "loose", "packed-refs", "commondir", "config", ".git", "gitdir"],
+)
+def test_metadata_symlinks_are_refused_without_reading_targets(
+    git_repo, private, monkeypatch, metadata
+):
+    from pydantic_ai_gepa.cli.safe_git import pin_commit
+
+    repository = Repository.discover(git_repo)
+    branch, sha = repository.head()
+    assert branch and sha
+    root = git_repo
+    target = repository.git_dir / metadata
+    if metadata == "loose":
+        target = repository.common_dir / branch
+    elif metadata == "packed-refs":
+        (repository.common_dir / branch).unlink()
+    elif metadata == "config":
+        (repository.git_dir / "HEAD").write_text("ref: refs/heads/unborn\n")
+    elif metadata in {".git", "gitdir"}:
+        root = private.parent / "linked"
+        _git(git_repo, "worktree", "add", "-b", "linked", str(root))
+        linked = Repository.discover(root)
+        target = root / ".git" if metadata == ".git" else linked.git_dir / "gitdir"
+    target.unlink(missing_ok=True)
+    secret = private.parent / "metadata-target"
+    secret.write_text("must not be read\n")
+    target.symlink_to(secret)
+    forbidden = secret.stat()
+    original = os.read
+
+    def read(fd, size):
+        info = os.fstat(fd)
+        assert (info.st_dev, info.st_ino) != (forbidden.st_dev, forbidden.st_ino)
+        return original(fd, size)
+
+    monkeypatch.setattr(os, "read", read)
+    with pytest.raises(OSError):
+        if metadata == "gitdir":
+            pin_commit(root, "refs/gepa/run/candidate", sha)
+        else:
+            with safe_repository(root):
+                pytest.fail("Unsafe metadata must be refused")
+
+
+@pytest.mark.parametrize("metadata", ["HEAD", "commondir", "config", ".git"])
+def test_metadata_fifo_fails_without_hanging(git_repo, metadata):
+    if metadata == ".git":
+        (git_repo / ".git").rename(git_repo / "original-git")
+        path = git_repo / ".git"
+    else:
+        path = git_repo / ".git" / metadata
+        if metadata == "config":
+            (git_repo / ".git/HEAD").write_text("ref: refs/heads/unborn\n")
+        path.unlink(missing_ok=True)
+    os.mkfifo(path)
+    # A separate process and timeout keep a regression from wedging pytest.
+    script = """from pathlib import Path
+from pydantic_ai_gepa.cli.safe_git import safe_repository
+try:
+    with safe_repository(Path.cwd()):
+        raise AssertionError('FIFO metadata accepted')
+except OSError:
+    pass
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script], cwd=git_repo, capture_output=True, timeout=10
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_metadata_size_is_bounded_before_reading(git_repo, monkeypatch):
+    from pydantic_ai_gepa.cli.safe_git import SafeGitError, _REF_LIMIT
+
+    (git_repo / ".git/HEAD").write_bytes(b"a" * (_REF_LIMIT + 1))
+    monkeypatch.setattr(os, "read", lambda *_: pytest.fail("Oversized metadata read"))
+    with pytest.raises(SafeGitError):
+        Repository.discover(git_repo).head()
+
+
+@pytest.mark.parametrize("object_format", ["sha1", "sha256"])
+def test_unborn_object_format_is_parsed_from_safe_stdin(tmp_path, object_format):
+    _git(tmp_path, "init", f"--object-format={object_format}")
+    with safe_repository(tmp_path) as git:
+        assert git.object_format == object_format
+        assert git.head_oid is None
+
+
+@pytest.mark.parametrize("source", ["xdg", "core.excludesFile"])
+def test_global_excludes_do_not_hide_git_candidates(
+    git_repo, tmp_path, monkeypatch, source
+):
+    home = tmp_path.parent / (tmp_path.name + "-home")
+    (home / "git").mkdir(parents=True)
+    ignore = home / "git/ignore"
+    ignore.write_text("globally-ignored\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home))
+    if source == "core.excludesFile":
+        config = home / ".gitconfig"
+        config.write_text(f"[core]\n excludesFile = {ignore}\n")
+        # Use a non-default location so this case exercises the config setting.
+        ignore.rename(home / "custom-ignore")
+        config.write_text(f"[core]\n excludesFile = {home / 'custom-ignore'}\n")
+    (git_repo / "globally-ignored").write_text("candidate content")
+    assert not _git(git_repo, "status", "--porcelain")
+    assert git_candidate_state(git_repo).dirty
+    exclude = git_repo / ".git/info/exclude"
+    exclude.write_text("globally-ignored\n")
+    assert not git_candidate_state(git_repo).dirty

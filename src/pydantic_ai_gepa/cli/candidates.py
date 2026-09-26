@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from ..gepa_graph.models import CandidateMap, ComponentValue
-from .safe_git import safe_repository
+from .safe_git import GitExecutableError, safe_repository
 
 
 @dataclass
@@ -162,6 +162,8 @@ def git_candidate_state(
                 check=True,
                 capture_output=True,
             ).stdout
+    except GitExecutableError as exc:
+        raise GitCandidateError(str(exc)) from None
     except (OSError, subprocess.CalledProcessError) as exc:
         raise GitCandidateError(
             f"Could not identify git candidate at {repository}."

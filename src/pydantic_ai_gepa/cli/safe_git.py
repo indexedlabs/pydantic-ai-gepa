@@ -11,6 +11,8 @@ from __future__ import annotations
 import atexit
 from contextlib import contextmanager
 from dataclasses import dataclass
+import errno
+from functools import lru_cache
 import hashlib
 import os
 from pathlib import Path
@@ -18,6 +20,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 from typing import Any, Iterator
@@ -25,6 +28,129 @@ from typing import Any, Iterator
 
 class SafeGitError(OSError):
     """Repository metadata cannot be safely interpreted."""
+
+
+class GitExecutableError(SafeGitError):
+    """No trusted, non-shim Git executable is installed."""
+
+
+def _root_owned_path(path: Path, *, executable: bool = False) -> Path:
+    resolved = path.resolve(strict=True)
+    for directory in reversed(resolved.parents):
+        info = directory.stat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise GitExecutableError("Unsafe Git installation.")
+    info = resolved.stat()
+    kind = stat.S_ISREG if executable else stat.S_ISDIR
+    if info.st_uid != 0 or info.st_mode & 0o022 or not kind(info.st_mode):
+        raise GitExecutableError("Unsafe Git installation.")
+    if executable and (not info.st_mode & 0o111 or not os.access(resolved, os.X_OK)):
+        raise GitExecutableError("Git is not executable.")
+    return resolved
+
+
+def _git_locations() -> list[Path]:
+    if sys.platform != "darwin":
+        return [Path("/usr/bin/git"), Path("/bin/git")]
+    candidates = []
+    selection = Path("/var/db/xcode_select_link")
+    try:
+        _root_owned_path(selection.parent)
+        if selection.lstat().st_uid == 0:
+            developer = Path(os.readlink(selection))
+            if developer.is_absolute():
+                candidates.append(developer / "usr/bin/git")
+    except OSError:
+        pass
+    candidates.append(Path("/Library/Developer/CommandLineTools/usr/bin/git"))
+    return candidates
+
+
+@lru_cache(maxsize=1)
+def _git_executable(pid: int) -> str:
+    # The PID makes a fork resolve its own binary. Never consult xcrun, PATH,
+    # DEVELOPER_DIR or a per-user tool lookup cache, even during discovery.
+    for candidate in _git_locations():
+        try:
+            resolved = _root_owned_path(candidate, executable=True)
+            if sys.platform == "darwin" and Path("/usr/bin/git") in (
+                candidate,
+                resolved,
+            ):
+                continue
+            return str(resolved)
+        except (OSError, RuntimeError):
+            continue
+    raise GitExecutableError(
+        "No trusted Git executable is available; a root-owned installation "
+        "with no group/other-writable path components is required."
+    )
+
+
+_METADATA_LIMIT = 1024 * 1024
+_REF_LIMIT = 4096
+_PACKED_REFS_LIMIT = 16 * 1024 * 1024
+
+
+def _read_metadata_at(directory: int, name: str, limit: int) -> bytes:
+    """Read bounded regular metadata through no-follow directory handles."""
+    parts = name.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise SafeGitError("Invalid Git metadata path.")
+    parent = os.dup(directory)
+    try:
+        for part in parts[:-1]:
+            child = os.open(
+                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent
+            )
+            os.close(parent)
+            parent = child
+        fd = os.open(
+            parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent
+        )
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise OSError(errno.EINVAL, "Git metadata must be a regular file.")
+            if info.st_size > limit:
+                raise SafeGitError("Git metadata exceeds the size limit.")
+            content = bytearray()
+            while block := os.read(fd, min(65536, limit + 1 - len(content))):
+                content.extend(block)
+                if len(content) > limit:
+                    raise SafeGitError("Git metadata exceeds the size limit.")
+            return bytes(content)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(parent)
+
+
+def _read_metadata(
+    directory: Path,
+    name: str,
+    *,
+    limit: int = _METADATA_LIMIT,
+    optional: bool = False,
+    unsafe_empty: bool = False,
+) -> bytes | None:
+    try:
+        with _directory_fd(directory) as fd:
+            return _read_metadata_at(fd, name, limit)
+    except FileNotFoundError:
+        if optional:
+            return None
+        raise
+    except OSError as exc:
+        if unsafe_empty and exc.errno in {
+            errno.ELOOP,
+            errno.ENOTDIR,
+            errno.EINVAL,
+            errno.ENXIO,
+            errno.EISDIR,
+        }:
+            return None
+        raise SafeGitError("Cannot safely read Git metadata.") from None
 
 
 @dataclass(frozen=True)
@@ -37,31 +163,42 @@ class Repository:
     def discover(cls, start: Path) -> Repository:
         start = start.resolve()
         for root in (start, *start.parents):
-            marker = root / ".git"
-            if marker.is_dir():
-                git_dir = marker.resolve()
-            elif marker.is_file():
-                value = marker.read_text().strip()
-                if not value.startswith("gitdir: ") or "\n" in value:
-                    raise SafeGitError("Invalid Git directory pointer.")
-                git_dir = (root / value[8:]).resolve()
+            with _directory_fd(root) as fd:
+                try:
+                    marker = os.stat(".git", dir_fd=fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                value = (
+                    None
+                    if stat.S_ISDIR(marker.st_mode)
+                    else os.fsdecode(_read_metadata_at(fd, ".git", _REF_LIMIT)).strip()
+                )
+            if value is None:
+                git_dir = root / ".git"
             else:
-                continue
-            common_file = git_dir / "commondir"
-            common = (
-                (git_dir / common_file.read_text().strip()).resolve()
-                if common_file.exists()
-                else git_dir
+                if not value.startswith("gitdir: ") or "\n" in value or "\0" in value:
+                    raise SafeGitError("Invalid Git directory pointer.")
+                git_dir = Path(os.path.abspath(root / value[8:]))
+            common_data = _read_metadata(
+                git_dir, "commondir", limit=_REF_LIMIT, optional=True
             )
-            if not (common / "objects").is_dir():
-                raise SafeGitError("Invalid Git object directory.")
+            common = git_dir
+            if common_data is not None:
+                pointer = os.fsdecode(common_data).strip()
+                if not pointer or "\n" in pointer or "\0" in pointer:
+                    raise SafeGitError("Invalid Git common directory pointer.")
+                common = Path(os.path.abspath(git_dir / pointer))
+            with _directory_fd(common / "objects"):
+                pass
             if (common / "reftable").exists():
                 raise SafeGitError("Reftable repositories are not supported.")
             return cls(root, git_dir, common)
         raise FileNotFoundError("not a git repository")
 
     def head(self) -> tuple[str | None, str | None]:
-        value = (self.git_dir / "HEAD").read_text().strip()
+        value = os.fsdecode(
+            _read_metadata(self.git_dir, "HEAD", limit=_REF_LIMIT) or b""
+        ).strip()
         branch = None
         seen: set[str] = set()
         while value.startswith("ref: "):
@@ -74,12 +211,16 @@ class Repository:
                 raise SafeGitError("Cyclic symbolic Git ref.")
             seen.add(ref)
             branch = branch or ref
-            loose = self.common_dir / ref
-            if loose.exists():
-                value = loose.read_text().strip()
+            loose = _read_metadata(
+                self.common_dir, ref, limit=_REF_LIMIT, optional=True
+            )
+            if loose is not None:
+                value = os.fsdecode(loose).strip()
                 continue
-            packed = self.common_dir / "packed-refs"
-            for line in packed.read_text().splitlines() if packed.exists() else ():
+            packed = _read_metadata(
+                self.common_dir, "packed-refs", limit=_PACKED_REFS_LIMIT, optional=True
+            )
+            for line in os.fsdecode(packed or b"").splitlines():
                 oid, _, name = line.partition(" ")
                 if name == ref:
                     value = oid
@@ -166,7 +307,7 @@ class SafeGit:
             "GIT_WORK_TREE": str(repository.root),
             "GIT_INDEX_FILE": str(private / "index"),
         }
-        self.command = ["git", "--no-pager"]
+        self.command = [_git_executable(os.getpid()), "--no-pager"]
         for option in _OPTIONS:
             self.command.extend(("-c", option))
         (self.directory / "objects/info").mkdir(parents=True)
@@ -181,10 +322,11 @@ class SafeGit:
                     "config",
                     "--no-includes",
                     "--file",
-                    str(repository.common_dir / "config"),
+                    "-",
                     "--get",
                     "extensions.objectformat",
                 ],
+                input=_read_metadata(repository.common_dir, "config"),
                 capture_output=True,
             )
             if fmt.returncode not in (0, 1) or fmt.stdout.strip() not in (
@@ -234,10 +376,12 @@ class SafeGit:
         self.index_ready = False
         # Excludes are inert patterns. Refresh them on every context so changes
         # to ignore rules cannot be hidden by the persistent private index.
-        exclude = repository.common_dir / "info/exclude"
         _write_changed(
             self.directory / "info/exclude",
-            exclude.read_bytes() if exclude.is_file() else b"",
+            _read_metadata(
+                repository.common_dir, "info/exclude", optional=True, unsafe_empty=True
+            )
+            or b"",
         )
 
     def prepare_index(self) -> None:
@@ -474,12 +618,14 @@ def pin_commit(root: Path, ref: str, sha: str) -> None:
         elif stat.S_ISREG(marker_mode):
             # Accept only Git's conventional linked-worktree layout, including
             # its backlink. Arbitrary gitdir/commondir redirects are read-only.
-            backlink = repository.git_dir / "gitdir"
             supported = (
                 repository.git_dir.parent.name == "worktrees"
                 and repository.git_dir.parent.parent == repository.common_dir
-                and not backlink.is_symlink()
-                and backlink.read_text().strip() == str(marker)
+                and os.fsdecode(
+                    _read_metadata(repository.git_dir, "gitdir", limit=_REF_LIMIT)
+                    or b""
+                ).strip()
+                == str(marker)
             )
         else:
             supported = False
