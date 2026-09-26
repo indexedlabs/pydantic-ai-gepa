@@ -42,7 +42,8 @@ def isolated_user_environment(
     tmp_path_factory: pytest.TempPathFactory,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    home = tmp_path / "home"
+    # Keep HOME inside pytest's sandbox without adding files to candidate trees.
+    home = tmp_path.parent / (tmp_path.name + "-home")
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("GEPA_DIR", raising=False)
