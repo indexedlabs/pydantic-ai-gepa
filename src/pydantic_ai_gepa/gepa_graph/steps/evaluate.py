@@ -23,6 +23,8 @@ async def evaluate_step(ctx: StepContext[GepaState, GepaDeps, None]) -> None:
     previous_best_idx = state.best_candidate_idx
     previous_best_score = state.best_score
     candidate = _current_candidate(state)
+    if _apply_pre_scored_seed(ctx, candidate):
+        return None
     validation_batch = await _get_validation_batch(state)
     if not can_evaluate(
         state,
@@ -91,6 +93,38 @@ async def evaluate_step(ctx: StepContext[GepaState, GepaDeps, None]) -> None:
     _hydrate_missing_components(candidate, ctx.deps)
 
     return None
+
+
+def _apply_pre_scored_seed(
+    ctx: StepContext[GepaState, GepaDeps, None], candidate: CandidateProgram
+) -> bool:
+    """Adopt harness-paid seed validation scores instead of re-scoring the seed.
+
+    Returns True when the candidate's validation came from the caller, so no
+    evaluator call happens and ``state.total_evaluations`` stays unchanged.
+    """
+    pre_scored = ctx.deps.seed_validation_scores
+    if (
+        pre_scored is None
+        or candidate.creation_type != "seed"
+        or candidate.idx != 0
+        or candidate.validation_scores
+    ):
+        return False
+    ctx.deps.seed_validation_scores = None
+    logfire.info(
+        "EvaluateStep reused pre-scored seed validation",
+        candidate_idx=candidate.idx,
+        validation_batch_size=len(pre_scored),
+    )
+    for data_id, score in pre_scored.items():
+        candidate.validation_scores[data_id] = score
+    ctx.deps.pareto_manager.update_fronts_from_scores(
+        ctx.state, candidate.idx, pre_scored
+    )
+    ctx.state.recompute_best_candidate()
+    _hydrate_missing_components(candidate, ctx.deps)
+    return True
 
 
 def _current_candidate(state: GepaState) -> CandidateProgram:

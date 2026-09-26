@@ -41,7 +41,20 @@ class ParetoFrontManager:
         eval_results: EvaluationResults,
     ) -> None:
         """Merge validation scores into the fronts without retaining outputs."""
-        for data_id, score, _output in eval_results:
+        self.update_fronts_from_scores(
+            state,
+            candidate_idx,
+            {data_id: score for data_id, score, _output in eval_results},
+        )
+
+    def update_fronts_from_scores(
+        self,
+        state: GepaState,
+        candidate_idx: int,
+        scores: Mapping[str, float],
+    ) -> None:
+        """Merge harness-provided validation scores into the fronts."""
+        for data_id, score in scores.items():
             entry = state.pareto_front.get(data_id)
             if entry is None:
                 entry = ParetoFrontEntry(data_id=data_id)

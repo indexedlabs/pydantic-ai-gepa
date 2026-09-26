@@ -59,13 +59,26 @@ class BestOfNEngine:
         seed = await task.seed_candidate()
         candidates = [seed]
         for _ in range(self._n):
-            candidates.append(await self._propose(seed))
+            # The proposer gets its own copy: mutating it in place must not
+            # change candidate zero, whose score may be reused below.
+            candidates.append(await self._propose(_copy_candidate(seed)))
+
+        # A composition helper may already have scored the seed; reuse that
+        # aggregate instead of spending this slice's budget on it again.
+        seed_scorer = getattr(task, "seed_validation_score", None)
+        pre_scored_seed = await seed_scorer() if seed_scorer is not None else None
 
         best_candidate = seed
         best_score: float | None = None
         scores: list[float | None] = []
         history: list[EngineEvent] = []
         for index, candidate in enumerate(candidates):
+            if index == 0 and pre_scored_seed is not None:
+                scores.append(pre_scored_seed.score)
+                if best_score is None or pre_scored_seed.score > best_score:
+                    best_candidate = candidate
+                    best_score = pre_scored_seed.score
+                continue
             try:
                 evaluation = await task.evaluate(candidate, budget=budget)
             except BudgetExhausted:
@@ -105,6 +118,13 @@ class BestOfNEngine:
             num_metric_calls=budget.spent - starting_spend,
             history=history,
         )
+
+
+def _copy_candidate(candidate: CandidateMap) -> CandidateMap:
+    """Isolate the evaluated seed from proposer-side mutation."""
+    return {
+        name: component.model_copy(deep=True) for name, component in candidate.items()
+    }
 
 
 register_engine(BestOfNEngine.name, BestOfNEngine, replace=True)

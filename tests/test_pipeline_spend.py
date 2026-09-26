@@ -186,8 +186,10 @@ async def test_smaller_engine_cap_does_not_stop_the_pipeline():
     )
     assert len(result.results) == 2
     assert all(_engine_spend(r)["stopped_by_cost"] for r in result.results)
-    assert all(_engine_spend(r)["total_dollars"] == 0.25 for r in result.results)
-    assert result.spend_report.total_dollars == 0.875
+    # The comparison-paid seed validation is reused, so each engine's own cap
+    # stops it one rollout earlier than a slice that re-scored its seed.
+    assert all(_engine_spend(r)["total_dollars"] == 0.125 for r in result.results)
+    assert result.spend_report.total_dollars == 0.625
     assert not result.spend_report.stopped_by_cost
 
 

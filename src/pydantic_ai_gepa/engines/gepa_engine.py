@@ -9,6 +9,7 @@ from pydantic_ai import usage as _usage
 
 from ..adapters.agent_adapter import create_adapter
 from ..exceptions import UsageBudgetExceeded
+from ..gepa_graph.datasets import data_id_for_instance
 from ..provider_errors import PROVIDER_STOP_REASON, is_provider_stop_error
 from ..gepa_graph import create_deps, create_gepa_graph
 from ..gepa_graph.models import CandidateMap, GepaConfig, GepaResult, GepaState
@@ -17,6 +18,7 @@ from ..spend import SpendMeter, _pipeline_meter
 from ..types import ReflectionConfig
 from .base import (
     BudgetTracker,
+    CandidateEvaluation,
     EngineConfig,
     EngineEvent,
     EngineResult,
@@ -105,6 +107,15 @@ class GepaEngine:
             memory_exporter=None,
             trace_collector=adapter.trace_collector,
         )
+        # A composition helper may already have paid for the seed's validation;
+        # hand those per-case scores to the graph instead of re-scoring the
+        # seed from this slice's budget.
+        seed_scorer = getattr(task, "seed_evaluation", None)
+        seed_evaluation = await seed_scorer() if seed_scorer is not None else None
+        if seed_evaluation is not None:
+            deps.seed_validation_scores = await _matching_seed_scores(
+                state, seed_evaluation
+            )
         graph = create_gepa_graph(config=gepa_config)
         # Reserve before the graph can invoke a rollout. The graph's own cap
         # is identical; unused capacity is refunded after its exact telemetry
@@ -223,6 +234,30 @@ class GepaEngine:
                 "registry-based engine configuration supports scalar GEPA options only."
             )
         return value
+
+
+async def _matching_seed_scores(
+    state: GepaState, seed_evaluation: CandidateEvaluation
+) -> dict[str, float] | None:
+    """Return the pre-scored seed's per-case scores only when they key cleanly.
+
+    The graph keys validation results by ``case.name or f"case-{index}"`` over
+    the validation loader's full fetch order, which is exactly how
+    ``OptimizationTask.evaluate`` builds ``per_case_scores`` for the same
+    task. Any deviation (duplicate case names, custom loaders) falls back to
+    the graph's own seed evaluation rather than trusting mismatched ids.
+    """
+    scores = seed_evaluation.per_case_scores
+    if not scores or len(scores) != seed_evaluation.num_cases:
+        return None
+    loader = state.validation_set
+    if loader is None or len(loader) != len(scores):
+        return None
+    batch = await loader.fetch(list(await loader.all_ids()))
+    graph_ids = {data_id_for_instance(case, index) for index, case in enumerate(batch)}
+    if set(scores) != graph_ids:
+        return None
+    return dict(scores)
 
 
 def _candidate_map(candidate: Any | None, fallback: CandidateMap) -> CandidateMap:

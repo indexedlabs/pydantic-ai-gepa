@@ -122,15 +122,27 @@ class OmniPlan(BaseModel):
             raise ValueError("Phase-one Omni engines must be distinct families.")
 
 
+def _copy_candidate(candidate: CandidateMap) -> CandidateMap:
+    """Isolate a retained or handed-out candidate from in-place mutation."""
+    return {
+        name: component.model_copy(deep=True) for name, component in candidate.items()
+    }
+
+
 class _SeededTask:
-    """Delegate a task while supplying a fixed seed candidate to an engine."""
+    """Delegate a task while supplying a fixed seed candidate to an engine.
+
+    The seed is deep-copied on the way in and on every handout: an engine (or
+    its caller-controlled proposer) mutating the candidate it received must
+    never desync the helper's incumbent from its pre-scored evaluation.
+    """
 
     def __init__(self, task: OptimizationTask, seed: CandidateMap) -> None:
         self._task = task
-        self._seed = seed
+        self._seed = _copy_candidate(seed)
 
     async def seed_candidate(self) -> CandidateMap:
-        return self._seed
+        return _copy_candidate(self._seed)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._task, name)
@@ -139,12 +151,36 @@ class _SeededTask:
 class _EngineTaskView:
     """A capability view that prevents engines from accessing held-out data."""
 
-    def __init__(self, task: OptimizationTask) -> None:
+    def __init__(
+        self,
+        task: OptimizationTask,
+        seed_score: ValidationScore | None = None,
+    ) -> None:
         self.__task = task
+        # Only the aggregate is ever stored on an untrusted view; the full
+        # CandidateEvaluation (records, outputs, per-case scores) never is.
+        self.__seed_score = seed_score
         self.__validation_context = copy_context()
 
     async def seed_candidate(self) -> CandidateMap:
         return await self.__task.seed_candidate()
+
+    async def seed_validation_score(self) -> ValidationScore | None:
+        """Return the aggregate score the helper already paid for the seed.
+
+        Only selection aggregates are exposed; per-case evidence stays with the
+        harness. ``None`` means the seed was not pre-scored and the engine must
+        evaluate it from its own budget as usual.
+        """
+        score = self.__seed_score
+        if score is None:
+            return None
+        return ValidationScore(
+            score=score.score,
+            num_cases=score.num_cases,
+            selectable=score.selectable,
+            objective_scores=dict(score.objective_scores),
+        )
 
     async def train_loader(self) -> Any:
         return await self.__task.train_loader()
@@ -199,9 +235,34 @@ class _EngineTaskView:
 class _TrustedEngineTaskView(_EngineTaskView):
     """Internal selection channel for the library's audited Pareto engines."""
 
-    def __init__(self, task: OptimizationTask) -> None:
-        super().__init__(task)
+    def __init__(
+        self,
+        task: OptimizationTask,
+        seed_evaluation: CandidateEvaluation | None = None,
+    ) -> None:
+        # Reduce once, up front: the base gets only the aggregate, and this
+        # view stores only the scores-only copy — never the full evaluation.
+        scores_only = (
+            _scores_only_copy(seed_evaluation) if seed_evaluation is not None else None
+        )
+        super().__init__(
+            task,
+            seed_score=_aggregate_seed_score(scores_only),
+        )
         self.__task = task
+        self.__seed_evaluation = scores_only
+
+    async def seed_evaluation(self) -> CandidateEvaluation | None:
+        """Return the helper-paid seed evaluation as a fresh scores-only copy.
+
+        This is no more than this view's ``evaluate()`` already returns for the
+        same candidate: records, outputs, traces and feedback stay with the
+        harness. ``None`` means the seed was not pre-scored.
+        """
+        evaluation = self.__seed_evaluation
+        if evaluation is None:
+            return None
+        return _scores_only_copy(evaluation)
 
     @property
     def agent(self) -> Any:
@@ -238,21 +299,56 @@ class _TrustedEngineTaskView(_EngineTaskView):
         return await self.__task.evaluate(candidate, **kwargs)
 
 
+def _aggregate_seed_score(
+    evaluation: CandidateEvaluation | None,
+) -> ValidationScore | None:
+    """Reduce a seed evaluation to the aggregate an untrusted view may hold."""
+    if evaluation is None:
+        return None
+    return ValidationScore(
+        score=evaluation.score,
+        num_cases=evaluation.num_cases,
+        selectable=evaluation.selectable,
+        objective_scores=dict(evaluation.objective_scores),
+    )
+
+
+def _scores_only_copy(evaluation: CandidateEvaluation) -> CandidateEvaluation:
+    """Copy a seed evaluation without records, outputs, traces or feedback."""
+    return CandidateEvaluation(
+        score=evaluation.score,
+        records=[],
+        side_info={},
+        num_cases=evaluation.num_cases,
+        objective_scores=dict(evaluation.objective_scores),
+        per_case_objective_scores={
+            case_id: dict(scores)
+            for case_id, scores in evaluation.per_case_objective_scores.items()
+        },
+        selectable=evaluation.selectable,
+        per_case_scores=dict(evaluation.per_case_scores),
+    )
+
+
 def _engine_task_view(
     task: OptimizationTask,
     engine: OptimizationEngine,
     seed: CandidateMap | None = None,
+    seed_evaluation: CandidateEvaluation | None = None,
 ) -> OptimizationTask:
     if seed is not None:
         task = cast(OptimizationTask, _SeededTask(task, seed))
     # Registry names and subclasses are caller-controlled. Only these exact
     # implementations keep validation evidence inside library-owned selection.
-    view = (
-        _TrustedEngineTaskView
-        if type(engine) in (GepaEngine, CodingAgentEngine)
-        else _EngineTaskView
+    if type(engine) in (GepaEngine, CodingAgentEngine):
+        return cast(
+            OptimizationTask,
+            _TrustedEngineTaskView(task, seed_evaluation=seed_evaluation),
+        )
+    return cast(
+        OptimizationTask,
+        _EngineTaskView(task, seed_score=_aggregate_seed_score(seed_evaluation)),
     )
-    return cast(OptimizationTask, view(task))
 
 
 SelectionRule = Callable[[Sequence[FairVote]], int]
@@ -518,6 +614,12 @@ async def optimize_sequential(
     seed_evaluation = await _evaluate(task, seed, budget=comparison_budget)
     seed_score = seed_evaluation.score
     incumbent_selectable = seed_evaluation.selectable
+    # The comparison budget already paid for the incumbent's validation score;
+    # hand it to each stage so no engine re-scores its seed. Only a real,
+    # non-interrupted evaluation of exactly that candidate may be reused.
+    incumbent_evaluation: CandidateEvaluation | None = (
+        None if isinstance(seed_evaluation, _InterruptedEvaluation) else seed_evaluation
+    )
     adopted_result = EngineResult(
         engine="seed",
         best_candidate=seed,
@@ -543,7 +645,9 @@ async def optimize_sequential(
         local = budget.reserve_slice(slice_size)
         try:
             engine = get_engine(config.engine, config)
-            stage_task = _engine_task_view(task, engine, seed)
+            stage_task = _engine_task_view(
+                task, engine, seed, seed_evaluation=incumbent_evaluation
+            )
             result = await engine.run(stage_task, config, local)
             _reconcile_engine_result(config, result, local)
         finally:
@@ -576,6 +680,7 @@ async def optimize_sequential(
         )
         if adopted:
             incumbent_selectable = True
+            incumbent_evaluation = evaluation
             seed, seed_score, adopted_result, adopted_index = (
                 result.best_candidate,
                 evaluation.score,
@@ -878,6 +983,12 @@ async def optimize_adaptive_sequential(
     comparison = BudgetTracker(comparison_metric_calls or cap)
     seed = await task.seed_candidate()
     incumbent = await _evaluate(task, seed, budget=comparison)
+    # The comparison budget already paid for the incumbent's validation score;
+    # hand it to each slice so no engine re-scores its seed. Only a real,
+    # non-interrupted evaluation of exactly that candidate may be reused.
+    incumbent_evaluation: CandidateEvaluation | None = (
+        None if isinstance(incumbent, _InterruptedEvaluation) else incumbent
+    )
     best = EngineResult(
         engine="seed",
         best_candidate=seed,
@@ -904,7 +1015,12 @@ async def optimize_adaptive_sequential(
         local = budget.reserve_slice(slice_size)
         try:
             engine = get_engine(config.engine, config)
-            seeded = _engine_task_view(task, engine, best.best_candidate)
+            seeded = _engine_task_view(
+                task,
+                engine,
+                best.best_candidate,
+                seed_evaluation=incumbent_evaluation,
+            )
             result = await engine.run(seeded, config, local)
             _reconcile_engine_result(config, result, local)
         finally:
@@ -931,6 +1047,7 @@ async def optimize_adaptive_sequential(
         if improved:
             best = result
             incumbent = observed
+            incumbent_evaluation = observed
             plateau_rounds = 0
         else:
             plateau_rounds += 1

@@ -36,3 +36,7 @@ class GepaDeps:
     seed_candidate: CandidateMap | None = None
     memory_exporter: InMemorySpanExporter | None = None
     trace_collector: "GepaTraceCollector | None" = None
+    # Per-case validation scores a composition helper already paid for the seed
+    # candidate; consumed once by EvaluateStep instead of re-running the
+    # evaluator. Never outputs or traces.
+    seed_validation_scores: dict[str, float] | None = None
