@@ -476,6 +476,7 @@ def test_heldout_lane_start_uses_owned_repositories(
 ):
     from pydantic_ai_gepa.cli.lane_repositories import load, lane_path
 
+    # Keep lanes running: 11 spent + 9 baseline/lane rows + 2 screens + 3 confirmation.
     result = _run(
         "run",
         "start",
@@ -484,7 +485,7 @@ def test_heldout_lane_start_uses_owned_repositories(
         "--size",
         "1",
         "--max-iterations",
-        "20",
+        "25",
         "--acceptance-repetitions",
         "1",
     )
