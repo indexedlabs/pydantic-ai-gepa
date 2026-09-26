@@ -890,7 +890,7 @@ def test_real_git_binary_is_pinned_and_not_the_macos_shim(git_repo):
         assert "GIT_EXEC_PATH" not in git.env
 
 
-@pytest.mark.parametrize("kind", ["symlink", "directory-symlink", "fifo"])
+@pytest.mark.parametrize("kind", ["symlink", "directory-symlink", "fifo", "hardlink"])
 def test_unsafe_exclude_is_empty_and_never_reads_heldout(
     git_repo, private, monkeypatch, kind
 ):
@@ -906,6 +906,8 @@ def test_unsafe_exclude_is_empty_and_never_reads_heldout(
     elif kind == "directory-symlink":
         exclude.parent.rename(git_repo / ".git/original-info")
         exclude.parent.symlink_to(private.parent, target_is_directory=True)
+    elif kind == "hardlink":
+        os.link(secret, exclude)
     else:
         os.mkfifo(exclude)
     forbidden = secret.stat()

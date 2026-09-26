@@ -110,7 +110,9 @@ def _read_metadata_at(directory: int, name: str, limit: int) -> bytes:
         )
         try:
             info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode):
+            # A hard link can alias a file the reflector can't read, such as
+            # the held-out set, so only a single-link regular file is data.
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 raise OSError(errno.EINVAL, "Git metadata must be a regular file.")
             if info.st_size > limit:
                 raise SafeGitError("Git metadata exceeds the size limit.")
