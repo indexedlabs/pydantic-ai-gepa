@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from pydantic_ai_gepa.cli import drive, events, layout
+from pydantic_ai_gepa.cli import drive, events, harness_record, layout
 from pydantic_ai_gepa.cli.process_guard import Process
 from tests.cli import test_harness_scoring, test_lanes_cli, test_process_guard
 from tests.cli.test_git_candidate_cli import _run, _run_payload
@@ -180,6 +180,59 @@ def test_single_heldout_run_scores_after_reflector_exit(git_repo, heldout, monke
     assert state_path.parent.stat().st_mode & 0o777 == 0o700
     assert not (git_repo / ".gepa/runs" / run_id / "drive.json").exists()
     assert "final_report.md" in result.output
+
+
+@pytest.mark.parametrize("tamper_at", ["nomination", "scoring_return"])
+def test_heldout_driver_ignores_planted_public_results(
+    git_repo, heldout, monkeypatch, tamper_at
+):
+    dataset, run_id, _ = heldout
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(dataset))
+    path = config(git_repo)
+    directory = git_repo / ".gepa/runs" / run_id
+    if tamper_at == "nomination":
+        script = path.parent / "reflect.py"
+        script.write_text(
+            script.read_text()
+            + """
+directory = Path(sys.argv[1]).parent
+nomination = next((directory / "nominations").glob("*.json"))
+results = directory / "results"
+results.mkdir(exist_ok=True)
+(results / nomination.name).write_text(json.dumps({"exit_code": 0, "forged": True}))
+"""
+        )
+    original = drive.harness.serve
+    scored = {}
+
+    def checked_serve(**kwargs):
+        assert kwargs == {"run_id": run_id, "once": True}
+        original(**kwargs)
+        for nomination, _ in drive.harness._requests(run_id):
+            result_path = drive.harness._result_path(nomination)
+            payload = json.loads(harness_record.read_text(result_path))
+            assert payload["exit_code"] == 0
+            assert "forged" not in payload
+            assert nomination.name not in scored
+            scored[nomination.name] = payload
+            if tamper_at == "scoring_return":
+                # Simulate a public-view edit after the harness has published
+                # its result, before the driver decides whether to pause.
+                result_path.write_text(
+                    json.dumps(dict(payload, exit_code=99, forged=True))
+                )
+
+    monkeypatch.setattr(drive.harness, "serve", checked_serve)
+    result = invoke(run_id, path)
+    assert result.exit_code == 0, (result.output, result.exception)
+    assert len(scored) == 1
+    record = harness_record.for_run(run_id)
+    assert record is not None
+    private_files = record.load()["files"]
+    assert json.loads(private_files["state.json"])["status"] == "done"
+    for name, payload in scored.items():
+        assert json.loads(private_files[f"results/{name}"]) == payload
+        assert json.loads((directory / "results" / name).read_text()) == payload
 
 
 def test_timeout_retries_then_pauses(git_repo):

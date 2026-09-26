@@ -18,7 +18,7 @@ from typing import Any, Iterator
 
 import typer
 
-from . import events, harness, lanes, reflector
+from . import events, harness, harness_record, lanes, reflector
 from .layout import gepa_dir, repo_root, run_dir, set_gepa_dirname
 from .process_guard import DarwinProcesses, GuardError, ProcessGuard
 from .run import _load_state
@@ -592,7 +592,7 @@ class Driver:
         return [
             (path, request)
             for path, request in harness._requests(self.run_id)
-            if not harness._result_path(path).exists()
+            if not harness_record.exists(harness._result_path(path))
         ]
 
     def score(self, lane_run: bool) -> None:
@@ -625,8 +625,8 @@ class Driver:
                 if request.get("reflector_epoch") != run.reflector["epoch"]:
                     continue
                 result = harness._result_path(path)
-                if result.exists():
-                    payload = json.loads(result.read_text())
+                if harness_record.exists(result):
+                    payload = json.loads(harness_record.read_text(result))
                     if payload.get("state_updated_at") == run.updated_at and payload[
                         "exit_code"
                     ] not in (0, 70):
