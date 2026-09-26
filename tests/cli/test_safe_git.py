@@ -532,6 +532,61 @@ def test_heldout_lane_start_uses_owned_repositories(
     assert str(private) not in result.output
 
 
+def test_trusted_scorer_uses_original_repository_with_independent_seed(
+    git_repo, private, protocol_backend, monkeypatch
+):
+    from pydantic_ai_gepa.cli.lane_repositories import lane_path
+
+    config = git_repo / ".gepa/gepa.toml"
+    config.write_text(
+        config.read_text()
+        + '\n[acceptance]\npinned_scorer = true\ntrusted_scorer = true\ncomponent_files = ["score.txt"]\n'
+    )
+    (git_repo / "task_pkg/evaluation.py").write_text(
+        "import json, os\n"
+        "async def evaluate(case):\n"
+        "    return json.loads(os.environ['GEPA_CANDIDATE_COMPONENTS_JSON'])['score.txt']\n"
+    )
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "Trusted scorer")
+    revision = _git(git_repo, "rev-parse", "HEAD")
+    monkeypatch.setenv("GEPA_HARNESS_SCORER_REVISION", revision)
+    export = git_repo.parent / (git_repo.name + "-export")
+    (export / "api").mkdir(parents=True)
+    (export / "api/score.txt").write_text("bad")
+    (export / "api/pyproject.toml").write_text(
+        '[project]\nname="export"\nversion="0.0.0"\n'
+    )
+    _git(export, "init")
+    _git(export, "config", "user.name", "Tests")
+    _git(export, "config", "user.email", "tests@example.com")
+    _git(export, "add", ".")
+    _git(export, "commit", "-m", "History-free candidate")
+    result = _run(
+        "run",
+        "start",
+        "--candidate-root",
+        str(export / "api"),
+        "--lanes",
+        "1",
+        "--size",
+        "1",
+        "--max-iterations",
+        "20",
+        "--acceptance-repetitions",
+        "1",
+    )
+    assert result.exit_code == 0, (result.output, result.exception)
+    state = _run_payload(result.output)
+    assert state["best_commit_sha"] == _git(export, "rev-parse", "HEAD")
+    lane = lane_path(git_repo, str(state["run_id"]), "lane-1")
+    assert not (lane / "task_pkg").exists()
+    with pytest.raises(subprocess.CalledProcessError):
+        _git(lane, "cat-file", "-e", revision)
+    assert _git(git_repo, "rev-parse", "HEAD") == revision
+    assert str(private) not in result.output
+
+
 def test_heldout_select_refuses_legacy_state(git_repo, private, monkeypatch):
     from types import SimpleNamespace
     from pydantic_ai_gepa.cli.select import _run_select_locked

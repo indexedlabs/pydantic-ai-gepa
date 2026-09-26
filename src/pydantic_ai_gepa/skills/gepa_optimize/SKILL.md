@@ -226,7 +226,9 @@ component_files = ["prompts/planner.md"]
 The orchestrator must set `GEPA_HARNESS_SCORER_REVISION` to the trusted scorer's
 full commit SHA (40 or 64 hexadecimal characters) in the harness environment,
 including `run start`, `harness serve` and `run select`. The revision must exist
-in the same repository. Missing, malformed or non-commit revisions are refused.
+in the original scorer project repository. With `--candidate-root`, component
+blobs come from the separate candidate repository; scorer history stays in the
+original repository. Missing, malformed or non-commit revisions are refused.
 The private checkout contains only that revision. The parent reads the nominated
 commit's component files as raw UTF-8 Git blobs, with no filters or candidate
 imports, and sends their text in the initialization message. The child sets
@@ -306,7 +308,7 @@ Public candidate retention refs are written as data through directory handles
 that refuse symlinks, without invoking source Git hooks; ordinary branch resets
 and garbage collection preserve the retained commits.
 
-Lane runs use independent repositories, including held-out scalar/unpinned
+Lane runs use independent repositories, including supported held-out scalar
 runs. `run start --lanes N --candidate-root /absolute/export/project` seeds them
 from a separate candidate project; omitting `--candidate-root` uses the current
 project. The caller must supply a history-free, training-only export when the
@@ -326,7 +328,8 @@ commits. Held-out stores live under the private dataset sibling's
 `<GEPA_DIR>.repositories/<run-id>/`. Keep these stores for replay/adoption after
 lane cleanup. The original project is never reset to a winning candidate.
 Later iterations start from the retained winner. Old linked-worktree runs must
-restart; no migration is attempted. Pinned-scorer held-out runs remain refused.
+restart; no migration is attempted. Pinned-scorer held-out runs require the
+trusted-scorer settings and harness revision described above.
 
 Sandbox rollouts run serially; the parent retains cost admission and response-level
 accounting. Public spend uses a fixed `sandbox` model bucket to prevent model names

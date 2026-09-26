@@ -741,6 +741,7 @@ def run_eval_once(
             records = scoring_sandbox.score_cases(
                 config=cfg,
                 project=active_candidate_project,
+                scorer_project=primary_project_root,
                 sha=git_state.commit_sha,
                 cases=subset,
                 validation=dataset_role == "validation",
