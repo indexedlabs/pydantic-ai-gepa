@@ -471,6 +471,49 @@ def test_heldout_lane_mutations_refused_before_git(
     assert str(git_repo) not in str(error.value)
 
 
+@pytest.mark.parametrize(
+    "lanes,budget,repetitions", [(0, 17, 5), (1, 17, 3), (3, 17, 0), (3, 24, 3)]
+)
+def test_heldout_start_reserves_first_lane_selection(
+    git_repo, private, protocol_backend, lanes, budget, repetitions
+):
+    from pydantic_ai_gepa.cli.lanes import load_all_lane_states
+    from pydantic_ai_gepa.cli.run import _load_state
+    from pydantic_ai_gepa.cli.validation import harness_environment
+
+    result = _run(
+        "run",
+        "start",
+        "--lanes",
+        str(lanes),
+        "--size",
+        "1",
+        "--max-iterations",
+        str(budget),
+        "--acceptance-repetitions",
+        "3",
+        "--acceptance-max-repetitions",
+        "5",
+    )
+    assert result.exit_code == 0, (result.output, result.exception)
+    run_id = str(_run_payload(result.output)["run_id"])
+    with harness_environment():
+        state = _load_state(run_id)
+        assert state.lanes == lanes
+        assert state.iterations == 4 + repetitions
+        assert len(state.reflection_baseline_samples) == repetitions
+        lane_states = load_all_lane_states(git_repo, run_id)
+    assert len(lane_states) == (lanes if repetitions else 0)
+    if repetitions:
+        assert state.status == ("running" if lanes else "paused_for_reflection")
+        if lanes:
+            assert budget - state.iterations - lanes * repetitions >= lanes + 5
+    else:
+        assert state.status == "done"
+        assert state.best_candidate_id is not None
+        assert state.last_comparison["reason_code"] == "selection_budget_exhausted"
+
+
 def test_heldout_lane_start_uses_owned_repositories(
     git_repo, private, protocol_backend, monkeypatch
 ):

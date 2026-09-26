@@ -881,6 +881,23 @@ def _validation_schedule(state: RunState, root: Path | None = None) -> tuple[int
     return _acceptance_schedule(state, len(cases))
 
 
+def _lane_baseline_budget(
+    state: RunState, remaining: int, root: Path | None = None
+) -> tuple[int, int]:
+    """Return affordable repetitions and rows reserved for scalar selection.
+
+    Reserve one screen per lane and the maximum confirmation schedule so every
+    statistical look remains affordable, then share rows among baseline and
+    lanes. Callers stop before fan-out if this cannot fund initial repetitions.
+    Startup excludes its already-paid failure-selected row from ``remaining``;
+    rebaseline includes its first row, which is usable baseline evidence.
+    """
+    reserve = 0
+    if harness_record.for_run(state.run_id, root) is not None:
+        reserve = state.lanes + _validation_schedule(state, root)[1]
+    return (remaining - reserve) // (state.lanes + 1), reserve
+
+
 def _case_scores(outcome: EvalOutcome) -> dict[str, float]:
     return {record.case_id: record.score for record in outcome.records}
 
@@ -1142,14 +1159,25 @@ def _capture_reflection_baseline(
 
     remaining_iterations = state.max_iterations - state.iterations
     initial, maximum = _acceptance_schedule(state, len(first_outcome.records))
-    validation_reserve = _validation_schedule(state)[0] if state.heldout_required else 0
     # The failure-selected outcome is already charged and is never evidence.
-    affordable_repetitions = (remaining_iterations - validation_reserve) // 2
+    reason_code = "baseline_budget_exhausted"
+    if (
+        state.lanes >= 1
+        and harness_record.for_run(state.run_id) is not None
+        and GepaConfig.load(config_path()).acceptance.mode != "vector"
+    ):
+        affordable_repetitions, _ = _lane_baseline_budget(state, remaining_iterations)
+        reason_code = "selection_budget_exhausted"
+    else:
+        validation_reserve = (
+            _validation_schedule(state)[0] if state.heldout_required else 0
+        )
+        affordable_repetitions = (remaining_iterations - validation_reserve) // 2
     if affordable_repetitions < initial:
         return _with_timestamp(
             state,
             status="done",
-            last_comparison=_inconclusive_comparison("baseline_budget_exhausted"),
+            last_comparison=_inconclusive_comparison(reason_code),
         ), []
     target_repetitions = min(maximum, affordable_repetitions)
     outcomes: list[EvalOutcome] = []

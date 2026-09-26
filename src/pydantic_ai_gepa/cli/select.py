@@ -893,9 +893,7 @@ def _phase_promote(
     #    or vectors, so its evidence never enters a reflection packet.
     accepted = [lane_state for lane_state in valid if lane_state.verdict == "accepted"]
     config = GepaConfig.load(config_path(workspace_root))
-    from .harness_record import for_run
-
-    validation_enabled = for_run(run_id, workspace_root) is not None
+    validation_enabled = harness_record.for_run(run_id, workspace_root) is not None
     if state.heldout_required and not validation_enabled:
         raise typer.BadParameter("Held-out selection requires harness access.")
     vector_validation = validation_enabled and config.acceptance.mode == "vector"
@@ -1446,7 +1444,8 @@ def _phase_journal(
     ctx["budget_rows"] = rows
     ctx["overshoot"] = max(0, rows - state.max_iterations)
     config = GepaConfig.load(config_path(workspace_root))
-    if state.heldout_required and config.acceptance.mode == "vector":
+    validation_enabled = harness_record.for_run(run_id, workspace_root) is not None
+    if validation_enabled and config.acceptance.mode == "vector":
         validation_rounds = int(ctx.get("validation_rounds", 0))
         overshoot_bound = (
             state.lanes * state.acceptance_max_repetitions
@@ -1459,7 +1458,7 @@ def _phase_journal(
     else:
         overshoot_bound = state.lanes * (state.acceptance_max_repetitions + 1)
         bound_detail = "lanes x (acceptance max-repetitions + validation)"
-        if state.heldout_required:
+        if validation_enabled:
             from .run import _validation_schedule
 
             overshoot_bound += _validation_schedule(state, workspace_root)[1]
@@ -1798,7 +1797,12 @@ def _phase_rebaseline(
     first verdict. If the remainder cannot fund initial training repetitions,
     finalize without emitting new lane work. Ample budgets keep the same cap.
     """
-    from .run import _mark_reflection_pause, _with_last_outcome, _with_timestamp
+    from .run import (
+        _lane_baseline_budget,
+        _mark_reflection_pause,
+        _with_last_outcome,
+        _with_timestamp,
+    )
 
     run_id = state.run_id
     if ctx.get("baseline_captured"):
@@ -1816,14 +1820,10 @@ def _phase_rebaseline(
     scalar_mode = (
         GepaConfig.load(config_path(workspace_root)).acceptance.mode != "vector"
     )
-    validation_reserve = 0
-    if scalar_mode and harness_record.for_run(run_id, workspace_root) is not None:
-        from .run import _validation_schedule
-
-        validation_reserve = (
-            state.lanes + _validation_schedule(state, workspace_root)[1]
+    if scalar_mode:
+        affordable_repetitions, validation_reserve = _lane_baseline_budget(
+            state, remaining, workspace_root
         )
-
     outcomes: list[Any] = []
 
     def fail_on_infrastructure_error(outcome: Any) -> None:
@@ -1881,9 +1881,6 @@ def _phase_rebaseline(
             from .run import _acceptance_schedule, _inconclusive_comparison
 
             initial, maximum = _acceptance_schedule(state, len(first.records))
-            affordable_repetitions = (remaining - validation_reserve) // (
-                state.lanes + 1
-            )
             if affordable_repetitions < initial:
                 state = replace(
                     state,
