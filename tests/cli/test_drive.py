@@ -544,7 +544,8 @@ def test_scrub_harness_environment(monkeypatch):
         "SCORER_TOKEN",
     ):
         monkeypatch.setenv(key, "secret")
-    monkeypatch.setenv("GEPA_HARNESS_PASS_ENV", "SCORER_TOKEN")
+    monkeypatch.setenv("GEPA_HARNESS_PASS_ENV", ", SCORER_TOKEN, ,")
+    assert "" not in drive.reserved_environment()
     monkeypatch.setenv("CODEX_HOME", "reflector-auth")
     environment = drive.reflector_environment()
     assert environment["CODEX_HOME"] == "reflector-auth"

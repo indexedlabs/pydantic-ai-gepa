@@ -120,6 +120,7 @@ def reserved_environment() -> set[str]:
         | {
             name.strip()
             for name in os.environ.get("GEPA_HARNESS_PASS_ENV", "").split(",")
+            if name.strip()
         }
         | {
             name
