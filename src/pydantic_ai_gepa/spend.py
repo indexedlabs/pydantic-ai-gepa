@@ -123,6 +123,15 @@ class SpendMeter:
     Near the cap the gate is conservative: with nothing in flight it stops
     once the kind's highest observed rollout no longer fits, so one outlier
     rollout can end a run with headroom left.
+
+    ``reserve`` withholds a live, callable-computed dollar amount from this
+    meter's own local cap so work running *outside* this meter (a composed
+    helper's follow-up fair comparison) stays fundable while this meter's
+    work is still in progress. The reserve is re-evaluated on every check,
+    so it tracks the parent's observed rollout costs as they arrive, and
+    projects at the per-rollout admission bound (see ``rollout_projection``).
+    It only ever stops this child earlier; the run's cap and its documented
+    margin are unchanged.
     """
 
     def __init__(
@@ -132,6 +141,7 @@ class SpendMeter:
         max_concurrent: int | None = None,
         *,
         parent: SpendMeter | None = None,
+        reserve: Callable[[], float] | None = None,
     ) -> None:
         if max_token_cost is not None and (
             not math.isfinite(max_token_cost) or max_token_cost <= 0
@@ -139,10 +149,13 @@ class SpendMeter:
             raise ValueError("max_token_cost must be finite and > 0")
         if max_concurrent is not None and max_concurrent <= 0:
             raise ValueError("max_concurrent must be > 0")
+        if reserve is not None and max_token_cost is None:
+            raise ValueError("reserve requires a local max_token_cost")
         self.parent = parent
         self.max_token_cost = max_token_cost
         self.price_fn = price_fn
         self.max_concurrent = max_concurrent
+        self._reserve = reserve
         self._lock = RLock()
         self._usage: dict[SpendCategory, dict[str, ModelSpend]] = {
             "reflection": {},
@@ -173,12 +186,71 @@ class SpendMeter:
             "gepa_step_usage", default=None
         )
 
+    def _local_cap(self) -> float | None:
+        """This meter's own cap net of its live reserve; None when uncapped."""
+        if self.max_token_cost is None:
+            return None
+        reserve = self._reserve() if self._reserve is not None else 0.0
+        return self.max_token_cost - max(0.0, reserve)
+
+    def current_spend(self) -> float:
+        """This meter's total metered dollars so far (aggregate, no case data)."""
+        with self._lock:
+            return self._total()
+
+    def rollout_projection(self, count: int, *, kind: RolloutKind) -> float:
+        """Project ``count`` rollouts of ``kind`` against this meter's history.
+
+        Every rollout projects at the kind's highest observed cost: that is
+        the bound ``_try_admit`` enforces, since each admission's remaining
+        headroom must cover the observed high when the rollout runs alone
+        near the cap. Projecting cheaper rollouts at the running mean would
+        let a comparison start that admission later refuses mid-round. An
+        unobserved kind projects zero, matching the first-observation rule in
+        ``can_start``.
+        """
+        with self._lock:
+            return self._projection_locked(count, kind)
+
+    def _projection_locked(self, count: int, kind: RolloutKind) -> float:
+        observations = self._kind_observations[kind]
+        if count <= 0 or not observations:
+            return 0.0
+        return count * self._kind_highest[kind]
+
+    def probe_rollouts(self, count: int, *, kind: RolloutKind = "validation") -> bool:
+        """Probe, with no stop side effect, whether ``count`` rollouts fit.
+
+        Each meter in the ancestry checks the projection from its own
+        observations against its remaining capped headroom. Unlike
+        ``can_start`` a refusal never sets a stop reason: a helper whose
+        comparison is refused ends itself, while the pipeline meter and any
+        siblings keep their headroom. Genuine exhaustion still stops a meter
+        through ``check``/``record``, never through this probe.
+
+        The probe reserves nothing. Work running concurrently under the same
+        capped ancestor (two helpers sharing one supplied meter) can pass it
+        for the same dollars; the cap still holds, and a comparison that is
+        then interrupted is discarded whole.
+        """
+        with self._lock:
+            if self.stop_reason is not None:
+                return False
+            cap = self._local_cap()
+            if (
+                cap is not None
+                and self._total() + self._projection_locked(count, kind) > cap
+            ):
+                return False
+        return self.parent.probe_rollouts(count, kind=kind) if self.parent else True
+
     def check(self) -> None:
         """Prevent queued work or another tool round after a cost stop."""
         if self.parent is not None:
             self.parent.check()
         with self._lock:
-            if self.max_token_cost is not None and self._total() >= self.max_token_cost:
+            cap = self._local_cap()
+            if cap is not None and self._total() >= cap:
                 self.stop_reason = self.stop_reason or COST_STOP_REASON
             if self.stop_reason is not None:
                 raise CostBudgetExceeded(self.stop_reason)
@@ -238,10 +310,8 @@ class SpendMeter:
                         )
             else:
                 usage.dollars += dollars
-                if (
-                    self.max_token_cost is not None
-                    and self._total() > self.max_token_cost
-                ):
+                cap = self._local_cap()
+                if cap is not None and self._total() > cap:
                     self.stop_reason = self.stop_reason or COST_STOP_REASON
             # Forward even a response that exceeded the local cap. Pricing is
             # resolved once so the engine and pipeline ledgers agree exactly.
@@ -310,11 +380,12 @@ class SpendMeter:
                     / training_observations
                     * following_rollouts
                 )
-            if self.max_token_cost is not None:
-                if self._total() >= self.max_token_cost:
+            cap = self._local_cap()
+            if cap is not None:
+                if self._total() >= cap:
                     self.stop_reason = COST_STOP_REASON
                     return False
-                if self._total() + projection > self.max_token_cost:
+                if self._total() + projection > cap:
                     if stop_on_projection:
                         self.stop_reason = COST_STOP_REASON
                     return False
@@ -367,7 +438,9 @@ class SpendMeter:
                 return None
             observations = self._kind_observations[kind]
             highest = self._kind_highest[kind]
-            remaining = self.max_token_cost - self._total() - self._reserved
+            cap = self._local_cap()
+            assert cap is not None
+            remaining = cap - self._total() - self._reserved
             concurrency = max(1, self.max_concurrent)
             # An unobserved kind, or headroom that cannot cover a full
             # concurrent batch at the observed high, starts one at a time.

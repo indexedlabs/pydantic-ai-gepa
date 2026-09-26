@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import math
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from contextlib import asynccontextmanager
 from contextvars import copy_context
 from functools import wraps
 from typing import Any, Literal, ParamSpec, TypeVar, cast
@@ -26,7 +27,14 @@ from .engines.base import OptimizationEngine, ValidationScore
 from .engines.coding_agent_engine import CodingAgentEngine
 from .engines.gepa_engine import GepaEngine
 from .gepa_graph.models import CandidateMap
-from .spend import CostBudgetExceeded, PriceFn, SpendMeter, SpendReport, _pipeline_meter
+from .spend import (
+    COST_STOP_REASON,
+    CostBudgetExceeded,
+    PriceFn,
+    SpendMeter,
+    SpendReport,
+    _pipeline_meter,
+)
 
 
 class FairVote(BaseModel):
@@ -446,6 +454,74 @@ def _cost_stopped() -> bool:
     return False
 
 
+def _rollouts_fit(rollouts: int) -> bool:
+    """Probe whether ``rollouts`` validation rollouts fit the capped headroom.
+
+    A projection probe with no stop side effect: a refusal ends the helper
+    before its comparison starts, never the pipeline meter, so a capped
+    helper never starts a comparison it cannot afford to finish. Uncapped
+    pipelines always fit. The guarantee covers the helper's own work: helpers
+    run concurrently under one shared capped meter are not reserved against
+    each other (see ``SpendMeter.probe_rollouts``).
+    """
+    meter = _pipeline_meter.get()
+    if meter is None:
+        return True
+    return meter.probe_rollouts(rollouts, kind="validation")
+
+
+@asynccontextmanager
+async def _exploration_phase(
+    task: OptimizationTask, reserve_rollouts: int
+) -> AsyncIterator[None]:
+    """Hold back the follow-up comparison's projected cost from an engine phase.
+
+    When the active pipeline meter descends from a capped meter, engines run
+    under an intermediate exploration meter: a child of the pipeline meter
+    whose local cap is the capped headroom at phase start minus a live
+    reserve projecting ``reserve_rollouts`` validation rollouts at the capped
+    meter's observed costs (N x the highest observed validation rollout cost,
+    the bound rollout admission enforces; zero until a validation rollout is
+    observed, matching the meter's first-observation rule). A
+    local cap stops only this child, so engines end with their best candidate
+    while the pipeline meter keeps the reserved headroom for the comparison
+    that must follow. If the reserve projection proves low, the comparison's
+    own preflight refuses it before it starts, so it is never paid for.
+
+    The exploration meter is set before engine tasks are created (asyncio
+    tasks copy their context at creation) and reset before the comparison.
+    Uncapped pipelines yield with no meter change, so their concurrency and
+    results are exactly as before.
+    """
+    meter = _pipeline_meter.get()
+    capped = meter
+    while capped is not None and capped.max_token_cost is None:
+        capped = capped.parent
+    if meter is None or capped is None or reserve_rollouts <= 0:
+        yield
+        return
+    headroom = capped._local_cap() - capped.current_spend()
+    if headroom <= 0:
+        # No headroom beyond the reserve: a pre-stopped child stops only this
+        # phase, exactly like an exhausted local cap.
+        exploration = SpendMeter(parent=meter)
+        exploration.stop_reason = COST_STOP_REASON
+    else:
+        exploration = SpendMeter(
+            headroom,
+            max_concurrent=task.concurrency,
+            parent=meter,
+            reserve=lambda: capped.rollout_projection(
+                reserve_rollouts, kind="validation"
+            ),
+        )
+    token = _pipeline_meter.set(exploration)
+    try:
+        yield
+    finally:
+        _pipeline_meter.reset(token)
+
+
 class _InterruptedEvaluation(CandidateEvaluation):
     """Internal marker: a cost stop discarded this entire evaluation."""
 
@@ -529,6 +605,10 @@ async def optimize_best_of(
     """Parallel exploration plus a charged repeated matched comparison.
 
     An interrupted comparison is discarded in full; return the unscored seed.
+    Under a pipeline cap the engine phase runs under an exploration meter
+    that holds back the comparison's projected cost, and a comparison the
+    remaining headroom cannot fund to completion is never started; both
+    paths return the unscored seed when nothing was fairly compared.
 
     Pass max_token_cost and optional price_fn, or an existing spend_meter
     (mutually exclusive). Capped supplied meters must set max_concurrent.
@@ -548,7 +628,11 @@ async def optimize_best_of(
         requested=comparison_metric_calls,
     )
     budget = BudgetTracker(max_metric_calls)
-    results = await _run_parallel(task, configs, budget, legacy_fallback=True)
+    validation_rollouts = await task.validation_case_count()
+    async with _exploration_phase(
+        task, len(configs) * fair_vote_max_repetitions * validation_rollouts
+    ):
+        results = await _run_parallel(task, configs, budget, legacy_fallback=True)
     winner, votes, comparison_budget, decision = await _select_fair_winner(
         task,
         results,
@@ -561,7 +645,9 @@ async def optimize_best_of(
         min_delta=acceptance_min_delta,
         baseline_index=None,
     )
-    if not votes and _cost_stopped():
+    if not votes:
+        # Interrupted or refused before round one: nothing was fairly
+        # compared, so the unscored seed is the only honest result.
         return PipelineResult(
             results=results,
             best=await _seed_result(task),
@@ -587,7 +673,11 @@ async def optimize_sequential(
 ) -> PipelineResult:
     """Run fresh sequential stages while never adopting a regressing seed.
 
-    A cost-interrupted comparison retains the last accepted incumbent.
+    A cost-interrupted comparison retains the last accepted incumbent. Under
+    a pipeline cap each stage's engine runs under an exploration meter that
+    holds back that stage's comparison cost, and a stage whose comparison
+    the remaining headroom cannot fund is never started (nor is the seed's
+    own first evaluation); the helper ends keeping its incumbent.
 
     Pass max_token_cost and optional price_fn, or an existing spend_meter
     (mutually exclusive). Capped supplied meters must set max_concurrent.
@@ -610,7 +700,23 @@ async def optimize_sequential(
             include_seed=True,
         )
     )
+    comparison_rollouts = await task.validation_case_count()
     seed = await task.seed_candidate()
+    if not _rollouts_fit(comparison_rollouts):
+        # Never start a comparison the remaining capped headroom cannot fund.
+        return PipelineResult(
+            results=[],
+            best=await _seed_result(task),
+            best_index=-1,
+            fair_scores=[],
+            total_metric_calls=budget.spent,
+            comparison_metric_calls=comparison_budget.spent,
+            decision={
+                "kind": "monotonic_sequential",
+                "seed_score": None,
+                "cost_refused_comparison": True,
+            },
+        )
     seed_evaluation = await _evaluate(task, seed, budget=comparison_budget)
     seed_score = seed_evaluation.score
     incumbent_selectable = seed_evaluation.selectable
@@ -631,6 +737,7 @@ async def optimize_sequential(
     results: list[EngineResult] = []
     votes: list[FairVote] = []
     phases: list[dict[str, Any]] = []
+    refused = False
     for index, config in enumerate(configs):
         if _cost_stopped():
             break
@@ -641,18 +748,35 @@ async def optimize_sequential(
                 {"stage": index, "engine": config.engine, "skipped": "budget_exhausted"}
             )
             break
+        if not _rollouts_fit(comparison_rollouts):
+            # Never start an engine whose comparison cannot be funded.
+            phases.append(
+                {
+                    "stage": index,
+                    "engine": config.engine,
+                    "skipped": "comparison_refused_cost",
+                }
+            )
+            refused = True
+            break
         slice_size = min(config.max_metric_calls, budget.remaining)
         local = budget.reserve_slice(slice_size)
         try:
             engine = get_engine(config.engine, config)
-            stage_task = _engine_task_view(
-                task, engine, seed, seed_evaluation=incumbent_evaluation
-            )
-            result = await engine.run(stage_task, config, local)
+            async with _exploration_phase(task, comparison_rollouts):
+                stage_task = _engine_task_view(
+                    task, engine, seed, seed_evaluation=incumbent_evaluation
+                )
+                result = await engine.run(stage_task, config, local)
             _reconcile_engine_result(config, result, local)
         finally:
             budget.release_slice(local)
         results.append(result)
+        if not _rollouts_fit(comparison_rollouts):
+            # The reserve estimate proved low or prices rose: end the helper
+            # keeping the incumbent rather than pay for a doomed comparison.
+            refused = True
+            break
         evaluation = await _evaluate(
             task, result.best_candidate, budget=comparison_budget
         )
@@ -695,7 +819,11 @@ async def optimize_sequential(
         total_metric_calls=budget.spent,
         comparison_metric_calls=comparison_budget.spent,
         fair_votes=votes,
-        decision={"kind": "monotonic_sequential", "seed_score": seed_score},
+        decision={
+            "kind": "monotonic_sequential",
+            "seed_score": seed_score,
+            **({"cost_refused_comparison": True} if refused else {}),
+        },
         phases=phases,
     )
 
@@ -713,6 +841,9 @@ async def optimize_vote(
     fair_vote_max_repetitions: int | None = None,
 ) -> PipelineResult:
     """Alias for a repeated, matched, charged cross-engine vote.
+
+    Under a pipeline cap the engine phase holds back the vote's projected
+    cost, and a vote the remaining headroom cannot fund is never started.
 
     Pass max_token_cost and optional price_fn, or an existing spend_meter
     (mutually exclusive). Capped supplied meters must set max_concurrent.
@@ -748,6 +879,13 @@ async def optimize_omni(
 ) -> PipelineResult:
     """Run the first-class Omni explore → fair-vote → fresh-continuation flow.
 
+    Under a pipeline cap each engine phase runs under an exploration meter
+    that holds back the projected cost of the comparison (and test report)
+    that must follow it. A comparison the remaining headroom cannot fund is
+    never started: a refused phase-one vote returns the unscored seed, a
+    refused continuation comparison keeps the fairly compared phase-one
+    winner, and a refused test report leaves ``test_score=None``.
+
     Pass max_token_cost and optional price_fn, or an existing spend_meter
     (mutually exclusive). Capped supplied meters must set max_concurrent.
     Nested helpers inherit the active meter as a parent; a supplied nested
@@ -772,8 +910,10 @@ async def optimize_omni(
         repetitions=plan.fair_vote_max_repetitions,
         requested=plan.continuation_comparison_metric_calls,
     )
+    test_case_count = (
+        len(await task._test_cases_for_reporting()) if task.test_set is not None else 0
+    )
     if task.test_set is not None:
-        test_case_count = len(await task._test_cases_for_reporting())
         if (
             plan.reporting_metric_calls is not None
             and plan.reporting_metric_calls < test_case_count
@@ -781,8 +921,15 @@ async def optimize_omni(
             raise ValueError(
                 "reporting_metric_calls cannot fund the held-out test_set."
             )
+    validation_rollouts = await task.validation_case_count()
     phase_one_budget = BudgetTracker(plan.phase_one_metric_calls)
-    phase_one = await _run_parallel(task, plan.phase_one, phase_one_budget)
+    async with _exploration_phase(
+        task,
+        (len(plan.phase_one) + 1)
+        * plan.fair_vote_max_repetitions
+        * validation_rollouts,
+    ):
+        phase_one = await _run_parallel(task, plan.phase_one, phase_one_budget)
     seed = await task.seed_candidate()
     seed_result = EngineResult(
         engine="seed",
@@ -837,8 +984,12 @@ async def optimize_omni(
     # A fresh registry lookup (rather than reusing phase one) is intentional.
     phase_two_budget = BudgetTracker(plan.phase_two_metric_calls)
     engine = get_engine(plan.phase_two.engine, plan.phase_two)
-    seeded_task = _engine_task_view(task, engine, winner.best_candidate)
-    continuation = await engine.run(seeded_task, plan.phase_two, phase_two_budget)
+    async with _exploration_phase(
+        task,
+        2 * plan.fair_vote_max_repetitions * validation_rollouts + test_case_count,
+    ):
+        seeded_task = _engine_task_view(task, engine, winner.best_candidate)
+        continuation = await engine.run(seeded_task, plan.phase_two, phase_two_budget)
     _reconcile_engine_result(plan.phase_two, continuation, phase_two_budget)
     (
         continuation_winner_index,
@@ -866,9 +1017,6 @@ async def optimize_omni(
         and continuation_decision.get("acceptance", {}).get("verdict") == "accepted"
     )
     final = continuation if adopted_continuation else winner
-    test_case_count = (
-        len(await task._test_cases_for_reporting()) if task.test_set is not None else 0
-    )
     final_budget = (
         BudgetTracker(plan.reporting_metric_calls or test_case_count)
         if test_case_count
@@ -876,7 +1024,7 @@ async def optimize_omni(
     )
     test_score: float | None = None
     reporting_calls = 0
-    if test_case_count and not _cost_stopped():
+    if test_case_count and not _cost_stopped() and _rollouts_fit(test_case_count):
         assert final_budget is not None
         test = await _evaluate(
             task, final.best_candidate, budget=final_budget, dataset="test"
@@ -946,7 +1094,12 @@ async def optimize_adaptive_sequential(
 ) -> PipelineResult:
     """Run bounded fresh slices and switch only after observed plateaus.
 
-    A cost-interrupted comparison retains the last accepted incumbent.
+    A cost-interrupted comparison retains the last accepted incumbent. Under
+    a pipeline cap each slice's engine runs under an exploration meter that
+    holds back that slice's comparison cost, and a slice whose comparison
+    the remaining headroom cannot fund is never started (nor is the seed's
+    own first evaluation); the helper ends keeping its incumbent instead of
+    re-evaluating it slice after slice.
 
     Pass max_token_cost and optional price_fn, or an existing spend_meter
     (mutually exclusive). Capped supplied meters must set max_concurrent.
@@ -981,7 +1134,30 @@ async def optimize_adaptive_sequential(
             "comparison_metric_calls cannot fund all scheduled adaptive comparisons."
         )
     comparison = BudgetTracker(comparison_metric_calls or cap)
+    comparison_rollouts = await task.validation_case_count()
     seed = await task.seed_candidate()
+    if not _rollouts_fit(comparison_rollouts):
+        # Never start a comparison the remaining capped headroom cannot fund.
+        return PipelineResult(
+            results=[],
+            best=EngineResult(
+                engine="seed",
+                best_candidate=seed,
+                best_score=None,
+                num_metric_calls=0,
+            ),
+            best_index=-1,
+            fair_scores=[],
+            total_metric_calls=budget.spent,
+            comparison_metric_calls=comparison.spent,
+            decision={
+                "kind": "adaptive_sequential",
+                "switches": 0,
+                "patience": patience,
+                "plateau_min_improvement": plateau_min_improvement,
+                "cost_refused_comparison": True,
+            },
+        )
     incumbent = await _evaluate(task, seed, budget=comparison)
     # The comparison budget already paid for the incumbent's validation score;
     # hand it to each slice so no engine re-scores its seed. Only a real,
@@ -1002,12 +1178,17 @@ async def optimize_adaptive_sequential(
     switches = 0
     plateau_rounds = 0
     calls_for_engine = 0
+    refused = False
     while (
         not _cost_stopped()
         and budget.remaining > 0
         and len(results) < slice_limit
         and (cycle or index < len(configs))
     ):
+        if not _rollouts_fit(comparison_rollouts):
+            # Never start a slice whose comparison cannot be funded.
+            refused = True
+            break
         config = configs[index % len(configs)]
         slice_size = min(config.max_metric_calls, budget.remaining)
         if slice_size < min_evaluations_per_engine:
@@ -1015,18 +1196,24 @@ async def optimize_adaptive_sequential(
         local = budget.reserve_slice(slice_size)
         try:
             engine = get_engine(config.engine, config)
-            seeded = _engine_task_view(
-                task,
-                engine,
-                best.best_candidate,
-                seed_evaluation=incumbent_evaluation,
-            )
-            result = await engine.run(seeded, config, local)
+            async with _exploration_phase(task, comparison_rollouts):
+                seeded = _engine_task_view(
+                    task,
+                    engine,
+                    best.best_candidate,
+                    seed_evaluation=incumbent_evaluation,
+                )
+                result = await engine.run(seeded, config, local)
             _reconcile_engine_result(config, result, local)
         finally:
             budget.release_slice(local)
         results.append(result)
         consumed = slice_size - local.remaining
+        if not _rollouts_fit(comparison_rollouts):
+            # The reserve estimate proved low or prices rose: end the helper
+            # keeping the incumbent rather than pay for a doomed comparison.
+            refused = True
+            break
         observed = await _evaluate(task, result.best_candidate, budget=comparison)
         if isinstance(observed, _InterruptedEvaluation):
             break
@@ -1104,6 +1291,7 @@ async def optimize_adaptive_sequential(
             "switches": switches,
             "patience": patience,
             "plateau_min_improvement": plateau_min_improvement,
+            **({"cost_refused_comparison": True} if refused else {}),
         },
     )
 
@@ -1187,6 +1375,18 @@ async def _select_fair_winner(
     min_delta: float = 0.0,
     baseline_index: int | None = None,
 ) -> tuple[int, list[FairVote], BudgetTracker, dict[str, Any]]:
+    """Run matched comparison rounds, or refuse/stop early under a cap.
+
+    Under a pipeline cap the base ``repetitions`` rounds for all candidates
+    are preflighted together before round one: if the remaining headroom
+    cannot fund them, nothing starts and the decision is
+    ``"cost_refused_comparison"`` (with ``comparison_discarded`` keeping its
+    meaning: no comparison evidence survives). Each tiebreak round beyond
+    the base is preflighted the same way; a round that does not fit stops
+    tiebreaking (``"tiebreak_stopped_for_cost"``) and the completed matched
+    rounds still decide fairly. A genuine mid-evaluation cost stop still
+    discards the whole comparison as ``"cost_interrupted_comparison"``.
+    """
     if not results and _cost_stopped():
         return (
             0,
@@ -1206,6 +1406,16 @@ async def _select_fair_winner(
             f"Fair comparison requires {required} metric calls for {max_repetitions} matched rounds; got {metric_calls}."
         )
     budget = BudgetTracker(metric_calls if metric_calls is not None else required)
+    validation_rollouts = await task.validation_case_count()
+    if not _rollouts_fit(len(results) * repetitions * validation_rollouts):
+        # Never start a comparison the remaining capped headroom cannot fund
+        # to completion: nothing is spent and no partial evidence is kept.
+        return (
+            baseline_index or 0,
+            [],
+            budget,
+            {"kind": "cost_refused_comparison", "comparison_discarded": True},
+        )
     evaluations: list[list[CandidateEvaluation]] = [[] for _ in results]
     # Round-robin evaluation provides matched repetitions: every candidate sees
     # the same immutable validation case order before anyone gets a tiebreak.
@@ -1250,7 +1460,15 @@ async def _select_fair_winner(
         continue_rounds = (
             provisional != baseline_index and acceptance["verdict"] == "inconclusive"
         )
+    tiebreak_stopped_for_cost = False
     while continue_rounds and rounds < max_repetitions:
+        if not _rollouts_fit(len(results) * validation_rollouts):
+            # Stop tiebreaking rather than start a matched round the cap
+            # cannot finish. Every candidate saw the same completed rounds,
+            # so the vote on those rounds is still fair; with a baseline an
+            # inconclusive acceptance keeps the baseline.
+            tiebreak_stopped_for_cost = True
+            break
         for index, result in enumerate(results):
             evaluations[index].append(
                 await _evaluate(task, result.best_candidate, budget=budget)
@@ -1309,6 +1527,9 @@ async def _select_fair_winner(
             "selectable_candidates": [
                 vote.candidate_index for vote in votes if vote.selectable
             ],
+            **(
+                {"tiebreak_stopped_for_cost": True} if tiebreak_stopped_for_cost else {}
+            ),
         },
     )
 
