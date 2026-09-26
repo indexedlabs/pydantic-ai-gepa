@@ -51,4 +51,4 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - run: uv sync --all-extras --frozen
       - name: Exercise real Seatbelt isolation (no skips for unusable backend)
-        run: uv run pytest -v
+        run: uv run pytest tests/cli/test_scoring_sandbox.py tests/cli/test_scoring_material.py tests/cli/test_scoring_tls.py tests/cli/test_scoring_diagnostics.py -v
