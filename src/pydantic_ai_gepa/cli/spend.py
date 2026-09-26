@@ -103,7 +103,15 @@ def _rows(
 
         completed = {row["eval_id"] for row in rows if row["kind"] == "validation"}
         owners = _validation_owners(directory)
-        private = _private_spend_path(run_id, root)
+        try:
+            private = _private_spend_path(run_id, root)
+        except (OSError, ValueError, typer.BadParameter):
+            if warnings is None:
+                raise
+            # Status can use published aggregates when the dataset is offline.
+            # Admission still requires the authoritative private checkpoint.
+            warnings["validation_checkpoint_missing"] = True
+            private = None
         if private is None:
             if set(owners) - completed:
                 if warnings is None:

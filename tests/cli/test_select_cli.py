@@ -1692,3 +1692,45 @@ def test_only_pinned_runs_create_scorers_and_finalize_cleans_them(
     select._phase_finalize(git_repo, _state(git_repo, run_id), {})
     assert not snapshot.parent.parent.exists()
     assert (victim / "keep").read_text() == "unchanged"
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_paired_lane_records_missing_or_mismatched_cases(
+    git_repo, monkeypatch, missing
+):
+    from dataclasses import replace
+    from pydantic_ai_gepa.cli import lanes
+
+    run = _start_lane_run(git_repo, 1, "--acceptance-paired-min-cases", "2")
+    run_id = _run_id(run)
+    incumbent = _state(git_repo, run_id)
+    original = ParetoLog.iter_rows
+    baseline_ids = set(incumbent.reflection_baseline_eval_ids)
+
+    def mismatched_rows(log):
+        return [
+            replace(
+                row,
+                per_case_scores={
+                    f"different-{key}": value
+                    for key, value in row.per_case_scores.items()
+                },
+            )
+            if row.extra.get("eval_id") in baseline_ids
+            else row
+            for row in original(log)
+            if not (missing and row.extra.get("eval_id") in baseline_ids)
+        ]
+
+    monkeypatch.setattr(lanes.ParetoLog, "iter_rows", mismatched_rows)
+    lane = _drive_lane(git_repo, run_id, "lane-1", {"out_case-2.txt": "b\n"})
+    assert lane.verdict == "inconclusive"
+    comparison = json.loads(Path(lane.comparison_path).read_text())
+    assert comparison["reason_code"] == (
+        "paired_evidence_missing" if missing else "paired_cases_mismatched"
+    )
+    assert comparison["improved"] is False
+    assert comparison["selectable"] is False
+    result = _select(git_repo, run_id)
+    assert result.exit_code == 0, result.output
+    assert _state(git_repo, run_id).best_commit_sha == incumbent.best_commit_sha

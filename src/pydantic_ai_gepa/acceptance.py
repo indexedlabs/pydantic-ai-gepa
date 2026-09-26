@@ -99,6 +99,7 @@ class AcceptanceComparison:
     degrees_of_freedom: float | None
     method: Literal["welch_t", "paired_t"]
     paired_case_count: int
+    reason_code: str | None = None
 
     @property
     def improved(self) -> bool:
@@ -131,6 +132,7 @@ class AcceptanceComparison:
             "degrees_of_freedom": self.degrees_of_freedom,
             "method": self.method,
             "paired_case_count": self.paired_case_count,
+            **({"reason_code": self.reason_code} if self.reason_code else {}),
         }
 
 
@@ -154,7 +156,29 @@ def compare_candidate_samples(
 
     baseline = tuple(float(value) for value in baseline_samples)
     candidate = tuple(float(value) for value in candidate_samples)
-    if not baseline or not candidate:
+    paired = paired_baseline_scores is not None or paired_candidate_scores is not None
+    reason_code = None
+    if paired:
+        if not paired_baseline_scores or not paired_candidate_scores:
+            reason_code = "paired_evidence_missing"
+        elif paired_baseline_scores.keys() != paired_candidate_scores.keys():
+            reason_code = "paired_cases_mismatched"
+        elif len(paired_baseline_scores) < 2:
+            reason_code = "paired_insufficient_cases"
+        elif not all(
+            isfinite(value)
+            for scores in (paired_baseline_scores, paired_candidate_scores)
+            for value in scores.values()
+        ):
+            reason_code = "paired_scores_non_finite"
+        if not all(isfinite(value) for value in (*baseline, *candidate)):
+            reason_code = "paired_scores_non_finite"
+            # Do not serialize invalid scores into public comparison records.
+            baseline = tuple(value for value in baseline if isfinite(value))
+            candidate = tuple(value for value in candidate if isfinite(value))
+        if not baseline or not candidate:
+            reason_code = reason_code or "paired_evidence_missing"
+    if not paired and (not baseline or not candidate):
         raise ValueError("baseline_samples and candidate_samples must not be empty.")
     if not 0.0 < confidence < 1.0:
         raise ValueError("confidence must be between 0 and 1.")
@@ -165,18 +189,18 @@ def compare_candidate_samples(
     if not isfinite(min_delta) or min_delta < 0.0:
         raise ValueError("min_delta must be greater than or equal to zero.")
 
-    baseline_mean = mean(baseline)
-    candidate_mean = mean(candidate)
+    baseline_mean = mean(baseline) if baseline else 0.0
+    candidate_mean = mean(candidate) if candidate else 0.0
     delta = candidate_mean - baseline_mean
     baseline_variance = variance(baseline) if len(baseline) > 1 else 0.0
     candidate_variance = variance(candidate) if len(candidate) > 1 else 0.0
 
-    method: Literal["welch_t", "paired_t"] = "welch_t"
+    method: Literal["welch_t", "paired_t"] = "paired_t" if paired else "welch_t"
     paired_case_count = 0
     degrees_of_freedom = None
     enough_samples = len(baseline) >= 2 and len(candidate) >= 2
-    baseline_term = baseline_variance / len(baseline)
-    candidate_term = candidate_variance / len(candidate)
+    baseline_term = baseline_variance / len(baseline) if baseline else 0.0
+    candidate_term = candidate_variance / len(candidate) if candidate else 0.0
     standard_error = sqrt(baseline_term + candidate_term)
     if enough_samples and standard_error > 0.0:
         degrees_of_freedom = (baseline_term + candidate_term) ** 2 / (
@@ -184,23 +208,10 @@ def compare_candidate_samples(
             + candidate_term**2 / (len(candidate) - 1)
         )
 
-    if paired_baseline_scores is not None or paired_candidate_scores is not None:
-        if (
-            paired_baseline_scores is None
-            or paired_candidate_scores is None
-            or paired_baseline_scores.keys() != paired_candidate_scores.keys()
-        ):
-            raise ValueError(
-                "Paired scores must contain identical case keys on both sides."
-            )
-        if len(paired_baseline_scores) < 2:
-            raise ValueError("Paired comparison requires at least two cases.")
-        if not all(
-            isfinite(value)
-            for scores in (paired_baseline_scores, paired_candidate_scores)
-            for value in scores.values()
-        ):
-            raise ValueError("Paired scores must be finite.")
+    if paired and reason_code is None:
+        assert (
+            paired_baseline_scores is not None and paired_candidate_scores is not None
+        )
         differences = [
             paired_candidate_scores[key] - score
             for key, score in paired_baseline_scores.items()
@@ -211,6 +222,10 @@ def compare_candidate_samples(
         standard_error = sqrt(variance(differences) / paired_case_count)
         degrees_of_freedom = float(paired_case_count - 1)
         enough_samples = True
+        # A tiny constant gain on a handful of cases is not reliable evidence.
+        # Treat rounding-scale spread as zero too; require at least ten cases.
+        if standard_error <= 1e-15 and paired_case_count < 10:
+            reason_code = "paired_zero_spread_insufficient_cases"
 
     per_look_confidence = 1.0 - (1.0 - confidence) / max_looks
     critical_value = (
@@ -222,8 +237,10 @@ def compare_candidate_samples(
     lower_bound = delta - margin
     upper_bound = delta + margin
 
-    if lower_bound > min_delta and enough_samples:
-        verdict: AcceptanceVerdict = "accepted"
+    if reason_code is not None:
+        verdict: AcceptanceVerdict = "inconclusive"
+    elif lower_bound > min_delta and enough_samples:
+        verdict = "accepted"
     elif upper_bound < -min_delta:
         verdict = "rejected"
     elif lower_bound >= -min_delta and upper_bound <= min_delta:
@@ -250,4 +267,5 @@ def compare_candidate_samples(
         degrees_of_freedom=degrees_of_freedom,
         method=method,
         paired_case_count=paired_case_count,
+        reason_code=reason_code,
     )

@@ -420,7 +420,16 @@ class RunState:
 
         if not self.heldout_required:
             return self
-        path, digest = check_heldout_pin(root or repo_root(), self.run_id)
+        try:
+            path, digest = check_heldout_pin(root or repo_root(), self.run_id)
+        except (OSError, ValueError, typer.BadParameter):
+            # Loading is best-effort; evaluation and promotion enforce the pin.
+            return replace(
+                self,
+                best_validation_per_case_scores={},
+                validation_dataset_path=None,
+                validation_dataset_digest=None,
+            )
         self = replace(
             self, validation_dataset_path=path, validation_dataset_digest=digest
         )
@@ -920,7 +929,11 @@ def _validation_improved(
         else None,
         paired_candidate_scores=_case_scores(outcomes[0]) if initial == 1 else None,
     )
-    return {"outcome": "valid", "selectable": True, **result.to_dict()}
+    return {
+        "outcome": "valid",
+        "selectable": result.verdict != "inconclusive",
+        **result.to_dict(),
+    }
 
 
 def _confirm_validation_candidate(
@@ -1374,7 +1387,7 @@ def _evaluate_reflected_candidate(
     }[comparison_result.verdict]
     comparison = {
         "outcome": "valid",
-        "selectable": True,
+        "selectable": comparison_result.verdict != "inconclusive",
         "minibatch_id": state.reflection_minibatch_id,
         "baseline_candidate_id": state.reflection_baseline_candidate_id,
         "baseline_commit_sha": state.reflection_baseline_commit_sha,
@@ -1509,14 +1522,21 @@ def _evaluate_gate_cases(
     """Evaluate a candidate gate without adding gate rows to the Pareto log."""
 
     gate_case_ids = _validate_gate_cases(state, gate_case_ids, root=workspace_root)
-    baseline_samples = _gate_baseline_samples(state, gate_case_ids, root=workspace_root)
+    initial_samples, maximum = _acceptance_schedule(state, len(gate_case_ids))
+    try:
+        baseline_samples = _gate_baseline_samples(
+            state, gate_case_ids, root=workspace_root
+        )
+    except typer.BadParameter:
+        if initial_samples != 1:
+            raise
+        return state, [], _inconclusive_comparison("paired_evidence_missing")
     remaining = state.max_iterations - state.iterations
     if lane is not None:
         remaining = len(baseline_samples)
     max_candidate_samples = min(len(baseline_samples), remaining)
     if max_candidate_samples < 1:
         raise typer.BadParameter("No evaluation budget remains for gate comparison.")
-    initial_samples, maximum = _acceptance_schedule(state, len(gate_case_ids))
     if max_candidate_samples < initial_samples:
         return state, [], _inconclusive_comparison("gate_baseline_evidence_missing")
     outcomes: list[EvalOutcome] = []
@@ -2094,7 +2114,11 @@ def start(
         raise typer.BadParameter("--acceptance-paired-min-cases must be >= 2.")
     heldout_required = heldout_required or _held_out_validation_enabled()
     if heldout_required:
-        _validation_dataset_identity()
+        dataset, _ = _validation_dataset_identity()
+        if acceptance_paired_min_cases is not None:
+            from .validation import check_validation_evidence_writable
+
+            check_validation_evidence_writable(dataset, project_root=repo_root())
         from . import scoring_sandbox
 
         if scoring_sandbox.required():

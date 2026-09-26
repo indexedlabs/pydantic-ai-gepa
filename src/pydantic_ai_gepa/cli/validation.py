@@ -142,6 +142,37 @@ def validation_spend_path(dataset: str, *, project_root: Path, run_id: str) -> P
     )
 
 
+def check_validation_evidence_writable(dataset: str, *, project_root: Path) -> None:
+    """Probe private evidence storage before creating a run or spending budget."""
+    directory = None
+    created = False
+    try:
+        directory = validation_evidence_path(
+            dataset, project_root=project_root, run_id="writability-probe"
+        ).parent
+        # The dataset parent must also permit creation of private harness stores.
+        with tempfile.TemporaryFile(dir=directory.parent) as probe:
+            probe.write(b"probe")
+            probe.flush()
+        if not directory.exists():
+            directory.mkdir(mode=0o700)
+            created = True
+        if not os.access(directory, os.W_OK):
+            raise PermissionError("Evidence directory is not writable")
+        os.chmod(directory, 0o700)
+        with tempfile.TemporaryFile(dir=directory) as probe:
+            probe.write(b"probe")
+            probe.flush()
+    except OSError:
+        raise typer.BadParameter(
+            "Cannot write private held-out validation evidence. "
+            "Make the evidence directory and its parent writable by the harness."
+        ) from None
+    finally:
+        if created and directory is not None:
+            directory.rmdir()
+
+
 def write_validation_evidence(
     dataset: str,
     *,
@@ -152,6 +183,7 @@ def write_validation_evidence(
 ) -> None:
     path = validation_evidence_path(dataset, project_root=project_root, run_id=run_id)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
     fd, temporary = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -171,13 +203,22 @@ def read_validation_evidence(
 ) -> dict[str, float]:
     if dataset is None:
         return {}
-    path = validation_evidence_path(dataset, project_root=project_root, run_id=run_id)
     try:
+        path = validation_evidence_path(
+            dataset, project_root=project_root, run_id=run_id
+        )
         raw = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(raw, dict) or raw.get("identity") != identity:
             return {}
         return {str(key): float(value) for key, value in raw["scores"].items()}
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        AttributeError,
+        typer.BadParameter,
+    ):
         # A missing or interrupted private write can never authorize promotion.
         return {}
 
