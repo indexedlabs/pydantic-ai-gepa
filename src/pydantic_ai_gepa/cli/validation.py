@@ -212,8 +212,11 @@ def harness_environment() -> Iterator[None]:
     dataset = heldout_dataset(required=False)
     original = os.environ.pop("GEPA_HELDOUT_DATASET", None)
     token = _harness_dataset.set(dataset)
+    from .harness_record import session
+
     try:
-        yield
+        with session():
+            yield
     finally:
         _harness_dataset.reset(token)
         if original is not None:

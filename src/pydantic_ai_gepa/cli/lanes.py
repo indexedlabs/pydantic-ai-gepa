@@ -1529,14 +1529,18 @@ app = typer.Typer(
 def _load_run_state(workspace_root: Path, run_id: str) -> Any:
     from .run import RunState  # local import: run.py imports lanes lazily
 
+    from . import harness_record
+
     path = run_dir(run_id, workspace_root) / "state.json"
-    if not path.exists():
+    if not harness_record.exists(path, root=workspace_root):
         typer.echo(
             f"No managed run state at {path}. Start one with `gepa run start`.",
             err=True,
         )
         raise typer.Exit(code=1)
-    return RunState.from_dict(json.loads(path.read_text(encoding="utf-8")))
+    return RunState.from_dict(
+        json.loads(harness_record.read_text(path, root=workspace_root))
+    )
 
 
 def _resolve_lane_run(run_id: str | None) -> tuple[Path, Any]:
@@ -2231,12 +2235,16 @@ def fan_out_lanes(run_state: Any, workspace_root: Path) -> None:
 def scan_run_lanes(run_id: str, root: Path | None = None) -> LaneScan | None:
     """Real scanner behind events.scan_lanes: None when this is not a lane run."""
     workspace_root = (root or repo_root()).resolve()
+    from . import harness_record
+
     state_path = run_dir(run_id, workspace_root) / "state.json"
-    if not state_path.exists():
+    if not harness_record.exists(state_path, root=workspace_root):
         return None
     from .run import RunState  # lazy: run.py imports lanes lazily
 
-    run_state = RunState.from_dict(json.loads(state_path.read_text(encoding="utf-8")))
+    run_state = RunState.from_dict(
+        json.loads(harness_record.read_text(state_path, root=workspace_root))
+    )
     if run_state.lanes < 1 or run_state.status == "done":
         return None
     return scan_lane_states(workspace_root, run_id, run_state)

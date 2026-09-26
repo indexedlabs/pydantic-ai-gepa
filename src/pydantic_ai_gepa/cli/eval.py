@@ -87,6 +87,7 @@ from .validation import (
     private_evaluation,
     validation_spend_path,
 )
+from .harness_record import VectorRecordStore, serialized_eval
 from .runs import (
     Minibatch,
     MinibatchStore,
@@ -101,7 +102,6 @@ from .spend import evaluation_spend, spend_report, validate_cap
 from ..vector_acceptance import (
     VectorRecord,
     VectorRecordKey,
-    VectorRecordStore,
     inventory_hash,
     scorer_identity,
     side_info_vector,
@@ -153,10 +153,11 @@ def _count_evals_in_run(run_id: str, root: Path | None = None) -> int:
     # stops repeated reflect -> gate-reject cycles.
     from .layout import run_state_path
     from .run import RunState
+    from .harness_record import read_text
 
     path = run_state_path(run_id, root)
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(read_text(path, root=root))
         if isinstance(data, dict):
             return rows + RunState.from_dict(data).gate_consumed_iterations
     except (OSError, ValueError, TypeError):
@@ -361,6 +362,7 @@ def _write_trace_file(
 
 
 @private_evaluation
+@serialized_eval
 def run_eval_once(
     *,
     candidate_file: Path | None,
@@ -416,6 +418,16 @@ def run_eval_once(
 
     primary_project_root = (workspace_root or repo_root()).resolve()
     active_candidate_project = (candidate_root or primary_project_root).resolve()
+    from .harness_record import for_run
+
+    active_run_id = _resolve_run_id(run_id, root=workspace_root)
+    record = for_run(active_run_id, primary_project_root)
+    if record is not None:
+        managed_text = record.read("state.json")
+        if managed_text is not None:
+            max_iterations = min(
+                max_iterations, int(json.loads(managed_text)["max_iterations"])
+            )
     cfg = GepaConfig.load(config_path(primary_project_root))
     source = candidate_source or cfg.candidate_source
     from . import scoring_sandbox
@@ -551,7 +563,6 @@ def run_eval_once(
             candidate_overrides_id = str(candidate_file)
             status = "evaluated"
 
-    active_run_id = _resolve_run_id(run_id, root=workspace_root)
     prior_count = _count_evals_in_run(active_run_id, root=workspace_root)
     if prior_count >= max_iterations:
         if not lane:  # None (single path) or empty: hard cap; lane str: advisory

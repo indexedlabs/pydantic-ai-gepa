@@ -374,6 +374,11 @@ class GepaConfig:
 
     @staticmethod
     def load(path: Path) -> GepaConfig:
+        from .harness_record import config_text
+
+        pinned = config_text(path)
+        if pinned is not None:
+            return GepaConfig.from_dict(tomllib.loads(pinned))
         if not path.exists():
             raise GepaConfigError(
                 f"No gepa.toml at {path}. Run `gepa init --agent module:attr` first."

@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from . import harness_record
 from .layout import (
     minibatch_path,
     pareto_log_path,
@@ -152,14 +153,14 @@ class MinibatchStore:
     def save(self, minibatch: Minibatch) -> Path:
         self._dir.mkdir(parents=True, exist_ok=True)
         path = minibatch_path(self._run_id, minibatch.id, self._root)
-        path.write_text(json.dumps(minibatch.to_dict(), indent=2), encoding="utf-8")
+        content = json.dumps(minibatch.to_dict(), indent=2)
+        if not harness_record.write_text(path, content, root=self._root):
+            path.write_text(content, encoding="utf-8")
         return path
 
     def load(self, mb_id: str) -> Minibatch:
         path = minibatch_path(self._run_id, mb_id, self._root)
-        if not path.exists():
-            raise FileNotFoundError(f"No minibatch at {path}")
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(harness_record.read_text(path, root=self._root))
         return Minibatch.from_dict(data)
 
     def list_ids(self) -> list[str]:
@@ -272,6 +273,10 @@ class ParetoLog:
     def append(self, row: ParetoRow) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(row.to_dict(), sort_keys=True)
+        if harness_record.write_text(
+            self._path, line + "\n", root=self._root, append=True
+        ):
+            return
         # One unbuffered O_APPEND write per row: concurrent writers never
         # interleave bytes within a row, and a killed writer can only ever
         # leave one trailing partial line (which readers tolerate below) —
@@ -314,9 +319,9 @@ class ParetoLog:
         return ParetoLog._parse_line(line) is not None
 
     def _read_lines(self) -> list[str]:
-        if not self._path.exists():
+        if not harness_record.exists(self._path, root=self._root):
             return []
-        return self._path.read_text(encoding="utf-8").splitlines()
+        return harness_record.read_text(self._path, root=self._root).splitlines()
 
     def iter_rows(self) -> list[ParetoRow]:
         rows: list[ParetoRow] = []

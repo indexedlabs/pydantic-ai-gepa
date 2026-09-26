@@ -412,7 +412,9 @@ def test_infrastructure_pause_keeps_parent_but_shows_recovery(
         next_parent_commit_sha=str(seed_state["best_commit_sha"]),
         best_validation_samples=(),
     )
-    state.save()
+    with monkeypatch.context() as env:
+        env.setenv("GEPA_HELDOUT_DATASET", str(path))
+        state.save()
     original = run_module.run_eval_once
     test_run_cli._fail_rollout_calls(monkeypatch, {1})
     assert harness._continue(run_id).exit_code == 0

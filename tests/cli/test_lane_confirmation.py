@@ -267,3 +267,36 @@ def test_lane_confirmation_seeded_noise(selection, effect):
     assert (
         rate <= 0.05 + 3 * (0.05 * 0.95 / trials) ** 0.5 if effect == 0 else rate >= 0.8
     )
+
+
+def test_changed_lane_identity_cannot_reuse_private_validation(selection):
+    root, calls, scores = selection
+    scores["lane-1:confirmation"] = 0.5
+    forged_prior = {
+        "validation_results": {
+            "lane-1": {
+                "candidate_id": "another-candidate",
+                "commit_sha": "another-commit",
+                "mean_score": 999.0,
+                "selectable": True,
+            }
+        }
+    }
+    state, _, _ = select._phase_promote(root, _state(), forged_prior)
+    assert "lane-1:validation" in calls
+    assert state.best_candidate_id == "incumbent"
+
+
+def test_lane_proposal_must_match_the_scored_commit(selection, monkeypatch):
+    root, calls, _ = selection
+    original = run._evaluate_validation_candidate
+
+    def mismatched(state, **kwargs):
+        state, outcome = original(state, **kwargs)
+        outcome.summary["commit_sha"] = "different-commit"
+        return state, outcome
+
+    monkeypatch.setattr(run, "_evaluate_validation_candidate", mismatched)
+    with pytest.raises(typer.BadParameter, match="differs from the commit scored"):
+        select._phase_promote(root, _state(), {})
+    assert calls == ["lane-1:validation"]

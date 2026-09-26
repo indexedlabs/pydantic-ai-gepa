@@ -61,9 +61,19 @@ def run_lock(
     timeout: float | None = None,
 ) -> Iterator[None]:
     """Serialize continuation and handoff; kernel releases the lock on death."""
-    path = run_dir(run_id, root) / "run.lock"
+    from .harness_record import _locks, private_lock_path
+    from .validation import heldout_dataset
+
+    key = str(run_dir(run_id, root))
+    if heldout_dataset(required=False) and key in _locks.get():
+        yield
+        return
+    private = private_lock_path(root, run_id)
+    path = private or run_dir(run_id, root) / "run.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+", encoding="utf-8") as handle:
+        if private is not None:
+            os.chmod(path, 0o600)
         deadline = time.monotonic() + timeout if timeout is not None else None
         while True:
             try:
@@ -93,7 +103,11 @@ def run_lock(
             handle.write(str(os.getpid()))
             handle.flush()
             os.fsync(handle.fileno())
-            yield
+            token = _locks.set(_locks.get() | {key})
+            try:
+                yield
+            finally:
+                _locks.reset(token)
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
@@ -314,8 +328,12 @@ def write_packet(run_id: str, root: Path | None = None) -> Path:
     from .run import RunState
 
     workspace_root = (root or repo_root()).resolve()
+    from .harness_record import read_text
+
     state = RunState.from_dict(
-        json.loads(run_state_path(run_id, workspace_root).read_text(encoding="utf-8"))
+        json.loads(
+            read_text(run_state_path(run_id, workspace_root), root=workspace_root)
+        )
     )
     project = (
         Path(state.project_root).resolve() if state.project_root else workspace_root

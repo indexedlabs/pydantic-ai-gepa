@@ -610,13 +610,14 @@ What this does not cover:
 - Evaluators that need a local database or another local service. The child has
   no direct local-service ports; only the allowlisted model proxy is reachable.
 - Parallel rollouts within a scoring child; scoring is serial.
-- Authentication of shared results/state and other `GEPA_DIR` coordination files;
-  a reflector with write access can still forge them. This needs a separate
-  ownership/authentication change.
+- Separate OS ownership of the harness and reflector. A reflector that can write
+  beside the held-out dataset can defeat the private record; filesystem isolation
+  of that directory remains required.
 
-Run files are shared coordination state, not authenticated messages; protection
-against a reflector forging state/results in `GEPA_DIR` requires an additional
-ownership or IPC boundary.
+For held-out runs, harness-written files in `GEPA_DIR` are views: the harness acts
+only on its private record beside the held-out dataset, refusing and restoring
+changed views. A missing private record fails closed; legacy held-out runs must
+be restarted. Runs without held-out validation keep their existing behavior.
 
 ### CLI rollout spend caps
 

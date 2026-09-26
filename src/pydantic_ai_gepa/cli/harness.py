@@ -18,6 +18,7 @@ from uuid import uuid4
 
 import typer
 
+from . import harness_record
 from .candidates import git_candidate_state
 from .layout import candidate_identity_exempt_paths, repo_root, run_dir
 from .reflector import _current_tree, run_lock
@@ -64,6 +65,8 @@ def abandoning_scoring_tree() -> Iterator[None]:
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    if harness_record.write_text(path, json.dumps(payload)):
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
@@ -110,8 +113,8 @@ def _wait(path: Path, wait_secs: float) -> None:
     deadline = time.monotonic() + wait_secs
     while True:
         result_path = _result_path(path)
-        if result_path.exists():
-            result = json.loads(result_path.read_text())
+        if harness_record.exists(result_path):
+            result = json.loads(harness_record.read_text(result_path))
             _atomic_json(
                 path.parent.parent / "receipts" / path.name, {"received": True}
             )
@@ -150,10 +153,10 @@ def _terminal_or_lane(state: Any) -> bool:
     for path, _ in reversed(_requests(state.run_id)):
         result_path = _result_path(path)
         if (
-            result_path.exists()
+            harness_record.exists(result_path)
             and not (path.parent.parent / "receipts" / path.name).exists()
         ):
-            result = json.loads(result_path.read_text())
+            result = json.loads(harness_record.read_text(result_path))
             if result.get("state_updated_at") == state.updated_at:
                 _wait(path, 0)
     final_path, final_text = _write_final_report(state)
@@ -188,7 +191,7 @@ def nominate(
         for path, request in requests:
             if request.get("reflector_epoch") != current_epoch:
                 continue
-            if not _result_path(path).exists():
+            if not harness_record.exists(_result_path(path)):
                 if all(request.get(key) == value for key, value in identity.items()):
                     return path
                 raise typer.BadParameter(
@@ -198,9 +201,9 @@ def nominate(
         for path, request in reversed(requests):
             if all(request.get(key) == value for key, value in identity.items()):
                 result_path = _result_path(path)
-                if not result_path.exists():
+                if not harness_record.exists(result_path):
                     continue
-                result = json.loads(result_path.read_text())
+                result = json.loads(harness_record.read_text(result_path))
                 received = (path.parent.parent / "receipts" / path.name).exists()
                 if (
                     not result.get("stale")
@@ -335,10 +338,14 @@ def serve(
             raise typer.BadParameter(
                 "This run does not require held-out harness scoring."
             )
+        record = harness_record.for_run(run_id)
+        if record is None:
+            raise typer.BadParameter("Held-out harness requires a private run record.")
+        record.restore_views()
         pending = [
             (path, request)
             for path, request in _requests(run_id)
-            if not _result_path(path).exists()
+            if not harness_record.exists(_result_path(path))
         ]
         if pending:
             with run_lock(run_id, wait=True):
@@ -346,7 +353,7 @@ def serve(
                 check_heldout_pin(repo_root(), run_id)
                 current = []
                 for path, request in pending:
-                    if _result_path(path).exists():
+                    if harness_record.exists(_result_path(path)):
                         continue
                     if request.get("reflector_epoch") != state.reflector["epoch"]:
                         _score(path, request, state)
