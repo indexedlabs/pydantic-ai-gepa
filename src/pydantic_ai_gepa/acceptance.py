@@ -222,10 +222,6 @@ def compare_candidate_samples(
         standard_error = sqrt(variance(differences) / paired_case_count)
         degrees_of_freedom = float(paired_case_count - 1)
         enough_samples = True
-        # A tiny constant gain on a handful of cases is not reliable evidence.
-        # Treat rounding-scale spread as zero too; require at least ten cases.
-        if standard_error <= 1e-15 and paired_case_count < 10:
-            reason_code = "paired_zero_spread_insufficient_cases"
 
     per_look_confidence = 1.0 - (1.0 - confidence) / max_looks
     critical_value = (
@@ -241,6 +237,15 @@ def compare_candidate_samples(
         verdict: AcceptanceVerdict = "inconclusive"
     elif lower_bound > min_delta and enough_samples:
         verdict = "accepted"
+        # Near-constant gains need ten cases: small jitter is not reliable
+        # spread. Scale the tolerance to the effect; losses and ties stand.
+        if (
+            paired
+            and paired_case_count < 10
+            and standard_error <= 1e-6 * max(1.0, abs(delta))
+        ):
+            verdict = "inconclusive"
+            reason_code = "paired_zero_spread_insufficient_cases"
     elif upper_bound < -min_delta:
         verdict = "rejected"
     elif lower_bound >= -min_delta and upper_bound <= min_delta:

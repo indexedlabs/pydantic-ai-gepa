@@ -931,7 +931,7 @@ def _validation_improved(
     )
     return {
         "outcome": "valid",
-        "selectable": result.verdict != "inconclusive",
+        "selectable": result.reason_code is None,
         **result.to_dict(),
     }
 
@@ -1387,7 +1387,7 @@ def _evaluate_reflected_candidate(
     }[comparison_result.verdict]
     comparison = {
         "outcome": "valid",
-        "selectable": comparison_result.verdict != "inconclusive",
+        "selectable": comparison_result.reason_code is None,
         "minibatch_id": state.reflection_minibatch_id,
         "baseline_candidate_id": state.reflection_baseline_candidate_id,
         "baseline_commit_sha": state.reflection_baseline_commit_sha,

@@ -280,3 +280,39 @@ def test_paired_nonfinite_scores_are_inconclusive(value, aggregate):
     assert comparison.reason_code == "paired_scores_non_finite"
     assert not comparison.improved
     json.dumps(comparison.to_dict(), allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    "candidate_score,verdict", [(0.0, "rejected"), (0.5, "equivalent")]
+)
+def test_small_zero_spread_paired_loss_or_tie_keeps_verdict(candidate_score, verdict):
+    comparison = compare_candidate_samples(
+        [0.5],
+        [candidate_score],
+        paired_baseline_scores={str(i): 0.5 for i in range(3)},
+        paired_candidate_scores={str(i): candidate_score for i in range(3)},
+    )
+    assert comparison.verdict == verdict
+    assert not comparison.improved
+    assert comparison.reason_code is None
+    assert "reason_code" not in comparison.to_dict()
+
+
+@pytest.mark.parametrize("scale", [1.0, 10_000.0])
+@pytest.mark.parametrize("count", [3, 10])
+def test_near_zero_spread_paired_gain_requires_ten_cases(scale, count):
+    differences = [
+        scale * value for value in [0.2, 0.2, 0.2000001] + [0.2] * (count - 3)
+    ]
+    comparison = compare_candidate_samples(
+        [0.0],
+        [mean(differences)],
+        paired_baseline_scores={str(i): 0.0 for i in range(count)},
+        paired_candidate_scores={str(i): value for i, value in enumerate(differences)},
+    )
+    assert comparison.improved is (count >= 10)
+    if count < 10:
+        assert comparison.verdict == "inconclusive"
+        assert comparison.reason_code == "paired_zero_spread_insufficient_cases"
+    else:
+        assert comparison.reason_code is None

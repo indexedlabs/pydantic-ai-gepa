@@ -619,6 +619,9 @@ def test_legacy_promotion_preserves_unknown_best_mean(git_repo: Path) -> None:
     lane = _drive_lane(git_repo, run_id, "lane-1", {"out_case-2.txt": "b\n"})
     comparison_path = Path(str(lane.comparison_path))
     comparison = json.loads(comparison_path.read_text(encoding="utf-8"))
+    assert comparison["method"] == "welch_t"
+    assert "selectable" not in comparison
+    assert "reason_code" not in comparison
     comparison.pop("candidate_mean", None)
     comparison.pop("display_score", None)
     comparison_path.write_text(json.dumps(comparison), encoding="utf-8")

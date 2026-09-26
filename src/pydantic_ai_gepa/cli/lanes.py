@@ -1572,10 +1572,9 @@ def _run_lane_eval_loop(
         display = vector_comparison.display_score
     else:
         assert comparison_result is not None
-        result_data = {
-            **comparison_result.to_dict(),
-            "selectable": comparison_result.verdict != "inconclusive",
-        }
+        result_data = comparison_result.to_dict()
+        if comparison_result.reason_code is not None:
+            result_data["selectable"] = False
         verdict = comparison_result.verdict
         display = comparison_result.delta
         if baseline_per_case is None and len(baseline_samples) < max(

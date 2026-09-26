@@ -147,6 +147,10 @@ def check_validation_evidence_writable(dataset: str, *, project_root: Path) -> N
     directory = None
     created = False
     try:
+        # Check the lexical directory before evidence path resolution follows it.
+        directory = Path(dataset).resolve().parent / ".gepa-validation-evidence"
+        if directory.is_symlink():
+            raise NotADirectoryError("Evidence directory must not be a symlink")
         directory = validation_evidence_path(
             dataset, project_root=project_root, run_id="writability-probe"
         ).parent
@@ -157,6 +161,8 @@ def check_validation_evidence_writable(dataset: str, *, project_root: Path) -> N
         if not directory.exists():
             directory.mkdir(mode=0o700)
             created = True
+        if not directory.is_dir():
+            raise NotADirectoryError("Evidence storage must be a directory")
         if not os.access(directory, os.W_OK):
             raise PermissionError("Evidence directory is not writable")
         os.chmod(directory, 0o700)

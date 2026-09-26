@@ -542,3 +542,17 @@ def test_paired_gate_missing_baseline_is_inconclusive(monkeypatch):
     assert comparison["verdict"] == "inconclusive"
     assert comparison["selectable"] is False
     assert comparison["improved"] is False
+
+
+def test_welch_inconclusive_validation_keeps_selectable_output():
+    comparison = run._validation_improved(
+        _state(best_validation_samples=(0.5, 0.5, 0.5)),
+        [_outcome([score]) for score in (0.0, 0.5, 1.0)],
+        initial=3,
+        maximum=3,
+    )
+    assert comparison["method"] == "welch_t"
+    assert comparison["verdict"] == "inconclusive"
+    assert comparison["improved"] is False
+    assert comparison["selectable"] is True
+    assert "reason_code" not in comparison
