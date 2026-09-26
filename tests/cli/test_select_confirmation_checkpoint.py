@@ -57,6 +57,9 @@ def _assert_withheld(record):
     for content in public:
         assert '"secret"' not in content
         assert '"secret-pair"' not in content
+        for index in range(1, 10):
+            assert f'"secret-pair-{index}"' not in content
+        assert '"mismatched-private-case"' not in content
         assert '"scores"' not in content
         assert '"finalist"' not in content
         assert '"pending"' not in content
@@ -81,7 +84,7 @@ def test_confirmation_survives_every_promotion_crash(
 ):
     record, winner, _ = lane_run
     if paired:
-        replace(_state(record), acceptance_paired_min_cases=2).save(record.root)
+        replace(_state(record), acceptance_paired_min_cases=10).save(record.root)
         monkeypatch.setattr(run, "_validation_schedule", lambda *_: (1, 1))
     calls = []
     evaluate = run._evaluate_validation_candidate
@@ -90,10 +93,13 @@ def test_confirmation_survives_every_promotion_crash(
         calls.append(kwargs.get("lane"))
         fresh, outcome = evaluate(*args, **kwargs)
         if paired:
-            # The paired comparator requires two cases; inject another fake
-            # case with the same deterministic score into this fixture.
-            outcome.records.append(
-                EvaluationRecord("secret-pair", outcome.records[0].score, None, {})
+            # Constant paired gains require ten cases. Preserve that contract
+            # while giving the crash tests a deterministic accepted finalist.
+            outcome.records.extend(
+                EvaluationRecord(
+                    f"secret-pair-{index}", outcome.records[0].score, None, {}
+                )
+                for index in range(1, 10)
             )
         return fresh, outcome
 
@@ -125,7 +131,7 @@ def test_confirmation_survives_every_promotion_crash(
                 return original(state, root, phase, ctx)
 
             patch.setattr(select, "_checkpoint", checkpoint)
-        elif point == "incumbent_evidence_write":
+        elif point in {"incumbent_evidence_write", "unreadable_incumbent_evidence"}:
             from pydantic_ai_gepa.cli import validation
 
             original = validation.write_validation_evidence
@@ -133,6 +139,13 @@ def test_confirmation_survives_every_promotion_crash(
             def write_evidence(*args, **kwargs):
                 original(*args, **kwargs)
                 if kwargs["scores"].get("secret") == 1.0:
+                    if point == "unreadable_incumbent_evidence":
+                        path = validation.validation_evidence_path(
+                            args[0],
+                            project_root=kwargs["project_root"],
+                            run_id=kwargs["run_id"],
+                        )
+                        path.write_bytes(b"\xff")
                     crash()
 
             patch.setattr(validation, "write_validation_evidence", write_evidence)
@@ -159,11 +172,16 @@ def test_confirmation_survives_every_promotion_crash(
     assert [
         sample["summary"]["mean_score"] for sample in saved["samples"]
     ] == expected_samples
-    expected_scores = {"secret": 1.0, **({"secret-pair": 1.0} if paired else {})}
+    expected_scores = {
+        "secret": 1.0,
+        **({f"secret-pair-{index}": 1.0 for index in range(1, 10)} if paired else {}),
+    }
     assert all(sample["scores"] == expected_scores for sample in saved["samples"])
     rows = _validation_rows(record)
     calls_before = list(calls)
     _assert_withheld(record)
+    if point == "unreadable_incumbent_evidence":
+        assert _state(record).best_validation_per_case_scores == {}
     if point != "control":
         select.run_select(record.run_id)
     assert calls == calls_before
@@ -186,25 +204,52 @@ def test_confirmation_survives_every_promotion_crash(
     _assert_withheld(record)
 
 
-def test_crash_between_incumbent_evidence_and_state_save(lane_run, monkeypatch):
+@pytest.mark.parametrize("unreadable", [False, True])
+def test_crash_between_incumbent_evidence_and_state_save(
+    lane_run, monkeypatch, unreadable
+):
     test_confirmation_survives_every_promotion_crash(
-        lane_run, monkeypatch, "incumbent_evidence_write", True
+        lane_run,
+        monkeypatch,
+        "unreadable_incumbent_evidence" if unreadable else "incumbent_evidence_write",
+        True,
     )
 
 
 @pytest.mark.parametrize(
     "point",
-    ["between_samples", "during_draw", "rejected", "inconclusive", "changed_finalist"],
+    [
+        "between_samples",
+        "during_draw",
+        "rejected",
+        "inconclusive",
+        "paired_mismatch",
+        "changed_finalist",
+    ],
 )
 def test_interrupted_confirmation_sequence(lane_run, monkeypatch, point):
     record, winner, _ = lane_run
     evaluate = run._evaluate_validation_candidate
     calls = []
+    if point == "paired_mismatch":
+        replace(_state(record), acceptance_paired_min_cases=2).save(record.root)
+        monkeypatch.setattr(run, "_validation_schedule", lambda *_: (1, 1))
 
     def counted(state, **kwargs):
         lane = kwargs.get("lane", "")
         calls.append(lane)
         fresh, outcome = evaluate(state, **kwargs)
+        if point == "paired_mismatch":
+            outcome.records.append(
+                EvaluationRecord(
+                    "mismatched-private-case"
+                    if lane.endswith(":confirmation")
+                    else "secret-pair",
+                    outcome.records[0].score,
+                    None,
+                    {},
+                )
+            )
         if lane.endswith(":confirmation") and point in {"rejected", "inconclusive"}:
             # Incumbent is zero: identical evidence is an equivalent verdict.
             for item in outcome.records:
@@ -240,7 +285,7 @@ def test_interrupted_confirmation_sequence(lane_run, monkeypatch, point):
                     raise Crash(point)
 
             patch.setattr(harness_record.Record, "write", save)
-        elif point in {"rejected", "inconclusive"}:
+        elif point in {"rejected", "inconclusive", "paired_mismatch"}:
             checkpoint = select._checkpoint
 
             def save(state, root, phase, ctx):
@@ -258,6 +303,12 @@ def test_interrupted_confirmation_sequence(lane_run, monkeypatch, point):
         with pytest.raises(Crash):
             select.run_select(record.run_id)
     saved = _confirmation(record)
+    if point == "paired_mismatch":
+        assert saved["comparison"]["verdict"] == "inconclusive"
+        assert saved["comparison"]["reason_code"] == "paired_cases_mismatched"
+        assert saved["comparison"]["selectable"] is False
+        assert len(saved["samples"]) == 1
+        _assert_withheld(record)
     rows = _validation_rows(record)
     before = len(calls)
     budget_before = ParetoLog(record.run_id, record.root).count_budget_rows()
@@ -298,16 +349,16 @@ def test_interrupted_confirmation_sequence(lane_run, monkeypatch, point):
             1 if point == "rejected" else 0
         )
         assert _state(record).accepted_promotion_count == 0
+        _assert_withheld(record)
 
 
-@pytest.mark.parametrize("failures, legacy", [(1, False), (2, False), (1, True)])
+@pytest.mark.parametrize("failures", [1, 2])
 def test_confirmation_infrastructure_failure_retries_kept_samples(
-    lane_run, monkeypatch, failures, legacy
+    lane_run, monkeypatch, failures
 ):
     record, winner, _ = lane_run
     evaluate = run._evaluate_validation_candidate
     calls = []
-    failed_samples = []
 
     def counted(state, **kwargs):
         lane = kwargs.get("lane", "")
@@ -324,7 +375,6 @@ def test_confirmation_infrastructure_failure_retries_kept_samples(
             }
             outcome.records[0].score = -1.0
             outcome.summary["mean_score"] = -1.0
-            failed_samples.append(outcome)
         return fresh, outcome
 
     monkeypatch.setattr(run, "_evaluate_validation_candidate", counted)
@@ -350,22 +400,6 @@ def test_confirmation_infrastructure_failure_retries_kept_samples(
             == ParetoLog(record.run_id, record.root).count_budget_rows()
         )
         _assert_withheld(record)
-    if legacy:
-        # Records from the first commit stored the failed draw as a terminal
-        # comparison. They must recover too, without using that failed score.
-        key = paused.select_context["confirmation_checkpoint"]
-        legacy_checkpoint = {
-            **saved,
-            "comparison": paused.last_comparison,
-            "samples": saved["samples"]
-            + [
-                {
-                    "summary": failed_samples[-1].summary,
-                    "scores": {"secret": -1.0},
-                }
-            ],
-        }
-        record.write(key, json.dumps(legacy_checkpoint))
     rows = _validation_rows(record)
     count_before_retry = len(calls)
     select.run_select(record.run_id)

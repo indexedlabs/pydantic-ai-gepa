@@ -663,14 +663,7 @@ def _confirm_finalist(
         raise typer.BadParameter(
             "Checkpointed confirmation finalist changed; refusing to redraw."
         )
-    # Recover checkpoints written before infrastructure failures became
-    # retryable: the last draw failed and is not statistical evidence.
-    if (saved.get("comparison") or {}).get("outcome") == "infrastructure_failure":
-        saved["samples"] = saved["samples"][:-1]
-        saved["comparison"] = None
-        saved["pending"] = False
-        record.write(key, json.dumps(saved))
-    elif saved.get("pending"):
+    if saved.get("pending"):
         saved["pending"] = False
         # An interrupted evaluation may already have published its paid row.
         # Reconcile accounting only; never recover its score as evidence.
@@ -813,11 +806,13 @@ def _phase_promote(
             saved_confirmation = json.loads(raw)
             finalist = saved_confirmation["finalist"]
             saved_comparison = saved_confirmation.get("comparison")
+            confirmation_finished = saved_comparison is not None
+            # Failures are diagnostics in ctx, never saved verdicts. Their
+            # valid samples remain available for a retry after this pause.
             failed_confirmation = (
-                saved_comparison or ctx.get("validation_confirmation") or {}
-            ).get("outcome") == "infrastructure_failure"
-            confirmation_finished = (
-                saved_comparison is not None and not failed_confirmation
+                not confirmation_finished
+                and (ctx.get("validation_confirmation") or {}).get("outcome")
+                == "infrastructure_failure"
             )
             if not any(
                 lane.lane == finalist["lane"]
