@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -179,6 +180,126 @@ def test_single_heldout_run_scores_after_reflector_exit(git_repo, heldout, monke
     assert state_path.stat().st_mode & 0o777 == 0o600
     assert state_path.parent.stat().st_mode & 0o777 == 0o700
     assert not (git_repo / ".gepa/runs" / run_id / "drive.json").exists()
+    assert "final_report.md" in result.output
+
+
+def test_heldout_lane_run_drives_candidate_projects_after_guard(git_repo, monkeypatch):
+    from pydantic_ai_gepa.cli import lane_repositories, lanes, select
+    from pydantic_ai_gepa.cli.validation import heldout_dataset
+
+    private = git_repo.parent / (git_repo.name + "-private")
+    private.mkdir()
+    dataset = private / "heldout.jsonl"
+    dataset.write_text(
+        json.dumps({"name": "secret", "inputs": "x", "expected_output": "good"}) + "\n"
+    )
+    seed = git_repo.parent / (git_repo.name + "-seed")
+    project = seed / "api"
+    shutil.copytree(git_repo, project, ignore=shutil.ignore_patterns(".git"))
+    for args in (
+        ("init",),
+        ("config", "user.email", "tests@example.com"),
+        ("config", "user.name", "GEPA Tests"),
+        ("add", "."),
+        ("commit", "-m", "Seed candidate project"),
+    ):
+        test_lanes_cli._git(seed, *args)
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(dataset))
+    started = _run(
+        "run",
+        "start",
+        "--candidate-root",
+        str(project),
+        "--lanes",
+        "2",
+        "--size",
+        "1",
+        "--max-iterations",
+        "20",
+        "--acceptance-repetitions",
+        "1",
+        "--acceptance-max-repetitions",
+        "1",
+    )
+    assert started.exit_code == 0, (started.output, started.exception)
+    run_id = str(_run_payload(started.output)["run_id"])
+    projects = {
+        lane: Path(lanes.load_lane_state(git_repo, run_id, lane).candidate_project_path)
+        for lane in ("lane-1", "lane-2")
+    }
+    repositories = lane_repositories.load(git_repo, run_id)
+    assert repositories.directory.is_relative_to(private / ".gepa-heldout/repositories")
+    assert all(
+        path.name == "api" and (path.parent / ".git").is_dir()
+        for path in projects.values()
+    )
+    path = config(git_repo)
+    entries = json.loads(path.read_text())
+    entries[0]["argv"] += ["{checkout}", "{prompt}"]
+    path.write_text(json.dumps(entries))
+    script = path.parent / "reflect.py"
+    script.write_text(
+        script.read_text()
+        + '\nprint(json.dumps({"cwd": str(Path.cwd()), "argv": sys.argv}))\n'
+    )
+    guarded = []
+    finished = set()
+    selections = []
+    original_finish = drive.ProcessGuard.finish
+    original_phase = drive.Driver.phase
+    original_select = select.run_select
+
+    def checked_finish(guard, *args, **kwargs):
+        survivors = original_finish(guard, *args, **kwargs)
+        assert not survivors
+        finished.add(guard.record["root"])
+        return survivors
+
+    def checked_phase(driver, phase, **kwargs):
+        if phase == "guard_passed":
+            step = driver.state["step"]
+            assert step["guard"]["root"] in finished
+            assert step["exit_code"] == 0
+            with pytest.raises(ProcessLookupError):
+                os.kill(step["pid"], 0)
+            guarded.append(step["lane"])
+        return original_phase(driver, phase, **kwargs)
+
+    def checked_select(selected_run_id):
+        assert selected_run_id == run_id
+        assert set(guarded) == set(projects)
+        assert "GEPA_HELDOUT_DATASET" not in os.environ
+        assert heldout_dataset() == str(dataset)
+        selections.append(selected_run_id)
+        return original_select(selected_run_id)
+
+    monkeypatch.setattr(drive.ProcessGuard, "finish", checked_finish)
+    monkeypatch.setattr(drive.Driver, "phase", checked_phase)
+    monkeypatch.setattr(select, "run_select", checked_select)
+    result = invoke(run_id, path)
+    assert result.exit_code == 0, (result.output, result.exception)
+    assert selections
+    directory = git_repo / ".gepa/runs" / run_id
+    observations = [
+        json.loads(log.read_text().splitlines()[-1])
+        for log in sorted((directory / "drive").glob("step-*/stdout.log"))
+    ]
+    assert {Path(item["cwd"]) for item in observations} == set(projects.values())
+    for item in observations:
+        assert item["argv"][2] == item["cwd"]
+        assert ".gepa-heldout" not in json.dumps(item)
+        assert str(repositories.directory) not in json.dumps(item)
+    pin = drive._pin_path(str(dataset), git_repo, run_id)
+    assert drive.private_state_path(run_id) == pin.with_name(pin.stem + ".drive.json")
+    assert not (directory / "drive.json").exists()
+    record = harness_record.for_run(run_id)
+    assert record is not None
+    files = record.load()["files"]
+    final = json.loads(files["state.json"])
+    assert final["status"] == "done"
+    assert final["best_mean_score"] == 1.0
+    assert final["best_commit_sha"] != test_lanes_cli._git(seed, "rev-parse", "HEAD")
+    assert files["final_report.md"] == (directory / "final_report.md").read_text()
     assert "final_report.md" in result.output
 
 
