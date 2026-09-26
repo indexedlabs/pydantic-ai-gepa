@@ -478,8 +478,9 @@ async def _exploration_phase(
     under an intermediate exploration meter: a child of the pipeline meter
     whose local cap is the capped headroom at phase start minus a live
     reserve projecting ``reserve_rollouts`` validation rollouts at the capped
-    meter's observed costs ((N - 1) x mean + highest; zero until a validation
-    rollout is observed, matching the meter's first-observation rule). A
+    meter's observed costs (N x the highest observed validation rollout cost,
+    the bound rollout admission enforces; zero until a validation rollout is
+    observed, matching the meter's first-observation rule). A
     local cap stops only this child, so engines end with their best candidate
     while the pipeline meter keeps the reserved headroom for the comparison
     that must follow. If the reserve projection proves low, the comparison's

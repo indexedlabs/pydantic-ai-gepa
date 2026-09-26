@@ -341,6 +341,69 @@ async def test_capped_omni_funds_its_vote_and_refuses_the_rest():
     assert not result.spend_report.stopped_by_cost
 
 
+def _high_recurring_price(requests: list):
+    """First rollout $0.125, every later rollout $0.25 (the high recurs)."""
+
+    def price(response):
+        requests.append(response)
+        return 0.125 if len(requests) == 1 else 0.25
+
+    return price
+
+
+@pytest.mark.asyncio
+async def test_comparison_is_refused_when_only_the_mean_projection_would_fit():
+    # The seed evaluation observes validation rollouts of $0.125 and $0.25
+    # (mean $0.1875, highest $0.25). A two-rollout stage comparison projects
+    # $0.4375 at (N - 1) x mean + highest but $0.50 at the admission bound
+    # N x highest; headroom is $0.45. Only the admission bound is safe: the
+    # first comparison rollout recurs at the observed $0.25 high, and the
+    # second would be refused with nothing in flight, stopping the pipeline
+    # meter and discarding the whole comparison.
+    requests = []
+    with _registered(_StaticEngine()) as name:
+        result = await optimize_sequential(
+            _task(cases=2),
+            [EngineConfig(engine=name, max_metric_calls=1)],
+            max_metric_calls=1,
+            max_token_cost=0.825,
+            price_fn=_high_recurring_price(requests),
+        )
+    # Refused before the stage engine or any comparison rollout starts.
+    assert len(requests) == 2  # The seed evaluation only.
+    assert result.results == []
+    assert result.phases == [
+        {"stage": 0, "engine": name, "skipped": "comparison_refused_cost"}
+    ]
+    assert result.decision["cost_refused_comparison"]
+    assert result.best.engine == "seed"
+    assert result.best.best_score == 0.5
+    assert result.spend_report.total_dollars == 0.375
+    assert not result.spend_report.stopped_by_cost
+
+
+@pytest.mark.asyncio
+async def test_comparison_runs_when_headroom_covers_the_admission_bound():
+    # Same observed costs, but headroom $0.55 covers 2 x $0.25: the
+    # comparison completes even though the high recurs on both rollouts.
+    requests = []
+    with _registered(_StaticEngine()) as name:
+        result = await optimize_sequential(
+            _task(cases=2),
+            [EngineConfig(engine=name, max_metric_calls=1)],
+            max_metric_calls=1,
+            max_token_cost=0.925,
+            price_fn=_high_recurring_price(requests),
+        )
+    assert len(requests) == 4  # Seed evaluation + both comparison rollouts.
+    assert len(result.results) == 1
+    assert result.fair_scores == [0.5]
+    assert result.best_index == 0
+    assert "cost_refused_comparison" not in result.decision
+    assert result.spend_report.total_dollars == 0.875
+    assert not result.spend_report.stopped_by_cost
+
+
 @pytest.mark.asyncio
 async def test_uncapped_best_of_has_no_exploration_meter():
     strong = _RolloutEngine("reserve-strong", "better")

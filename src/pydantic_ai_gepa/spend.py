@@ -128,9 +128,10 @@ class SpendMeter:
     meter's own local cap so work running *outside* this meter (a composed
     helper's follow-up fair comparison) stays fundable while this meter's
     work is still in progress. The reserve is re-evaluated on every check,
-    so it tracks the parent's observed rollout costs as they arrive. It only
-    ever stops this child earlier; the run's cap and its documented margin
-    are unchanged.
+    so it tracks the parent's observed rollout costs as they arrive, and
+    projects at the per-rollout admission bound (see ``rollout_projection``).
+    It only ever stops this child earlier; the run's cap and its documented
+    margin are unchanged.
     """
 
     def __init__(
@@ -200,10 +201,13 @@ class SpendMeter:
     def rollout_projection(self, count: int, *, kind: RolloutKind) -> float:
         """Project ``count`` rollouts of ``kind`` against this meter's history.
 
-        ``count - 1`` rollouts project at the kind's running mean and one at
-        its highest observed cost: the last admission must fit the high, like
-        ``_try_admit``. An unobserved kind projects zero, matching the
-        first-observation rule in ``can_start``.
+        Every rollout projects at the kind's highest observed cost: that is
+        the bound ``_try_admit`` enforces, since each admission's remaining
+        headroom must cover the observed high when the rollout runs alone
+        near the cap. Projecting cheaper rollouts at the running mean would
+        let a comparison start that admission later refuses mid-round. An
+        unobserved kind projects zero, matching the first-observation rule in
+        ``can_start``.
         """
         with self._lock:
             return self._projection_locked(count, kind)
@@ -212,8 +216,7 @@ class SpendMeter:
         observations = self._kind_observations[kind]
         if count <= 0 or not observations:
             return 0.0
-        mean = self._kind_dollars[kind] / observations
-        return (count - 1) * mean + self._kind_highest[kind]
+        return count * self._kind_highest[kind]
 
     def probe_rollouts(self, count: int, *, kind: RolloutKind = "validation") -> bool:
         """Probe, with no stop side effect, whether ``count`` rollouts fit.
