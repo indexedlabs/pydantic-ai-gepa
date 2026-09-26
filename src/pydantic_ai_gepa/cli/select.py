@@ -456,16 +456,14 @@ def _invalidate_cross_baseline(
 
 
 def _is_ancestor(workspace_root: Path, ancestor_sha: str, head_sha: str) -> bool:
-    completed = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(workspace_root),
-            "merge-base",
-            "--is-ancestor",
-            ancestor_sha,
-            head_sha,
-        ],
+    from .safe_git import run_git
+
+    completed = run_git(
+        workspace_root,
+        "merge-base",
+        "--is-ancestor",
+        ancestor_sha,
+        head_sha,
         capture_output=True,
     )
     return completed.returncode == 0
@@ -2022,6 +2020,10 @@ def _run_select_locked(workspace_root: Path, run_state: Any) -> Any:
             err=True,
         )
         raise typer.Exit(code=1)
+
+    from .safe_git import refuse_heldout_git_mutations
+
+    refuse_heldout_git_mutations()
 
     if run_state.heldout_required:
         from .run import _assert_validation_dataset_unchanged

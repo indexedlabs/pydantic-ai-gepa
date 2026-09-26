@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from ..gepa_graph.models import CandidateMap, ComponentValue
+from .safe_git import GitExecutableError, safe_repository
 
 
 @dataclass
@@ -129,28 +130,44 @@ def git_candidate_state(
     repository = (root or Path.cwd()).resolve()
     excluded = _relative_exclusions(repository, exclude_paths)
     pathspecs = [".", *(f":(exclude){path}" for path in excluded)]
-    commit_sha = _git_output(repository, "rev-parse", "HEAD").decode().strip()
-    short_commit_sha = (
-        _git_output(repository, "rev-parse", "--short=12", "HEAD").decode().strip()
-    )
-    tracked_diff = _git_output(
-        repository,
-        "diff",
-        "--binary",
-        "--full-index",
-        "HEAD",
-        "--",
-        *pathspecs,
-    )
-    untracked_output = _git_output(
-        repository,
-        "ls-files",
-        "--others",
-        "--exclude-standard",
-        "-z",
-        "--",
-        *pathspecs,
-    )
+    try:
+        with safe_repository(repository) as git:
+            commit_sha = git.head_oid
+            if commit_sha is None:
+                raise GitCandidateError("A git candidate requires a committed HEAD.")
+            short_commit_sha = (
+                git.run(
+                    "rev-parse", "--short=12", "HEAD", check=True, capture_output=True
+                )
+                .stdout.decode()
+                .strip()
+            )
+            tracked_diff = git.run(
+                "diff",
+                "--binary",
+                "--full-index",
+                "HEAD",
+                "--",
+                *pathspecs,
+                check=True,
+                capture_output=True,
+            ).stdout
+            untracked_output = git.run(
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+                "--",
+                *pathspecs,
+                check=True,
+                capture_output=True,
+            ).stdout
+    except GitExecutableError as exc:
+        raise GitCandidateError(str(exc)) from None
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise GitCandidateError(
+            f"Could not identify git candidate at {repository}."
+        ) from exc
     untracked_paths = [path for path in untracked_output.split(b"\0") if path]
     dirty = bool(tracked_diff or untracked_paths)
     if not dirty:
@@ -174,6 +191,25 @@ def git_candidate_state(
         digest.update(b"\0")
         if stat.S_ISLNK(file_stat.st_mode):
             digest.update(os.fsencode(os.readlink(path)))
+        elif stat.S_ISDIR(file_stat.st_mode):
+            # Git emits untracked nested repositories as a directory. Include
+            # their ordinary files without opening their Git metadata.
+            for directory, dirs, files in os.walk(path, followlinks=False):
+                dirs[:] = sorted(name for name in dirs if name.casefold() != ".git")
+                for name in sorted(files):
+                    if name.casefold() == ".git":
+                        continue
+                    child = Path(directory) / name
+                    digest.update(os.fsencode(child.relative_to(path)))
+                    digest.update(b"\0")
+                    digest.update(_git_mode(child.lstat().st_mode).encode())
+                    digest.update(b"\0")
+                    digest.update(
+                        os.fsencode(os.readlink(child))
+                        if child.is_symlink()
+                        else child.read_bytes()
+                    )
+                    digest.update(b"\0")
         else:
             digest.update(path.read_bytes())
         digest.update(b"\0")
@@ -186,24 +222,6 @@ def git_candidate_state(
         dirty=True,
         dirty_hash=dirty_hash,
     )
-
-
-def _git_output(repository: Path, *args: str) -> bytes:
-    try:
-        return subprocess.run(
-            ["git", "-C", str(repository), *args],
-            check=True,
-            capture_output=True,
-        ).stdout
-    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
-        detail = (
-            exc.stderr.decode(errors="replace").strip()
-            if isinstance(exc, subprocess.CalledProcessError)
-            else str(exc)
-        )
-        raise GitCandidateError(
-            f"Could not identify git candidate at {repository}: {detail}"
-        ) from exc
 
 
 def _git_mode(mode: int) -> str:

@@ -19,6 +19,7 @@ import typer
 from ..gepa_graph.evaluation.pareto import remove_dominated_programs
 from .eval import EvalOutcome
 from .layout import components_dir, gepa_dir, run_dir
+from .safe_git import Repository, pin_commit
 from .validation import (
     check_heldout_pin,
     read_validation_evidence,
@@ -57,11 +58,7 @@ def _pin_git_candidate(root: Path, run_id: str, candidate_id: str, sha: str) -> 
         raise typer.BadParameter("Invalid public candidate identity for retention.")
     ref = f"refs/gepa/{run_id}/{candidate_id}"
     try:
-        subprocess.run(
-            ["git", "-C", str(root), "update-ref", ref, sha],
-            check=True,
-            capture_output=True,
-        )
+        pin_commit(root, ref, sha)
     except (OSError, subprocess.CalledProcessError):
         raise typer.BadParameter(
             "Could not retain the validated candidate commit."
@@ -81,14 +78,11 @@ def parent_restore_command(state: Any, root: Path) -> str:
         f"gepa --gepa-dir {shlex.quote(str(gepa_dir(root)))} "
         f"apply --candidate-file {shlex.quote(str(path))}"
     )
-    tree = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
-        capture_output=True,
-        text=True,
-    )
-    if tree.returncode == 0 and components_dir(root).resolve().is_relative_to(
-        Path(tree.stdout.strip()).resolve()
-    ):
+    try:
+        tree = Repository.discover(root).root
+    except OSError:
+        return command
+    if components_dir(root).resolve().is_relative_to(tree):
         command += " --commit"
     return command
 

@@ -11,7 +11,13 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def legacy_scoring_flow_backend(request, monkeypatch):
-    if request.node.path.name != "test_scoring_sandbox.py":
+    if request.node.path.name not in {"test_scoring_sandbox.py", "test_safe_git.py"}:
         monkeypatch.setattr(
             "pydantic_ai_gepa.cli.scoring_sandbox.required", lambda: False
+        )
+        # Preserve legacy controller transition tests for the deferred lane
+        # mutation design. Production has no switch for either injected backend;
+        # test_safe_git exercises the real refusal with a hostile repository.
+        monkeypatch.setattr(
+            "pydantic_ai_gepa.cli.safe_git.refuse_heldout_git_mutations", lambda: None
         )

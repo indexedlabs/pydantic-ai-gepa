@@ -804,7 +804,7 @@ def test_paired_validation_recovers_private_evidence_and_incumbent(
             raise RuntimeError("died after paid paired evaluation")
         return outcome
 
-    def die_before_final_state(source, destination):
+    def die_before_final_state(source, destination, **kwargs):
         nonlocal killed
         if (
             not killed
@@ -814,7 +814,7 @@ def test_paired_validation_recovers_private_evidence_and_incumbent(
         ):
             killed = True
             raise RuntimeError("died after replacing private incumbent evidence")
-        return original_replace(source, destination)
+        return original_replace(source, destination, **kwargs)
 
     monkeypatch.setattr(run_module, "run_eval_once", die_after_row)
     monkeypatch.setattr(os, "replace", die_before_final_state)
