@@ -150,8 +150,14 @@ async def test_composition_charges_only_spent_gepa_rollouts(
 
     assert len(result.results) == 1
     stage = result.results[0]
-    assert stage.best_candidate["instructions"].text == "seed"
+    # Adaptive slices reuse the comparison-paid seed validation score instead
+    # of re-scoring the seed (3 calls on this valset), so the freed slice buys
+    # real search: slice 2 reflects, slice 6 reflects fully, and slice 8 even
+    # validates the improved candidate the slice could never reach before.
+    expected_spent = spent if not adaptive else {2: 2, 6: 4, 8: 7}[slice_size]
+    expected_best = "improved" if adaptive and slice_size == 8 else "seed"
+    assert stage.best_candidate["instructions"].text == expected_best
     assert stage.history[-1].data["stop_reason"].startswith("Max evaluations reached")
-    assert result.total_metric_calls == stage.num_metric_calls == spent
+    assert result.total_metric_calls == stage.num_metric_calls == expected_spent
     assert result.comparison_metric_calls == 6  # Full seed and result comparisons.
-    assert result.accounted_metric_calls == len(calls) == spent + 6
+    assert result.accounted_metric_calls == len(calls) == expected_spent + 6
