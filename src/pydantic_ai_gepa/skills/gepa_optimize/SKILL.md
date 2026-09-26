@@ -9,6 +9,65 @@ You are the reflection model. The `gepa` CLI is a small toolkit that handles min
 
 There is no `propose` or `reflect` verb on the CLI because that's the work you do — while `gepa run` is paused, or between manual `gepa eval` invocations — by editing files.
 
+## Driving an already-started run
+
+`gepa --gepa-dir /absolute/workspace run drive --run-id RUN --reflectors reflectors.json`
+automates lane runs and single-checkout held-out runs with one short-lived
+reflector per step. Run it in the harness environment. It leases/reset lanes,
+dispatches the fixed training-reflection prompt, guards process exit, and calls
+`run select` or `harness serve --once`. **No separate harness service, selector,
+or reflector may run for a driven run: the driver owns scoring timing.** The
+existing held-out lane refusal remains until standalone lane repositories land.
+
+The ordered JSON fallback list contains only allowed commands, for example:
+
+```json
+[{"label":"codex","argv":["codex","exec","--profile","gepa-reflector","-C","{checkout}","Read {prompt}; follow its instructions using {packet}."],"usage_limit":{"exit_codes":[9],"output_regexes":["(?i)usage limit"]}}]
+```
+
+Configure detection for the actual command; exit 9 above is an example, not a
+Codex exit-code guarantee. Templates accept `{checkout}`, `{packet}`, `{prompt}`.
+The default is one Codex entry using `--profile gepa-reflector` and usage-limit
+output detection. In current `exec --help`, `--profile` loads a separate
+`$CODEX_HOME/gepa-reflector.config.toml` overlay; provision its actual permissions.
+It is not the `codex sandbox -P` permissions selector. Follow the README's dated
+verified-profile table and held-out read restrictions. Verification is the caller's
+responsibility; never list unverified Claude Code or Pi profiles for held-out runs.
+
+`--step-timeout` defaults to 900 seconds; `--max-attempts` to 2; `--max-steps`
+optionally bounds sessions. Lane nomination adds `--foreground`; single-checkout
+nomination adds `--wait-secs 0`. Subprocesses receive no held-out dataset variable,
+`GEPA_HARNESS_*`, pass-through harness secrets, scorer provider keys, or candidate
+components/trace variables. Preserve reflector subscription configuration only;
+keep other harness secrets out of its environment. Public step directories hold
+training-only prompts and logs. Held-out driver state lives beside the private pin.
+
+Restart the same drive command after a kill: unfinished reflectors are guarded
+first, interrupted lanes reset, and scoring reuses existing durable checkpoints.
+Events are acknowledged after recording the action; merge opportunities are never
+auto-merged. A changed list requires `--accept-reflector-change`. Exhausted fallback
+lists restart from the first entry. Exit 0 prints the final report; 2 is input/list
+refusal; 76 is an attempt/step/scoring pause; 77 is usage-limit exhaustion; 78 is
+process-guard refusal. Scoring errors do not retry: recover the service, explicitly
+resume the managed run, then drive again.
+
+### What the process guard does not detect
+
+On macOS libproc creation IDs retain ancestry despite reparenting. The guard kills
+attributed survivors only. Unrelated processes are ignored; unknown ancestry is
+never killed and causes a fail-closed pause after `--survivor-grace` (default 5
+seconds), with PIDs and command names printed. Unsupported platforms refuse to drive.
+
+Launchd/XPC/`launchctl`/`open` and another pre-existing same-UID process can start
+work that looks unrelated. Same-UID processes can hide or act before inspection;
+snapshots/signals are not atomic and PID reuse races remain (a future Linux
+PID-plus-start-time backend also needs to address reuse). Reads during the step
+are not prevented: raw `KERN_PROCARGS2` still reads other processes' argv on the
+README's tested profiles. This guard separates steps from scoring in time.
+Unattributable same-UID processes remain alive and can keep the drive paused,
+causing denial of service. A separate scoring UID would close these same-UID
+disclosure and interference channels.
+
 ## Outer Omni protocol for code candidates
 
 `gepa run --lanes` is intentionally a single-parent managed run. Do not try to
