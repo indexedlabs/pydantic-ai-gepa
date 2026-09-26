@@ -147,7 +147,9 @@ def test_private_index_required_even_if_public_flag_is_false(
     assert "forged" not in result.output
 
 
-def test_leaf_and_parent_links_refuse_direct_record_access(prepared, monkeypatch):
+def test_leaf_link_repairs_but_parent_link_refuses_direct_record_access(
+    prepared, monkeypatch
+):
     dataset, directory, _, _ = prepared
     with monkeypatch.context() as env:
         env.setenv("GEPA_HELDOUT_DATASET", str(dataset))
@@ -158,14 +160,11 @@ def test_leaf_and_parent_links_refuse_direct_record_access(prepared, monkeypatch
             state = directory / "state.json"
             state.unlink()
             state.symlink_to(record.path)
-            for action in [
-                lambda: record.read("state.json"),
-                lambda: record.write("state.json", "forged"),
-            ]:
-                with pytest.raises(typer.BadParameter, match="private record missing"):
-                    action()
+            original = record.load()["files"]["state.json"]
+            assert record.read("state.json") == original
+            assert not state.is_symlink()
+            assert state.read_text() == original
             assert record.path.read_bytes() == before
-            assert state.is_symlink()
             state.unlink()
             results = directory / "results"
             results.symlink_to(record.path.parent, target_is_directory=True)

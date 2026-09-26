@@ -601,11 +601,17 @@ def is_run_id(value: str) -> bool:
 
 
 def latest_run_id(root: Path | None = None) -> str | None:
+    from .harness_record import list_paths
+
     base = runs_dir(root)
     if not base.is_dir():
         return None
     candidates = sorted(
-        (p.name for p in base.iterdir() if p.is_dir() and is_run_id(p.name)),
+        (
+            p.name
+            for p in list_paths(base, root=root)
+            if p.is_dir() and is_run_id(p.name)
+        ),
         reverse=True,
     )
     return candidates[0] if candidates else None

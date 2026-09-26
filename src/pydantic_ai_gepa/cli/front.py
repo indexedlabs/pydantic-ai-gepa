@@ -16,6 +16,8 @@ from typing import Any
 
 import typer
 
+from . import harness_record
+
 from ..gepa_graph.evaluation.pareto import remove_dominated_programs
 from .eval import EvalOutcome
 from .layout import components_dir, gepa_dir, run_dir
@@ -139,8 +141,11 @@ def snapshot_components(outcome: EvalOutcome, root: Path) -> None:
         / "parents"
         / f"{candidate_id}.json"
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    Candidate(id=candidate_id, components=components).write(path)
+    candidate = Candidate(id=candidate_id, components=components)
+    if not harness_record.write_text(
+        path, json.dumps(candidate.to_dict(), indent=2), root=root
+    ):
+        candidate.write(path)
 
 
 class ValidationFront:

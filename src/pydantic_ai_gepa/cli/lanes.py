@@ -41,6 +41,8 @@ from typing import Any, Literal
 
 import typer
 
+from . import harness_record
+
 from ..acceptance import compare_candidate_samples
 from ..vector_acceptance import (
     VectorComparison,
@@ -188,6 +190,10 @@ class LaneState:
     handoff_component_hash: str | None = None
     updated_at: str = ""
 
+    def __post_init__(self) -> None:
+        # Lane IDs also come from reflector-written JSON, not just CLI args.
+        _validate_harness_lane_id(self.lane)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "lane": self.lane,
@@ -251,8 +257,7 @@ class LaneState:
 
     def save(self, workspace_root: Path, run_id: str) -> Path:
         path = lane_state_path(workspace_root, run_id, self.lane)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write_json(path, self.to_dict())
+        _atomic_write_json(path, self.to_dict(), root=workspace_root)
         return path
 
 
@@ -266,6 +271,18 @@ def _lane_lock(workspace_root: Path, run_id: str, lane: str) -> Any:
     auto-releases if the holder dies.
     """
     path = lane_state_path(workspace_root, run_id, lane)
+    from .validation import heldout_dataset
+
+    if heldout_dataset(required=False):
+        with harness_record.view_file(
+            path.parent / ".lane.lock", root=workspace_root
+        ) as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path.parent / ".lane.lock", os.O_RDWR | os.O_CREAT, 0o644)
     try:
@@ -281,14 +298,20 @@ def lanes_dir(workspace_root: Path, run_id: str) -> Path:
 
 
 def lane_state_path(workspace_root: Path, run_id: str, lane: str) -> Path:
+    _validate_harness_lane_id(lane)
     return lanes_dir(workspace_root, run_id) / lane / "state.json"
 
 
-def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+def _atomic_write_json(
+    path: Path, data: dict[str, Any], *, root: Path | None = None
+) -> None:
     """Write JSON via sibling tmpfile + os.replace — a torn state file can
     never wedge the verbs that read it."""
     import tempfile
 
+    if harness_record.write_text(path, json.dumps(data, indent=2) + "\n", root=root):
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
         dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
     )
@@ -309,7 +332,7 @@ def load_lane_state(workspace_root: Path, run_id: str, lane: str) -> LaneState:
             f"No lane state at {path}. Was this run started with --lanes?"
         )
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(harness_record.read_text(path, root=workspace_root))
     except json.JSONDecodeError as exc:
         raise typer.BadParameter(
             f"Lane state at {path} is corrupt ({exc.msg}); recover with "
@@ -320,14 +343,16 @@ def load_lane_state(workspace_root: Path, run_id: str, lane: str) -> LaneState:
 
 def load_all_lane_states(workspace_root: Path, run_id: str) -> list[LaneState]:
     base = lanes_dir(workspace_root, run_id)
-    if not base.is_dir():
-        return []
     states: list[LaneState] = []
-    for entry in sorted(base.iterdir()):
+    for entry in sorted(harness_record.list_paths(base, root=workspace_root)):
         state_path = entry / "state.json"
-        if state_path.exists():
+        if harness_record.exists(state_path, root=workspace_root):
             states.append(
-                LaneState.from_dict(json.loads(state_path.read_text(encoding="utf-8")))
+                LaneState.from_dict(
+                    json.loads(
+                        harness_record.read_text(state_path, root=workspace_root)
+                    )
+                )
             )
     return states
 
@@ -455,7 +480,7 @@ def _journal_rows(workspace_root: Path, run_id: str, kind: str) -> list[dict[str
     if not path.exists():
         return []
     rows: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in harness_record.read_text(path).splitlines():
         try:
             row = json.loads(line)
         except json.JSONDecodeError:
@@ -476,7 +501,7 @@ def _collect_metric_side_info(trace_paths: list[str]) -> dict[str, Any]:
         path = Path(raw)
         if not path.exists():
             continue
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in harness_record.read_text(path).splitlines():
             stripped = line.strip()
             if not stripped:
                 continue
@@ -535,6 +560,7 @@ def write_packet(
     report/trace paths, metric side info, a bounded journal tail, the worktree
     path, and the exact `gepa lane continue` invocation.
     """
+    _validate_harness_lane_id(lane)
     repository = git_root(workspace_root)
     candidate_project = candidate_project_root(workspace_root, worktree_path)
     gepa_abs = str(gepa_dir(workspace_root).resolve())
@@ -592,8 +618,11 @@ def write_packet(
         candidate_project=candidate_project,
     )
     path = lanes_dir(workspace_root, run_state.run_id) / lane / "packet.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(packet, indent=2, default=str), encoding="utf-8")
+    if not harness_record.write_text(
+        path, json.dumps(packet, indent=2, default=str), root=workspace_root
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(packet, indent=2, default=str), encoding="utf-8")
     return path
 
 
@@ -830,11 +859,15 @@ def _candidate_gate(
     journal_receipts = _journal_rows(workspace_root, run_state.run_id, "probe_receipt")
     # A reflector may cite a receipt file, but it is only evidence when its
     # complete content is anchored by a prior CLI-authored journal row.
-    for receipt_path in probe_receipts_dir(run_state.run_id, workspace_root).glob(
-        "*.json"
+    for receipt_path in harness_record.list_paths(
+        probe_receipts_dir(run_state.run_id, workspace_root), root=workspace_root
     ):
+        if receipt_path.suffix != ".json":
+            continue
         try:
-            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt = json.loads(
+                harness_record.read_text(receipt_path, root=workspace_root)
+            )
         except (OSError, json.JSONDecodeError):
             continue
         probe_row_id = receipt.get("probe_row_id")
@@ -1030,9 +1063,13 @@ def _write_comparison(
     iteration: int,
     comparison: dict[str, Any],
 ) -> Path:
+    _validate_harness_lane_id(lane)
     path = lanes_dir(workspace_root, run_id) / lane / f"comparison-{iteration:04d}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(comparison, indent=2, default=str), encoding="utf-8")
+    if not harness_record.write_text(
+        path, json.dumps(comparison, indent=2, default=str), root=workspace_root
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(comparison, indent=2, default=str), encoding="utf-8")
     return path
 
 
@@ -1608,6 +1645,13 @@ def _resolve_lane_run(run_id: str | None) -> tuple[Path, Any]:
     return workspace_root, run_state
 
 
+def _validate_harness_lane_id(lane: str) -> None:
+    from .validation import heldout_dataset
+
+    if heldout_dataset(required=False):
+        _validate_lane_id(lane)
+
+
 def _validate_lane_id(lane: str) -> str:
     if not LANE_ID_RE.match(lane):
         raise typer.BadParameter(f"Invalid lane id {lane!r}.")
@@ -1961,6 +2005,9 @@ def lane_continue(
     # refreshes the lane heartbeat.
     gepa_abs = str(gepa_dir(workspace_root).resolve())
     lane_dir = lanes_dir(workspace_root, run_state.run_id) / lane
+    from .safe_git import refuse_heldout_git_mutations
+
+    refuse_heldout_git_mutations()  # Detached lane workers are reflector-only.
     lane_dir.mkdir(parents=True, exist_ok=True)
     log_path = lane_dir / "eval.log"
     argv = _lane_continue_argv(

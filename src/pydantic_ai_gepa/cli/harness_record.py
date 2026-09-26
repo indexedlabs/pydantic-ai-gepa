@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 import json
 import hashlib
+import errno
 import os
 from pathlib import Path
 import stat
@@ -78,6 +79,11 @@ def _unavailable() -> typer.BadParameter:
         "Harness private record missing or unreadable; refusing GEPA_DIR state. "
         "Restore the original private record or start a new run (legacy runs cannot be adopted)."
     )
+
+
+class _PlantedLeaf(typer.BadParameter):
+    def __init__(self):
+        super().__init__(_unavailable().message)
 
 
 def _public_path(root: Path, path: Path) -> Path:
@@ -168,17 +174,22 @@ class SafeDir:
     @contextmanager
     def file(self, name: str, flags: int = os.O_RDONLY) -> Iterator[Any]:
         self._name(name)
+        if self.planted_leaf(name):
+            raise _PlantedLeaf()
         try:
             fd = os.open(
                 name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=self.fd
             )
         except FileNotFoundError:
             raise
-        except OSError:
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise _PlantedLeaf() from None
             raise _unavailable() from None
         try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise _unavailable()
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink > 1:
+                raise _PlantedLeaf()
             handle = os.fdopen(fd, "r+" if flags & os.O_RDWR else "r", encoding="utf-8")
         except BaseException:
             os.close(fd)
@@ -197,10 +208,48 @@ class SafeDir:
             raise _unavailable() from None
 
     def append_text(self, name: str, content: str) -> None:
-        with self.file(name, os.O_RDWR | os.O_CREAT | os.O_APPEND) as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
+        # Never modify an existing inode: a public hard link must not turn an
+        # append into a write to its private/outside source.
+        try:
+            previous = self.read_text(name)
+        except (FileNotFoundError, _PlantedLeaf):
+            previous = ""
+        self.write_text(name, previous + content)
+
+    def discard_leaf(self, name: str) -> None:
+        self._name(name)
+        try:
+            os.unlink(name, dir_fd=self.fd)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            # Empty planted leaf directories can be removed without walking
+            # them. Nonempty directories fail closed; never recursively repair.
+            if exc.errno not in {errno.EISDIR, errno.EPERM}:
+                raise _unavailable() from None
+            try:
+                os.rmdir(name, dir_fd=self.fd)
+            except OSError:
+                raise _unavailable() from None
+
+    def planted_leaf(self, name: str) -> bool:
+        self._name(name)
+        try:
+            info = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            raise _unavailable() from None
+        return not stat.S_ISREG(info.st_mode) or info.st_nlink > 1
+
+    def repair_leaf(self, name: str) -> None:
+        if self.planted_leaf(name):
+            self.discard_leaf(name)
+            public_echo(
+                "Harness record: GEPA_DIR view was changed outside the harness; "
+                "replaced the planted leaf.",
+                err=True,
+            )
 
     def names(self) -> list[str]:
         try:
@@ -219,8 +268,7 @@ class SafeDir:
 
     def write_text(self, name: str, content: str, *, exclusive: bool = False) -> None:
         self._name(name)
-        if not exclusive:
-            self.check_leaf(name)
+        self.repair_leaf(name)
         temporary = f".{uuid4().hex}.tmp"
         try:
             fd = os.open(
@@ -392,21 +440,31 @@ class Record:
     def _restore_at(self, directory: SafeDir, name: str, content: str | None) -> None:
         try:
             actual = directory.read_text(name)
+        except _PlantedLeaf:
+            actual = None
+            self._refusal()
+            directory.discard_leaf(name)
+            if content is not None:
+                directory.write_text(name, content)
+            return
         except (FileNotFoundError, UnicodeError):
             actual = None
         if actual == content and (
             content is not None or not directory.check_leaf(name)
         ):
             return
+        self._refusal()
+        if content is None:
+            directory.unlink(name)
+        else:
+            directory.write_text(name, content)
+
+    def _refusal(self) -> None:
         public_echo(
             f"Harness record: GEPA_DIR state for run {self.run_id} was changed "
             "outside the harness; restored from the harness record.",
             err=True,
         )
-        if content is None:
-            directory.unlink(name)
-        else:
-            directory.write_text(name, content)
 
     def read(self, key: str) -> str | None:
         with self.locked():
@@ -417,7 +475,10 @@ class Record:
     def write(self, key: str, content: str, *, append: bool = False) -> None:
         with self.locked():
             if not key.startswith("@"):
-                check_view_path(self.root, self.directory / key)
+                with SafeDir.open(
+                    self.root, (self.directory / key).parent, create=True
+                ):
+                    pass
             data = self.load()
             if append:
                 content = data["files"].get(key, "") + content
@@ -426,7 +487,6 @@ class Record:
             # write is repaired on the next read; it never authorizes a retry.
             _atomic_text(self.path, json.dumps(data), private=True)
             if not key.startswith("@"):
-                check_view_path(self.root, self.directory / key)
                 _atomic_text(self.directory / key, content, root=self.root)
 
     def restore_views(self) -> None:
@@ -583,6 +643,18 @@ def read_text(path: Path, *, root: Path | None = None, errors: str = "strict") -
     if content is None:
         raise FileNotFoundError(f"No harness-written view at {path.name}")
     return content
+
+
+def read_bytes(path: Path, *, root: Path | None = None) -> bytes:
+    view = _view(path, root)
+    if view is not None:
+        return read_text(path, root=root).encode("utf-8")
+    workspace = _public_workspace(path, root)
+    if workspace is None:
+        return path.read_bytes()
+    with SafeDir.open(workspace, path.parent) as directory:
+        with directory.file(path.name) as handle:
+            return handle.buffer.read()
 
 
 def exists(path: Path, *, root: Path | None = None) -> bool:

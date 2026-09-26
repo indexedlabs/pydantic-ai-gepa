@@ -544,7 +544,9 @@ def resume(
         state = replace(state, reflector=issued, updated_at=now)
         state.save()
         path = write_packet(state.run_id)
-        packet = json.loads(path.read_text(encoding="utf-8"))
+        from .harness_record import read_text
+
+        packet = json.loads(read_text(path))
         typer.echo(packet["instructions"])
         if packet["next_command"]:
             typer.echo(packet["next_command"]["shell"])

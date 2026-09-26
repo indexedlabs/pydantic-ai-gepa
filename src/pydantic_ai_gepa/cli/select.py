@@ -56,6 +56,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import signal
 import subprocess
 import time
@@ -66,6 +67,8 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import typer
+
+from . import harness_record
 
 from .candidates import GitCandidateError, git_candidate_state
 from .eval import run_eval_once
@@ -163,7 +166,15 @@ def _chdir(path: Path) -> Iterator[None]:
 
 def _load_comparison(lane_state: LaneState) -> dict[str, Any]:
     if lane_state.comparison_path and Path(lane_state.comparison_path).exists():
-        data = json.loads(Path(lane_state.comparison_path).read_text(encoding="utf-8"))
+        from .validation import heldout_dataset
+
+        path = Path(lane_state.comparison_path)
+        if (
+            heldout_dataset(required=False)
+            and harness_record._public_workspace(path) is None
+        ):
+            raise harness_record._unavailable()
+        data = json.loads(harness_record.read_text(path))
         if isinstance(data, dict):
             return data
     return {}
@@ -176,7 +187,7 @@ def _lane_outcome_journaled(
     path = journal_path(workspace_root)
     if not path.exists():
         return False
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in harness_record.read_text(path, root=workspace_root).splitlines():
         stripped = line.strip()
         if not stripped:
             continue
@@ -221,7 +232,9 @@ def _journal_rows(workspace_root: Path, run_id: str, kind: str) -> list[dict[str
     content = (
         (record.read("@select-journal") or "")
         if record
-        else (path.read_text(encoding="utf-8") if path.exists() else "")
+        else (
+            harness_record.read_text(path, root=workspace_root) if path.exists() else ""
+        )
     )
     rows: list[dict[str, Any]] = []
     for line in content.splitlines():
@@ -514,6 +527,40 @@ def _primary_checkout_state(workspace_root: Path) -> tuple[str, bool]:
     return head, dirty
 
 
+def _check_winner_views(workspace_root: Path, commit_sha: str) -> None:
+    """A winner cannot materialize links/gitlinks in the harness workspace."""
+    from .layout import gepa_dir
+    from .safe_git import run_git
+    from .validation import heldout_dataset
+
+    if not heldout_dataset(required=False):
+        return
+    if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", commit_sha):
+        raise typer.BadParameter("Winner must name an immutable full commit ID.")
+    repository = git_root(workspace_root)
+    public = Path(os.path.abspath(gepa_dir(workspace_root)))
+    if not public.is_relative_to(repository):
+        return  # An external GEPA_DIR is not materialized by this reset.
+    relative = public.relative_to(repository)
+    tree = run_git(
+        repository, "ls-tree", "-rz", commit_sha, check=True, capture_output=True
+    ).stdout
+    for entry in tree.split(b"\0"):
+        if not entry:
+            continue
+        metadata, name = entry.split(b"\t", 1)
+        path = Path(os.fsdecode(name))
+        # Also reject a symlink in an ancestor of a nested GEPA_DIR.
+        if (
+            path == relative
+            or path.is_relative_to(relative)
+            or relative.is_relative_to(path)
+        ) and metadata.split()[0] not in {b"100644", b"100755"}:
+            raise typer.BadParameter(
+                "Winner commit contains an unsafe GEPA_DIR path; refusing promotion."
+            )
+
+
 def _reset_primary_to(workspace_root: Path, commit_sha: str) -> None:
     """Fast-forward the primary checkout to ``commit_sha``.
 
@@ -523,6 +570,14 @@ def _reset_primary_to(workspace_root: Path, commit_sha: str) -> None:
     select just performed (and every uncommitted entry before it). The
     journal content is preserved across the reset.
     """
+    from .validation import heldout_dataset
+
+    if heldout_dataset(required=False):
+        _check_winner_views(workspace_root, commit_sha)
+        # The private select-journal is authority. Do not read or restore the
+        # reflector's pre-reset bytes after materializing a winner's tree.
+        _git(workspace_root, "reset", "--hard", commit_sha)
+        return
     journal_file = journal_path(workspace_root)
     journal_bytes = journal_file.read_bytes() if journal_file.exists() else None
     _git(workspace_root, "reset", "--hard", commit_sha)
@@ -560,16 +615,17 @@ def _emit_merge_opportunities(
         if not files_a or not files_b or not files_a.isdisjoint(files_b):
             continue
         merge_dir = run_dir(run_id, workspace_root) / "merge_opportunities"
-        merge_dir.mkdir(parents=True, exist_ok=True)
         stat_path = merge_dir / f"{first.lane}--{second.lane}.diffstat"
-        stat_path.write_text(
+        contents = (
             f"# {first.lane} ({first.branch}) vs baseline {baseline_sha}\n"
             + _diff_stat(workspace_root, baseline_sha, str(first.candidate_sha))
             + f"\n\n# {second.lane} ({second.branch}) vs baseline {baseline_sha}\n"
             + _diff_stat(workspace_root, baseline_sha, str(second.candidate_sha))
-            + "\n",
-            encoding="utf-8",
+            + "\n"
         )
+        if not harness_record.write_text(stat_path, contents, root=workspace_root):
+            merge_dir.mkdir(parents=True, exist_ok=True)
+            stat_path.write_text(contents, encoding="utf-8")
         duplicate = any(
             event.type == "merge_opportunity"
             and event.payload.get("lane_a") == first.lane
@@ -1190,6 +1246,7 @@ def _phase_promote(
         else comparison.get("candidate_id") or str(winner.candidate_sha)[:12]
     )
     winner_sha = str(winner.candidate_sha)
+    _check_winner_views(workspace_root, winner_sha)
 
     _journal_lane_outcome(
         workspace_root,
@@ -2090,6 +2147,18 @@ def _run_select_locked(workspace_root: Path, run_state: Any) -> Any:
             err=True,
         )
         raise typer.Exit(code=1)
+
+    from .validation import heldout_dataset
+
+    if heldout_dataset(required=False):
+        # Refuse planted directories/committed workspace links before any
+        # scoring or checkpoint writes. Actual I/O still uses SafeDir.
+        directory = run_dir(run_state.run_id, workspace_root)
+        for path in (directory / "merge_opportunities", directory / "events/.reaped"):
+            harness_record.check_view_path(workspace_root, path)
+        for lane in load_all_lane_states(workspace_root, run_state.run_id):
+            if lane.candidate_sha:
+                _check_winner_views(workspace_root, lane.candidate_sha)
 
     from .safe_git import refuse_heldout_git_mutations
 

@@ -169,7 +169,11 @@ class MinibatchStore:
     def list_ids(self) -> list[str]:
         if not self._dir.is_dir():
             return []
-        return sorted(p.stem for p in self._dir.iterdir() if p.suffix == ".json")
+        return sorted(
+            p.stem
+            for p in harness_record.list_paths(self._dir, root=self._root)
+            if p.suffix == ".json"
+        )
 
 
 # ----------------------------- Pareto log ------------------------------

@@ -48,6 +48,8 @@ from typing import TYPE_CHECKING, Any, Iterator, Literal, Sequence, cast
 
 import typer
 
+from . import harness_record
+
 from ..evaluation import (
     EvaluationRecord,
     evaluate_callable_dataset,
@@ -142,7 +144,9 @@ def _candidate_component_hashes(
     for relative in component_files:
         path = candidate_root / relative
         if path.is_file():
-            hashes[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+            hashes[relative] = hashlib.sha256(
+                harness_record.read_bytes(path)
+            ).hexdigest()
     return hashes
 
 
@@ -502,7 +506,8 @@ def run_eval_once(
                 and held_out_path.is_file()
                 and (
                     dataset_path.samefile(held_out_path)
-                    or dataset_path.read_bytes() == held_out_path.read_bytes()
+                    or harness_record.read_bytes(dataset_path)
+                    == harness_record.read_bytes(held_out_path)
                 )
             ):
                 raise typer.BadParameter(
@@ -800,9 +805,9 @@ def run_eval_once(
                             f"Declared candidate component file is missing: {relative}"
                         )
                     try:
-                        candidate_components[relative] = path.read_bytes().decode(
-                            "utf-8"
-                        )
+                        candidate_components[relative] = harness_record.read_bytes(
+                            path
+                        ).decode("utf-8")
                     except UnicodeDecodeError as exc:
                         raise typer.BadParameter(
                             f"Declared component file {relative} must be UTF-8 text."

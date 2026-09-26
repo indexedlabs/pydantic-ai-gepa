@@ -16,6 +16,8 @@ from typing import Any, Literal, Sequence, cast
 
 import typer
 
+from . import harness_record
+
 from ..acceptance import AcceptanceComparison, compare_candidate_samples
 from ..evaluation_health import (
     EvaluationInfrastructureFailure,
@@ -446,7 +448,6 @@ class RunState:
                 identity=self._validation_evidence_identity(),
                 scores=self.best_validation_per_case_scores,
             )
-        from . import harness_record
 
         path = run_state_path(self.run_id, root)
         # Atomic (tmpfile + os.replace): lane evals, select checkpoints, and
@@ -491,7 +492,6 @@ def _load_state(run_id: str | None) -> RunState:
     if active_run_id is None:
         public_echo("No run found. Start one with `gepa run start`.", err=True)
         raise typer.Exit(code=1)
-    from . import harness_record
 
     path = run_state_path(active_run_id)
     if not harness_record.exists(path):
@@ -514,7 +514,7 @@ def _latest_managed_run_id() -> str | None:
     if not base.is_dir():
         return None
     for candidate in sorted(
-        (p.name for p in base.iterdir() if p.is_dir()), reverse=True
+        (p.name for p in harness_record.list_paths(base) if p.is_dir()), reverse=True
     ):
         if exists(run_state_path(candidate)):
             return candidate
@@ -1732,7 +1732,6 @@ def _write_final_report(
         ]
     )
     text = "\n".join(lines) + "\n"
-    from . import harness_record
 
     if not harness_record.write_text(path, text, root=root):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2155,10 +2154,11 @@ def start(
         # that never reached `done` still owns its lane refs and events.
         from .layout import is_run_id
 
-        for entry in sorted(runs_dir(workspace_root).iterdir()):
+        for entry in sorted(
+            harness_record.list_paths(runs_dir(workspace_root), root=workspace_root)
+        ):
             if not (entry.is_dir() and is_run_id(entry.name)):
                 continue
-            from . import harness_record
 
             prior_state_path = entry / "state.json"
             if not harness_record.exists(prior_state_path, root=workspace_root):
