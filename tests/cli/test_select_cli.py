@@ -1597,12 +1597,25 @@ def test_refan_repairs_scorer_after_lane_publish_crash(git_repo, monkeypatch):
                 new_best=sha,
             )
     assert not snapshot.exists()
+    # HEAD already matches the predictable next branch and commit, but its
+    # metadata is still reflector-owned. Resume must replace it again.
+    worktree = Path(str(lane.worktree_path))
+    assert _git(worktree, "rev-parse", "--abbrev-ref", "HEAD") == branch
+    assert _git(worktree, "rev-parse", "HEAD") == sha
+    hook = worktree / ".git/hooks/post-checkout"
+    hook.parent.mkdir(exist_ok=True)
+    marker = git_repo / ".gepa/runs" / run_id / "hook-executed"
+    hook.write_text(f'#!/bin/sh\ntouch "{marker}"\n')
+    hook.chmod(0o700)
+    original = lane_repositories.Repositories.create_lane
+    rebuilt = []
+
+    def rebuild(self, *args, **kwargs):
+        rebuilt.append((args, kwargs))
+        return original(self, *args, **kwargs)
+
     with monkeypatch.context() as patch:
-        patch.setattr(
-            lane_repositories.Repositories,
-            "create_lane",
-            lambda *args, **kwargs: pytest.fail("lane already published"),
-        )
+        patch.setattr(lane_repositories.Repositories, "create_lane", rebuild)
         select._refan_lane(
             git_repo,
             _state(git_repo, run_id),
@@ -1611,6 +1624,9 @@ def test_refan_repairs_scorer_after_lane_publish_crash(git_repo, monkeypatch):
             new_iteration=lane.iteration + 1,
             new_best=sha,
         )
+    assert rebuilt == [(("lane-1", sha, branch), {"replace": True})]
+    assert not hook.exists()
+    assert not marker.exists()
     assert _git(snapshot, "rev-parse", "HEAD") == sha
 
 

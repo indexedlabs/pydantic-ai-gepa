@@ -20,6 +20,7 @@ from . import lanes as lanes_cmd
 from . import pareto as pareto_cmd
 from . import probe as probe_cmd
 from . import run as run_cmd
+from . import drive as drive_cmd
 from . import omni as omni_cmd
 from .layout import load_dotenv, set_gepa_dirname
 
@@ -102,6 +103,7 @@ app.add_typer(
     name="run",
     help="Start/resume a managed pause-for-reflection GEPA loop.",
 )
+run_cmd.app.command(name="drive")(drive_cmd.drive)
 
 app.add_typer(
     components_cmd.app,

@@ -54,7 +54,6 @@ import json
 import math
 import os
 import signal
-import subprocess
 import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
@@ -1533,29 +1532,16 @@ def _refan_lane(
 ) -> LaneState:
     """Reset one lane worktree onto the new best with a fresh branch.
 
-    Idempotent: a lane already on ``new_branch`` at ``new_best`` (resume after
-    a mid-phase kill) is left alone; its state is still rewritten below.
+    Rebuild even on resume: matching HEAD/branch does not make reflector-owned
+    Git metadata safe for the next reflector's unsandboxed launcher.
     """
     run_id = state.run_id
     from .lane_repositories import load
 
     repositories = load(workspace_root, run_id)
-    worktree = lane_worktree_path(workspace_root, run_id, lane_state.lane)
-    try:
-        on_new_branch = (
-            worktree.exists()
-            and (worktree / ".git").is_dir()
-            and (
-                _git(worktree, "rev-parse", "--abbrev-ref", "HEAD") == new_branch
-                and _git(worktree, "rev-parse", "HEAD") == new_best
-            )
-        )
-    except (OSError, ValueError, typer.BadParameter, subprocess.CalledProcessError):
-        on_new_branch = False
-    if not on_new_branch:
-        worktree = repositories.create_lane(
-            lane_state.lane, new_best, new_branch, replace=True
-        )
+    worktree = repositories.create_lane(
+        lane_state.lane, new_best, new_branch, replace=True
+    )
     # A crash can publish the lane before its scorer snapshot. Resume must
     # repair the snapshot even when the lane already has the expected branch.
     if GepaConfig.load(config_path(workspace_root)).acceptance.pinned_scorer:
