@@ -1113,7 +1113,9 @@ async def evaluate(case):
         },
     )
     before = spend_report(run_id, lane_repo)
-    assert before["total_dollars"] == pytest.approx(0.405)
+    # The private ledger counts only harness-authorized evaluations. The lane's
+    # three training repetitions cannot add their public $0.045 to that ledger.
+    assert before["total_dollars"] == pytest.approx(0.36)
     selected = test_select_cli._select(lane_repo, run_id)
     assert selected.exit_code == 70, selected.output
     state = test_select_cli._state(lane_repo, run_id)

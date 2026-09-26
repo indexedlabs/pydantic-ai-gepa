@@ -242,6 +242,8 @@ def _continue_vector_lane(repo: Path, run_id: str, lane: str, value: str) -> Lan
     worktree = Path(str(state.worktree_path))
     (worktree / "score.txt").write_text(value, encoding="utf-8")
     previous_cwd = Path.cwd()
+    # Match the real reflector launcher: training never receives this capability.
+    dataset = os.environ.pop("GEPA_HELDOUT_DATASET", None)
     try:
         os.chdir(worktree)
         continued = _run(
@@ -256,6 +258,8 @@ def _continue_vector_lane(repo: Path, run_id: str, lane: str, value: str) -> Lan
         )
     finally:
         os.chdir(previous_cwd)
+        if dataset is not None:
+            os.environ["GEPA_HELDOUT_DATASET"] = dataset
     assert continued.exit_code == 0, continued.output
     return load_lane_state(repo, run_id, lane)
 

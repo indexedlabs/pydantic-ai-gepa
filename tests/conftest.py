@@ -41,7 +41,7 @@ def isolated_user_environment(
     tmp_path: Path,
     tmp_path_factory: pytest.TempPathFactory,
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+) -> Iterator[None]:
     # Keep HOME inside pytest's sandbox without adding files to candidate trees.
     home = tmp_path_factory.mktemp("isolated-home")
     monkeypatch.setenv("HOME", str(home))
@@ -61,6 +61,12 @@ def isolated_user_environment(
         return repository
 
     monkeypatch.setattr(Repository, "discover", classmethod(discover_test_repository))
+    from pydantic_ai_gepa.cli.harness_record import session
+
+    # Direct helper tests also need the CLI's private-record session boundary.
+    # A cached workspace from one test must never become another test's authority.
+    with session():
+        yield
 
 
 @pytest.fixture(scope="session")
