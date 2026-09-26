@@ -460,7 +460,9 @@ def _rollouts_fit(rollouts: int) -> bool:
     A projection probe with no stop side effect: a refusal ends the helper
     before its comparison starts, never the pipeline meter, so a capped
     helper never starts a comparison it cannot afford to finish. Uncapped
-    pipelines always fit.
+    pipelines always fit. The guarantee covers the helper's own work: helpers
+    run concurrently under one shared capped meter are not reserved against
+    each other (see ``SpendMeter.probe_rollouts``).
     """
     meter = _pipeline_meter.get()
     if meter is None:

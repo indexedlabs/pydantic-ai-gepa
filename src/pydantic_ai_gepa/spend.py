@@ -227,6 +227,11 @@ class SpendMeter:
         comparison is refused ends itself, while the pipeline meter and any
         siblings keep their headroom. Genuine exhaustion still stops a meter
         through ``check``/``record``, never through this probe.
+
+        The probe reserves nothing. Work running concurrently under the same
+        capped ancestor (two helpers sharing one supplied meter) can pass it
+        for the same dollars; the cap still holds, and a comparison that is
+        then interrupted is discarded whole.
         """
         with self._lock:
             if self.stop_reason is not None:
