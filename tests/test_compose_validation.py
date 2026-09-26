@@ -299,10 +299,12 @@ async def test_every_builtin_composes_with_restricted_driver(helper):
         ["autoresearch"] if helper == "omni" else []
     )
     assert all(result.best_score == 0.5 for result in results)
-    # Adaptive slices reuse the incumbent's helper-paid seed score: each
-    # built-in engine drops its one-case seed validation pass. The custom
-    # autoresearch driver still scores the seed itself.
-    expected_calls = [0, 0, 1, 1] if helper == "adaptive" else [1, 1, 2, 1]
+    # Sequential and adaptive slices reuse the incumbent's helper-paid seed
+    # score: each built-in engine drops its one-case seed validation pass. The
+    # custom autoresearch driver still scores the seed itself.
+    expected_calls = (
+        [0, 0, 1, 1] if helper in {"adaptive", "sequential"} else [1, 1, 2, 1]
+    )
     assert [result.num_metric_calls for result in results[:4]] == expected_calls
 
 

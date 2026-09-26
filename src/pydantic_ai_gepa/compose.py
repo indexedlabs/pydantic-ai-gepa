@@ -614,6 +614,12 @@ async def optimize_sequential(
     seed_evaluation = await _evaluate(task, seed, budget=comparison_budget)
     seed_score = seed_evaluation.score
     incumbent_selectable = seed_evaluation.selectable
+    # The comparison budget already paid for the incumbent's validation score;
+    # hand it to each stage so no engine re-scores its seed. Only a real,
+    # non-interrupted evaluation of exactly that candidate may be reused.
+    incumbent_evaluation: CandidateEvaluation | None = (
+        None if isinstance(seed_evaluation, _InterruptedEvaluation) else seed_evaluation
+    )
     adopted_result = EngineResult(
         engine="seed",
         best_candidate=seed,
@@ -639,7 +645,9 @@ async def optimize_sequential(
         local = budget.reserve_slice(slice_size)
         try:
             engine = get_engine(config.engine, config)
-            stage_task = _engine_task_view(task, engine, seed)
+            stage_task = _engine_task_view(
+                task, engine, seed, seed_evaluation=incumbent_evaluation
+            )
             result = await engine.run(stage_task, config, local)
             _reconcile_engine_result(config, result, local)
         finally:
@@ -672,6 +680,7 @@ async def optimize_sequential(
         )
         if adopted:
             incumbent_selectable = True
+            incumbent_evaluation = evaluation
             seed, seed_score, adopted_result, adopted_index = (
                 result.best_candidate,
                 evaluation.score,

@@ -380,9 +380,9 @@ async def test_composition_with_real_gepa_and_coding_agent_engines(
     assert [record.case_id for record in contexts[0].minibatch_records] == ["case"]
     assert result.best.best_candidate == _candidate("correct")
     assert result.best.best_score == 1.0
-    # Adaptive slices reuse the incumbent's helper-paid seed score, so gepa can
-    # reach its stop_at_score without spending any of its own slice.
-    min_calls = 0 if helper == "adaptive_sequential" else 1
+    # Sequential and adaptive slices reuse the incumbent's helper-paid seed
+    # score, so gepa can reach its stop_at_score without spending its slice.
+    min_calls = 0 if helper in {"adaptive_sequential", "sequential"} else 1
     assert all(
         item.num_metric_calls >= min_calls
         for item in result.results
