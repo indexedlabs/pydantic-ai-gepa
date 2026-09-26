@@ -636,7 +636,9 @@ def _confirm_finalist(
     """Keep finalist draws and the verdict exclusively in the private record.
 
     Normal state.json is also a public view, so its context holds only a key.
-    A pending draw with no durable result is ambiguous and must never be redrawn.
+    The reflector cannot see an in-flight validation result, so redrawing one
+    unobserved draw grants no second look at a verdict. Keep completed samples;
+    any orphan Pareto row remains budgeted but is never confirmation evidence.
     """
     from ..evaluation import EvaluationRecord
     from .eval import EvalOutcome
@@ -661,18 +663,36 @@ def _confirm_finalist(
         raise typer.BadParameter(
             "Checkpointed confirmation finalist changed; refusing to redraw."
         )
-    if saved.get("pending"):
-        raise typer.BadParameter(
-            "Finalist confirmation was interrupted during a draw without a durable result; "
-            "refusing to redraw."
+    # Recover checkpoints written before infrastructure failures became
+    # retryable: the last draw failed and is not statistical evidence.
+    if (saved.get("comparison") or {}).get("outcome") == "infrastructure_failure":
+        saved["samples"] = saved["samples"][:-1]
+        saved["comparison"] = None
+        saved["pending"] = False
+        record.write(key, json.dumps(saved))
+    elif saved.get("pending"):
+        saved["pending"] = False
+        # An interrupted evaluation may already have published its paid row.
+        # Reconcile accounting only; never recover its score as evidence.
+        saved["validation_evaluations"] = max(
+            saved.get("validation_evaluations", 0),
+            sum(
+                row.extra.get("row_scope") == "validation"
+                for row in ParetoLog(state.run_id, workspace_root).iter_rows()
+            ),
         )
+        record.write(key, json.dumps(saved))
     outcomes = [
         EvalOutcome(
             records=[
                 EvaluationRecord(case, score, None, {})
                 for case, score in sample["scores"].items()
             ],
-            summary=sample["summary"],
+            summary={
+                "dataset_role": "validation",
+                "minibatch_id": None,
+                **sample["summary"],
+            },
             report_path=None,
             trace_path=None,
         )
@@ -695,6 +715,9 @@ def _confirm_finalist(
     def checkpoint(
         fresh: Any, samples: list[Any], comparison: dict[str, Any] | None
     ) -> None:
+        if (comparison or {}).get("outcome") == "infrastructure_failure":
+            samples = samples[:-1]
+            comparison = None
         if any(
             sample.summary["candidate_id"] != candidate_id
             or sample.summary.get("commit_sha") != winner.candidate_sha
@@ -789,7 +812,13 @@ def _phase_promote(
         if raw is not None:
             saved_confirmation = json.loads(raw)
             finalist = saved_confirmation["finalist"]
-            confirmation_finished = saved_confirmation.get("comparison") is not None
+            saved_comparison = saved_confirmation.get("comparison")
+            failed_confirmation = (
+                saved_comparison or ctx.get("validation_confirmation") or {}
+            ).get("outcome") == "infrastructure_failure"
+            confirmation_finished = (
+                saved_comparison is not None and not failed_confirmation
+            )
             if not any(
                 lane.lane == finalist["lane"]
                 and lane.candidate_sha == finalist["commit_sha"]
@@ -800,6 +829,11 @@ def _phase_promote(
                 raise typer.BadParameter(
                     "Checkpointed confirmation finalist changed; refusing to redraw."
                 )
+            if (
+                failed_confirmation
+                and state.status == "paused_after_infrastructure_error"
+            ):
+                state = replace(state, status="running")
     from .lane_repositories import CandidateAncestryError, LaneSourceError, load
 
     repositories = load(workspace_root, run_id)
@@ -1218,8 +1252,7 @@ def _phase_promote(
             state = _checkpoint(state, workspace_root, "promote", ctx)
             typer.echo(
                 "Held-out finalist confirmation failed; incumbent preserved. "
-                "The failed confirmation is checkpointed and cannot be redrawn; "
-                "recover the evaluator before starting a new run.",
+                "Recover the evaluator and retry `gepa run select`.",
                 err=True,
             )
             raise typer.Exit(code=1)

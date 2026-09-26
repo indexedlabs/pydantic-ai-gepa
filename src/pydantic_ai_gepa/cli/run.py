@@ -937,7 +937,7 @@ def _confirm_validation_candidate(
     """Confirm once, optionally continuing a privately checkpointed sequence.
 
     Checkpoint each completed look before another draw. A caller can mark a
-    draw pending beforehand to fail closed if its result cannot be recovered.
+    draw pending beforehand and retry just that draw if its result is lost.
     """
     initial, maximum = _validation_schedule(state, workspace_root)
     outcomes = list(prior_outcomes)

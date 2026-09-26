@@ -1,4 +1,4 @@
-"""A select crash cannot grant its finalist another validation draw."""
+"""Select resumes saved confirmation evidence and retries unfinished draws."""
 
 from dataclasses import replace
 import json
@@ -9,6 +9,7 @@ import typer
 from pydantic_ai_gepa.cli import harness_record, lane_repositories, run, select
 from pydantic_ai_gepa.cli.runs import ParetoLog
 from pydantic_ai_gepa.evaluation import EvaluationRecord
+from pydantic_ai_gepa.types import RolloutOutput
 from tests.cli import test_harness_record_select_paths as flows
 
 git_repo = flows.git_repo
@@ -210,7 +211,11 @@ def test_interrupted_confirmation_sequence(lane_run, monkeypatch, point):
                 item.score = 0.0
             outcome.summary["mean_score"] = 0.0
         if lane.endswith(":confirmation") and point == "during_draw":
-            raise Crash(point)
+            for item in outcome.records:
+                item.score = 0.8
+            outcome.summary["mean_score"] = 0.8
+            if calls.count(lane) == 2:
+                raise Crash(point)
         return fresh, outcome
 
     monkeypatch.setattr(run, "_evaluate_validation_candidate", counted)
@@ -255,9 +260,10 @@ def test_interrupted_confirmation_sequence(lane_run, monkeypatch, point):
     saved = _confirmation(record)
     rows = _validation_rows(record)
     before = len(calls)
+    budget_before = ParetoLog(record.run_id, record.root).count_budget_rows()
     if point == "changed_finalist":
         replace(winner, candidate_sha="0" * 40).save(record.root, record.run_id)
-    if point in {"changed_finalist", "during_draw"}:
+    if point == "changed_finalist":
         with pytest.raises(typer.BadParameter, match="refusing to redraw"):
             select.run_select(record.run_id)
         assert len(calls) == before
@@ -265,11 +271,25 @@ def test_interrupted_confirmation_sequence(lane_run, monkeypatch, point):
         return
     select.run_select(record.run_id)
     final = _confirmation(record)
-    if point == "between_samples":
+    if point in {"between_samples", "during_draw"}:
         assert len(calls) == before + 2
         assert len(_validation_rows(record)) == len(rows) + 2
         assert final["samples"][:1] == saved["samples"]
-        assert _state(record).best_validation_samples == (1.0, 1.0, 1.0)
+        score = 0.8 if point == "during_draw" else 1.0
+        assert _state(record).best_validation_samples == (score,) * 3
+        assert final["comparison"]["verdict"] == "accepted"
+        assert final["comparison"]["candidate_mean"] == pytest.approx(score)
+        if point == "during_draw":
+            assert saved["pending"] is True
+            assert len(saved["samples"]) == 1
+            assert _validation_rows(record)[: len(rows)] == rows
+            # The orphan's 1.0 Pareto score is neither recovered as a sample
+            # nor used as the winner's mean. Its paid row still consumes budget.
+            assert rows[-1]["mean_score"] == 1.0
+            assert final["iterations"] == budget_before + 2
+            assert _state(record).validation_evaluations == len(
+                _validation_rows(record)
+            )
     else:
         assert len(calls) == before
         assert _validation_rows(record) == rows
@@ -278,3 +298,90 @@ def test_interrupted_confirmation_sequence(lane_run, monkeypatch, point):
             1 if point == "rejected" else 0
         )
         assert _state(record).accepted_promotion_count == 0
+
+
+@pytest.mark.parametrize("failures, legacy", [(1, False), (2, False), (1, True)])
+def test_confirmation_infrastructure_failure_retries_kept_samples(
+    lane_run, monkeypatch, failures, legacy
+):
+    record, winner, _ = lane_run
+    evaluate = run._evaluate_validation_candidate
+    calls = []
+    failed_samples = []
+
+    def counted(state, **kwargs):
+        lane = kwargs.get("lane", "")
+        calls.append(lane)
+        fresh, outcome = evaluate(state, **kwargs)
+        if lane.endswith(":confirmation") and 2 <= calls.count(lane) <= failures + 1:
+            outcome.records[0].payload = {
+                "output": RolloutOutput(
+                    result=None,
+                    success=False,
+                    error_message="fake transport failure",
+                    error_kind="transport",
+                )
+            }
+            outcome.records[0].score = -1.0
+            outcome.summary["mean_score"] = -1.0
+            failed_samples.append(outcome)
+        return fresh, outcome
+
+    monkeypatch.setattr(run, "_evaluate_validation_candidate", counted)
+    before = _state(record)
+    for attempt in range(failures):
+        with pytest.raises(typer.Exit) as error:
+            select.run_select(record.run_id)
+        assert error.value.exit_code == 1
+        saved = _confirmation(record)
+        paused = _state(record)
+        assert paused.status == "paused_after_infrastructure_error"
+        assert paused.best_candidate_id == before.best_candidate_id
+        assert paused.iterations_since_acceptance == before.iterations_since_acceptance
+        assert (
+            paused.validation_evaluations == before.validation_evaluations + 4 + attempt
+        )
+        assert saved["comparison"] is None
+        assert saved["pending"] is False
+        assert len(saved["samples"]) == 1
+        assert saved["samples"][0]["summary"]["mean_score"] == 1.0
+        assert (
+            saved["iterations"]
+            == ParetoLog(record.run_id, record.root).count_budget_rows()
+        )
+        _assert_withheld(record)
+    if legacy:
+        # Records from the first commit stored the failed draw as a terminal
+        # comparison. They must recover too, without using that failed score.
+        key = paused.select_context["confirmation_checkpoint"]
+        legacy_checkpoint = {
+            **saved,
+            "comparison": paused.last_comparison,
+            "samples": saved["samples"]
+            + [
+                {
+                    "summary": failed_samples[-1].summary,
+                    "scores": {"secret": -1.0},
+                }
+            ],
+        }
+        record.write(key, json.dumps(legacy_checkpoint))
+    rows = _validation_rows(record)
+    count_before_retry = len(calls)
+    select.run_select(record.run_id)
+    final = _confirmation(record)
+    state = _state(record)
+    assert len(calls) == count_before_retry + 2
+    assert _validation_rows(record)[: len(rows)] == rows
+    assert len(_validation_rows(record)) == len(rows) + 2
+    assert final["samples"][:1] == saved["samples"]
+    assert len(final["samples"]) == 3
+    assert final["comparison"]["verdict"] == "accepted"
+    assert final["iterations"] == saved["iterations"] + 2
+    assert state.validation_evaluations == paused.validation_evaluations + 2
+    assert state.best_validation_samples == (1.0, 1.0, 1.0)
+    assert state.best_commit_sha == winner.candidate_sha
+    assert state.accepted_promotion_count == 1
+    assert state.iterations_since_acceptance == 0
+    assert state.status == "running"
+    _assert_withheld(record)
