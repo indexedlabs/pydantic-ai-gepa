@@ -112,12 +112,14 @@ It never evaluates a held-out run, even if the variable was accidentally set
 in its environment. The harness takes the run lock, checks the epoch and clean
 candidate identity, evaluates the training gate, then confirms training winners
 on validation. It rechecks the tree before saving state and after scoring.
-Held-out runs require a **committed, clean git candidate with scalar, unpinned
-acceptance**. Component, vector and pinned-scorer held-out modes currently fail
-closed before candidate imports. A dirty-tree refusal asks you to commit
+Held-out runs require a **committed, clean git candidate with scalar acceptance**.
+They support unpinned code scoring or the trusted-scorer mode described below.
+Component candidates, vector comparators and pinned scoring without
+`trusted_scorer` fail closed before candidate imports. A dirty-tree refusal asks you to commit
 before nominating. Keep the nominated tree unchanged until the result arrives.
 The harness checks the shared checkout for stale nominations, but scores a
-private checkout of the nominated commit's raw objects. No worktree registration,
+private checkout of raw Git objects (the nominated commit for unpinned scoring,
+or the harness-pinned scorer revision for trusted scoring). No worktree registration,
 index update, or ref write exposes that checkout in the shared repository.
 
 The reflector receives training feedback reports, aggregate validation verdicts
@@ -211,6 +213,49 @@ UID is outside the sweep. Private checkout/scratch directories are removed on
 exit. Checkouts are built from raw Git tree/blob objects without worktree
 conversion; symlinks, gitlinks and special files are refused.
 
+For **trusted-scorer held-out scoring**, freeze these settings in `gepa.toml`:
+
+```toml
+[acceptance]
+mode = "scalar"
+pinned_scorer = true
+trusted_scorer = true
+component_files = ["prompts/planner.md"]
+```
+
+The orchestrator must set `GEPA_HARNESS_SCORER_REVISION` to the trusted scorer's
+full commit SHA (40 or 64 hexadecimal characters) in the harness environment,
+including `run start`, `harness serve` and `run select`. The revision must exist
+in the same repository. Missing, malformed or non-commit revisions are refused.
+The private checkout contains only that revision. The parent reads the nominated
+commit's component files as raw UTF-8 Git blobs, with no filters or candidate
+imports, and sends their text in the initialization message. The child sets
+`GEPA_CANDIDATE_COMPONENTS_JSON` before importing the scorer. Keys are the exact
+`component_files` paths, relative to the Python project root. Missing files,
+symlinks, non-blobs and invalid UTF-8 are refused. The scorer must consume this
+text as data. The candidate's tree is never written into the child's checkout.
+
+For either held-out mode, the harness can set `GEPA_HARNESS_FROZEN_FILES` to a
+JSON object mapping **Git repository root-relative paths** to SHA-256 hashes,
+for example `{"api/evals/scorer.py": "<64 hex characters>"}`. The trusted parent
+verifies the exact private-checkout bytes before starting the child: candidate
+revision files in unpinned mode, trusted revision files in trusted mode. A bad
+manifest, unsafe path, missing/non-regular file or hash mismatch is a static
+infrastructure refusal, never a quality score. Omission means no frozen-file
+checks; launchers requiring a freeze must supply the complete mapping. Both
+variables come only from the orchestrator's environment, never nominations,
+reflector config or run state, and cannot be forwarded with
+`GEPA_HARNESS_PASS_ENV`. Training-only `gepa eval` behavior is unchanged.
+
+The parent verifies the commit, every tree and every consumed blob against its
+Git object ID (SHA-1 or SHA-256) before launching the child. Shared object-store
+substitutions are refused. Frozen manifest paths must match verified tree names
+exactly, including case. When `GEPA_HARNESS_FROZEN_FILES` is set (even to `{}`),
+checkouts cannot contain `__pycache__/`, `.pyc`, `.so` or `.pyd` files, or package
+directories shadowing a frozen `.py` module. In unpinned code-engine mode,
+frozen hashes detect edits; they do not isolate the scorer from candidate code
+running in the same interpreter. **Trusted mode is the scorer isolation boundary.**
+
 The current backend is macOS Seatbelt (`/usr/bin/sandbox-exec`). It denies writes
 outside private scratch, reads of the held-out directory outside the child's own
 checkout/scratch, and network connections except to the harness's loopback CONNECT
@@ -231,7 +276,9 @@ the fixed provider keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
 setting, set `GEPA_HARNESS_PASS_ENV=TYPESAFE_API_KEY,OTHER_NAME` in the harness
 environment. Names are never read from a nomination, `gepa.toml` or `.env`.
 Reserved harness/runtime names (including `GEPA_HELDOUT_DATASET` and
-`GEPA_HARNESS_ALLOWED_HOSTS`) and values containing the held-out path are refused.
+`GEPA_HARNESS_ALLOWED_HOSTS`, `GEPA_HARNESS_SCORER_REVISION`,
+`GEPA_HARNESS_FROZEN_FILES` and `GEPA_CANDIDATE_COMPONENTS_JSON`) and values
+containing the held-out path are refused.
 Held-out harness commands skip candidate-owned `.env` files. Install the harness and its Python dependencies
 in storage the reflector cannot modify, and keep provider credentials out of the
 reflector environment.

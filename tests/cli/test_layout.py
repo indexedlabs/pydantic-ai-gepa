@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from pydantic_ai_gepa.cli.layout import (
+    AcceptanceConfig,
     GepaConfig,
     GepaConfigError,
     _module_source_paths,
@@ -42,6 +43,28 @@ from pydantic_ai_gepa.cli.layout import (
     traces_dir,
     write_default_config,
 )
+
+
+@pytest.mark.parametrize(
+    "pinned, files", [(False, ["prompt.md"]), (True, []), (False, [])]
+)
+def test_trusted_scorer_requires_pinned_components(pinned, files):
+    with pytest.raises(GepaConfigError, match="requires pinned_scorer"):
+        AcceptanceConfig.from_dict(
+            {"trusted_scorer": True, "pinned_scorer": pinned, "component_files": files}
+        )
+
+
+def test_trusted_scorer_config():
+    config = AcceptanceConfig.from_dict(
+        {
+            "trusted_scorer": True,
+            "pinned_scorer": True,
+            "component_files": ["prompts/a.md"],
+        }
+    )
+    assert config.trusted_scorer
+    assert config.component_files == ("prompts/a.md",)
 
 
 class _BrokenNamespacePath:

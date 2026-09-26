@@ -19,6 +19,7 @@ from pydantic_ai_gepa.cli.safe_git import Repository, run_git, safe_repository
 from pydantic_ai_gepa.cli.scoring_sandbox import (
     ScoringSandboxError,
     _checkout_entries,
+    candidate_components,
     private_checkout,
 )
 from pydantic_ai_gepa.cli.validation import validation_dataset_path
@@ -103,6 +104,32 @@ def attributes(repo):
     (repo / ".gitattributes").write_text("* filter=x diff=x\n")
     _git(repo, "add", ".gitattributes")
     _git(repo, "commit", "-m", "Attribute names with no executable drivers")
+
+
+@pytest.mark.parametrize("missing_blob", [False, True])
+def test_trusted_scorer_reads_ignore_hostile_git_config(
+    git_repo, private, missing_blob
+):
+    scorer = _git(git_repo, "rev-parse", "HEAD")
+    (git_repo / "score.txt").write_text("trusted component input")
+    _git(git_repo, "add", "score.txt")
+    _git(git_repo, "commit", "-m", "Candidate text")
+    candidate = _git(git_repo, "rev-parse", "HEAD")
+    blob = _git(git_repo, "rev-parse", "HEAD:score.txt")
+    if missing_blob:
+        (git_repo / ".git/objects" / blob[:2] / blob[2:]).unlink()
+    sentinel = private.parent / "git-config-executed"
+    poison(git_repo, sentinel)
+    if missing_blob:
+        with pytest.raises(ScoringSandboxError, match="blob response"):
+            candidate_components(git_repo, candidate, ("score.txt",))
+    else:
+        assert candidate_components(git_repo, candidate, ("score.txt",)) == {
+            "score.txt": "trusted component input"
+        }
+    with private_checkout(git_repo, scorer) as (_, checkout, _):
+        assert (checkout / "score.txt").read_text() == "bad\n"
+    assert not sentinel.exists()
 
 
 @pytest.mark.parametrize(
