@@ -870,8 +870,11 @@ def test_git_locations_ignore_user_tool_selection(fake_git_filesystem, monkeypat
     assert locations() == [Path("/root-developer/usr/bin/git"), fallback]
     entries[selection].st_uid = 501
     assert locations() == [fallback]
-    monkeypatch.setattr(safe_git.sys, "platform", "linux")
-    assert locations() == [Path("/usr/bin/git"), Path("/bin/git")]
+    # Undo before the fixture restores the real platform. A test-level
+    # monkeypatch would restore the fixture's "darwin" last and leak it.
+    with monkeypatch.context() as patch:
+        patch.setattr(safe_git.sys, "platform", "linux")
+        assert locations() == [Path("/usr/bin/git"), Path("/bin/git")]
 
 
 def test_real_git_binary_is_pinned_and_not_the_macos_shim(git_repo):
