@@ -934,6 +934,73 @@ def test_expensive_validation_uses_own_projection_and_stays_within_one_rollout(
     assert report["by_model"]["student"]["requests"] == 7
 
 
+def test_cheap_first_validation_case_does_not_admit_a_full_batch(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """OTTO-4840: a cheap first validation case must not start a full batch.
+
+    Same shape as the Python-API probe through the managed CLI spend path:
+    the first validation rollout runs alone at $0.01, the rest cost $0.50.
+    The gate ramps the in-flight limit with the kind's observation count, so
+    only one more rollout is admitted; its $0.50 sets the kind's high and the
+    eval stops within one rollout of the $0.60 cap.
+    """
+    checkpoint = _checkpoint(tmp_path, "ramp", monkeypatch)
+
+    from pydantic_ai.messages import ModelResponse, TextPart
+    from pydantic_ai.models.function import FunctionModel
+
+    async def model(messages, info):
+        # Fake latency so every admitted in-flight rollout issues its request
+        # before the first priced response can stop the eval.
+        await asyncio.sleep(0.02)
+        return ModelResponse(parts=[TextPart("ok")])
+
+    agent = Agent(FunctionModel(model, model_name="student"))
+
+    async def slow_evaluate(case):
+        return (
+            await agent.run("?", capabilities=[current_rollout_capability()])
+        ).output
+
+    async def evaluate(case):
+        return (await _metered_agent()).output
+
+    def batch(eval_id, kind, count, price, concurrency, slow=False):
+        with evaluation_spend(
+            run_id="ramp",
+            root=tmp_path,
+            eval_id=eval_id,
+            kind=kind,
+            count=count,
+            cap=0.60,
+            price_fn=price,
+            concurrency=concurrency,
+            validation_spend_path=checkpoint if kind == "validation" else None,
+        ):
+            return asyncio.run(
+                evaluate_callable_dataset(
+                    evaluate=slow_evaluate if slow else evaluate,
+                    metric=lambda c, o: 1.0,
+                    dataset=[Case(inputs="?") for _ in range(count)],
+                    concurrency=concurrency,
+                )
+            )
+
+    batch("training", "training", 6, lambda r: 0.005, 1)
+    # The unobserved validation kind runs its first rollout alone, so the
+    # cheap case is priced first deterministically.
+    costs = iter([0.01, 0.5, 0.5, 0.5])
+    with pytest.raises(typer.Exit):
+        batch("validation", "validation", 4, lambda r: next(costs), 4, slow=True)
+    report = spend_report("ramp", tmp_path)
+    assert report["total_dollars"] == pytest.approx(0.54)
+    assert report["validation_dollars"] == pytest.approx(0.51)
+    assert report["total_dollars"] <= 0.60 + 0.50
+    assert report["by_model"]["student"]["requests"] == 8
+
+
 def test_select_validation_refuses_projected_batch_and_preserves_incumbent(
     repo: Path, monkeypatch
 ):

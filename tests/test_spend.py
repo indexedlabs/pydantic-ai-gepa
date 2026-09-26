@@ -624,6 +624,76 @@ async def test_expensive_validation_probe_ends_within_one_rollout_of_cap() -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("case_count,cap", [(11, 1.00), (4, 0.60)])
+async def test_cheap_first_validation_case_stays_within_one_rollout_of_cap(
+    case_count: int, cap: float
+) -> None:
+    """The reviewer's OTTO-4840 probe on the Python API.
+
+    The first validation case costs $0.01 and every other validation case
+    $0.50 (training rollouts and reflection $0.005), at the default
+    ``max_concurrent_evaluations=10``. The admission gate ramps a kind's
+    in-flight limit with its observation count, so the cheap first case
+    admits only one more rollout; its $0.50 becomes the kind's observed high
+    and the run stops within one rollout of the cap instead of starting the
+    whole batch on the $0.01 estimate.
+    """
+    from pydantic_ai_gepa._validation import validation_active
+
+    cheap_case_pending = True
+
+    def price_response(response: ModelResponse) -> float:
+        nonlocal cheap_case_pending
+        if response.model_name == "reflector-test" or not validation_active():
+            return 0.005
+        if cheap_case_pending:
+            # The unobserved validation kind runs its first rollout alone, so
+            # the cheap case is priced first deterministically.
+            cheap_case_pending = False
+            return 0.01
+        return 0.50
+
+    async def student(messages, info):
+        # Fake latency so every admitted in-flight rollout issues its request
+        # before the first priced response can stop the run.
+        await asyncio.sleep(0.01)
+        return ModelResponse(
+            parts=[TextPart("ok")],
+            usage=RequestUsage(input_tokens=10, output_tokens=3),
+        )
+
+    inputs = _optimization_inputs()
+    seed = extract_seed_candidate(inputs["agent"])
+    inputs["agent"] = Agent(
+        FunctionModel(student, model_name="student-test"),
+        instructions="Original instructions",
+    )
+    inputs["valset"] = [
+        Case(name=f"validation-{index}", inputs=f"prompt {index}")
+        for index in range(case_count)
+    ]
+    result = await optimize_agent(
+        **inputs, max_token_cost=cap, price_fn=price_response
+    )
+
+    report = result.spend_report
+    assert report.stopped_by_cost
+    assert report.stop_reason == COST_STOP_REASON
+    assert result.raw_result is not None
+    assert result.raw_result.stop_reason == COST_STOP_REASON
+    # The $0.01 first case observes the kind; the ramp admits one more
+    # rollout, whose $0.50 sets the kind's high. No further rollout fits in
+    # the remaining headroom, so the run stops at $0.51.
+    assert report.by_model["student-test"].requests == 2
+    assert report.rollout_dollars == pytest.approx(0.51)
+    assert report.total_dollars == pytest.approx(0.51)
+    assert report.total_dollars <= cap + 0.50
+    # OTTO-4707: the partly validated seed is never picked and reports no score.
+    assert result.best_score is None
+    assert result.best_candidate == seed
+
+
+@pytest.mark.asyncio
 async def test_per_kind_projection_is_not_diluted_by_cheap_training_rollouts() -> None:
     """Validation is first observed after many cheap training rollouts.
 
