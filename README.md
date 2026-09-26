@@ -775,8 +775,9 @@ count with its observed rollout count, up to the configured concurrency, and
 only while remaining headroom covers the ramped count × the kind's highest
 observed rollout cost; each in-flight rollout is reserved at that high, so a
 cheap first case cannot start a full batch on an underestimated cost. An
-unobserved kind, or a batch near the cap, starts one rollout at a time and
-rechecks before each start. Uncapped concurrency is unchanged.
+unobserved kind starts one rollout at a time; near the cap the gate stops
+once the kind's highest observed rollout no longer fits, even with headroom
+left. Uncapped concurrency is unchanged.
 
 The margin is **one rollout per concurrent eval process**, provided no rollout
 costs more than the highest observed for its kind. A new price high adds each

@@ -127,15 +127,21 @@ class SpendMeter:
     remaining headroom covers the ramped slots at ``h``. The bound on a
     capped run, stated plainly:
 
-    - After in-flight rollouts settle, overshoot is at most the sum over the
-      rollouts in flight at the stop of ``max(0, c_i - h_i)``: each rollout's
-      actual cost above the high it was reserved at. With ``M`` the kind's
-      true highest rollout cost, that is at most ``min(max_concurrent, n) *
-      (M - h)``; a cheap first case (n = 1) ends the run within one rollout
-      of the cap. An adversarial order (many cheap cases, then expensive
-      ones) can still reach ``max_concurrent * (M - h)``; a declared
-      per-rollout cost ceiling would close that and is a tracked follow-up,
-      not implemented here.
+    - After in-flight rollouts settle, overshoot is at most the sum over
+      every rollout in flight at the stop, of any kind, of ``max(0,
+      c_i - h_i)``: each rollout's actual cost above its own kind's high when
+      it was admitted. The slot check compares all in-flight rollouts against
+      the requesting kind's ramped limit, so per kind that term is at most
+      ``min(max_concurrent, n_k) * (M_k - h_k)`` (``n_k`` observations,
+      ``M_k`` the kind's true highest cost) and at most ``max_concurrent``
+      rollouts are in flight in total. A cheap first case (n = 1) keeps its
+      kind to one in-flight rollout, so a run with a single kind in flight
+      (a validation pass) ends within one rollout of the cap; rollouts of
+      another kind in flight at the same time add their own excess. An
+      adversarial order (many cheap cases, then expensive ones) can still
+      reach ``max_concurrent * (M - h)`` for one kind; a declared per-rollout
+      cost ceiling would close that and is a tracked follow-up, not
+      implemented here.
     - The first rollout of a kind runs alone with no projection and can
       overshoot by its own cost.
     - Reflection overshoot stays bounded by the reflection projection plus

@@ -24,7 +24,11 @@ from pydantic_ai_gepa.evaluation import (
     evaluate_callable_dataset,
     evaluate_candidate_dataset,
 )
-from pydantic_ai_gepa.spend import current_rollout_capability, report_cached_rollout
+from pydantic_ai_gepa.spend import (
+    COST_STOP_REASON,
+    current_rollout_capability,
+    report_cached_rollout,
+)
 from pydantic_ai_gepa.types import MetricResult, RolloutOutput
 from pydantic_ai_gepa.evaluation_health import evaluation_infrastructure_failures
 from tests.cli import test_run_cli, test_git_candidate_cli, test_select_cli
@@ -1001,6 +1005,64 @@ def test_cheap_first_validation_case_does_not_admit_a_full_batch(
     assert report["by_model"]["student"]["requests"] == 8
 
 
+def test_near_cap_start_reserves_the_full_observed_high(repo: Path):
+    """A lone start near the cap must cover the kind's full observed high.
+
+    Training history: one $0.50 rollout, then four $0.125 rollouts (observed
+    high $0.50, mean $0.083), on top of the managed run's own $0.08. The next
+    one-rollout eval has $0.40 headroom: its $0.083 mean projection admits the
+    eval, but the per-rollout reservation is the full $0.50 high, so the
+    rollout never starts — the run stops with spend unchanged and the
+    incumbent preserved, exactly like the Python gate.
+    """
+    _price(repo)
+    started = _start("1.48")
+    assert started.exit_code == 0, started.output
+    run_id = _run_payload(started.output)["run_id"]
+    incumbent = _run_payload(started.output)["best_candidate_id"]
+
+    async def evaluate(case):
+        return (await _metered_agent()).output
+
+    def batch(eval_id, price):
+        with evaluation_spend(
+            run_id=run_id,
+            root=repo,
+            eval_id=eval_id,
+            kind="training",
+            count=1,
+            cap=None,
+            price_fn=lambda r: price,
+        ):
+            return asyncio.run(
+                evaluate_callable_dataset(
+                    evaluate=evaluate,
+                    metric=lambda c, o: 1.0,
+                    dataset=[Case(inputs="?")],
+                    concurrency=1,
+                )
+            )
+
+    batch("high", 0.50)
+    for index in range(4):
+        batch(f"settle-{index}", 0.125)
+    before = spend_report(run_id, repo)
+    assert before["total_dollars"] == pytest.approx(1.08)
+
+    with pytest.raises(typer.Exit) as stopped:
+        batch("near-cap", 0.50)
+    assert stopped.value.exit_code == 70
+    report = spend_report(run_id, repo)
+    # The $0.50 rollout was never started: spend and usage are unchanged.
+    assert report["total_dollars"] == before["total_dollars"]
+    assert report["by_model"] == before["by_model"]
+    assert report["stopped_by_cost"]
+    assert report["stop_reason"] == COST_STOP_REASON
+    final = RunState.from_dict(json.loads(run_state_path(run_id).read_text()))
+    assert final.status == "done"
+    assert final.best_candidate_id == incumbent
+
+
 def test_select_validation_refuses_projected_batch_and_preserves_incumbent(
     repo: Path, monkeypatch
 ):
@@ -1325,10 +1387,10 @@ def test_adaptive_concurrency_uses_highest_cost_and_preserves_parallelism(
         costs = iter([0.1, 0.0, 0.0])
         batch("seed", 3, 1, lambda r: next(costs), 1)
         peak = 0
-        # Mean=.033, highest=.10. Remaining=.25 fits the complete batch's
+        # Mean=.033, highest=.10. Remaining=.26 fits the complete batch's
         # mean (.13), but is below the ramped limit * highest (3 * .10):
-        # serial starts.
-        records = batch("near", 4, 0.35, lambda r: 0.05, 4)
+        # serial starts, each reserving the full observed high.
+        records = batch("near", 4, 0.36, lambda r: 0.05, 4)
         assert len(records) == 4
         assert peak == 1
     else:
