@@ -122,11 +122,17 @@ async def test_pipeline_cap_combines_engines_and_helper_rollouts(helper):
     if helper is optimize_parallel:
         assert isinstance(result, list)
         assert len(result) == 2
+        assert report.stopped_by_cost
     else:
         assert isinstance(result, PipelineResult)
         assert result.spend_report == report
-        assert result.decision["stopped_by_cost"]
-    assert report.stopped_by_cost
+        # A capped helper now holds back its comparison's projected cost and
+        # refuses a comparison that no longer fits instead of running the
+        # meter into a stop; either way the run ends because of cost.
+        assert report.stopped_by_cost or result.decision.get("cost_refused_comparison")
+        assert result.decision.get("stopped_by_cost") or result.decision.get(
+            "cost_refused_comparison"
+        )
     assert report.max_token_cost == 0.8
     assert report.total_dollars == sum(prices)
     assert report.total_dollars <= 0.8 + 2 * 0.125
@@ -155,24 +161,38 @@ async def test_pipeline_cap_combines_engines_and_helper_rollouts(helper):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("helper", [optimize_best_of, optimize_vote])
 async def test_interrupted_vote_discards_even_completed_candidate_samples(helper):
-    task = _task(cases=2)
-    result = await helper(
-        task,
-        [_config(calls=2), _config(calls=2)],
-        max_metric_calls=4,
-        fair_vote_repetitions=1,
-        max_token_cost=0.9,
-        price_fn=_price,
-    )
-    assert all(_engine_spend(r)["total_dollars"] == 0.25 for r in result.results)
+    # A new price high mid-comparison is a genuine mid-evaluation stop: the
+    # interrupted comparison is still discarded whole, even though its first
+    # rounds fit the headroom the exploration reserve held back.
+    requests = []
+
+    def price(response):
+        requests.append(response)
+        return 0.5 if len(requests) >= 4 else 0.125
+
+    with _registered(_StaticEngine()) as name:
+        task = _task(cases=2)
+        result = await helper(
+            task,
+            [
+                EngineConfig(engine=name, max_metric_calls=1),
+                EngineConfig(engine=name, max_metric_calls=1),
+            ],
+            max_metric_calls=2,
+            fair_vote_repetitions=1,
+            max_token_cost=0.5,
+            price_fn=price,
+        )
     assert result.spend_report.total_dollars == 0.875
     assert result.spend_report.stopped_by_cost
     assert result.spend_report.rollout_dollars > 0.5  # Comparison really ran.
     assert result.decision["comparison_discarded"]
+    assert result.decision["kind"] == "cost_interrupted_comparison"
     assert result.fair_votes == []
     assert result.best_index == -1
     assert result.best.best_candidate == await task.seed_candidate()
     assert result.best.best_score is None
+    assert len(requests) == 4
 
 
 @pytest.mark.asyncio
@@ -338,13 +358,37 @@ async def test_single_family_omni_meters_continuation_and_reporting(cap):
     )
     assert result.spend_report.total_dollars == sum(prices)
     assert result.spend_report.total_dollars <= cap + 0.125
+    # Comparisons/reporting that cannot finish are now refused before they
+    # start instead of spending up to the cap, so the meter never stops.
+    assert not result.spend_report.stopped_by_cost
     if cap == 5:
         assert result.spend_report.total_dollars == 0.875
         assert result.reporting_metric_calls == 1
         assert result.test_score == 0.5
-        assert not result.spend_report.stopped_by_cost
+    elif cap == 0.8:
+        # Vote and continuation comparison are funded; only the test report
+        # no longer fits and is refused, leaving test_score=None.
+        assert result.spend_report.total_dollars == 0.75
+        assert len(result.fair_votes) == 2
+        assert result.decision["continuation_vote"]["kind"] == "instance"
+        assert result.reporting_metric_calls == 0
+        assert result.test_score is None
+    elif cap == 0.6:
+        # The continuation comparison is refused (the fairly compared
+        # phase-one winner is kept); the winner's test report still fits.
+        assert result.spend_report.total_dollars == 0.5
+        assert len(result.fair_votes) == 2
+        assert result.decision["continuation_vote"]["kind"] == "cost_refused_comparison"
+        assert not result.decision["phase_two_adopted"]
+        assert result.reporting_metric_calls == 1
+        assert result.test_score == 0.5
     else:
-        assert result.spend_report.stopped_by_cost
+        # cap 0.3 cannot fund the phase-one vote: it is refused before any
+        # comparison rollout starts, so only the engine's own rollout ran.
+        assert result.spend_report.total_dollars == 0.125
+        assert result.decision["kind"] == "cost_refused_comparison"
+        assert result.fair_votes == []
+        assert result.best.engine == "seed"
         assert result.test_score is None
 
 
@@ -368,7 +412,7 @@ async def test_complete_vote_at_exact_cap_is_retained():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("helper", [optimize_best_of, optimize_vote])
-async def test_supplied_meter_stops_vote_and_is_reported(helper):
+async def test_supplied_meter_refuses_an_unaffordable_vote(helper):
     meter = SpendMeter(0.3, _price, max_concurrent=2)
     result = await helper(
         _task(),
@@ -378,8 +422,13 @@ async def test_supplied_meter_stops_vote_and_is_reported(helper):
         spend_meter=meter,
     )
     assert result.spend_report == meter.report()
-    assert result.spend_report.total_dollars == 0.25
-    assert result.spend_report.stopped_by_cost
+    # The two-round vote is refused before any comparison rollout starts:
+    # only the engine's own rollout is ever paid for, and the refusal is a
+    # probe that never stops the supplied meter.
+    assert result.spend_report.total_dollars == 0.125
+    assert not result.spend_report.stopped_by_cost
+    assert result.decision["kind"] == "cost_refused_comparison"
+    assert result.decision["comparison_discarded"]
     assert result.best.best_score is None
 
 
@@ -696,9 +745,14 @@ async def test_nested_helper_inherits_outer_spend_cap_and_pricing():
         )
     assert 0 < meter.report().total_dollars == sum(prices)
     assert meter.report().total_dollars <= 0.5 + 2 * 0.125
-    assert meter.report().stopped_by_cost
+    # The nested helper inherits the outer cap through its exploration
+    # reserve: the inner engine phase stops early enough that the stage
+    # comparison is funded, so the run now ends inside the cap instead of
+    # stopping the shared meter.
+    assert not meter.report().stopped_by_cost
+    assert inner_results[0].phases[0]["adopted"]
+    assert inner_results[0].best_index == 0
     assert inner_results[0].spend_report.total_dollars == meter.report().total_dollars
-    assert inner_results[0].spend_report.stopped_by_cost
     assert not inner_results[0].spend_report.unpriced_usage
     assert _pipeline_meter.get() is None
 
