@@ -65,6 +65,7 @@ class AcceptanceConfig:
     packet_projector: str | None = None
     require_probe_receipt: bool = False
     pinned_scorer: bool = False
+    trusted_scorer: bool = False
     component_files: tuple[str, ...] = ()
     meta_files: tuple[str, ...] = ("prediction.json",)
     reviewer: str | None = None
@@ -129,6 +130,13 @@ class AcceptanceConfig:
                 "acceptance.component_files must be an array of paths."
             )
         raw_meta_files = data.get("meta_files", ["prediction.json"])
+        trusted_scorer = data.get("trusted_scorer", False)
+        if not isinstance(trusted_scorer, bool):
+            raise GepaConfigError("acceptance.trusted_scorer must be a boolean.")
+        if trusted_scorer and (data.get("pinned_scorer") is not True or not files):
+            raise GepaConfigError(
+                "acceptance.trusted_scorer requires pinned_scorer = true and non-empty component_files."
+            )
         if not isinstance(raw_meta_files, list) or not all(
             isinstance(item, str) for item in raw_meta_files
         ):
@@ -182,6 +190,7 @@ class AcceptanceConfig:
             packet_projector=packet_projector,
             require_probe_receipt=bool(data.get("require_probe_receipt", False)),
             pinned_scorer=bool(data.get("pinned_scorer", False)),
+            trusted_scorer=trusted_scorer,
             component_files=tuple(files),
             meta_files=tuple(meta_files),
             reviewer=reviewer,

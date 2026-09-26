@@ -45,6 +45,10 @@ def main() -> None:
     initialization = receive()
     config = GepaConfig.from_dict(initialization["config"])
     validation = initialization["validation"]
+    if config.acceptance.trusted_scorer:
+        os.environ["GEPA_CANDIDATE_COMPONENTS_JSON"] = json.dumps(
+            initialization["components"], sort_keys=True
+        )
     root = Path.cwd()
     insert_repo_root_on_path(root)
     # This file stays private even for training; the parent only accepts the
