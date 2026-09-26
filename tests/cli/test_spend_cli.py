@@ -36,12 +36,25 @@ lane_repo = test_select_cli.git_repo
 
 
 def _checkpoint(root, run_id, monkeypatch):
-    from pydantic_ai_gepa.cli.validation import validation_spend_path
+    from pydantic_ai_gepa.cli import harness_record
+    from pydantic_ai_gepa.cli.validation import pin_heldout, validation_spend_path
 
     dataset = root.parent / f"{root.name}-heldout" / "validation.jsonl"
     dataset.parent.mkdir(exist_ok=True)
     dataset.write_text('{"inputs": "private"}\n')
     monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(dataset))
+    # These synthetic spend tests establish harness authority explicitly, just
+    # as run start does. Existing bytes here were produced by the test harness.
+    config = config_path(root)
+    config.parent.mkdir(parents=True, exist_ok=True)
+    if not config.exists():
+        config.write_text("")
+    pin_heldout(root, run_id)
+    harness_record.initialize(root, run_id)
+    record = harness_record.for_run(run_id, root)
+    assert record is not None
+    for view in record.directory.glob("*.json*"):
+        record.write(view.name, view.read_text())
     return validation_spend_path(str(dataset), project_root=root, run_id=run_id)
 
 

@@ -145,9 +145,11 @@ def test_non_mean_winner_becomes_parent_without_leaking(
     assert candidate_b in front.weights()
     pending = _run_payload(rejected.output)
     assert pending["next_parent_candidate_id"] == seed_state["best_candidate_id"]
-    resumed_output = _run(
-        "run", "resume", "--run-id", run_id, "--reflector", "replacement"
-    )
+    with monkeypatch.context() as env:
+        env.setenv("GEPA_HELDOUT_DATASET", str(path))
+        resumed_output = _run(
+            "run", "resume", "--run-id", run_id, "--reflector", "replacement"
+        )
     assert resumed_output.exit_code == 0, resumed_output.output
     assert (
         _run_payload(resumed_output.output)["next_parent_candidate_id"]
@@ -198,7 +200,10 @@ def test_non_mean_winner_becomes_parent_without_leaking(
         final_text,
     ]
     for command in [("run", "status"), ("run", "resume")]:
-        output = _run(*command, "--run-id", run_id)
+        with monkeypatch.context() as env:
+            if command[-1] == "resume":
+                env.setenv("GEPA_HELDOUT_DATASET", str(path))
+            output = _run(*command, "--run-id", run_id)
         assert output.exit_code == 0, output.output
         outputs.append(output.output)
     for format_ in ("json", "tsv"):

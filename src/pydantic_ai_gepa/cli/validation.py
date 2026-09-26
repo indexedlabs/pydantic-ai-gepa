@@ -236,7 +236,9 @@ def heldout_identity(root: Path) -> tuple[str, str]:
 def _pin_path(dataset: str, root: Path, run_id: str) -> Path:
     from .layout import gepa_dir
 
-    key = hashlib.sha256(f"{gepa_dir(root).resolve()}\0{run_id}".encode()).hexdigest()
+    key = hashlib.sha256(
+        f"{os.path.abspath(gepa_dir(root.resolve()))}\0{run_id}".encode()
+    ).hexdigest()
     return validation_dataset_path(
         str(Path(dataset).parent / ".gepa-heldout" / f"{key}.json"),
         project_root=root,
@@ -245,12 +247,17 @@ def _pin_path(dataset: str, root: Path, run_id: str) -> Path:
 
 
 def pin_heldout(root: Path, run_id: str) -> None:
+    from .harness_record import check_view_path, register_run
+    from .layout import run_dir
+
+    check_view_path(root, run_dir(run_id, root))
     dataset, digest = heldout_identity(root)
     path = _pin_path(dataset, root, run_id)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with path.open("x", encoding="utf-8") as handle:
         os.chmod(path, 0o600)
         json.dump({"dataset": dataset, "digest": digest}, handle)
+    register_run(root, run_id, path)
 
 
 def check_heldout_pin(root: Path, run_id: str) -> tuple[str, str]:

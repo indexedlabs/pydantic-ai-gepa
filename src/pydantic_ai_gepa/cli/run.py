@@ -2176,6 +2176,10 @@ def start(
                 )
                 raise typer.Exit(code=1)
     run_id = new_run_id()
+    if heldout_required:
+        from .harness_record import check_view_path
+
+        check_view_path(workspace_root, run_dir(run_id))
     run_dir(run_id).mkdir(parents=True, exist_ok=True)
     now = utc_now_iso()
     if heldout_required:

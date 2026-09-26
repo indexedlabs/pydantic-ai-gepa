@@ -10,8 +10,10 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 import json
+import hashlib
 import os
 from pathlib import Path
+import stat
 import tempfile
 from threading import RLock
 from typing import Any, Callable, Iterator, TypeVar
@@ -23,7 +25,7 @@ from ..vector_acceptance import (
 
 import typer
 
-from .validation import _pin_path, heldout_dataset, public_echo
+from .validation import _pin_path, heldout_dataset, public_echo, validation_dataset_path
 
 _active: ContextVar[Record | None] = ContextVar("harness_record", default=None)
 _locks: ContextVar[frozenset[str]] = ContextVar(
@@ -41,7 +43,12 @@ def session() -> Iterator[None]:
         _active.reset(token)
 
 
-def _atomic_text(path: Path, content: str, *, private: bool = False) -> None:
+def _atomic_text(
+    path: Path, content: str, *, private: bool = False, root: Path | None = None
+) -> None:
+    if not private:
+        assert root is not None
+        check_view_path(root, path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700 if private else 0o755)
     if private:
         path.parent.chmod(0o700)
@@ -51,6 +58,9 @@ def _atomic_text(path: Path, content: str, *, private: bool = False) -> None:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
+        if not private:
+            assert root is not None
+            check_view_path(root, path)
         os.replace(temporary, path)
         directory = os.open(path.parent, os.O_RDONLY)
         try:
@@ -58,7 +68,14 @@ def _atomic_text(path: Path, content: str, *, private: bool = False) -> None:
         finally:
             os.close(directory)
     except BaseException:
-        if os.path.exists(temporary):
+        safe_cleanup = True
+        if not private:
+            assert root is not None
+            try:
+                check_view_path(root, Path(temporary))
+            except typer.BadParameter:
+                safe_cleanup = False
+        if safe_cleanup and os.path.exists(temporary):
             os.unlink(temporary)
         raise
 
@@ -68,6 +85,99 @@ def _unavailable() -> typer.BadParameter:
         "Harness private record missing or unreadable; refusing GEPA_DIR state. "
         "Restore the original private record or start a new run (legacy runs cannot be adopted)."
     )
+
+
+def _public_path(root: Path, path: Path) -> Path:
+    workspace = root.resolve()
+    # Normalize a checkout alias (including macOS /var) without resolving any
+    # reflector-controlled component inside GEPA_DIR.
+    lexical_root = Path(os.path.abspath(root))
+    target = Path(os.path.abspath(path))
+    for ancestor in (lexical_root, *reversed(target.parents)):
+        if target.is_relative_to(ancestor) and ancestor.resolve() == workspace:
+            return workspace / target.relative_to(ancestor)
+    return target
+
+
+def check_view_path(root: Path, path: Path, *, base: Path | None = None) -> None:
+    """Refuse redirected public paths before reading, listing, or changing them."""
+    from .layout import gepa_dir
+
+    workspace = root.resolve()
+    base = _public_path(root, base or gepa_dir(workspace))
+    target = _public_path(root, path)
+    if not target.is_relative_to(base):
+        raise _unavailable()
+    anchor = workspace if base.is_relative_to(workspace) else Path(base.anchor)
+    current = anchor
+    for component in target.relative_to(anchor).parts:
+        current /= component
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise _unavailable() from None
+        if stat.S_ISLNK(mode) or (current != target and not stat.S_ISDIR(mode)):
+            raise _unavailable()
+
+
+def _index_path(dataset: str, root: Path, run_id: str) -> Path:
+    # Workspace identity is canonical; GEPA_DIR is deliberately NOT resolved.
+    # Moving or redirecting GEPA_DIR cannot change which private index we read.
+    key = hashlib.sha256(f"index\0{root.resolve()}\0{run_id}".encode()).hexdigest()
+    return validation_dataset_path(
+        str(Path(dataset).parent / ".gepa-heldout" / f"{key}.index.json"),
+        project_root=root,
+        allow_missing=True,
+    )
+
+
+def register_run(root: Path, run_id: str, pin: Path) -> None:
+    """Register immutable run identity at pin creation, before public state."""
+    from .layout import gepa_dir, run_dir
+
+    check_view_path(root, run_dir(run_id, root))
+    dataset = heldout_dataset()
+    assert dataset is not None
+    index = _index_path(dataset, root, run_id)
+    entry = {
+        "workspace": str(root.resolve()),
+        "gepa_dir": os.path.abspath(gepa_dir(root.resolve())),
+        "run_id": run_id,
+        "pin": pin.name,
+    }
+    # Exclusive creation prevents a second GEPA_DIR from taking over the same
+    # workspace/run identity. A partially created index fails closed.
+    fd = os.open(index, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(entry, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+    directory = os.open(index.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def _indexed_record_path(dataset: str, root: Path, run_id: str) -> Path:
+    from .layout import gepa_dir, run_dir
+
+    check_view_path(root, run_dir(run_id, root))
+    index = _index_path(dataset, root, run_id)
+    try:
+        entry = json.loads(index.read_text(encoding="utf-8"))
+        if (
+            entry["workspace"] != str(root.resolve())
+            or entry["run_id"] != run_id
+            or entry["gepa_dir"] != os.path.abspath(gepa_dir(root.resolve()))
+            or entry["pin"] != _pin_path(dataset, root, run_id).name
+        ):
+            raise ValueError
+    except (OSError, ValueError, KeyError, TypeError):
+        raise _unavailable() from None
+    return (index.parent / entry["pin"]).with_suffix(".record.json")
 
 
 class Record:
@@ -86,6 +196,7 @@ class Record:
             yield
 
     def load(self) -> dict[str, Any]:
+        check_view_path(self.root, self.directory)
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             if (
@@ -103,6 +214,7 @@ class Record:
         if key.startswith("@"):
             return  # Private bookkeeping has no whole-file public counterpart.
         path = self.directory / key
+        check_view_path(self.root, path)
         try:
             actual = path.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
@@ -119,9 +231,11 @@ class Record:
             err=True,
         )
         if content is None:
+            check_view_path(self.root, path)
             path.unlink(missing_ok=True)
         else:
-            _atomic_text(path, content)
+            check_view_path(self.root, path)
+            _atomic_text(path, content, root=self.root)
 
     def read(self, key: str) -> str | None:
         with self.locked():
@@ -131,6 +245,8 @@ class Record:
 
     def write(self, key: str, content: str, *, append: bool = False) -> None:
         with self.locked():
+            if not key.startswith("@"):
+                check_view_path(self.root, self.directory / key)
             data = self.load()
             if append:
                 content = data["files"].get(key, "") + content
@@ -139,10 +255,12 @@ class Record:
             # write is repaired on the next read; it never authorizes a retry.
             _atomic_text(self.path, json.dumps(data), private=True)
             if not key.startswith("@"):
-                _atomic_text(self.directory / key, content)
+                check_view_path(self.root, self.directory / key)
+                _atomic_text(self.directory / key, content, root=self.root)
 
     def restore_views(self) -> None:
         with self.locked():
+            check_view_path(self.root, self.directory / "results")
             files = self.load()["files"]
             keys = {key for key in files if not key.startswith("@")}
             keys.update(
@@ -154,12 +272,13 @@ class Record:
 
 
 def for_run(run_id: str, root: Path | None = None) -> Record | None:
-    from .layout import repo_root, run_state_path
+    from .layout import repo_root, run_dir
 
     dataset = heldout_dataset(required=False)
     if dataset is None:
         return None
     workspace = (root or repo_root()).resolve()
+    check_view_path(workspace, run_dir(run_id, workspace))
     active = _active.get()
     if (
         active
@@ -168,20 +287,7 @@ def for_run(run_id: str, root: Path | None = None) -> Record | None:
         and active.dataset == dataset
     ):
         return active
-    pin = _pin_path(dataset, workspace, run_id)
-    path = pin.with_suffix(".record.json")
-    if not pin.exists() and not path.exists():
-        # Non-held-out/ad-hoc runs retain their original behavior. The private
-        # pin, not a reflector-controlled flag, identifies established runs.
-        try:
-            required = json.loads(run_state_path(run_id, workspace).read_text()).get(
-                "heldout_required", False
-            )
-        except (OSError, ValueError, AttributeError):
-            required = False
-        if required:
-            raise _unavailable()
-        return None
+    path = _indexed_record_path(dataset, workspace, run_id)
     record = Record(workspace, run_id, path)
     record.load()
     _active.set(record)
@@ -193,7 +299,7 @@ def initialize(root: Path, run_id: str) -> None:
 
     dataset = heldout_dataset()
     assert dataset is not None
-    path = _pin_path(dataset, root, run_id).with_suffix(".record.json")
+    path = _indexed_record_path(dataset, root, run_id)
     record = Record(root.resolve(), run_id, path)
     with record.locked():
         if path.exists():
@@ -217,14 +323,30 @@ def _view(path: Path, root: Path | None = None) -> tuple[Record, str] | None:
 
     active = _active.get() if heldout_dataset(required=False) else None
     workspace = root or repo_root()
+    if (
+        root is None
+        and active is not None
+        and runs_dir(workspace) == runs_dir(active.root)
+    ):
+        # An absolute GEPA_DIR still belongs to the primary workspace while
+        # candidate evaluation temporarily changes cwd to a lane checkout.
+        workspace = active.root
     try:
-        parts = Path(os.path.abspath(path)).relative_to(runs_dir(workspace)).parts
+        parts = (
+            _public_path(workspace, path)
+            .relative_to(runs_dir(workspace.resolve()))
+            .parts
+        )
     except ValueError:
         if root is not None or active is None:
             return None
         workspace = active.root
         try:
-            parts = Path(os.path.abspath(path)).relative_to(runs_dir(workspace)).parts
+            parts = (
+                _public_path(workspace, path)
+                .relative_to(runs_dir(workspace.resolve()))
+                .parts
+            )
         except ValueError:
             return None
     if len(parts) < 2:
@@ -274,13 +396,19 @@ def write_text(
 
 
 def config_text(path: Path) -> str | None:
-    from .layout import config_path
+    from .layout import config_path, repo_root
 
+    if not heldout_dataset(required=False):
+        return None
+    # Candidate config validation may read a checkout-local copy outside the
+    # primary absolute GEPA_DIR. Check its ancestors without treating that
+    # untrusted candidate copy as the harness's pinned configuration.
+    check_view_path(repo_root(path.parent), path, base=path.parent)
     record = _active.get()
     if (
         not record
         or not heldout_dataset(required=False)
-        or path != config_path(record.root)
+        or path.resolve() != config_path(record.root).resolve()
     ):
         return None
     content = record.read("@config")
@@ -326,10 +454,7 @@ def private_lock_path(root: Path | None, run_id: str) -> Path | None:
         and active.dataset == dataset
     ):
         return active.path.with_suffix(".lock")
-    pin = _pin_path(dataset, workspace, run_id)
-    if pin.exists():
-        return pin.with_suffix(".record.lock")
-    return None
+    return _indexed_record_path(dataset, workspace, run_id).with_suffix(".lock")
 
 
 _ResultT = TypeVar("_ResultT")

@@ -47,6 +47,11 @@ def _state(**overrides):
 
 @pytest.fixture
 def selection(monkeypatch, tmp_path):
+    from pydantic_ai_gepa.cli import harness_record
+
+    # These unit tests inject held-out scoring and its private authority; real
+    # index/record lookup is covered by harness and lane CLI integration tests.
+    monkeypatch.setattr(harness_record, "for_run", lambda *_: object())
     lanes = [
         LaneState(
             lane=f"lane-{index}",
@@ -154,6 +159,18 @@ def test_lane_promotion_stores_confirmation_evidence(selection):
     # against its own newly saved incumbent samples.
     select._phase_promote(root, state, ctx)
     assert len(calls) == 5
+
+
+def test_private_authority_enables_validation_even_if_state_flag_is_false(selection):
+    root, calls, scores = selection
+    scores["lane-1:confirmation"] = 0.8
+    state, ctx, _ = select._phase_promote(root, _state(heldout_required=False), {})
+    assert (
+        calls
+        == ["lane-1:validation", "lane-2:validation"] + ["lane-1:confirmation"] * 3
+    )
+    assert state.best_candidate_id == "candidate-1"
+    assert ctx["validation_confirmation"]["verdict"] == "accepted"
 
 
 def test_lane_confirmation_budget_fails_closed(selection):

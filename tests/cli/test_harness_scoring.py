@@ -171,7 +171,9 @@ def test_only_harness_scores_and_results_preserve_continue_contract(
     assert saved["exit_code"] == result.exit_code
     status = _run("run", "status", "--run-id", run_id)
     resume = _run("run", "resume", "--run-id", run_id)
-    assert status.exit_code == resume.exit_code == 0
+    assert status.exit_code == 0
+    assert resume.exit_code == 2
+    assert "GEPA_HELDOUT_DATASET" in resume.output
     _sweep(
         git_repo,
         path,

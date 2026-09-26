@@ -736,7 +736,11 @@ def _phase_promote(
     #    or vectors, so its evidence never enters a reflection packet.
     accepted = [lane_state for lane_state in valid if lane_state.verdict == "accepted"]
     config = GepaConfig.load(config_path(workspace_root))
-    validation_enabled = state.heldout_required
+    from .harness_record import for_run
+
+    validation_enabled = for_run(run_id, workspace_root) is not None
+    if state.heldout_required and not validation_enabled:
+        raise typer.BadParameter("Held-out selection requires harness access.")
     vector_validation = validation_enabled and config.acceptance.mode == "vector"
     validation_results = {
         lane.lane: result
@@ -2026,11 +2030,14 @@ def run_select(run_id: str | None) -> Any:
     """Execute `gepa run select` (see module docstring for the phase model)."""
     workspace_root, run_state = _resolve_lane_run(run_id)
     from .reflector import run_lock
+    from .harness_record import for_run
+
+    record = for_run(run_state.run_id, workspace_root)
 
     with (
         (
             run_lock(run_state.run_id, workspace_root, wait=True)
-            if run_state.heldout_required
+            if record is not None
             else nullcontext()
         ),
         _select_lock(workspace_root, run_state.run_id),
