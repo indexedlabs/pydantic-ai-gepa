@@ -1101,7 +1101,7 @@ async def evaluate(case):
     test_select_cli._git(lane_repo, "add", ".")
     test_select_cli._git(lane_repo, "commit", "-m", "Meter fake student")
     payload = test_select_cli._start_lane_run(lane_repo, 1, "--max-token-cost", "0.45")
-    run_id = payload["run_id"]
+    run_id = str(payload["run_id"])
     incumbent = payload["best_candidate_id"]
     test_select_cli._drive_lane(
         lane_repo,
