@@ -120,7 +120,7 @@ def test_trusted_scorer_reads_ignore_hostile_git_config(
     sentinel = private.parent / "git-config-executed"
     poison(git_repo, sentinel)
     if missing_blob:
-        with pytest.raises(ScoringSandboxError, match="component UTF-8 blobs"):
+        with pytest.raises(ScoringSandboxError, match="blob response"):
             candidate_components(git_repo, candidate, ("score.txt",))
     else:
         assert candidate_components(git_repo, candidate, ("score.txt",)) == {

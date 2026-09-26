@@ -558,6 +558,15 @@ variables come only from the orchestrator's environment, never nominations,
 reflector config or run state, and cannot be forwarded with
 `GEPA_HARNESS_PASS_ENV`. Training-only `gepa eval` behavior is unchanged.
 
+The parent verifies the commit, every tree and every consumed blob against its
+Git object ID (SHA-1 or SHA-256) before launching the child. Shared object-store
+substitutions are refused. Frozen manifest paths must match verified tree names
+exactly, including case. When `GEPA_HARNESS_FROZEN_FILES` is set (even to `{}`),
+checkouts cannot contain `__pycache__/`, `.pyc`, `.so` or `.pyd` files, or package
+directories shadowing a frozen `.py` module. In unpinned code-engine mode,
+frozen hashes detect edits; they do not isolate the scorer from candidate code
+running in the same interpreter. **Trusted mode is the scorer isolation boundary.**
+
 The current backend is macOS Seatbelt (`/usr/bin/sandbox-exec`). It denies writes
 outside private scratch, reads of the held-out directory outside the child's own
 checkout/scratch, and network connections except to the harness's loopback CONNECT
