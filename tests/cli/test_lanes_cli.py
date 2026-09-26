@@ -16,6 +16,7 @@ from click.testing import Result
 from typer.testing import CliRunner
 
 from pydantic_ai_gepa.cli import app as gepa_app
+from pydantic_ai_gepa.cli.lanes import worktrees_root
 from pydantic_ai_gepa.cli.lanes import (
     LaneState,
     lane_state_path,
@@ -148,7 +149,7 @@ def test_run_start_lanes_fans_out(git_repo: Path) -> None:
     # Worktrees + branches cut from the frozen baseline commit.
     base_sha = _git(git_repo, "rev-parse", "HEAD")
     for lane in ("lane-1", "lane-2"):
-        worktree = git_repo / "worktrees" / run_id / lane
+        worktree = worktrees_root(git_repo) / run_id / lane
         assert worktree.is_dir()
         assert _git(worktree, "rev-parse", "HEAD") == base_sha
         state = _lane_state(git_repo, run_id, lane)
@@ -205,7 +206,7 @@ def test_single_path_run_untouched(git_repo: Path) -> None:
     assert run["lanes"] == 0
     assert run["status"] == "paused_for_reflection"
     run_id = str(run["run_id"])
-    assert not (git_repo / "worktrees").exists()
+    assert not (worktrees_root(git_repo)).exists()
     assert not (git_repo / ".gepa" / "runs" / run_id / "events").exists()
     assert run["next_command"] == f"gepa run continue --run-id {run_id}"
 
@@ -257,7 +258,7 @@ def test_packet_is_self_contained(git_repo: Path) -> None:
     assert packet["continue_cwd"] == packet["candidate_project_root"]
     assert packet["continue_argv"][0] == sys.executable
     assert packet["continue_argv"][1] == "-I"
-    assert invocation.startswith(f"cd {git_repo}/worktrees/")
+    assert invocation.startswith(f"cd {worktrees_root(git_repo)}/")
 
 
 def test_redirect_journal_entry_reaches_next_reflection_packet(git_repo: Path) -> None:
@@ -426,7 +427,7 @@ def test_nested_monorepo_lane_uses_candidate_project_and_src_imports(
         assert start.exit_code == 0, start.output
         run = _run_payload(start.output)
         run_id = str(run["run_id"])
-        candidate_git = repository / "worktrees" / run_id / "lane-1"
+        candidate_git = worktrees_root(repository) / run_id / "lane-1"
         candidate_project = candidate_git / "api"
         assert candidate_project.is_dir()
         assert not (project / ".git").exists()
@@ -540,7 +541,15 @@ def test_nested_monorepo_lane_uses_candidate_project_and_src_imports(
             for line in path.read_text(encoding="utf-8").splitlines()
         ]
         assert len(all_origin_lines) >= 6
-        assert all(str(candidate_project) in line for line in all_origin_lines)
+        from pydantic_ai_gepa.cli.lane_repositories import load
+
+        retained_project = load(project, run_id).candidate(
+            str(_git(candidate_git, "rev-parse", "HEAD"))
+        )
+        assert all(
+            str(candidate_project) in line or str(retained_project) in line
+            for line in all_origin_lines
+        )
 
         packet = json.loads(Path(str(state.packet_path)).read_text(encoding="utf-8"))
         assert packet["git_root"] == str(repository)
@@ -607,7 +616,7 @@ def test_lane_continue_evaluates_and_emits_verdict(git_repo: Path) -> None:
     primary_head = _git(git_repo, "rev-parse", "HEAD")
 
     # The reflector improves the candidate inside the lane worktree only.
-    worktree = git_repo / "worktrees" / run_id / "lane-1"
+    worktree = worktrees_root(git_repo) / run_id / "lane-1"
     (worktree / "score.txt").write_text("good\n", encoding="utf-8")
 
     # Invoke from inside the worktree using only the packet's invocation
@@ -674,7 +683,7 @@ def test_lane_evaluation_failure_stalls_without_verdict_or_selection(
     run_id = str(run["run_id"])
     gepa_dir = str(git_repo / ".gepa")
     baseline_sha = str(run["best_commit_sha"])
-    worktree = git_repo / "worktrees" / run_id / "lane-1"
+    worktree = worktrees_root(git_repo) / run_id / "lane-1"
     (worktree / "score.txt").write_text("error\n", encoding="utf-8")
 
     result = _run(
@@ -755,7 +764,7 @@ def test_two_lanes_evaluate_in_distinct_worktrees(git_repo: Path) -> None:
     old_cwd = Path.cwd()
     try:
         for lane, content in edits.items():
-            worktree = git_repo / "worktrees" / run_id / lane
+            worktree = worktrees_root(git_repo) / run_id / lane
             (worktree / "score.txt").write_text(content, encoding="utf-8")
             os.chdir(worktree)
             result = _run(
@@ -826,7 +835,7 @@ def test_lane_reset_terminates_live_eval_and_preserves_worktree(
     run_id = str(run["run_id"])
     gepa_dir = str(git_repo / ".gepa")
 
-    worktree = git_repo / "worktrees" / run_id / "lane-1"
+    worktree = worktrees_root(git_repo) / run_id / "lane-1"
     (worktree / "notes.txt").write_text("uncommitted work\n", encoding="utf-8")
 
     sleeper = subprocess.Popen(["sleep", "30"])
@@ -990,7 +999,7 @@ def test_dispatch_lease_is_consumed_by_continue(git_repo: Path) -> None:
     assert "already leased" in again.output
 
     # The reflector's continue consumes the dispatch lease and evaluates.
-    worktree = git_repo / "worktrees" / run_id / "lane-1"
+    worktree = worktrees_root(git_repo) / run_id / "lane-1"
     (worktree / "score.txt").write_text("good\n", encoding="utf-8")
     import os
 
@@ -1094,7 +1103,7 @@ def test_lane_reset_refuses_awaiting_selection(git_repo: Path) -> None:
     run = _start_lane_run(git_repo, lanes=1)
     run_id = str(run["run_id"])
     gepa_dir = str(git_repo / ".gepa")
-    worktree = git_repo / "worktrees" / run_id / "lane-1"
+    worktree = worktrees_root(git_repo) / run_id / "lane-1"
     (worktree / "score.txt").write_text("good\n", encoding="utf-8")
 
     import os
@@ -1132,7 +1141,7 @@ def test_foreground_continue_evaluates_worktree_not_primary(git_repo: Path) -> N
     run = _start_lane_run(git_repo, lanes=1)
     run_id = str(run["run_id"])
     gepa_dir = str(git_repo / ".gepa")
-    worktree = git_repo / "worktrees" / run_id / "lane-1"
+    worktree = worktrees_root(git_repo) / run_id / "lane-1"
     (worktree / "score.txt").write_text("good\n", encoding="utf-8")
     # Primary still scores "bad".
     assert (git_repo / "score.txt").read_text(encoding="utf-8") == "bad\n"

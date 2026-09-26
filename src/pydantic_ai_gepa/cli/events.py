@@ -140,7 +140,8 @@ def _validate_draft(type: str, lane: str | None, payload: dict[str, Any]) -> Non
         )
     expected = EVENT_PAYLOAD_FIELDS[type]
     missing = expected - payload.keys()
-    extra = payload.keys() - expected
+    optional = {"commit_a", "commit_b"} if type == "merge_opportunity" else set()
+    extra = payload.keys() - expected - optional
     if missing:
         raise EventError(
             f"Event type {type!r} is missing payload fields: "

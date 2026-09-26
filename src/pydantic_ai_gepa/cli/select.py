@@ -16,8 +16,8 @@ phase on the next invocation:
    baseline commit, validate every training-accepted candidate on the held-out
    dataset, use aggregate score in scalar mode or the configured comparator in
    vector mode, promote the winning validation improvement to the run's best
-   (the primary checkout is reset only when clean and still on
-   the old best — user work is never destroyed), journal the winner, and emit
+   in controller-owned storage (the original checkout stays unchanged),
+   journal the winner, and emit
    ``merge_opportunity`` for accepted lane pairs with disjoint diffs (merging
    itself is always delegated to the coding agent — never auto-merged).
 2. ``journal`` — every non-promoted resolved lane is journaled (diff summary,
@@ -26,13 +26,10 @@ phase on the next invocation:
    reaches an accepted-promotion multiple, compare the promoted incumbent
    with the immutable run-start vector set. Its result is journal evidence;
    it never rolls back or promotes either side.
-4. ``refan`` — reset every lane worktree onto the new best on a fresh
-   ``gepa/lane/<lane>/<iteration>`` branch, delete the previous-iteration
-   branches (already journaled), and return lanes to ``paused_for_reflection``
-   with a bumped iteration and fresh lease epoch. The winner's branch is
-   deleted too once the primary checkout carries its commit; when the primary
-   could not be promoted (dirty or moved), the winner branch is kept so the
-   commit stays reachable.
+4. ``refan`` — replace each independent lane repository with a complete
+   checkout of the retained best on a fresh lane branch, and return lanes to
+   ``paused_for_reflection`` with a bumped iteration and fresh lease epoch.
+   Retention refs keep nominated commits available after lane deletion.
 5. ``rebaseline`` — sample the next reflection minibatch and re-measure the
    shared baseline once per iteration against the new best tree (baseline
    evals are paid once per iteration, not once per lane).
@@ -57,7 +54,6 @@ import json
 import math
 import os
 import signal
-import subprocess
 import time
 from contextlib import contextmanager
 from dataclasses import replace
@@ -67,7 +63,6 @@ from typing import Any, Iterator
 
 import typer
 
-from .candidates import GitCandidateError, git_candidate_state
 from .eval import run_eval_once
 from .events import EventDraft, emit, list_events
 from ..evaluation_health import evaluation_infrastructure_failures
@@ -83,7 +78,6 @@ from .lanes import (
     _git,
     _pid_alive,
     _resolve_lane_run,
-    create_lane_worktree,
     lane_branch,
     lane_worktree_path,
     load_all_lane_states,
@@ -94,7 +88,6 @@ from .lanes import (
 )
 from .layout import (
     GepaConfig,
-    candidate_identity_exempt_paths,
     candidate_project_root,
     config_path,
     final_report_path,
@@ -458,8 +451,10 @@ def _invalidate_cross_baseline(
 def _is_ancestor(workspace_root: Path, ancestor_sha: str, head_sha: str) -> bool:
     from .safe_git import run_git
 
+    from .lane_repositories import candidate_root
+
     completed = run_git(
-        workspace_root,
+        candidate_root(workspace_root),
         "merge-base",
         "--is-ancestor",
         ancestor_sha,
@@ -469,40 +464,15 @@ def _is_ancestor(workspace_root: Path, ancestor_sha: str, head_sha: str) -> bool
     return completed.returncode == 0
 
 
-def _primary_checkout_state(workspace_root: Path) -> tuple[str, bool]:
-    """Return (HEAD sha, dirty) for the primary checkout.
-
-    Dirtiness reuses git candidate identity exclusions so run bookkeeping —
-    the run ledger, lane worktrees, and the append-only reflection ledger
-    (journal.jsonl, which select itself appends to every iteration) — never
-    counts as user changes.
-    """
-    head = _git(workspace_root, "rev-parse", "HEAD")
-    try:
-        candidate = git_candidate_state(
-            workspace_root,
-            exclude_paths=candidate_identity_exempt_paths(workspace_root),
-        )
-        dirty = candidate.dirty
-    except GitCandidateError:
-        dirty = True
-    return head, dirty
-
-
 def _reset_primary_to(workspace_root: Path, commit_sha: str) -> None:
-    """Fast-forward the primary checkout to ``commit_sha``.
+    """Advance the controller-owned candidate checkout, preserving the scorer."""
+    from .lane_repositories import load
+    from .layout import latest_run_id
 
-    The reflection ledger is append-only run bookkeeping that lane commits
-    never carry, so a plain ``reset --hard`` would revert a tracked
-    journal.jsonl to the winner commit's content and destroy the write-back
-    select just performed (and every uncommitted entry before it). The
-    journal content is preserved across the reset.
-    """
-    journal_file = journal_path(workspace_root)
-    journal_bytes = journal_file.read_bytes() if journal_file.exists() else None
-    _git(workspace_root, "reset", "--hard", commit_sha)
-    if journal_bytes is not None:
-        journal_file.write_bytes(journal_bytes)
+    run_id = latest_run_id(workspace_root)
+    if run_id is None:
+        raise typer.BadParameter("Missing lane run.")
+    load(workspace_root, run_id).promote(commit_sha)
 
 
 def _emit_merge_opportunities(
@@ -565,6 +535,8 @@ def _emit_merge_opportunities(
                         "lane_b": second.lane,
                         "branch_a": str(first.branch),
                         "branch_b": str(second.branch),
+                        "commit_a": first.candidate_sha,
+                        "commit_b": second.candidate_sha,
                         "diff_stat_path": str(stat_path),
                     },
                 ),
@@ -592,36 +564,14 @@ def _emit_merge_opportunities(
 def _validation_incumbent_root(workspace_root: Path, commit_sha: str) -> Iterator[Path]:
     """Yield the exact incumbent tree without touching the primary checkout."""
 
-    primary_head, primary_dirty = _primary_checkout_state(workspace_root)
-    if primary_head == commit_sha and not primary_dirty:
-        yield workspace_root
-        return
-
+    from .lane_repositories import candidate_root, checkout
     import tempfile
 
-    repository = git_root(workspace_root)
-    removal_failed = False
-    try:
-        with tempfile.TemporaryDirectory(prefix="gepa-validation-incumbent-") as temp:
-            checkout = Path(temp) / "worktree"
-            _git(repository, "worktree", "add", "--detach", str(checkout), commit_sha)
-            try:
-                yield candidate_project_root(workspace_root, checkout)
-            finally:
-                try:
-                    _git(repository, "worktree", "remove", "--force", str(checkout))
-                except subprocess.CalledProcessError:
-                    removal_failed = True
-    finally:
-        if removal_failed:
-            try:
-                _git(repository, "worktree", "prune")
-            except subprocess.CalledProcessError:
-                typer.echo(
-                    "Warning: could not prune the temporary validation worktree; "
-                    "run `git worktree prune` before the next selection.",
-                    err=True,
-                )
+    repository = git_root(candidate_root(workspace_root))
+    with tempfile.TemporaryDirectory(dir=repository.parent) as temporary:
+        target = Path(temporary) / "incumbent"
+        checkout(repository, commit_sha, target, "incumbent")
+        yield candidate_project_root(workspace_root, target)
 
 
 def _numeric_ranking_key(raw: Any, *, label: str) -> tuple[float, ...]:
@@ -680,6 +630,18 @@ def _phase_promote(
         raise typer.Exit(code=1)
 
     lane_states = load_all_lane_states(workspace_root, run_id)
+    from .lane_repositories import load
+
+    repositories = load(workspace_root, run_id)
+    from .lane_repositories import CandidateAncestryError
+
+    unrelated = set()
+    for proposal in lane_states:
+        if proposal.status == "awaiting_selection" and proposal.candidate_sha:
+            try:
+                repositories.import_lane(proposal.lane, proposal.candidate_sha)
+            except CandidateAncestryError:
+                unrelated.add(proposal.lane)
 
     # 1. Straggler invalidation (dec-4tw): anything not awaiting_selection when
     #    select runs is terminated, journaled, and stalled — never compared,
@@ -705,8 +667,10 @@ def _phase_promote(
         if lane_state.status != "awaiting_selection":
             continue
         candidate_sha = lane_state.candidate_sha
-        if candidate_sha and _is_ancestor(
-            workspace_root, str(baseline_sha), candidate_sha
+        if (
+            candidate_sha
+            and lane_state.lane not in unrelated
+            and _is_ancestor(workspace_root, str(baseline_sha), candidate_sha)
         ):
             valid.append(lane_state)
         else:
@@ -862,12 +826,7 @@ def _phase_promote(
             )
             state = _checkpoint(state, workspace_root, "promote", ctx)
             continue
-        worktree = Path(str(lane_state.worktree_path))
-        candidate_root = (
-            Path(lane_state.candidate_project_path)
-            if lane_state.candidate_project_path
-            else candidate_project_root(workspace_root, worktree)
-        )
+        candidate_root = repositories.candidate(str(lane_state.candidate_sha))
         validation_outcomes = []
         repetitions = state.acceptance_max_repetitions if vector_validation else 1
         if not vector_validation and state.iterations >= state.max_iterations:
@@ -1047,11 +1006,7 @@ def _phase_promote(
     if winner is not None and validation_enabled and not vector_validation:
         from .run import _confirm_validation_candidate
 
-        candidate_root = (
-            Path(winner.candidate_project_path)
-            if winner.candidate_project_path
-            else candidate_project_root(workspace_root, Path(str(winner.worktree_path)))
-        )
+        candidate_root = repositories.candidate(str(winner.candidate_sha))
         with _chdir(candidate_root):
             state, confirmation_outcomes, confirmation = _confirm_validation_candidate(
                 state,
@@ -1172,28 +1127,8 @@ def _phase_promote(
         and state.run_start_baseline is not None
     )
 
-    old_best = state.best_commit_sha
-    primary_head, primary_dirty = _primary_checkout_state(workspace_root)
-    primary_promoted = False
-    if primary_head == winner_sha:
-        primary_promoted = True  # already at the winner (resume after reset)
-    elif primary_dirty:
-        typer.echo(
-            "Warning: primary checkout is dirty; promoted the winner in run "
-            "state only — uncommitted work is preserved. Restore with: "
-            f"git checkout {winner_sha}",
-            err=True,
-        )
-    elif old_best and primary_head != old_best:
-        typer.echo(
-            f"Warning: primary checkout HEAD ({primary_head[:12]}) is not the "
-            f"run's previous best ({str(old_best)[:12]}); promoted the winner "
-            f"in run state only. Restore with: git checkout {winner_sha}",
-            err=True,
-        )
-    else:
-        _reset_primary_to(workspace_root, winner_sha)
-        primary_promoted = True
+    _reset_primary_to(workspace_root, winner_sha)
+    primary_promoted = True
 
     state = replace(
         state,
@@ -1337,18 +1272,10 @@ def _phase_journal(
 def _run_start_rebaseline_root(
     workspace_root: Path, state: Any, ctx: dict[str, Any]
 ) -> Path:
-    """Locate the promoted incumbent without mutating the primary checkout."""
-    best_sha = str(state.best_commit_sha)
-    primary_head, primary_dirty = _primary_checkout_state(workspace_root)
-    if primary_head == best_sha and not primary_dirty:
-        return workspace_root
-    winner = load_lane_state(workspace_root, state.run_id, str(ctx["winner"]))
-    worktree = Path(str(winner.worktree_path))
-    return (
-        Path(winner.candidate_project_path)
-        if winner.candidate_project_path
-        else candidate_project_root(workspace_root, worktree)
-    )
+    """Use retained objects, independent of the current lane contents."""
+    from .lane_repositories import load
+
+    return load(workspace_root, state.run_id).candidate(str(state.best_commit_sha))
 
 
 def _journal_run_start_rebaseline(
@@ -1535,33 +1462,6 @@ def _phase_run_start_rebaseline(
     return state, ctx, "refan"
 
 
-def _keep_branches(ctx: dict[str, Any]) -> frozenset[str]:
-    """Branches that survive re-fan deletion.
-
-    The winner's branch survives while it is the commit's sole ref (primary
-    not promoted), and every merge-opportunity branch pair survives until the
-    next select — the event names branches for the orchestrator to merge, so
-    deleting them in the same select would make the documented merge workflow
-    unexecutable (the payload carries branch names, not SHAs).
-    """
-    keep: set[str] = set()
-    if ctx.get("winner") and not ctx.get("primary_promoted"):
-        winner_branch = ctx.get("winner_branch")
-        if winner_branch:
-            keep.add(str(winner_branch))
-    for pair in ctx.get("merge_pairs") or []:
-        for branch in pair.get("branches", ()):  # type: ignore[union-attr]
-            keep.add(str(branch))
-    return frozenset(keep)
-
-
-def _delete_branch(workspace_root: Path, branch: str) -> None:
-    try:
-        _git(workspace_root, "branch", "-D", branch)
-    except subprocess.CalledProcessError:
-        pass  # already deleted (resume)
-
-
 def _refan_lane(
     workspace_root: Path,
     state: Any,
@@ -1570,7 +1470,6 @@ def _refan_lane(
     new_branch: str,
     new_iteration: int,
     new_best: str,
-    keep_branches: frozenset[str],
 ) -> LaneState:
     """Reset one lane worktree onto the new best with a fresh branch.
 
@@ -1578,33 +1477,18 @@ def _refan_lane(
     a mid-phase kill) is left alone; its state is still rewritten below.
     """
     run_id = state.run_id
-    old_branch = lane_state.branch
-    worktree = (
-        Path(lane_state.worktree_path)
-        if lane_state.worktree_path
-        else lane_worktree_path(workspace_root, run_id, lane_state.lane)
+    from .lane_repositories import load
+
+    repositories = load(workspace_root, run_id)
+    worktree = lane_worktree_path(workspace_root, run_id, lane_state.lane)
+    on_new_branch = worktree.exists() and (
+        _git(worktree, "rev-parse", "--abbrev-ref", "HEAD") == new_branch
+        and _git(worktree, "rev-parse", "HEAD") == new_best
     )
-    if worktree.exists():
-        on_new_branch = (
-            _git(worktree, "rev-parse", "--abbrev-ref", "HEAD") == new_branch
-            and _git(worktree, "rev-parse", "HEAD") == new_best
+    if not on_new_branch:
+        worktree = repositories.create_lane(
+            lane_state.lane, new_best, new_branch, replace=True
         )
-        if not on_new_branch:
-            # Uncommitted work was journaled during invalidation/journaling;
-            # resetting here never destroys unrecorded diffs (spec-er3).
-            _git(worktree, "reset", "--hard", "HEAD")
-            _git(worktree, "clean", "-fd")
-            _git(workspace_root, "branch", "-f", new_branch, new_best)
-            _git(worktree, "checkout", new_branch)
-    else:
-        # Repair a missing worktree from scratch (create_lane_worktree cuts
-        # the fresh branch from the new best).
-        path, _ = create_lane_worktree(
-            workspace_root, run_id, lane_state.lane, new_iteration, new_best
-        )
-        worktree = path
-    if old_branch and old_branch != new_branch and old_branch not in keep_branches:
-        _delete_branch(workspace_root, old_branch)
     return LaneState(
         **{
             **lane_state.to_dict(),
@@ -1643,7 +1527,6 @@ def _phase_refan(
         )
         raise typer.Exit(code=1)
     new_iteration = int(ctx.get("new_lane_iteration", 0)) or 1
-    keep_branches = _keep_branches(ctx)
     refanned: list[str] = list(ctx.get("refanned_lanes", []))
     for lane_state in load_all_lane_states(workspace_root, run_id):
         if lane_state.lane in refanned:
@@ -1656,7 +1539,6 @@ def _phase_refan(
             new_branch=new_branch,
             new_iteration=new_iteration,
             new_best=str(new_best),
-            keep_branches=keep_branches,
         )
         fresh.save(workspace_root, run_id)
         refanned.append(lane_state.lane)
@@ -1686,23 +1568,9 @@ def _phase_rebaseline(
         return state, ctx, "emit"
 
     new_best = str(state.best_commit_sha)
-    primary_head, primary_dirty = _primary_checkout_state(workspace_root)
-    if primary_head == new_best and not primary_dirty:
-        baseline_root = workspace_root
-    else:
-        lane_states = load_all_lane_states(workspace_root, run_id)
-        lane_state = lane_states[0]
-        worktree = Path(str(lane_state.worktree_path))
-        baseline_root = (
-            Path(lane_state.candidate_project_path)
-            if lane_state.candidate_project_path
-            else candidate_project_root(workspace_root, worktree)
-        )
-        typer.echo(
-            "Primary checkout does not carry the new best; measuring the "
-            f"shared baseline in {baseline_root} (same commit).",
-            err=True,
-        )
+    from .lane_repositories import load
+
+    baseline_root = load(workspace_root, run_id).candidate(new_best)
 
     ledger = ParetoLog(run_id, workspace_root)
     remaining = state.max_iterations - ledger.count_budget_rows()
@@ -1891,9 +1759,8 @@ def _phase_finalize(
 ) -> tuple[Any, dict[str, Any], str | None]:
     """Budget exhausted: mark done, record overshoot, emit run_done.
 
-    Lanes are removed when the run completes (spec-1do): worktrees are removed
-    and lane branches deleted (all journaled by now) — except the winner's
-    branch when the primary checkout could not carry its commit.
+    Lane repositories are removed after their nominated commits have been
+    retained in the controller's store for replay and adoption.
     """
     from .run import _write_final_report
 
@@ -1902,18 +1769,13 @@ def _phase_finalize(
     overshoot = max(0, rows - state.max_iterations)
     state = replace(state, iterations=rows, status="done")
 
-    keep_branches = _keep_branches(ctx)
-    _git(workspace_root, "worktree", "prune")
+    from .lane_repositories import load
+
+    repositories = load(workspace_root, run_id)
     for lane_state in load_all_lane_states(workspace_root, run_id):
-        worktree = Path(lane_state.worktree_path) if lane_state.worktree_path else None
-        if worktree is not None and worktree.exists():
-            try:
-                _git(workspace_root, "worktree", "remove", "--force", str(worktree))
-            except subprocess.CalledProcessError:
-                pass
-        branch = lane_state.branch
-        if branch and branch not in keep_branches:
-            _delete_branch(workspace_root, branch)
+        if lane_state.eval_pid:
+            _terminate_eval_pid(lane_state.eval_pid, lane=lane_state.lane)
+        repositories.remove_lane(lane_state.lane)
 
     final_path, final_text = _write_final_report(
         state, overshoot=overshoot, root=workspace_root
@@ -1996,7 +1858,12 @@ def _select_lock(workspace_root: Path, run_id: str) -> Iterator[None]:
 def run_select(run_id: str | None) -> Any:
     """Execute `gepa run select` (see module docstring for the phase model)."""
     workspace_root, run_state = _resolve_lane_run(run_id)
-    with _select_lock(workspace_root, run_state.run_id):
+    from .lane_repositories import load
+
+    with (
+        _select_lock(workspace_root, run_state.run_id),
+        load(workspace_root, run_state.run_id).route(),
+    ):
         # Resolve before taking the lock only to locate the run. A second
         # selector may have waited while the first completed every phase, so
         # its pre-lock snapshot must never drive a second selection.
@@ -2021,10 +1888,6 @@ def _run_select_locked(workspace_root: Path, run_state: Any) -> Any:
         )
         raise typer.Exit(code=1)
 
-    from .safe_git import refuse_heldout_git_mutations
-
-    refuse_heldout_git_mutations()
-
     if run_state.heldout_required:
         from .run import _assert_validation_dataset_unchanged
         from . import scoring_sandbox
@@ -2034,6 +1897,9 @@ def _run_select_locked(workspace_root: Path, run_state: Any) -> Any:
             scoring_sandbox.require_supported(
                 GepaConfig.load(config_path(workspace_root)), run_state.candidate_source
             )
+
+    if getattr(run_state, "lane_repository_version", 0) != 1:
+        raise typer.BadParameter("Linked lane runs cannot resume; start a new run.")
 
     state = run_state
     if state.select_phase is None:

@@ -415,7 +415,11 @@ def run_eval_once(
         redact_selection_evidence = True
 
     primary_project_root = (workspace_root or repo_root()).resolve()
-    active_candidate_project = (candidate_root or primary_project_root).resolve()
+    from .lane_repositories import candidate_root as routed_candidate
+
+    active_candidate_project = routed_candidate(
+        candidate_root or primary_project_root
+    ).resolve()
     cfg = GepaConfig.load(config_path(primary_project_root))
     source = candidate_source or cfg.candidate_source
     from . import scoring_sandbox

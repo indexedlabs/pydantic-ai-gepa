@@ -91,6 +91,7 @@ def poison(repo: Path, sentinel: Path, *, worktree: bool = False) -> None:
             file.write("[extensions]\n worktreeConfig = true\n")
     if worktree:
         (metadata.git_dir / "config.worktree").write_bytes(included.read_bytes())
+    (metadata.common_dir / "info").mkdir(exist_ok=True)
     (metadata.common_dir / "info/attributes").write_text("* filter=x diff=x\n")
 
 
@@ -438,22 +439,74 @@ def test_heldout_lane_mutations_refused_before_git(
     assert str(git_repo) not in str(error.value)
 
 
-def test_heldout_lane_start_refused_before_scoring(git_repo, private):
-    result = _run("run", "start", "--lanes", "2")
-    assert result.exit_code == 2, (result.output, result.exception)
-    assert "single-checkout" in result.output
+def test_heldout_lane_start_uses_owned_repositories(
+    git_repo, private, protocol_backend, monkeypatch
+):
+    from pydantic_ai_gepa.cli.lane_repositories import load, lane_path
+
+    result = _run(
+        "run",
+        "start",
+        "--lanes",
+        "2",
+        "--size",
+        "1",
+        "--max-iterations",
+        "20",
+        "--acceptance-repetitions",
+        "1",
+    )
+    assert result.exit_code == 0, (result.output, result.exception)
+    run_id = str(_run_payload(result.output)["run_id"])
+    from pydantic_ai_gepa.cli.validation import harness_environment
+
+    with harness_environment():
+        record = load(git_repo, run_id)
+        assert record.directory.is_relative_to(private.parent)
+    source_sha = _git(git_repo, "rev-parse", "HEAD")
+    candidate_sha = None
+    for lane in ("lane-1", "lane-2"):
+        path = lane_path(git_repo, run_id, lane)
+        assert (path / ".git").is_dir()
+        assert not (path / ".git/objects/info/alternates").exists()
+        if lane == "lane-1":
+            (path / "score.txt").write_text("good\n")
+            _git(path, "add", "score.txt")
+            _git(path, "commit", "-m", "Improve candidate")
+            candidate_sha = _git(path, "rev-parse", "HEAD")
+        with monkeypatch.context() as patch:
+            patch.delenv("GEPA_HELDOUT_DATASET")
+            patch.chdir(path)
+            result = _run(
+                "-G",
+                str(git_repo / ".gepa"),
+                "lane",
+                "continue",
+                lane,
+                "--run-id",
+                run_id,
+                "--foreground",
+            )
+        assert result.exit_code == 0, (result.output, result.exception)
+        poison(path, git_repo.parent / (git_repo.name + "-" + lane + "-hook"))
+    result = _run("-G", str(git_repo / ".gepa"), "run", "select", "--run-id", run_id)
+    assert result.exit_code == 0, (result.output, result.exception)
+    assert _run_payload(result.output)["best_commit_sha"] == candidate_sha
+    assert _run_payload(result.output)["status"] == "done"
+    assert _git(record.repository, "rev-parse", "HEAD") == candidate_sha
+    assert _git(git_repo, "rev-parse", "HEAD") == source_sha
+    for lane in ("lane-1", "lane-2"):
+        assert not (git_repo.parent / (git_repo.name + "-" + lane + "-hook")).exists()
+        assert not lane_path(git_repo, run_id, lane).exists()
     assert str(private) not in result.output
-    assert not (git_repo / "worktrees").exists()
 
 
-def test_heldout_select_refused_before_state_changes(git_repo, private, monkeypatch):
+def test_heldout_select_refuses_legacy_state(git_repo, private, monkeypatch):
     from types import SimpleNamespace
     from pydantic_ai_gepa.cli.select import _run_select_locked
 
-    # This also refuses a training lane run if held-out access is introduced
-    # later, rather than only checking its persisted heldout_required flag.
     state = SimpleNamespace(status="paused_for_reflection", heldout_required=False)
-    with pytest.raises(typer.BadParameter, match="single-checkout") as error:
+    with pytest.raises(typer.BadParameter, match="start a new run") as error:
         _run_select_locked(git_repo, state)
     assert str(private) not in str(error.value)
 

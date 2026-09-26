@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import typer
 
-from pydantic_ai_gepa.cli import run, select
+from pydantic_ai_gepa.cli import lane_repositories, run, select
 from pydantic_ai_gepa.cli.eval import EvalOutcome
 from pydantic_ai_gepa.cli.lanes import LaneState
 from pydantic_ai_gepa.evaluation import EvaluationRecord
@@ -76,8 +76,13 @@ def selection(monkeypatch, tmp_path):
     monkeypatch.setattr(select, "_journal_lane_outcome", lambda *_: None)
     monkeypatch.setattr(select, "_diff_stat", lambda *_: "")
     monkeypatch.setattr(select, "_record_accepted_promotion", lambda *_, **__: 1)
+    monkeypatch.setattr(select, "_reset_primary_to", lambda *_: None)
     monkeypatch.setattr(
-        select, "_primary_checkout_state", lambda _: ("incumbent", True)
+        lane_repositories,
+        "load",
+        lambda *_: SimpleNamespace(
+            import_lane=lambda *_: None, candidate=lambda _: tmp_path
+        ),
     )
     monkeypatch.setattr(select, "_emit_merge_opportunities", lambda *_: None)
     monkeypatch.setattr(run, "_validation_schedule", lambda *_: (3, 5))

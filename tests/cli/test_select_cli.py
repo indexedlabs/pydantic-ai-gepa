@@ -20,6 +20,8 @@ from click.testing import Result
 from typer.testing import CliRunner
 
 from pydantic_ai_gepa.cli import app as gepa_app
+from pydantic_ai_gepa.cli.lanes import worktrees_root
+from pydantic_ai_gepa.cli.lane_repositories import load as load_repositories
 from pydantic_ai_gepa.cli.lanes import LaneState, load_lane_state
 from pydantic_ai_gepa.cli.run import RunState
 from pydantic_ai_gepa.cli.runs import ParetoLog, utc_now_iso
@@ -161,7 +163,7 @@ def _start_lane_run(repo: Path, lanes: int = 3, *extra: str) -> dict[str, object
 
 def _drive_lane(repo: Path, run_id: str, lane: str, files: dict[str, str]) -> LaneState:
     """Reflector flow: edit the lane worktree, foreground `lane continue`."""
-    worktree = repo / "worktrees" / run_id / lane
+    worktree = worktrees_root(repo) / run_id / lane
     for name, content in files.items():
         (worktree / name).write_text(content, encoding="utf-8")
     old_cwd = Path.cwd()
@@ -232,8 +234,13 @@ def _events(repo: Path, run_id: str, type_: str | None = None) -> list[dict[str,
 
 
 def _lane_branches(repo: Path) -> list[str]:
-    out = _git(repo, "branch", "--format=%(refname:short)", "--list", "gepa/lane/*")
-    return sorted(line for line in out.splitlines() if line)
+    assert (
+        _git(repo, "branch", "--format=%(refname:short)", "--list", "gepa/lane/*") == ""
+    )
+    return sorted(
+        _git(path.parent, "symbolic-ref", "--short", "HEAD")
+        for path in worktrees_root(repo).glob("*/*/.git")
+    )
 
 
 def _run_id(run: dict[str, object]) -> str:
@@ -268,8 +275,13 @@ def test_select_promotes_winner_journals_losers_and_refans(git_repo: Path) -> No
     assert state.status == "running"
     assert state.best_commit_sha == lane_2.candidate_sha
     assert state.best_mean_score == pytest.approx(1.0)
-    assert _git(git_repo, "rev-parse", "HEAD") == lane_2.candidate_sha
-    assert (git_repo / "out_case-3.txt").read_text(encoding="utf-8") == "c\n"
+    assert (
+        _git(load_repositories(git_repo, run_id).repository, "rev-parse", "HEAD")
+        == lane_2.candidate_sha
+    )
+    assert (load_repositories(git_repo, run_id).project / "out_case-3.txt").read_text(
+        encoding="utf-8"
+    ) == "c\n"
 
     # Journal write-back: two loser entries + the promoted entry, each with
     # diff summary, verdict, delta, and confidence.
@@ -302,7 +314,7 @@ def test_select_promotes_winner_journals_losers_and_refans(git_repo: Path) -> No
         assert lane_state.lease_epoch >= 1
         assert lane_state.candidate_sha is None
         assert lane_state.verdict is None
-        worktree = git_repo / "worktrees" / run_id / lane
+        worktree = worktrees_root(git_repo) / run_id / lane
         assert _git(worktree, "rev-parse", "HEAD") == lane_2.candidate_sha
         assert Path(str(lane_state.packet_path)).exists()
         packet = json.loads(Path(str(lane_state.packet_path)).read_text())
@@ -692,7 +704,7 @@ def test_straggler_terminated_journaled_and_refanned(git_repo: Path) -> None:
 
     # Simulate an in-flight eval on lane-2: committed partial work, an
     # uncommitted scratch file, partial samples, live pid, fresh heartbeat.
-    worktree = git_repo / "worktrees" / run_id / "lane-2"
+    worktree = worktrees_root(git_repo) / run_id / "lane-2"
     (worktree / "out_case-2.txt").write_text("b\n", encoding="utf-8")
     (worktree / "notes.txt").write_text("scratch\n", encoding="utf-8")
     _git(worktree, "add", "out_case-2.txt")
@@ -761,7 +773,7 @@ def test_cross_branch_point_lane_invalidated(git_repo: Path) -> None:
     winner = _drive_lane(git_repo, run_id, "lane-1", {"out_case-2.txt": "b\n"})
 
     # lane-2's "candidate" is an orphan root commit (different branch point).
-    worktree = git_repo / "worktrees" / run_id / "lane-2"
+    worktree = worktrees_root(git_repo) / run_id / "lane-2"
     _git(worktree, "checkout", "--orphan", "lane-2-orphan")
     _git(
         worktree,
@@ -891,7 +903,10 @@ def test_select_killed_after_promotion_resumes_exactly_once(
     assert state.select_phase is None
     assert state.select_context is None
     assert state.best_commit_sha == lane_2.candidate_sha
-    assert _git(git_repo, "rev-parse", "HEAD") == lane_2.candidate_sha
+    assert (
+        _git(load_repositories(git_repo, run_id).repository, "rev-parse", "HEAD")
+        == lane_2.candidate_sha
+    )
 
 
 def test_merge_opportunity_for_disjoint_accepted_lanes(git_repo: Path) -> None:
@@ -923,9 +938,12 @@ def test_merge_opportunity_for_disjoint_accepted_lanes(git_repo: Path) -> None:
     # the promoted tree.
     state = _state(git_repo, run_id)
     assert state.best_commit_sha == lane_1.candidate_sha
-    assert _git(git_repo, "rev-parse", "HEAD") == lane_1.candidate_sha
-    assert (git_repo / "out_case-2.txt").exists()
-    assert not (git_repo / "out_case-3.txt").exists()
+    assert (
+        _git(load_repositories(git_repo, run_id).repository, "rev-parse", "HEAD")
+        == lane_1.candidate_sha
+    )
+    assert (load_repositories(git_repo, run_id).project / "out_case-2.txt").exists()
+    assert not (load_repositories(git_repo, run_id).project / "out_case-3.txt").exists()
 
 
 def test_budget_exhausted_marks_done_with_overshoot(git_repo: Path) -> None:
@@ -955,16 +973,19 @@ def test_budget_exhausted_marks_done_with_overshoot(git_repo: Path) -> None:
     assert "budget_overshoot: 1" in report
 
     # Lanes are removed when the run completes: no re-fan happened.
-    assert not (git_repo / "worktrees" / run_id / "lane-1").exists()
-    assert not (git_repo / "worktrees" / run_id / "lane-2").exists()
+    assert not (worktrees_root(git_repo) / run_id / "lane-1").exists()
+    assert not (worktrees_root(git_repo) / run_id / "lane-2").exists()
     # Both lanes were accepted with disjoint diffs, so their branches form a
     # merge pair and SURVIVE finalize — the merge_opportunity event names
     # branches for the orchestrator to merge, so deleting them in the same
     # select would make the event unactionable.
-    assert _lane_branches(git_repo) == [
-        f"gepa/lane/{run_id}/lane-1/4",
-        f"gepa/lane/{run_id}/lane-2/4",
-    ]
+    assert _lane_branches(git_repo) == []
+    retained = load_repositories(git_repo, run_id).repository
+    for event in _events(git_repo, run_id, "merge_opportunity"):
+        for key in ("commit_a", "commit_b"):
+            assert (
+                _git(retained, "cat-file", "-t", str(event["payload"][key])) == "commit"
+            )
     assert len(_events(git_repo, run_id, "lane_ready")) == 2  # fan-out only
 
     # A done run has nothing to select.
@@ -1005,7 +1026,11 @@ def test_select_dirty_primary_promotes_in_run_state_only(git_repo: Path) -> None
     (git_repo / "untracked-note.txt").write_text("user work\n", encoding="utf-8")
     result = _select(git_repo, run_id)
     assert result.exit_code == 0, result.output
-    assert "primary checkout is dirty" in result.output
+    assert "primary checkout is dirty" not in result.output
+    assert (
+        _git(load_repositories(git_repo, run_id).repository, "rev-parse", "HEAD")
+        == lane_1.candidate_sha
+    )
 
     state = _state(git_repo, run_id)
     assert state.best_commit_sha == lane_1.candidate_sha
@@ -1016,7 +1041,6 @@ def test_select_dirty_primary_promotes_in_run_state_only(git_repo: Path) -> None
     # Winner branch kept so the promoted commit stays reachable; the fresh
     # re-fan branch exists alongside it.
     assert _lane_branches(git_repo) == [
-        f"gepa/lane/{run_id}/lane-1/4",
         f"gepa/lane/{run_id}/lane-1/5",
     ]
     # The shared baseline was still re-measured at the new best (via the
@@ -1356,7 +1380,7 @@ def test_external_validation_leaves_only_aggregate_artifacts(
     assert payload["validation_evaluations"] == 3
     assert not (git_repo / ".gepa" / "validation.jsonl").exists()
     if lanes:
-        worktree = git_repo / "worktrees" / run_id / "lane-1"
+        worktree = worktrees_root(git_repo) / run_id / "lane-1"
         assert worktree.is_dir()
         assert not (worktree / ".gepa" / "validation.jsonl").exists()
         assert "validation.jsonl" not in _git(worktree, "ls-files")
