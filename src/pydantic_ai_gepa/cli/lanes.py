@@ -106,7 +106,7 @@ def lane_branch(run_id: str, lane: str, iteration: int) -> str:
 # ----------------------------- workspace resolution ---------------------
 
 
-def _resolve_workspace_root() -> Path:
+def _resolve_workspace_root(run_id: str | None = None) -> Path:
     """Resolve the primary workspace root from the explicit gepa dir.
 
     Lane processes are invoked with an absolute ``--gepa-dir`` (or the
@@ -124,7 +124,7 @@ def _resolve_workspace_root() -> Path:
     # Resolve external workspaces without reading the scorer checkout.
     from .layout import latest_run_id
 
-    run_id = latest_run_id(path.parent)
+    run_id = run_id or latest_run_id(path.parent)
     if run_id:
         state = _load_run_state(path.parent, run_id)
         if state.project_root:
@@ -365,14 +365,19 @@ def ensure_worktrees_ignored(workspace_root: Path) -> None:
     for path in (
         lanes_root(workspace_root),
         public.with_name(public.name + ".repositories"),
+        public.with_name(public.name + ".scorers"),
     ):
         if path.is_relative_to(repository.root):
             entries.append("/" + path.relative_to(repository.root).as_posix() + "/")
     if entries:
         info = repository.common_dir / "info"
         info.mkdir(exist_ok=True)
-        with (info / "exclude").open("a") as handle:
-            handle.write("\n" + "\n".join(entries) + "\n")
+        exclude = info / "exclude"
+        existing = exclude.read_text() if exclude.exists() else ""
+        missing = [entry for entry in entries if entry not in existing.splitlines()]
+        if missing:
+            with exclude.open("a") as handle:
+                handle.write("\n" + "\n".join(missing) + "\n")
 
 
 def _git(root: Path, *args: str) -> str:
@@ -588,6 +593,11 @@ def write_packet(
         "continue_cwd": str(candidate_project),
         "continue_argv": continue_argv,
         "continue_invocation": invocation,
+        "runtime_setup": (
+            f"Provision this lane's own virtualenv at {candidate_project / '.venv'} (for example, run uv sync in {candidate_project}) before running continue; the packet interpreter is missing."
+            if not Path(continue_argv[0]).exists()
+            else None
+        ),
     }
     if cfg.acceptance.mode != "vector":
         packet["baseline"]["mean_score"] = run_state.reflection_baseline_mean_score
@@ -1586,7 +1596,7 @@ def _load_run_state(workspace_root: Path, run_id: str) -> Any:
 
 def _resolve_lane_run(run_id: str | None) -> tuple[Path, Any]:
     """Resolve (workspace_root, RunState) explicitly; reject non-lane runs."""
-    workspace_root = _resolve_workspace_root()
+    workspace_root = _resolve_workspace_root(run_id)
     if run_id is None:
         from .layout import latest_run_id
 
@@ -1721,7 +1731,25 @@ def lane_continue(
     prefix = Path(run_state.candidate_prefix)
     if prefix.is_absolute() or ".." in prefix.parts:
         raise typer.BadParameter("Invalid candidate project prefix.")
-    workspace_root = expected_lane / prefix
+    candidate_project = expected_lane / prefix
+    workspace_root = candidate_project
+    cfg = GepaConfig.load(config_path(workspace_root))
+    if cfg.acceptance.pinned_scorer:
+        from .lane_repositories import scorer_path
+
+        workspace_root = (
+            scorer_path(
+                workspace_root,
+                run_state.run_id,
+                lane,
+                str(run_state.reflection_baseline_commit_sha),
+            )
+            / prefix
+        )
+        if not workspace_root.is_dir():
+            raise typer.BadParameter(
+                "Pinned training scorer snapshot missing; ask the controller to re-fan this lane."
+            )
     if gate_case:
         from .run import _validate_gate_cases
 
@@ -1732,7 +1760,7 @@ def lane_continue(
         state = load_lane_state(workspace_root, run_state.run_id, lane)
         if (
             Path(str(state.worktree_path)) != expected_lane
-            or Path(str(state.candidate_project_path)) != workspace_root
+            or Path(str(state.candidate_project_path)) != candidate_project
             or not (expected_lane / ".git").is_dir()
             or (expected_lane / ".git").is_symlink()
         ):
@@ -1978,7 +2006,7 @@ def lane_continue(
         from .layout import candidate_import_context
 
         # Pricing and comparison happen outside run_eval_once's inner import
-        # context. Keep the entire training operation in this lane's namespace.
+        # context. Pinned runs use the controller snapshot for all scorer imports.
         with candidate_import_context(
             primary_project_root=workspace_root,
             candidate_project_root=workspace_root,

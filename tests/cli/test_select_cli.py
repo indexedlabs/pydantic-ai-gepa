@@ -1411,3 +1411,151 @@ def test_external_validation_leaves_only_aggregate_artifacts(
     assert len(rows) == 3
     assert all(row.mean_score == 0.0 for row in rows)
     assert all(row.per_case_scores == {} for row in rows)
+
+
+def test_pinned_lane_uses_controller_incumbent_scorer(git_repo: Path) -> None:
+    config = git_repo / ".gepa/gepa.toml"
+    with config.open("a") as handle:
+        handle.write("\n[acceptance]\npinned_scorer = true\n")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "Pin scorer")
+    run = _start_lane_run(git_repo, 1, "--max-iterations", "20")
+    run_id = str(run["run_id"])
+    lane = _drive_lane(
+        git_repo,
+        run_id,
+        "lane-1",
+        {
+            "task_pkg/evaluation.py": "async def evaluate(case):\n    return case.expected_output\n"
+        },
+    )
+    assert lane.verdict == "equivalent"
+    from pydantic_ai_gepa.cli.lane_repositories import scorer_path
+
+    snapshot = scorer_path(
+        git_repo, run_id, "lane-1", str(run["reflection_baseline_commit_sha"])
+    )
+    assert (snapshot / "task_pkg/evaluation.py").read_text() == EVALUATE_MODULE_SOURCE
+    assert not (snapshot / ".git/objects/info/alternates").exists()
+    result = _select(git_repo, run_id)
+    assert result.exit_code == 0, result.output
+    assert _state(git_repo, run_id).best_commit_sha == run["best_commit_sha"]
+
+
+def test_select_older_lane_run_after_new_single_run(git_repo: Path) -> None:
+    run = _start_lane_run(git_repo, 1, "--max-iterations", "20")
+    run_id = str(run["run_id"])
+    lane = _drive_lane(git_repo, run_id, "lane-1", {"out_case-2.txt": "b\n"})
+    later = _run("run", "start", "--size", "3", "--max-iterations", "20")
+    assert later.exit_code == 0, later.output
+    result = _select(git_repo, run_id)
+    assert result.exit_code == 0, result.output
+    assert _state(git_repo, run_id).best_commit_sha == lane.candidate_sha
+
+
+@pytest.mark.parametrize(
+    "damage", ["missing_git", "alternate", "missing_sha", "symlink", "gitlink"]
+)
+def test_broken_lane_does_not_wedge_other_selection(
+    git_repo: Path, damage: str
+) -> None:
+    import shutil
+    from dataclasses import replace
+
+    run = _start_lane_run(git_repo, 2, "--max-iterations", "20")
+    run_id = str(run["run_id"])
+    good = _drive_lane(git_repo, run_id, "lane-1", {"out_case-2.txt": "b\n"})
+    bad = _drive_lane(
+        git_repo, run_id, "lane-2", {"out_case-2.txt": "b\n", "out_case-3.txt": "c\n"}
+    )
+    lane = worktrees_root(git_repo) / run_id / "lane-2"
+    if damage == "missing_git":
+        shutil.rmtree(lane / ".git")
+    elif damage == "alternate":
+        (lane / ".git/objects/info/alternates").write_text("/not-permitted\n")
+    elif damage == "missing_sha":
+        bad = replace(bad, candidate_sha="a" * 40)
+    else:
+        if damage == "symlink":
+            (lane / "link").symlink_to("out_case-1.txt")
+            _git(lane, "add", ".")
+        else:
+            _git(
+                lane,
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000," + str(bad.candidate_sha) + ",submodule",
+            )
+        _git(lane, "commit", "-m", "Unsupported tree entry")
+        bad = replace(bad, candidate_sha=_git(lane, "rev-parse", "HEAD"))
+    bad.save(git_repo, run_id)
+    result = _select(git_repo, run_id)
+    assert result.exit_code == 0, result.output
+    assert _state(git_repo, run_id).best_commit_sha == good.candidate_sha
+    assert _journal_outcomes(git_repo, run_id, lane="lane-2", outcome="invalidated")
+
+
+def test_finalize_does_not_signal_stale_pid_on_resolved_lane(
+    git_repo: Path, monkeypatch
+) -> None:
+    from dataclasses import replace
+    import importlib
+
+    select = importlib.import_module("pydantic_ai_gepa.cli.select")
+    run = _start_lane_run(git_repo, 1, "--max-iterations", "20")
+    run_id = str(run["run_id"])
+    lane = load_lane_state(git_repo, run_id, "lane-1")
+    replace(lane, eval_pid=os.getpid(), status="awaiting_selection").save(
+        git_repo, run_id
+    )
+    monkeypatch.setattr(
+        select,
+        "_terminate_eval_pid",
+        lambda *args, **kwargs: pytest.fail("signaled a stale pid"),
+    )
+    select._phase_finalize(git_repo, _state(git_repo, run_id), {})
+
+
+def test_straggler_ignores_forged_worktree_path(git_repo: Path, monkeypatch) -> None:
+    from dataclasses import replace
+    import importlib
+
+    select = importlib.import_module("pydantic_ai_gepa.cli.select")
+    run = _start_lane_run(git_repo, 1)
+    run_id = str(run["run_id"])
+    lane = load_lane_state(git_repo, run_id, "lane-1")
+    forged = replace(lane, worktree_path=str(git_repo))
+    seen = []
+
+    def read(root, *args):
+        seen.append(root)
+        return ""
+
+    monkeypatch.setattr(select, "_git", read)
+    select._invalidate_straggler(
+        git_repo, _state(git_repo, run_id), forged, reason="test"
+    )
+    assert seen and all(
+        path == worktrees_root(git_repo) / run_id / "lane-1" for path in seen
+    )
+
+
+def test_packet_explains_missing_lane_interpreter(git_repo: Path, monkeypatch) -> None:
+    from pydantic_ai_gepa.cli.lanes import write_packet
+
+    run = _start_lane_run(git_repo, 1)
+    run_id = str(run["run_id"])
+    lane = load_lane_state(git_repo, run_id, "lane-1")
+    monkeypatch.setattr(sys, "executable", str(git_repo / ".venv/bin/python"))
+    packet = write_packet(
+        git_repo,
+        _state(git_repo, run_id),
+        "lane-1",
+        lane.iteration,
+        Path(str(lane.worktree_path)),
+        str(lane.branch),
+    )
+    data = json.loads(packet.read_text())
+    assert str(Path(str(lane.worktree_path)) / ".venv") in data["runtime_setup"]
+    assert "uv sync" in data["runtime_setup"]

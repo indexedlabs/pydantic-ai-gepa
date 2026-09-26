@@ -76,12 +76,13 @@ def selection(monkeypatch, tmp_path):
     monkeypatch.setattr(select, "_journal_lane_outcome", lambda *_: None)
     monkeypatch.setattr(select, "_diff_stat", lambda *_: "")
     monkeypatch.setattr(select, "_record_accepted_promotion", lambda *_, **__: 1)
-    monkeypatch.setattr(select, "_reset_primary_to", lambda *_: None)
     monkeypatch.setattr(
         lane_repositories,
         "load",
         lambda *_: SimpleNamespace(
-            import_lane=lambda *_: None, candidate=lambda _: tmp_path
+            import_lane=lambda *_: None,
+            candidate=lambda _: tmp_path,
+            promote=lambda _: None,
         ),
     )
     monkeypatch.setattr(select, "_emit_merge_opportunities", lambda *_: None)

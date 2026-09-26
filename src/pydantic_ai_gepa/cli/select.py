@@ -54,6 +54,7 @@ import json
 import math
 import os
 import signal
+import subprocess
 import time
 from contextlib import contextmanager
 from dataclasses import replace
@@ -385,7 +386,7 @@ def _invalidate_straggler(
     diff_summary = ""
     untracked: tuple[str, ...] = ()
     baseline_sha = state.reflection_baseline_commit_sha
-    worktree = Path(lane_state.worktree_path) if lane_state.worktree_path else None
+    worktree = lane_worktree_path(workspace_root, run_id, lane_state.lane)
     if worktree is not None and worktree.exists() and baseline_sha:
         try:
             # Working-tree diff against the frozen baseline captures both the
@@ -414,7 +415,11 @@ def _invalidate_straggler(
 
 
 def _invalidate_cross_baseline(
-    workspace_root: Path, state: Any, lane_state: LaneState
+    workspace_root: Path,
+    state: Any,
+    lane_state: LaneState,
+    *,
+    reason: str | None = None,
 ) -> None:
     """Invalidate a lane whose branch point is not the frozen baseline commit.
 
@@ -439,7 +444,8 @@ def _invalidate_cross_baseline(
             outcome="invalidated",
             diff_summary=diff_summary,
             confidence=_load_comparison(lane_state).get("confidence"),
-            reason=(
+            reason=reason
+            or (
                 "candidate commit does not descend from the frozen baseline "
                 f"commit {baseline_sha}; never compared or promoted"
             ),
@@ -462,17 +468,6 @@ def _is_ancestor(workspace_root: Path, ancestor_sha: str, head_sha: str) -> bool
         capture_output=True,
     )
     return completed.returncode == 0
-
-
-def _reset_primary_to(workspace_root: Path, commit_sha: str) -> None:
-    """Advance the controller-owned candidate checkout, preserving the scorer."""
-    from .lane_repositories import load
-    from .layout import latest_run_id
-
-    run_id = latest_run_id(workspace_root)
-    if run_id is None:
-        raise typer.BadParameter("Missing lane run.")
-    load(workspace_root, run_id).promote(commit_sha)
 
 
 def _emit_merge_opportunities(
@@ -630,18 +625,30 @@ def _phase_promote(
         raise typer.Exit(code=1)
 
     lane_states = load_all_lane_states(workspace_root, run_id)
-    from .lane_repositories import load
+    from .lane_repositories import CandidateAncestryError, load
 
     repositories = load(workspace_root, run_id)
-    from .lane_repositories import CandidateAncestryError
 
-    unrelated = set()
+    unrelated: dict[str, str | None] = {}
+    candidate_roots: dict[str, Path] = {}
     for proposal in lane_states:
         if proposal.status == "awaiting_selection" and proposal.candidate_sha:
             try:
                 repositories.import_lane(proposal.lane, proposal.candidate_sha)
+                candidate_roots[proposal.lane] = repositories.candidate(
+                    proposal.candidate_sha
+                )
             except CandidateAncestryError:
-                unrelated.add(proposal.lane)
+                unrelated[proposal.lane] = None
+            except (
+                OSError,
+                ValueError,
+                typer.BadParameter,
+                subprocess.CalledProcessError,
+            ) as error:
+                unrelated[proposal.lane] = (
+                    f"Candidate import/checkout refused ({type(error).__name__}); never compared or promoted"
+                )
 
     # 1. Straggler invalidation (dec-4tw): anything not awaiting_selection when
     #    select runs is terminated, journaled, and stalled — never compared,
@@ -674,7 +681,9 @@ def _phase_promote(
         ):
             valid.append(lane_state)
         else:
-            _invalidate_cross_baseline(workspace_root, state, lane_state)
+            _invalidate_cross_baseline(
+                workspace_root, state, lane_state, reason=unrelated.get(lane_state.lane)
+            )
             invalidated.append(lane_state.lane)
 
     # 3. Training verdicts are consumed from lane state (memoized by the lane
@@ -826,7 +835,7 @@ def _phase_promote(
             )
             state = _checkpoint(state, workspace_root, "promote", ctx)
             continue
-        candidate_root = repositories.candidate(str(lane_state.candidate_sha))
+        candidate_root = candidate_roots[lane_state.lane]
         validation_outcomes = []
         repetitions = state.acceptance_max_repetitions if vector_validation else 1
         if not vector_validation and state.iterations >= state.max_iterations:
@@ -1006,7 +1015,7 @@ def _phase_promote(
     if winner is not None and validation_enabled and not vector_validation:
         from .run import _confirm_validation_candidate
 
-        candidate_root = repositories.candidate(str(winner.candidate_sha))
+        candidate_root = candidate_roots[winner.lane]
         with _chdir(candidate_root):
             state, confirmation_outcomes, confirmation = _confirm_validation_candidate(
                 state,
@@ -1127,7 +1136,7 @@ def _phase_promote(
         and state.run_start_baseline is not None
     )
 
-    _reset_primary_to(workspace_root, winner_sha)
+    repositories.promote(winner_sha)
     primary_promoted = True
 
     state = replace(
@@ -1481,10 +1490,17 @@ def _refan_lane(
 
     repositories = load(workspace_root, run_id)
     worktree = lane_worktree_path(workspace_root, run_id, lane_state.lane)
-    on_new_branch = worktree.exists() and (
-        _git(worktree, "rev-parse", "--abbrev-ref", "HEAD") == new_branch
-        and _git(worktree, "rev-parse", "HEAD") == new_best
-    )
+    try:
+        on_new_branch = (
+            worktree.exists()
+            and (worktree / ".git").is_dir()
+            and (
+                _git(worktree, "rev-parse", "--abbrev-ref", "HEAD") == new_branch
+                and _git(worktree, "rev-parse", "HEAD") == new_best
+            )
+        )
+    except (OSError, ValueError, typer.BadParameter, subprocess.CalledProcessError):
+        on_new_branch = False
     if not on_new_branch:
         worktree = repositories.create_lane(
             lane_state.lane, new_best, new_branch, replace=True
@@ -1773,7 +1789,11 @@ def _phase_finalize(
 
     repositories = load(workspace_root, run_id)
     for lane_state in load_all_lane_states(workspace_root, run_id):
-        if lane_state.eval_pid:
+        if (
+            lane_state.eval_pid
+            and lane_state.status == "evaluating"
+            and _pid_alive(lane_state.eval_pid)
+        ):
             _terminate_eval_pid(lane_state.eval_pid, lane=lane_state.lane)
         repositories.remove_lane(lane_state.lane)
 

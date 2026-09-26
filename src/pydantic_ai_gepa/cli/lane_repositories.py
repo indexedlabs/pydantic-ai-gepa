@@ -65,6 +65,35 @@ def lane_path(root: Path, run_id: str, lane: str) -> Path:
     return lanes_root(root) / _identifier(run_id) / _identifier(lane)
 
 
+def scorer_path(root: Path, run_id: str, lane: str, sha: str) -> Path:
+    """Controller-owned incumbent snapshot; grant the lane read, never write."""
+    from .layout import gepa_dir
+
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
+        raise typer.BadParameter("Invalid scorer commit SHA.")
+    public = gepa_dir(root).resolve()
+    return (
+        public.with_name(public.name + ".scorers")
+        / _identifier(run_id)
+        / _identifier(lane)
+        / sha
+    )
+
+
+def _atomic_checkout(source: Path, sha: str, target: Path, branch: str) -> None:
+    if target.is_symlink():
+        raise typer.BadParameter("Refusing redirected controller checkout.")
+    if target.exists():
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        dir=target.parent, prefix=".checkout-"
+    ) as temporary:
+        stage = Path(temporary) / "repository"
+        checkout(source, sha, stage, branch)
+        stage.rename(target)
+
+
 def _storage(root: Path, run_id: str) -> Path:
     from .layout import gepa_dir
     from .validation import heldout_dataset
@@ -270,8 +299,7 @@ class Repositories:
         if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
             raise typer.BadParameter("Invalid retained candidate SHA.")
         target = self.directory / ("candidate-" + sha)
-        if not target.exists():
-            checkout(self.repository, sha, target, "candidate")
+        _atomic_checkout(self.repository, sha, target, "candidate")
         return target / self.prefix
 
     def create_lane(
@@ -300,6 +328,12 @@ class Repositories:
             stage.rename(path)
             if previous.exists():
                 shutil.rmtree(previous)
+        _atomic_checkout(
+            self.repository,
+            sha,
+            scorer_path(self.root, self.run_id, lane, sha),
+            "gepa-scorer",
+        )
         return path
 
     def remove_lane(self, lane: str) -> None:
@@ -308,10 +342,6 @@ class Repositories:
             raise typer.BadParameter("Refusing redirected lane directory.")
         with _directory_fd(path.parent):
             if path.exists():
-                if not (path / ".git").is_dir() or (path / ".git").is_symlink():
-                    raise typer.BadParameter(
-                        "Linked lane repositories are unsupported; start a new run."
-                    )
                 shutil.rmtree(path)
 
     def promote(self, sha: str) -> None:

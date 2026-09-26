@@ -333,3 +333,42 @@ def test_candidate_root_and_training_need_no_scorer_reads(
         raise result.exception
     assert result.exit_code == 0, (result.output, result.exception)
     assert load_lane_state(scorer, run_id, "lane-1").status == "awaiting_selection"
+
+
+def test_candidate_checkout_failure_is_never_published(seed: Path, monkeypatch) -> None:
+    record = repos.initialize(seed / "api", "run1", seed / "api")
+    original = repos.checkout
+
+    def interrupted(source, sha, destination, branch):
+        destination.mkdir()
+        (destination / "partial").touch()
+        raise OSError("interrupted checkout")
+
+    monkeypatch.setattr(repos, "checkout", interrupted)
+    with pytest.raises(OSError, match="interrupted"):
+        record.candidate(record.seed)
+    assert not (record.directory / ("candidate-" + record.seed)).exists()
+    monkeypatch.setattr(repos, "checkout", original)
+    assert (
+        record.candidate(record.seed) / "prompt.txt"
+    ).read_text() == "training seed\n"
+
+
+def test_ignore_entries_are_not_duplicated(seed: Path, monkeypatch) -> None:
+    from pydantic_ai_gepa.cli.lanes import ensure_worktrees_ignored
+
+    monkeypatch.setattr(layout, "_explicit_gepa_dirname", str(seed / "api/.gepa"))
+    ensure_worktrees_ignored(seed / "api")
+    before = (seed / ".git/info/exclude").read_bytes()
+    ensure_worktrees_ignored(seed / "api")
+    assert (seed / ".git/info/exclude").read_bytes() == before
+
+
+def test_remove_lane_ignores_malformed_git_metadata(seed: Path) -> None:
+    record = repos.initialize(seed / "api", "run1", seed / "api")
+    lane = repos.lane_path(seed / "api", "run1", "lane-1")
+    lane.mkdir(parents=True)
+    (lane / ".git").symlink_to(seed / ".git", target_is_directory=True)
+    record.remove_lane("lane-1")
+    assert not lane.exists()
+    assert (seed / ".git").is_dir()

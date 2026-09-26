@@ -318,8 +318,20 @@ Repositories live at `<GEPA_DIR>.lanes/<run-id>/<lane>/` and have no shared refs
 objects, alternates or remotes. Grant each reflector access only to its own lane,
 the public GEPA workspace and required runtimes; keep the source/export, other
 lanes and the controller's repository store outside every grant. Use an external
-absolute GEPA_DIR for that boundary. Training `lane continue` imports from its own
-lane and does not need the original scorer checkout.
+absolute GEPA_DIR for that boundary. Unpinned training imports from its lane.
+Pinned `lane continue` loads evaluator, metric and scorer code from the controller-owned
+incumbent checkout at `<GEPA_DIR>.scorers/<run-id>/<lane>/<incumbent-sha>/<prefix>`.
+Grant that lane read-only access to this snapshot, never write access. It contains
+only the seeded incumbent and its ancestry, with no unrelated refs. When seeded
+from a history-free export, no source checkout history is introduced. The controller
+creates it at fan-out; no original scorer-checkout
+read is required by the reflector. Held-out scoring still uses the private trusted scorer.
+
+Seed trees containing symlinks or gitlinks anywhere are refused. Exporters must drop
+or materialize those entries before starting lanes. Each lane needs its own
+`<prefix>/.venv` when the packet uses a workspace-local interpreter; provision it
+(e.g. `uv sync` from that lane's project) before executing the packet command.
+The packet's `runtime_setup` message identifies a missing interpreter.
 
 The controller copies nominated objects without using lane config/hooks, keeps
 only their reachable closure in its own durable repository, and scores retained
