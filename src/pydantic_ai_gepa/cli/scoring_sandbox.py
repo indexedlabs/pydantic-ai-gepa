@@ -328,6 +328,7 @@ def _private_temporary(storage: Path) -> Iterator[str]:
         # Even deletion must not enumerate validation output in the harness.
         # A trusted isolated janitor removes the entire retired phase tree,
         # after worker/descendant termination, without returning any bytes.
+        # Preserve TemporaryDirectory's no-follow flag/permission recovery.
         try:
             result = subprocess.run(
                 [
@@ -335,7 +336,7 @@ def _private_temporary(storage: Path) -> Iterator[str]:
                     "-I",
                     "-B",
                     "-c",
-                    "import shutil, sys; shutil.rmtree(sys.argv[1])",
+                    "import tempfile, sys; tempfile.TemporaryDirectory._rmtree(sys.argv[1])",
                     temporary,
                 ],
                 stdin=subprocess.DEVNULL,
@@ -622,17 +623,21 @@ def _result(raw: dict[str, Any], case_id: str, validation: bool) -> EvaluationRe
 def _case_output(scratch: Path, validation: bool) -> Iterator[tuple[Path, int | None]]:
     name = "output-" + uuid4().hex
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    scratch_fd = os.open(scratch, flags)
-    output_fd = None
+    scratch_fd = output_fd = None
     try:
-        os.mkdir(name, mode=0o700, dir_fd=scratch_fd)
-        if not validation:
-            output_fd = os.open(name, flags, dir_fd=scratch_fd)
+        try:
+            scratch_fd = os.open(scratch, flags)
+            os.mkdir(name, mode=0o700, dir_fd=scratch_fd)
+            if not validation:
+                output_fd = os.open(name, flags, dir_fd=scratch_fd)
+        except OSError:
+            raise ScoringSandboxError("Cannot create scoring output storage.") from None
         yield scratch / name, output_fd
     finally:
         if output_fd is not None:
             os.close(output_fd)
-        os.close(scratch_fd)
+        if scratch_fd is not None:
+            os.close(scratch_fd)
 
 
 def _training_material(

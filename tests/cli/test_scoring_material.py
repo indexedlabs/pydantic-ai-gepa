@@ -303,6 +303,7 @@ def test_malicious_files_refused_without_losing_good_file(tmp_path, attack):
     if attack == "oversize":
         bad.write_bytes(b"x" * (material.MAX_FILE_BYTES + 1))
     elif attack.startswith("symlink"):
+        bad = output / "bad.txt"
         target = (
             output / "good.txt"
             if attack.endswith("inside")
@@ -311,6 +312,7 @@ def test_malicious_files_refused_without_losing_good_file(tmp_path, attack):
         target.write_text("retained" if attack.endswith("inside") else "secret")
         bad.symlink_to(target)
     elif attack == "hardlink":
+        bad = output / "bad.txt"
         target = tmp_path / "secret.txt"
         target.write_text("secret")
         os.link(target, bad)
@@ -542,8 +544,9 @@ def metric(case, output):
     assert records[0].payload["sandbox_material"]["output"] == "training answer"
 
 
+@pytest.mark.parametrize("oversize_case", [False, True])
 def test_malicious_training_child_keeps_score_and_safe_material(
-    git_repo, private, private_run, protocol_backend
+    git_repo, private, private_run, protocol_backend, oversize_case
 ):
     sha = existing.commit_evaluator(
         git_repo,
@@ -561,7 +564,7 @@ async def evaluate(case):
     os.link(outside, directory / "hard.txt")
     os.mkfifo(directory / "fifo.txt")
     (directory / "too-big.txt").write_bytes(b'x' * (1024 * 1024 + 1))
-    for i in range(5):
+    for i in range(5 if case.metadata["oversize_case"] else 0):
         (directory / f"total-{i}.txt").write_bytes(b'x' * 1024 * 1024)
     (directory / "invalid.jsonl").write_text("[]")
     (directory / "program.py").write_text("untrusted")
@@ -574,15 +577,25 @@ async def evaluate(case):
         git_repo,
         sha,
         validation=False,
-        cases=[Case(name="parent-case", inputs="training", expected_output="good")],
+        cases=[
+            Case(
+                name="parent-case",
+                inputs="training",
+                expected_output="good",
+                metadata={"oversize_case": oversize_case},
+            )
+        ],
     )
     record = records[0]
     assert record.score == 1
     assert record.payload["sandbox_material"]["output"] == "good"
     assert material.REFUSAL_NOTE in _format_failures(records)
     files = record.payload["sandbox_files"]
-    assert json.loads(files["trace.jsonl"])["case_id"] == "parent-case"
-    assert files["inside.txt"] == "inside"
+    # Exhausting the read allowance can omit later files in native walk order.
+    # Ordinary file refusals still retain both the trace and unrelated text.
+    if not oversize_case:
+        assert json.loads(files["trace.jsonl"])["case_id"] == "parent-case"
+        assert files["inside.txt"] == "inside"
     assert set(files) <= {
         "trace.jsonl",
         "inside.txt",
@@ -735,3 +748,206 @@ def test_jsonl_preserves_unicode_string_separators(tmp_path, separator):
     files, refused = collect(tmp_path)
     assert not refused
     assert json.loads(files["trace.jsonl"]) == row
+
+
+@pytest.mark.parametrize(
+    "backend,protection",
+    [
+        ("protocol_backend", "permissions"),
+        ("real_backend", "permissions"),
+        ("real_backend", "immutable"),
+    ],
+)
+def test_child_protected_scratch_is_retired(
+    request, backend, protection, git_repo, private, private_run
+):
+    request.getfixturevalue(backend)
+    sha = existing.commit_evaluator(
+        git_repo,
+        f"""import os, stat
+from pathlib import Path
+async def evaluate(case):
+    scratch = Path(os.environ["TMPDIR"])
+    locked = scratch / "locked"
+    locked.mkdir()
+    leaf = locked / "locked.txt"
+    leaf.write_text("candidate scratch")
+    if {protection!r} == "immutable":
+        os.chflags(leaf, stat.UF_IMMUTABLE, follow_symlinks=False)
+        assert leaf.stat().st_flags & stat.UF_IMMUTABLE
+    else:
+        locked.chmod(0)
+        assert stat.S_IMODE(locked.stat().st_mode) == 0
+    return "good"
+""",
+    )
+    # Use validation too: the janitor must recover without the parent walking
+    # the output tree, and without relying on training-material collection.
+    records = existing.score(git_repo, sha)
+    assert records[0].score == 1
+    assert records[0].payload == {}
+    assert not list((private.parent / ".gepa-heldout" / "work").iterdir())
+
+
+def test_janitor_permission_recovery_does_not_follow_symlinks(tmp_path):
+    import stat
+
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o750)
+    target = outside / "retained.txt"
+    target.write_text("retained")
+    target.chmod(0o640)
+    storage = tmp_path / "private-work"
+    storage.mkdir()
+    with sandbox._private_temporary(storage) as temporary:
+        locked = Path(temporary) / "locked"
+        locked.mkdir()
+        (locked / "outside-dir").symlink_to(outside, target_is_directory=True)
+        (locked / "outside-file").symlink_to(target)
+        (locked / "scratch.txt").write_text("scratch")
+        locked.chmod(0)
+    assert not list(storage.iterdir())
+    assert target.read_text() == "retained"
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o750
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
+
+
+@pytest.mark.parametrize("refusal", ["json", "utf8", "nodes"])
+def test_refused_files_share_per_case_read_cap(tmp_path, monkeypatch, refusal):
+    payload = {
+        "json": b"invalid JSON",
+        "utf8": b"\xff",
+        "nodes": json.dumps({"values": [0] * 16}).encode(),
+    }[refusal].ljust(128)
+    for index in range(8):
+        (tmp_path / f"{index}.json").write_bytes(payload)
+    cap = 2 * len(payload) + 7
+    monkeypatch.setattr(material, "MAX_CASE_READ_BYTES", cap)
+    monkeypatch.setattr(material, "MAX_JSON_NODES", 4)
+    original_read = os.read
+    reads = []
+
+    def counted_read(fd, size):
+        data = original_read(fd, size)
+        reads.append(len(data))
+        return data
+
+    budget = material.MaterialBudget()
+    with monkeypatch.context() as patch:
+        patch.setattr(material.os, "read", counted_read)
+        files, refused = collect(tmp_path, budget)
+    assert refused and files == {}
+    assert reads == [len(payload), len(payload), 7]
+    assert sum(reads) == cap
+    assert budget.used == 0  # Refused reads consume read allowance, not output quota.
+
+
+def test_accepted_and_refused_files_share_read_cap(tmp_path, monkeypatch):
+    # Use a deterministic walk to exercise accepted bytes followed by a refusal
+    # and a final valid item which must not be silently truncated or returned.
+    (tmp_path / "good.txt").write_text("good")
+    (tmp_path / "bad.json").write_text("bad!")
+    (tmp_path / "last.txt").write_text("last")
+    monkeypatch.setattr(material, "MAX_CASE_READ_BYTES", 9)
+    original_scandir = os.scandir
+
+    @contextmanager
+    def ordered_scandir(fd):
+        with original_scandir(fd) as iterator:
+            entries = {entry.name: entry for entry in iterator}
+        yield iter(entries[name] for name in ("good.txt", "bad.json", "last.txt"))
+
+    monkeypatch.setattr(material.os, "scandir", ordered_scandir)
+    files, refused = collect(tmp_path)
+    assert refused and files == {"good.txt": "good"}
+
+
+@pytest.mark.parametrize("limit", ["case", "eval", "read"])
+def test_exhausted_budget_never_opens_directory(tmp_path, monkeypatch, limit):
+    (tmp_path / "unread.txt").write_text("must not read")
+    budget = material.MaterialBudget(
+        used=material.MAX_EVAL_BYTES if limit == "eval" else 0
+    )
+    case_used = material.MAX_CASE_BYTES if limit == "case" else 0
+    if limit == "read":
+        monkeypatch.setattr(material, "MAX_CASE_READ_BYTES", 0)
+    monkeypatch.setattr(
+        material.os, "scandir", lambda *a: pytest.fail("exhausted walk enumerated")
+    )
+    assert collect(tmp_path, budget, case_used) == ({}, True)
+
+
+@pytest.mark.parametrize("limit", ["case", "eval"])
+def test_walk_stops_when_accepted_item_exhausts_budget(tmp_path, monkeypatch, limit):
+    for index in range(4):
+        (tmp_path / f"{index}.txt").write_text("good")
+    size = len("good") + material.FILE_OVERHEAD_BYTES + len("null")
+    monkeypatch.setattr(
+        material, "MAX_CASE_BYTES" if limit == "case" else "MAX_EVAL_BYTES", size
+    )
+    reads = []
+    original_read = os.read
+
+    def counted_read(fd, size):
+        data = original_read(fd, size)
+        reads.append(data)
+        return data
+
+    with monkeypatch.context() as patch:
+        patch.setattr(material.os, "read", counted_read)
+        files, refused = collect(tmp_path)
+    assert refused and len(files) == 1
+    assert reads == [b"good"]
+
+
+@pytest.mark.parametrize("validation", [False, True])
+@pytest.mark.parametrize("replacement", ["symlink", "file", "missing"])
+def test_case_output_refuses_replaced_scratch_with_static_error(
+    tmp_path, validation, replacement
+):
+    scratch = tmp_path / "PRIVATE_SCRATCH_SENTINEL"
+    if replacement == "symlink":
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        scratch.symlink_to(elsewhere, target_is_directory=True)
+    elif replacement == "file":
+        scratch.write_text("not a directory")
+    with pytest.raises(sandbox.ScoringSandboxError) as error:
+        with sandbox._case_output(scratch, validation):
+            pytest.fail("unsafe scratch admitted")
+    assert str(error.value) == "Cannot create scoring output storage."
+    assert "PRIVATE_SCRATCH_SENTINEL" not in str(error.value)
+    assert error.value.__suppress_context__
+
+
+@pytest.mark.parametrize("failure", ["mkdir", "output-open"])
+def test_case_output_setup_errors_are_static_and_close_fds(
+    tmp_path, monkeypatch, failure
+):
+    scratch = tmp_path / "PRIVATE_SCRATCH_SENTINEL"
+    scratch.mkdir()
+    original_open = os.open
+    opened = []
+
+    def controlled_open(path, flags, *args, **kwargs):
+        if failure == "output-open" and str(path).startswith("output-"):
+            raise OSError(f"private filename: {scratch / path}")
+        fd = original_open(path, flags, *args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    def refused_mkdir(*args, **kwargs):
+        raise OSError(f"private filename: {scratch}")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sandbox.os, "open", controlled_open)
+        if failure == "mkdir":
+            patch.setattr(sandbox.os, "mkdir", refused_mkdir)
+        with pytest.raises(sandbox.ScoringSandboxError) as error:
+            with sandbox._case_output(scratch, False):
+                pytest.fail("failed setup admitted")
+    assert str(error.value) == "Cannot create scoring output storage."
+    assert error.value.__suppress_context__
+    assert len(opened) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened[0])

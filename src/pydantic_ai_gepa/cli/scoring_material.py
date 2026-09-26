@@ -13,6 +13,7 @@ from typing import Any
 
 MAX_FILE_BYTES = 1024 * 1024
 MAX_CASE_BYTES = 4 * 1024 * 1024
+MAX_CASE_READ_BYTES = 4 * 1024 * 1024
 MAX_EVAL_BYTES = 32 * 1024 * 1024
 MAX_PAYLOAD_BYTES = 256 * 1024
 MAX_ENTRIES = 256
@@ -111,12 +112,26 @@ def collect_files(
     files: dict[str, str] = {}
     refused = False
     entries = 0
+    read_bytes = 0
+
+    def exhausted() -> bool:
+        return (
+            case_used >= MAX_CASE_BYTES
+            or budget.used >= MAX_EVAL_BYTES
+            or read_bytes >= MAX_CASE_READ_BYTES
+        )
 
     def walk(directory: int, prefix: str = "") -> None:
-        nonlocal entries, refused, case_used
+        nonlocal entries, refused, case_used, read_bytes
+        if exhausted():
+            refused = True
+            return
         # scandir streams entries so even an enormous directory is bounded.
         with os.scandir(directory) as iterator:
             for entry in iterator:
+                if exhausted():
+                    refused = True
+                    return
                 entries += 1
                 if entries > MAX_ENTRIES:
                     refused = True
@@ -155,19 +170,29 @@ def collect_files(
                         or before.st_size > MAX_FILE_BYTES
                     ):
                         raise ValueError
-                    with os.fdopen(os.dup(opened), "rb") as stream:
-                        data = stream.read(MAX_FILE_BYTES + 1)
+                    # A raw read has no hidden buffering/prefetch. Charge it
+                    # before any inode, UTF-8 or JSON check can refuse the item.
+                    data = os.read(
+                        opened,
+                        min(MAX_FILE_BYTES + 1, MAX_CASE_READ_BYTES - read_bytes),
+                    )
+                    read_bytes += len(data)
                     after = os.fstat(opened)
-                    if len(data) > MAX_FILE_BYTES or (
-                        before.st_size,
-                        before.st_mtime_ns,
-                        before.st_ctime_ns,
-                        before.st_nlink,
-                    ) != (
-                        after.st_size,
-                        after.st_mtime_ns,
-                        after.st_ctime_ns,
-                        after.st_nlink,
+                    if (
+                        len(data) != before.st_size
+                        or len(data) > MAX_FILE_BYTES
+                        or (
+                            before.st_size,
+                            before.st_mtime_ns,
+                            before.st_ctime_ns,
+                            before.st_nlink,
+                        )
+                        != (
+                            after.st_size,
+                            after.st_mtime_ns,
+                            after.st_ctime_ns,
+                            after.st_nlink,
+                        )
                     ):
                         raise ValueError
                     content = data.decode("utf-8")
