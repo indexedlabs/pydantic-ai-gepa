@@ -528,3 +528,17 @@ def test_non_selectable_seed_remains_incumbent(
     assert state.best_validation_samples == (0.4, 0.4, 0.4)
     assert state.best_mean_score == pytest.approx(0.4)
     assert state.last_comparison is None
+
+
+def test_paired_gate_missing_baseline_is_inconclusive(monkeypatch):
+    monkeypatch.setattr(
+        run, "_validate_gate_cases", lambda state, cases, **kwargs: cases
+    )
+    state = _state(acceptance_paired_min_cases=2, reflection_minibatch_id="batch")
+    updated, outcomes, comparison = run._evaluate_gate_cases(state, ["a", "b"])
+    assert updated == state
+    assert not outcomes
+    assert comparison["reason_code"] == "paired_evidence_missing"
+    assert comparison["verdict"] == "inconclusive"
+    assert comparison["selectable"] is False
+    assert comparison["improved"] is False

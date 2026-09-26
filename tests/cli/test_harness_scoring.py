@@ -58,7 +58,10 @@ async def evaluate(case):
             json.dumps(
                 {"name": name, "inputs": "WITHHELD_INPUT", "expected_output": "good"}
             )
-            for name in ("WITHHELD_ALPHA", "WITHHELD_BETA")
+            for name in (
+                ["WITHHELD_ALPHA", "WITHHELD_BETA"]
+                + ([] if metered else [f"WITHHELD_{i}" for i in range(8)])
+            )
         )
         + "\n"
     )
@@ -131,12 +134,17 @@ def test_only_harness_scores_and_results_preserve_continue_contract(
         outcome = original(**kwargs)
         if kwargs.get("dataset_role") == "validation":
             print(f"Private evaluator diagnostic: {path} WITHHELD_ALPHA 0.723456789")
-            scores = [0.723456789, 0.876543211] if verdict == "improved" else [0.0, 0.0]
+            scores = [
+                (0.723456789 if index % 2 == 0 else 0.876543211)
+                if verdict == "improved"
+                else 0.0
+                for index in range(len(outcome.records))
+            ]
             outcome.records[:] = [
                 replace(record, score=score)
                 for record, score in zip(outcome.records, scores)
             ]
-            outcome.summary["mean_score"] = sum(scores) / 2
+            outcome.summary["mean_score"] = sum(scores) / len(scores)
         return outcome
 
     monkeypatch.setattr(run_module, "run_eval_once", evaluate)
@@ -327,11 +335,11 @@ def test_private_helpers_require_harness_environment_even_with_cached_evidence(h
     _, run_id, _ = heldout
     state = run_module._load_state(run_id)
     assert state.heldout_required and state.best_validation_samples
+    assert state.restore_validation_evidence().best_validation_per_case_scores == {}
     row = ParetoLog(run_id).validation_rows()[0]
     for call in (
         lambda: run_module._ensure_validation_seed(state),
         lambda: run_module._confirm_validation_candidate(state),
-        lambda: state.restore_validation_evidence(),
         lambda: _row_outcome(state, row, 1, state.threshold),
         # Reach the capability guard with a current lane-layout state; this
         # fixture otherwise represents a single-checkout run.

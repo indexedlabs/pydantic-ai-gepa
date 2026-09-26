@@ -139,7 +139,7 @@ def test_deterministic_repetitions_can_accept() -> None:
 
 
 def test_paired_comparison_uses_matching_case_differences() -> None:
-    baseline = {"a": 0.1, "b": 0.3, "c": 0.7, "d": 0.8}
+    baseline = {str(i): i / 20 for i in range(10)}
     candidate = {key: value + 0.1 for key, value in reversed(list(baseline.items()))}
     comparison = compare_candidate_samples(
         [mean(baseline.values())],
@@ -151,14 +151,16 @@ def test_paired_comparison_uses_matching_case_differences() -> None:
     assert comparison.delta == pytest.approx(0.1)
     assert comparison.standard_error == pytest.approx(0.0, abs=1e-15)
     assert comparison.method == "paired_t"
-    assert comparison.degrees_of_freedom == 3
-    assert comparison.paired_case_count == 4
+    assert comparison.degrees_of_freedom == 9
+    assert comparison.paired_case_count == 10
 
 
 @pytest.mark.parametrize(
     "baseline,candidate",
     [
         ({"a": 0.4, "b": 0.5}, None),
+        ({}, {}),
+        ({}, {"a": 0.5}),
         ({"a": 0.4}, {"a": 0.5}),
         ({"a": 0.4, "b": 0.5}, {"a": 0.4, "c": 0.5}),
     ],
@@ -167,13 +169,16 @@ def test_paired_comparison_rejects_missing_or_unmatched_cases(
     baseline: dict[str, float],
     candidate: dict[str, float] | None,
 ) -> None:
-    with pytest.raises(ValueError, match="Paired"):
-        compare_candidate_samples(
-            [0.4],
-            [0.5],
-            paired_baseline_scores=baseline,
-            paired_candidate_scores=candidate,
-        )
+    comparison = compare_candidate_samples(
+        [0.4], [0.5], paired_baseline_scores=baseline, paired_candidate_scores=candidate
+    )
+    assert comparison.verdict == "inconclusive"
+    assert not comparison.improved
+    assert comparison.reason_code in {
+        "paired_evidence_missing",
+        "paired_cases_mismatched",
+        "paired_insufficient_cases",
+    }
 
 
 @pytest.mark.parametrize("max_looks", [0, -1, 1.5])
@@ -244,3 +249,34 @@ def test_seeded_paired_single_repetition_simulations() -> None:
     print(
         f"paired cases={cases}: false promotion={rates[0.0]:.3f}, power(+0.2)={rates[0.2]:.3f}; n={trials}"
     )
+
+
+@pytest.mark.parametrize("count", [2, 9, 10, 20])
+def test_zero_spread_requires_ten_paired_cases(count):
+    comparison = compare_candidate_samples(
+        [0.4],
+        [0.6],
+        paired_baseline_scores={str(i): 0.4 for i in range(count)},
+        paired_candidate_scores={str(i): 0.6 for i in range(count)},
+    )
+    assert comparison.improved is (count >= 10)
+    if count < 10:
+        assert comparison.verdict == "inconclusive"
+        assert comparison.reason_code == "paired_zero_spread_insufficient_cases"
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize("aggregate", [False, True])
+def test_paired_nonfinite_scores_are_inconclusive(value, aggregate):
+    import json
+
+    comparison = compare_candidate_samples(
+        [0.4],
+        [value if aggregate else 0.6],
+        paired_baseline_scores={"a": 0.4, "b": 0.4},
+        paired_candidate_scores={"a": value, "b": 0.6},
+    )
+    assert comparison.verdict == "inconclusive"
+    assert comparison.reason_code == "paired_scores_non_finite"
+    assert not comparison.improved
+    json.dumps(comparison.to_dict(), allow_nan=False)
