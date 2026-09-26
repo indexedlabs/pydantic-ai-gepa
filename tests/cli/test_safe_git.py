@@ -1,6 +1,7 @@
 """Executable Git configuration must never cross the held-out boundary."""
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import shlex
@@ -520,8 +521,19 @@ def test_heldout_lane_start_uses_owned_repositories(
             )
         assert result.exit_code == 0, (result.output, result.exception)
         poison(path, git_repo.parent / (git_repo.name + "-" + lane + "-hook"))
+    # Reflector evidence is outside the harness-owned ledgers and survives select.
+    lane_ledgers = {
+        lane: git_repo / ".gepa/runs" / run_id / "lanes" / lane / "pareto.jsonl"
+        for lane in ("lane-1", "lane-2")
+    }
+    before = {lane: path.read_bytes() for lane, path in lane_ledgers.items()}
+    assert all(len(raw.splitlines()) == 3 for raw in before.values())
+    harness_rows = (git_repo / ".gepa/runs" / run_id / "pareto.jsonl").read_text()
+    assert all(json.loads(row)["lane"] is None for row in harness_rows.splitlines())
     result = _run("-G", str(git_repo / ".gepa"), "run", "select", "--run-id", run_id)
     assert result.exit_code == 0, (result.output, result.exception)
+    assert "restored from the harness record" not in result.output
+    assert {lane: path.read_bytes() for lane, path in lane_ledgers.items()} == before
     assert _run_payload(result.output)["best_commit_sha"] == candidate_sha
     # Reflector-written training rows cannot exhaust the private harness budget.
     assert _run_payload(result.output)["status"] == "running"

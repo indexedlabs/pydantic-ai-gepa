@@ -725,6 +725,13 @@ In the managed loop,
 until it either pauses for reflection or reaches `status=done`. In one-off
 `gepa eval`, exceeding the cap exits with code 70.
 
+For held-out lane runs, `max_iterations` and `max_token_cost` bound only harness
+baseline, rebaseline, validation and confirmation evaluations. Reflector training
+spend is outside the run's cap. Lane training writes `pareto.jsonl`, `vectors.jsonl`
+and `spend.jsonl` under `runs/<run>/lanes/<lane>/`; these survive select and remain
+available to reflectors. The main run ledgers are harness-owned views and must not
+be edited. Their forged-state refusal and restoration remain in force.
+
 ## Parallel reflection lanes
 
 Use lanes when you want to explore several independent reflection directions

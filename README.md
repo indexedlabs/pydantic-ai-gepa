@@ -742,8 +742,15 @@ tighter one-off cap stops that eval without finalizing the managed run.
 Unpriced or unmetered work under a one-off cap also invalidates a managed run's
 own cap and finalizes it with the fail-closed reason.
 
-The run's locked `spend.jsonl` ledger checkpoints training-side deltas after each
-response. Validation response checkpoints stay beside the private validation
+In held-out lane runs, `max_iterations` and `max_token_cost` bound only harness-side
+baseline, rebaseline, validation and confirmation evaluations. Reflector training
+spend is outside the run's cap. Its Pareto, vector and spend ledgers live under
+`runs/<run>/lanes/<lane>/`, so selecting a candidate preserves that evidence and
+does not mistake it for a forged harness record. The main run ledgers remain
+harness-owned; edits to those public views still trigger refusal and restoration.
+
+The run's locked `spend.jsonl` ledger checkpoints harness-side training deltas
+after each response. Validation response checkpoints stay beside the private validation
 evidence outside checkouts; the workspace receives one aggregate row when a
 validation eval ends. Budget checks include all private checkpoints. Public
 reports withhold live validation spend and tokens with `validation_in_progress: true`,

@@ -109,6 +109,7 @@ from .runs import (
     utc_now_iso,
 )
 from .store import ComponentStore
+from .lane_ledger import lane_training_evaluation
 from .spend import evaluation_spend, spend_report, validate_cap
 from ..vector_acceptance import (
     VectorRecord,
@@ -397,6 +398,7 @@ def _write_trace_file(
 
 @private_evaluation
 @serialized_eval
+@lane_training_evaluation
 def run_eval_once(
     *,
     candidate_file: Path | None,

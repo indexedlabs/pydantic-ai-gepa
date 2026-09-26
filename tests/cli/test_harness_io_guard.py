@@ -10,7 +10,7 @@ import ast
 from collections import Counter
 from pathlib import Path
 
-MODULES = "harness eval select run runs spend lanes reflector events front pareto notes reflector_recovery".split()
+MODULES = "harness eval select run runs spend lanes lane_ledger reflector events front pareto notes reflector_recovery".split()
 OPERATIONS = {
     "write_text",
     "write_bytes",
@@ -93,6 +93,10 @@ class Inventory(ast.NodeVisitor):
 # Each reason describes the branch containing precisely these call counts.
 # Moving/removing a guard still requires review; adding raw calls fails this test.
 ALLOWLIST = {
+    "lane_ledger.lane_training_evaluation.wrapped": (
+        "Reflector-only public state lookup after refusing any held-out capability; cannot read as the harness.",
+        {"state.read_text": 1},
+    ),
     "reflector_recovery.cleanup_continuation": (
         "Deletes private replay evidence outside GEPA_DIR, never public artifacts.",
         {"path.unlink": 1},

@@ -25,7 +25,8 @@ from ..spend import (
     SpendCategory,
     rollout_spend,
 )
-from .layout import repo_root, run_dir, run_state_path
+from .layout import repo_root, run_state_path
+from .lane_ledger import directory as ledger_directory, active as lane_training_active
 from . import harness_record
 from .validation import public_echo
 
@@ -93,7 +94,7 @@ def _validation_owners(directory: Path) -> dict[str, int]:
 def _rows(
     run_id: str, root: Path | None, warnings: dict[str, Any] | None = None
 ) -> list[dict[str, Any]]:
-    directory = run_dir(run_id, root)
+    directory = ledger_directory(run_id, root)
     rows = _read_rows(directory / "spend.jsonl", warnings)
     pointer = directory / "validation-spend-registered"
     if harness_record.exists(pointer, root=root):
@@ -195,7 +196,7 @@ def _report(rows: list[dict[str, Any]], cap: float | None) -> dict[str, Any]:
 def spend_report(
     run_id: str, root: Path | None = None, cap: float | None = None
 ) -> dict[str, Any]:
-    with _lock(run_dir(run_id, root) / "spend.lock"):
+    with _lock(ledger_directory(run_id, root) / "spend.lock"):
         warnings: dict[str, Any] = {}
         return dict(_report(_rows(run_id, root, warnings), cap), **warnings)
 
@@ -216,7 +217,7 @@ def _reservations(run_id: str, root: Path | None) -> dict[str, Any]:
     """Read under spend.lock; dead owners no longer reserve future work."""
     from .lanes import _pid_alive
 
-    path = run_dir(run_id, root) / "spend-reservations.json"
+    path = ledger_directory(run_id, root) / "spend-reservations.json"
     reservations = (
         json.loads(harness_record.read_text(path))
         if harness_record.exists(path)
@@ -268,7 +269,9 @@ def _save_reservations(
         for key, value in reservations.items()
         if value.get("kind") != "validation"
     }
-    _write_reservations(run_dir(run_id, root) / "spend-reservations.json", public_rows)
+    _write_reservations(
+        ledger_directory(run_id, root) / "spend-reservations.json", public_rows
+    )
     if private is not None:
         _write_reservations(
             private,
@@ -376,7 +379,7 @@ class EvalSpendMeter(SpendMeter):
                     }
                     for name, usage in current[field].items()
                 }
-            directory = run_dir(self.run_id, self.root)
+            directory = ledger_directory(self.run_id, self.root)
             with _lock(directory / "spend.lock"):
                 path = self.private_path or directory / "spend.jsonl"
                 if not harness_record.write_text(
@@ -396,10 +399,10 @@ class EvalSpendMeter(SpendMeter):
         if self.private_path is not None:
             # Publish once per validation eval. The private deltas remain the
             # authority until this aggregate exists, including after a crash.
-            with _lock(run_dir(self.run_id, self.root) / "spend.lock"):
+            with _lock(ledger_directory(self.run_id, self.root) / "spend.lock"):
                 row = dict(self._saved, eval_id=self.eval_id, kind=self.kind)
                 row.pop("max_rollout_dollars")
-                path = run_dir(self.run_id, self.root) / "spend.jsonl"
+                path = ledger_directory(self.run_id, self.root) / "spend.jsonl"
                 if not harness_record.write_text(
                     path, json.dumps(row) + "\n", root=self.root, append=True
                 ):
@@ -428,7 +431,7 @@ class EvalSpendMeter(SpendMeter):
     def _check_shared(self, *, after_response: bool = False) -> None:
         if self.run_cap is None:
             return
-        with _lock(run_dir(self.run_id, self.root) / "spend.lock"):
+        with _lock(ledger_directory(self.run_id, self.root) / "spend.lock"):
             rows = _rows(self.run_id, self.root)
             report = _report(rows, self.run_cap)
             other = _reserved_other(
@@ -472,7 +475,7 @@ class EvalSpendMeter(SpendMeter):
         self.check()
         if self.run_cap is None:
             return True
-        with _lock(run_dir(self.run_id, self.root) / "spend.lock"):
+        with _lock(ledger_directory(self.run_id, self.root) / "spend.lock"):
             rows = _rows(self.run_id, self.root)
             reservations = _reservations(self.run_id, self.root)
             spent = sum(row["total_dollars"] for row in rows)
@@ -607,7 +610,7 @@ def evaluation_spend(
     path = run_state_path(run_id, root)
     managed = (
         RunState.from_dict(json.loads(harness_record.read_text(path)))
-        if harness_record.exists(path)
+        if not lane_training_active(run_id) and harness_record.exists(path)
         else None
     )
     if managed and managed.max_token_cost is not None:
@@ -652,7 +655,7 @@ def evaluation_spend(
 
     def register_private_path() -> None:
         if validation_spend_path is not None:
-            pointer = run_dir(run_id, root) / "validation-spend-registered"
+            pointer = ledger_directory(run_id, root) / "validation-spend-registered"
             if not harness_record.exists(pointer, root=root):
                 if not harness_record.write_text(pointer, "registered\n", root=root):
                     temporary = pointer.with_suffix(".tmp")
@@ -668,15 +671,16 @@ def evaluation_spend(
                 with validation_spend_path.open("a") as handle:
                     handle.flush()
                     os.fsync(handle.fileno())
-            owners = _validation_owners(run_dir(run_id, root))
+            owners = _validation_owners(ledger_directory(run_id, root))
             if eval_id not in owners:
                 owners[eval_id] = os.getpid()
                 _write_reservations(
-                    run_dir(run_id, root) / "validation-spend-owners.json", owners
+                    ledger_directory(run_id, root) / "validation-spend-owners.json",
+                    owners,
                 )
 
     try:
-        with _lock(run_dir(run_id, root) / "spend.lock"):
+        with _lock(ledger_directory(run_id, root) / "spend.lock"):
             try:
                 rows = _rows(run_id, root)
             except json.JSONDecodeError:
@@ -743,19 +747,19 @@ def evaluation_spend(
             # Missing accounting invalidates the managed cap too, even when
             # this particular eval requested a tighter one-off limit.
             own_cap = meter.persist_stop = True
-        with _lock(run_dir(run_id, root) / "spend.lock"):
+        with _lock(ledger_directory(run_id, root) / "spend.lock"):
             register_private_path()
         meter.stop_reason = exc.stop_reason
         meter.finish()
         # Only terminal state/report emission is serialized, never paid work.
-        with _lock(run_dir(run_id, root) / "spend-finalize.lock"):
+        with _lock(ledger_directory(run_id, root) / "spend-finalize.lock"):
             latest = (
                 RunState.from_dict(json.loads(harness_record.read_text(path)))
                 if harness_record.exists(path)
                 else None
             )
             terminal = latest if latest and latest.status == "done" else state or latest
-            if own_cap:
+            if own_cap and not lane_training_active(run_id):
                 _finish_cost_stop(run_id, root, terminal, exc.stop_reason, cap)
             else:
                 public_echo(
@@ -771,7 +775,7 @@ def evaluation_spend(
         if admitted:
             meter.finish()
         if admitted and cap is not None:
-            with _lock(run_dir(run_id, root) / "spend.lock"):
+            with _lock(ledger_directory(run_id, root) / "spend.lock"):
                 reservations = _reservations(run_id, root)
                 reservations.pop(eval_id, None)
                 _save_reservations(run_id, root, reservations)

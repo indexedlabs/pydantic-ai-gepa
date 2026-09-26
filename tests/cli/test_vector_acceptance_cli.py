@@ -378,6 +378,13 @@ def test_vector_validation_uses_comparator_ranking_without_persisting_detail(
     )
 
     assert selected.exit_code == 0, selected.output
+    assert "restored from the harness record" not in selected.output
+    assert all(
+        (
+            vector_repo / ".gepa/runs" / run_id / "lanes" / lane / "vectors.jsonl"
+        ).read_text()
+        for lane in resolved
+    )
     final = RunState.from_dict(
         json.loads((vector_repo / ".gepa" / "runs" / run_id / "state.json").read_text())
     )

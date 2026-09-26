@@ -1478,7 +1478,21 @@ def _run_lane_eval_loop(
                     )
                 current = VectorRecord.from_dict(raw_record)
                 store = VectorRecordStore(vector_records_path(run_id, workspace_root))
-                candidate_records = tuple(store.matching(current.key))
+                # Baseline vectors are harness-written; the candidate's vectors
+                # live in its public lane ledger in held-out runs.
+                from .lane_ledger import training_directory
+                from .validation import heldout_dataset
+
+                candidate_store = (
+                    VectorRecordStore(
+                        training_directory(run_id, lane, workspace_root)
+                        / "vectors.jsonl"
+                    )
+                    if run_state.heldout_required
+                    and not heldout_dataset(required=False)
+                    else store
+                )
+                candidate_records = tuple(candidate_store.matching(current.key))
                 from dataclasses import replace
 
                 incumbent_records = tuple(

@@ -1112,12 +1112,19 @@ async def evaluate(case):
             "out_secret-holdout.txt": "v\n",
         },
     )
+    lane_spend = lane_repo / ".gepa/runs" / run_id / "lanes/lane-1/spend.jsonl"
+    lane_rows = lane_spend.read_bytes()
+    assert sum(
+        json.loads(line)["total_dollars"] for line in lane_rows.splitlines()
+    ) == pytest.approx(0.045)
     before = spend_report(run_id, lane_repo)
     # The private ledger counts only harness-authorized evaluations. The lane's
     # three training repetitions cannot add their public $0.045 to that ledger.
     assert before["total_dollars"] == pytest.approx(0.36)
     selected = test_select_cli._select(lane_repo, run_id)
     assert selected.exit_code == 70, selected.output
+    assert "restored from the harness record" not in selected.output
+    assert lane_spend.read_bytes() == lane_rows
     state = test_select_cli._state(lane_repo, run_id)
     assert state.status == "done"
     assert state.best_candidate_id == incumbent

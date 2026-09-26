@@ -561,12 +561,16 @@ def traces_dir(run_id: str, case_id: str, root: Path | None = None) -> Path:
 
 
 def pareto_log_path(run_id: str, root: Path | None = None) -> Path:
-    return run_dir(run_id, root) / "pareto.jsonl"
+    from .lane_ledger import directory
+
+    return directory(run_id, root) / "pareto.jsonl"
 
 
 def vector_records_path(run_id: str, root: Path | None = None) -> Path:
     """Append-only assertion-vector rollout records for a managed run."""
-    return run_dir(run_id, root) / "vectors.jsonl"
+    from .lane_ledger import directory
+
+    return directory(run_id, root) / "vectors.jsonl"
 
 
 def probe_receipts_dir(run_id: str, root: Path | None = None) -> Path:
