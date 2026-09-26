@@ -898,6 +898,7 @@ def test_harness_pass_env_requires_a_present_variable(tmp_path, monkeypatch):
             "feedback": None,
             "failed": False,
             "cached": False,
+            "material": None,
         },
         {
             "type": "result",
@@ -905,6 +906,7 @@ def test_harness_pass_env_requires_a_present_variable(tmp_path, monkeypatch):
             "feedback": None,
             "failed": False,
             "cached": False,
+            "material": None,
         },
         {
             "type": "result",
@@ -912,6 +914,7 @@ def test_harness_pass_env_requires_a_present_variable(tmp_path, monkeypatch):
             "feedback": {},
             "failed": False,
             "cached": False,
+            "material": None,
         },
         {
             "type": "result",
@@ -919,6 +922,7 @@ def test_harness_pass_env_requires_a_present_variable(tmp_path, monkeypatch):
             "feedback": None,
             "failed": False,
             "cached": False,
+            "material": None,
             "path": "/tmp/leak",
         },
     ],
@@ -935,6 +939,7 @@ def test_validation_discards_feedback():
         "feedback": "secret",
         "failed": False,
         "cached": False,
+        "material": None,
     }
     record = sandbox._result(raw, "case", True)
     assert record.feedback is None

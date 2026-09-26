@@ -24,6 +24,7 @@ import sys
 import tempfile
 import time
 from typing import Any, Iterator
+from uuid import uuid4
 
 import typer
 from pydantic_ai.messages import ModelResponse
@@ -33,6 +34,12 @@ from ..evaluation import EvaluationRecord
 from ..types import RolloutOutput
 from .layout import GepaConfig, git_root
 from .scoring_proxy import allowed_addresses, connect_proxy
+from .scoring_material import (
+    MaterialBudget,
+    checked_json,
+    collect_files,
+    structured_payload,
+)
 from .validation import heldout_dataset
 
 from .safe_git import SafeGit, safe_repository, unsafe_checkout_component
@@ -291,7 +298,7 @@ def private_checkout(
     os.chmod(storage, 0o700)
     repository = git_root(project)
     prefix = project.resolve().relative_to(repository)
-    with tempfile.TemporaryDirectory(dir=storage) as temporary:
+    with _private_temporary(storage) as temporary:
         base = Path(temporary)
         checkout, scratch = base / "checkout", base / "scratch"
         checkout.mkdir(mode=0o700)
@@ -310,6 +317,39 @@ def private_checkout(
                 "Cannot create private candidate checkout."
             ) from None
         yield private, checkout / prefix, scratch
+
+
+@contextmanager
+def _private_temporary(storage: Path) -> Iterator[str]:
+    temporary = tempfile.mkdtemp(dir=storage)
+    try:
+        yield temporary
+    finally:
+        # Even deletion must not enumerate validation output in the harness.
+        # A trusted isolated janitor removes the entire retired phase tree,
+        # after worker/descendant termination, without returning any bytes.
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    "-c",
+                    "import shutil, sys; shutil.rmtree(sys.argv[1])",
+                    temporary,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+                close_fds=True,
+            )
+            if result.returncode:
+                raise OSError
+        except (OSError, subprocess.TimeoutExpired):
+            raise ScoringSandboxError(
+                "Cannot retire private scoring storage."
+            ) from None
 
 
 def _checkout_entries(
@@ -553,7 +593,7 @@ def _number(value: Any, *, integer: bool = False) -> float:
 
 def _result(raw: dict[str, Any], case_id: str, validation: bool) -> EvaluationRecord:
     if (
-        set(raw) != {"type", "score", "feedback", "failed", "cached"}
+        set(raw) != {"type", "score", "feedback", "failed", "cached", "material"}
         or raw["type"] != "result"
     ):
         raise ScoringSandboxError("Invalid scoring result shape.")
@@ -566,11 +606,52 @@ def _result(raw: dict[str, Any], case_id: str, validation: bool) -> EvaluationRe
     ):
         raise ScoringSandboxError("Invalid scoring feedback.")
     payload: dict[str, Any] = {}
+    if not validation:
+        try:
+            payload["sandbox_material"] = structured_payload(raw["material"])
+        except (ValueError, UnicodeError, RecursionError):
+            payload["sandbox_material_refused"] = True
     if raw["failed"]:
         payload["output"] = RolloutOutput.from_error(
             RuntimeError("Sandboxed evaluation failed"), kind="system"
         )
     return EvaluationRecord(case_id, score, None if validation else feedback, payload)
+
+
+@contextmanager
+def _case_output(scratch: Path, validation: bool) -> Iterator[tuple[Path, int | None]]:
+    name = "output-" + uuid4().hex
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    scratch_fd = os.open(scratch, flags)
+    output_fd = None
+    try:
+        os.mkdir(name, mode=0o700, dir_fd=scratch_fd)
+        if not validation:
+            output_fd = os.open(name, flags, dir_fd=scratch_fd)
+        yield scratch / name, output_fd
+    finally:
+        if output_fd is not None:
+            os.close(output_fd)
+        os.close(scratch_fd)
+
+
+def _training_material(
+    record: EvaluationRecord, fd: int, budget: MaterialBudget
+) -> None:
+    payload = record.payload
+    case_used = 0
+    material = payload.get("sandbox_material")
+    if material is not None:
+        size = len(checked_json(material).encode())
+        if budget.charge(size, case_used):
+            case_used += size
+        else:
+            payload.pop("sandbox_material")
+            payload["sandbox_material_refused"] = True
+    files, refused = collect_files(fd, budget, case_used, case_id=record.case_id)
+    payload["sandbox_files"] = files
+    if refused or payload.get("sandbox_material_refused"):
+        payload["sandbox_material_refused"] = True
 
 
 def _process_cleanup(scratch: Path) -> Any:
@@ -664,63 +745,78 @@ def score_cases(
 
             async def evaluate() -> list[EvaluationRecord]:
                 records = []
+                budget = MaterialBudget()
                 for case in cases:
                     async with meter.rollout():
-                        channel.send(
-                            {
-                                "name": case.name,
-                                "inputs": case.inputs,
-                                "expected_output": case.expected_output,
-                                "metadata": case.metadata,
-                            }
-                        )
-                        while True:
-                            raw = channel.receive()
-                            if raw.get("type") != "usage":
-                                record = _result(raw, case.name, validation)
-                                if raw["cached"]:
-                                    meter.declare_cached_rollout()
-                                if not raw["failed"]:
-                                    meter.callable_completed()
-                                records.append(record)
-                                break
-                            if set(raw) != {
-                                "type",
-                                "dollars",
-                                "input_tokens",
-                                "output_tokens",
-                            }:
-                                raise ScoringSandboxError(
-                                    "Invalid scoring usage shape."
-                                )
-                            dollars = raw["dollars"]
-                            if dollars is not None and _number(dollars) < 0:
-                                raise ScoringSandboxError("Invalid scoring cost.")
-                            input_tokens = _number(raw["input_tokens"], integer=True)
-                            output_tokens = _number(raw["output_tokens"], integer=True)
-
-                            def price(_response: Any) -> float:
-                                if dollars is None:
-                                    raise ValueError(
-                                        "Sandboxed response price unavailable"
-                                    )
-                                return dollars
-
-                            meter.price_fn = price
-                            # Model names are candidate-controlled strings. Publish
-                            # a fixed bucket, never a validation input hidden in one.
-                            meter.record(
-                                "rollout",
-                                ModelResponse(
-                                    parts=[],
-                                    model_name="sandbox",
-                                    usage=RequestUsage(
-                                        input_tokens=int(input_tokens),
-                                        output_tokens=int(output_tokens),
-                                    ),
-                                ),
+                        with _case_output(scratch, validation) as (
+                            output_dir,
+                            output_fd,
+                        ):
+                            channel.send(
+                                {
+                                    "case": {
+                                        "name": case.name,
+                                        "inputs": case.inputs,
+                                        "expected_output": case.expected_output,
+                                        "metadata": case.metadata,
+                                    },
+                                    "output_dir": str(output_dir),
+                                }
                             )
-                            channel.send({"type": "ack"})
+                            while True:
+                                raw = channel.receive()
+                                if raw.get("type") != "usage":
+                                    record = _result(raw, case.name, validation)
+                                    if not validation:
+                                        assert output_fd is not None
+                                        _training_material(record, output_fd, budget)
+                                    if raw["cached"]:
+                                        meter.declare_cached_rollout()
+                                    if not raw["failed"]:
+                                        meter.callable_completed()
+                                    records.append(record)
+                                    break
+                                if set(raw) != {
+                                    "type",
+                                    "dollars",
+                                    "input_tokens",
+                                    "output_tokens",
+                                }:
+                                    raise ScoringSandboxError(
+                                        "Invalid scoring usage shape."
+                                    )
+                                dollars = raw["dollars"]
+                                if dollars is not None and _number(dollars) < 0:
+                                    raise ScoringSandboxError("Invalid scoring cost.")
+                                input_tokens = _number(
+                                    raw["input_tokens"], integer=True
+                                )
+                                output_tokens = _number(
+                                    raw["output_tokens"], integer=True
+                                )
+
+                                def price(_response: Any) -> float:
+                                    if dollars is None:
+                                        raise ValueError(
+                                            "Sandboxed response price unavailable"
+                                        )
+                                    return dollars
+
+                                meter.price_fn = price
+                                # Model names are candidate-controlled strings. Publish
+                                # a fixed bucket, never a validation input hidden in one.
+                                meter.record(
+                                    "rollout",
+                                    ModelResponse(
+                                        parts=[],
+                                        model_name="sandbox",
+                                        usage=RequestUsage(
+                                            input_tokens=int(input_tokens),
+                                            output_tokens=int(output_tokens),
+                                        ),
+                                    ),
+                                )
+                                channel.send({"type": "ack"})
                 return records
 
             return asyncio.run(evaluate())
