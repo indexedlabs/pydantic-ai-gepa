@@ -775,7 +775,10 @@ def test_paired_validation_recovers_private_evidence_and_incumbent(
         calls.append("validation" if private else "training")
         return [
             EvaluationRecord(
-                case.name, (0.7 if proposed else 0.2) + index * 0.1, None, {}
+                case.name,
+                (0.7 + index * 0.11 if proposed else 0.2 + index * 0.1),
+                None,
+                {},
             )
             for index, case in enumerate(kwargs["dataset"])
         ]
@@ -842,10 +845,10 @@ def test_paired_validation_recovers_private_evidence_and_incumbent(
     assert after[: len(before)] == before
     assert len(after) == 5
     state = run_module._load_state(run_id).restore_validation_evidence()
-    assert state.best_validation_samples == (pytest.approx(0.75),)
+    assert state.best_validation_samples == (pytest.approx(0.755),)
     assert state.best_validation_per_case_scores == {
         "secret-paired-0": pytest.approx(0.7),
-        "secret-paired-1": pytest.approx(0.8),
+        "secret-paired-1": pytest.approx(0.81),
     }
     packet = _packet(validation_repo, run_id)
     assert "secret-paired" not in json.dumps(packet)
@@ -1106,8 +1109,10 @@ def test_private_replay_snapshots_removed_after_completion_or_abandonment(
 
     async def paired_evaluator(**kwargs):
         return [
-            EvaluationRecord(case.name, 0.7 if proposed else 0.2, None, {})
-            for case in kwargs["dataset"]
+            EvaluationRecord(
+                case.name, 0.7 + index * 0.01 if proposed else 0.2, None, {}
+            )
+            for index, case in enumerate(kwargs["dataset"])
         ]
 
     monkeypatch.setattr(eval_module, "evaluate_callable_dataset", paired_evaluator)

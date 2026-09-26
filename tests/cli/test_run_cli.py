@@ -842,16 +842,26 @@ def test_managed_run_prints_final_report_at_max_iterations(repo: Path) -> None:
     assert "GEPA Run Final Report" in done.output
 
 
+@pytest.mark.parametrize(
+    "mismatch", [None, "training", "validation", "missing_training"]
+)
 def test_paired_config_drives_single_repetition_promotion(
-    repo: Path, monkeypatch: pytest.MonkeyPatch
+    repo: Path, monkeypatch: pytest.MonkeyPatch, mismatch: str | None
 ) -> None:
     from pydantic_ai_gepa.cli import eval as eval_module
     from pydantic_ai_gepa.cli.store import ComponentStore
 
     validation = [
-        {"name": "held-out-a", "inputs": "?", "expected_output": "a"},
-        {"name": "held-out-b", "inputs": "?", "expected_output": "b"},
+        {"name": f"held-out-{i}", "inputs": "?", "expected_output": "a"}
+        for i in range(10)
     ]
+    (repo / ".gepa/dataset.jsonl").write_text(
+        "".join(
+            json.dumps({"name": f"training-{i}", "inputs": "?", "expected_output": "a"})
+            + "\n"
+            for i in range(10)
+        )
+    )
     validation_path = repo.parent / "validation.jsonl"
     validation_path.write_text("\n".join(json.dumps(row) for row in validation) + "\n")
     config = repo / ".gepa" / "gepa.toml"
@@ -863,7 +873,11 @@ def test_paired_config_drives_single_repetition_promotion(
         improved = kwargs["candidate"]["instructions"].text == "Improved prompt"
         return [
             EvaluationRecord(
-                case_id=case.name,
+                case_id=("different-" + case.name)
+                if improved
+                and mismatch
+                == ("validation" if case.name.startswith("held-out") else "training")
+                else case.name,
                 score=0.6 if improved else 0.4,
                 feedback="Synthetic feedback",
                 payload={},
@@ -879,32 +893,49 @@ def test_paired_config_drives_single_repetition_promotion(
                     assert case["name"].encode() not in contents, artifact
 
     monkeypatch.setattr(eval_module, "evaluate_candidate_dataset", evaluate)
-    started = _run("run", "start", "--size", "2", "--max-iterations", "6")
+    started = _run("run", "start", "--size", "10", "--max-iterations", "6")
     assert started.exit_code == 0, (started.output, started.exception)
     start_payload = _run_payload(started.output)
     assert start_payload["acceptance_paired_min_cases"] == 2
-    assert start_payload["reflection_baseline_samples"] == [0.4]
-    assert start_payload["best_validation_samples"] == [0.4]
+    assert start_payload["reflection_baseline_samples"] == pytest.approx([0.4])
+    assert start_payload["best_validation_samples"] == pytest.approx([0.4])
     assert "best_validation_per_case_scores" not in start_payload
     for case in validation:
         assert case["name"] not in started.output
     run_id = str(start_payload["run_id"])
     seed_state = _load_state(run_id).restore_validation_evidence()
     assert seed_state.best_validation_per_case_scores == {
-        "held-out-a": 0.4,
-        "held-out-b": 0.4,
+        case["name"]: 0.4 for case in validation
     }
     assert_validation_ids_withheld()
     ComponentStore().write("instructions", "Improved prompt")
+    if mismatch == "missing_training":
+        from pydantic_ai_gepa.cli import run as run_module
+
+        monkeypatch.setattr(run_module, "_reflection_case_scores", lambda *a, **k: {})
     result = scored_continue(
         "run", "continue", "--run-id", str(start_payload["run_id"])
     )
     assert result.exit_code == 0, (result.output, result.exception)
     state = _load_state(str(start_payload["run_id"])).restore_validation_evidence()
-    assert state.best_validation_samples == (0.6,)
+    if mismatch:
+        assert state.best_candidate_id == seed_state.best_candidate_id
+        assert state.last_comparison["verdict"] == "inconclusive"
+        assert state.last_comparison["reason_code"] == (
+            "paired_evidence_missing"
+            if mismatch == "missing_training"
+            else "paired_cases_mismatched"
+        )
+        assert state.last_comparison["selectable"] is False
+        assert state.last_comparison["improved"] is False
+        status = _run("run", "status", "--run-id", state.run_id)
+        assert status.exit_code == 0, status.output
+        assert _run_payload(status.output)["last_comparison"] == state.last_comparison
+        assert_validation_ids_withheld()
+        return
+    assert state.best_validation_samples == pytest.approx((0.6,))
     assert state.best_validation_per_case_scores == {
-        "held-out-a": 0.6,
-        "held-out-b": 0.6,
+        case["name"]: 0.6 for case in validation
     }
     assert state.validation_evaluations == 2
     for case in validation:
@@ -939,3 +970,269 @@ def test_reflected_candidate_budget_refusal_records_comparison_and_exits_70(
     assert after.iterations == before.iterations
     assert ParetoLog(run_id).count_rows() == rows_before
     assert _run_payload(result.output)["last_comparison"] == after.last_comparison
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "moved",
+        "changed",
+        "unreadable_dataset",
+        "unreadable_evidence",
+        "corrupt",
+        "invalid_utf8",
+    ],
+)
+@pytest.mark.parametrize("finished", [False, True])
+def test_paired_status_survives_unavailable_private_evidence(
+    repo, monkeypatch, damage, finished
+):
+    import os
+    from pydantic_ai_gepa.cli import run as run_module
+    from pydantic_ai_gepa.cli.validation import validation_evidence_path
+    from pydantic_ai_gepa.cli.store import ComponentStore
+
+    private = repo.parent / f"{repo.name}-private"
+    private.mkdir()
+    dataset = private / "validation.jsonl"
+    dataset.write_text(
+        "".join(
+            json.dumps({**row, "name": "private-" + row["name"]}) + "\n"
+            for row in DATASET
+        )
+    )
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(dataset))
+    started = _run(
+        "run",
+        "start",
+        "--size",
+        "2",
+        "--max-iterations",
+        "8",
+        "--acceptance-paired-min-cases",
+        "2",
+    )
+    assert started.exit_code == 0, (started.output, started.exception)
+    run_id = str(_run_payload(started.output)["run_id"])
+    before = _load_state(run_id).restore_validation_evidence()
+    assert before.best_validation_per_case_scores
+    if finished:
+        replace(before, status="done").save()
+    evidence = validation_evidence_path(str(dataset), project_root=repo, run_id=run_id)
+    assert evidence.parent.stat().st_mode & 0o777 == 0o700
+    if damage == "moved":
+        dataset.rename(private / "moved.jsonl")
+    elif damage == "changed":
+        dataset.write_text(dataset.read_text() + "\n")
+    elif damage in {"unreadable_dataset", "unreadable_evidence"}:
+        if os.geteuid() == 0:
+            pytest.skip("root bypasses file permissions")
+        target = dataset if damage == "unreadable_dataset" else evidence
+        target.chmod(0)
+    elif damage == "invalid_utf8":
+        evidence.write_bytes(b"\xff")
+    else:
+        evidence.write_text('{"scores": "PRIVATE_CORRUPT_DATA"')
+    try:
+        status = _run("run", "status", "--run-id", run_id)
+        assert status.exit_code == 0, status.output
+        restored = _load_state(run_id).restore_validation_evidence()
+        assert restored.best_validation_per_case_scores == {}
+        assert str(dataset) not in status.output
+        assert "PRIVATE_CORRUPT_DATA" not in status.output
+        assert "best_validation_per_case_scores" not in _run_payload(status.output)
+        # The same restore operation clears even evidence already held in memory.
+        assert (
+            before.restore_validation_evidence().best_validation_per_case_scores == {}
+        )
+        if damage in {"moved", "changed", "unreadable_dataset"}:
+            import typer
+            from pydantic_ai_gepa.cli.spend import _rows
+
+            if damage != "changed":
+                assert _run_payload(status.output)["spend"][
+                    "validation_checkpoint_missing"
+                ]
+                with pytest.raises(typer.BadParameter):
+                    _rows(run_id, repo)  # Admission must still fail closed.
+            for evaluate in (
+                run_module._confirm_validation_candidate,
+                run_module._evaluate_validation_candidate,
+                run_module._ensure_validation_seed,
+            ):
+                with pytest.raises(typer.BadParameter):
+                    evaluate(restored)
+        else:
+            updated, outcomes, comparison = run_module._confirm_validation_candidate(
+                restored
+            )
+            assert not outcomes
+            assert comparison["reason_code"] == "incumbent_evidence_missing"
+            assert comparison["improved"] is False
+            assert updated.best_candidate_id == before.best_candidate_id
+        # A public continuation also cannot promote with a missing/changed pin.
+        if not finished and damage in {"moved", "changed", "unreadable_dataset"}:
+            ComponentStore().write("instructions", "Improved prompt")
+            result = scored_continue("run", "continue", "--run-id", run_id)
+            assert result.exit_code != 0, result.output
+            assert str(dataset) not in result.output
+            assert _load_state(run_id).best_candidate_id == before.best_candidate_id
+    finally:
+        if damage in {"unreadable_dataset", "unreadable_evidence"}:
+            target.chmod(0o600)
+
+
+@pytest.mark.parametrize(
+    "blocked", ["parent", "directory", "file", "symlink", "dangling_symlink"]
+)
+def test_paired_start_refuses_unwritable_evidence_before_run_creation(
+    repo, monkeypatch, blocked
+):
+    import os
+    from pydantic_ai_gepa.cli.layout import runs_dir
+
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory permissions")
+    private = repo.parent / f"{repo.name}-private"
+    private.mkdir()
+    dataset = private / "validation.jsonl"
+    dataset.write_text(
+        "".join(
+            json.dumps({**row, "name": "private-" + row["name"]}) + "\n"
+            for row in DATASET
+        )
+    )
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(dataset))
+    directory = private / ".gepa-validation-evidence"
+    if blocked == "directory":
+        directory.mkdir(mode=0o500)
+    elif blocked == "file":
+        directory.write_text("not a directory")
+        directory.chmod(0o640)
+    elif blocked in {"symlink", "dangling_symlink"}:
+        target = private / "target"
+        if blocked == "symlink":
+            target.mkdir(mode=0o750)
+        directory.symlink_to(target, target_is_directory=True)
+    else:
+        private.chmod(0o500)
+    before = set(private.iterdir())
+    mode_before = directory.lstat().st_mode if blocked != "parent" else None
+    target_mode_before = target.stat().st_mode if blocked == "symlink" else None
+    store_before = list(runs_dir(repo).glob("*"))
+    try:
+        result = _run("run", "start", "--acceptance-paired-min-cases", "2")
+        assert result.exit_code == 2, (result.output, result.exception)
+        assert "Cannot write private held-out validation evidence" in result.output
+        assert str(private) not in result.output
+        assert "private path must not escape" not in result.output
+        assert set(private.iterdir()) == before
+        if mode_before is not None:
+            assert directory.lstat().st_mode == mode_before
+        if blocked == "symlink":
+            assert target.stat().st_mode == target_mode_before
+            assert list(target.iterdir()) == []
+        assert list(runs_dir(repo).glob("*")) == store_before
+    finally:
+        if blocked == "directory":
+            directory.chmod(0o700)
+        private.chmod(0o700)
+
+
+def test_small_paired_uniform_gate_loss_skips_full_minibatch(repo, monkeypatch):
+    from pydantic_ai_gepa.cli import eval as eval_module
+    from pydantic_ai_gepa.cli.store import ComponentStore
+
+    cases = [f"case-{i}" for i in range(4)]
+    (repo / ".gepa/dataset.jsonl").write_text(
+        "".join(
+            json.dumps({"name": case, "inputs": "?", "expected_output": "Paris"}) + "\n"
+            for case in cases
+        )
+    )
+    calls = []
+
+    async def evaluate(**kwargs):
+        calls.append([case.name for case in kwargs["dataset"]])
+        worse = kwargs["candidate"]["instructions"].text == "Worse prompt"
+        return [
+            EvaluationRecord(case.name, 0.2 if worse else 0.8, None, {})
+            for case in kwargs["dataset"]
+        ]
+
+    monkeypatch.setattr(eval_module, "evaluate_candidate_dataset", evaluate)
+    started = _run(
+        "run",
+        "start",
+        "--size",
+        "4",
+        "--max-iterations",
+        "8",
+        "--acceptance-paired-min-cases",
+        "2",
+    )
+    assert started.exit_code == 0, started.output
+    run_id = str(_run_payload(started.output)["run_id"])
+    before = ParetoLog(run_id).count_rows()
+    calls.clear()
+    ComponentStore().write("instructions", "Worse prompt")
+    result = _run(
+        "run",
+        "continue",
+        "--run-id",
+        run_id,
+        "--gate-case",
+        cases[0],
+        "--gate-case",
+        cases[1],
+        "--gate-case",
+        cases[2],
+    )
+    assert result.exit_code == 0, result.output
+    comparison = _run_payload(result.output)["last_comparison"]
+    assert comparison["method"] == "paired_t"
+    assert comparison["paired_case_count"] == 3
+    assert comparison["verdict"] == "rejected"
+    assert comparison["rejection_reason"] == "gate"
+    assert "reason_code" not in comparison
+    assert len(calls) == 1 and set(calls[0]) == set(cases[:3])
+    assert ParetoLog(run_id).count_rows() == before
+    assert _load_state(run_id).gate_consumed_iterations == 1
+
+
+def test_welch_inconclusive_reflection_keeps_selectable_output(repo, monkeypatch):
+    from pydantic_ai_gepa.cli import run as run_module
+
+    started = _run(
+        "run",
+        "start",
+        "--size",
+        "2",
+        "--max-iterations",
+        "8",
+        "--acceptance-repetitions",
+        "3",
+        "--acceptance-max-repetitions",
+        "3",
+    )
+    assert started.exit_code == 0, started.output
+    run_id = str(_run_payload(started.output)["run_id"])
+    original = run_module.run_eval_once
+    samples = iter([0.0, 0.5, 1.0])
+
+    def noisy_evaluation(**kwargs):
+        outcome = original(**kwargs)
+        outcome.summary["mean_score"] = next(samples)
+        return outcome
+
+    monkeypatch.setattr(run_module, "run_eval_once", noisy_evaluation)
+    result = _run("run", "continue", "--run-id", run_id)
+    assert result.exit_code == 0, result.output
+    comparison = _run_payload(result.output)["last_comparison"]
+    assert comparison["method"] == "welch_t"
+    assert comparison["verdict"] == "inconclusive"
+    assert comparison["improved"] is False
+    assert comparison["selectable"] is True
+    assert "reason_code" not in comparison
+    assert comparison["recommendation"] == "inconclusive_revise_or_end"
+    assert _load_state(run_id).last_comparison == comparison

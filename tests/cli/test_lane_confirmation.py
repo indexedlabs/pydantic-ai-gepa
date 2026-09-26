@@ -105,7 +105,7 @@ def selection(monkeypatch, tmp_path):
         score = scores[lane]
         if callable(score):
             score = score()
-        records = [EvaluationRecord(f"case-{i}", score, None, {}) for i in range(3)]
+        records = [EvaluationRecord(f"case-{i}", score, None, {}) for i in range(10)]
         if score < 0:
             records[0].payload = {
                 "output": RolloutOutput(
@@ -235,7 +235,7 @@ def test_lane_confirmation_paired_mode_uses_one_fresh_sample(
 ):
     root, calls, scores = selection
     monkeypatch.setattr(run, "_validation_schedule", lambda *_: (1, 1))
-    incumbent_scores = {f"case-{i}": 0.5 for i in range(3)}
+    incumbent_scores = {f"case-{i}": 0.5 for i in range(10)}
     if missing_evidence:
         recovered = []
 

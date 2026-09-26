@@ -1293,6 +1293,9 @@ def _run_lane_eval_loop(
             and len(baseline_row.per_case_scores) >= paired_min_cases
         ):
             baseline_per_case = baseline_row.per_case_scores
+        if baseline_per_case is None and len(baseline_samples) == 1:
+            # A lost paired baseline must not fall back to an unpaired test.
+            baseline_per_case = {}
     max_candidate_samples = (
         run_state.acceptance_repetitions + 1
         if vector_mode
@@ -1570,6 +1573,8 @@ def _run_lane_eval_loop(
     else:
         assert comparison_result is not None
         result_data = comparison_result.to_dict()
+        if comparison_result.reason_code is not None:
+            result_data["selectable"] = False
         verdict = comparison_result.verdict
         display = comparison_result.delta
         if baseline_per_case is None and len(baseline_samples) < max(
