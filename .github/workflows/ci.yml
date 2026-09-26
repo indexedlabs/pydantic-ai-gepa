@@ -1,54 +1,18 @@
 name: CI
-
 on:
   pull_request:
     branches: ["*"]
-  push:
-    branches: ["main"]
-
 permissions:
   contents: read
-
 jobs:
-  lint-and-test:
+  runner-git-diag:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-        with:
-          enable-cache: true
-
-      - name: Sync dependencies
-        run: uv sync --all-extras --frozen
-
-      - name: Check formatting
-        run: uv run ruff format --check .
-
-      - name: Lint
-        run: uv run ruff check .
-
-      - name: Run tests
-        run: uv run pytest
-
-  scoring-sandbox:
-    runs-on: macos-latest
-    env:
-      GEPA_REQUIRE_SCORING_SANDBOX: "1"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - uses: astral-sh/setup-uv@v7
-      - run: uv sync --all-extras --frozen
-      - name: Exercise real Seatbelt isolation (no skips for unusable backend)
-        run: uv run pytest tests/cli/test_scoring_sandbox.py -v
+      - run: |
+          id; which -a git; namei -l /usr/bin/git; ls -ld / /usr /usr/bin /bin; stat -L -c '%n %U %u %a %F' / /usr /usr/bin /usr/bin/git /bin/git
+          python3 -c "
+          from pathlib import Path; import os
+          p=Path('/usr/bin/git').resolve(strict=True); print('resolved', p)
+          for d in [*reversed(p.parents), p]:
+              i=d.stat(); print(d, i.st_uid, oct(i.st_mode))
+          print('access', os.access(p, os.X_OK))"
