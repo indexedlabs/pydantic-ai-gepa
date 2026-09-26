@@ -155,6 +155,130 @@ def _read_metadata(
         raise SafeGitError("Cannot safely read Git metadata.") from None
 
 
+# Keys emitted by lane_repositories._init: template-free Git init (including
+# platform filesystem probes and SHA-256) followed by the two identity writes.
+_GIT_BOOLEAN = frozenset({"true", "false", "yes", "no", "on", "off", "1", "0"})
+_LANE_CONFIG: dict[str, frozenset[str] | None] = {
+    "core.repositoryformatversion": frozenset({"0", "1"}),
+    "core.bare": frozenset({"false", "no", "off", "0"}),
+    "core.filemode": _GIT_BOOLEAN,
+    "core.logallrefupdates": _GIT_BOOLEAN | {"always"},
+    "core.ignorecase": _GIT_BOOLEAN,
+    "core.precomposeunicode": _GIT_BOOLEAN,
+    "extensions.objectformat": frozenset({"sha1", "sha256"}),
+    "user.name": None,
+    "user.email": None,
+}
+_LANE_REDIRECTS = (
+    "commondir",
+    "config.worktree",
+    "info/attributes",
+    "objects/info/alternates",
+    "objects/info/http-alternates",
+    "worktrees",
+    "modules",
+    "remotes",
+    "branches",
+)
+
+
+def _check_lane_config(raw: bytes) -> None:
+    """Accept only plain sections and explicit, unquoted ASCII values."""
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError:
+        raise SafeGitError("Lane .git/config is not plain ASCII.") from None
+    if "\r" in text or "\0" in text:
+        raise SafeGitError("Lane .git/config contains CR or NUL bytes.")
+    section = None
+    for line in text.split("\n"):
+        line = line.strip(" \t")
+        if not line or line.startswith(("#", ";")):
+            continue
+        if header := re.fullmatch(r"\[([A-Za-z]+)\]", line):
+            section = header[1].lower()
+            if section not in {"core", "extensions", "user"}:
+                raise SafeGitError("Lane .git/config has an unsupported section.")
+            continue
+        entry = re.fullmatch(
+            r"([A-Za-z][A-Za-z0-9-]*)[ \t]*=[ \t]*([\x20-\x7e]*)", line
+        )
+        if entry is None or section is None or any(c in entry[2] for c in '"\\#;'):
+            raise SafeGitError("Lane .git/config is not a plain entry.")
+        key, value = f"{section}.{entry[1].lower()}", entry[2].rstrip(" \t")
+        allowed = _LANE_CONFIG.get(key, frozenset())
+        if allowed is not None and value.lower() not in allowed:
+            raise SafeGitError(f"Lane .git/config has unsupported key or value: {key}.")
+
+
+def _refuse_bare_layout(directory: Path) -> None:
+    # Git follows objects/refs links and accepts symbolic HEAD links, even dangling.
+    head = directory / "HEAD"
+    if (
+        (head.is_file() or head.is_symlink())
+        and (directory / "objects").is_dir()
+        and (directory / "refs").is_dir()
+    ):
+        raise SafeGitError(f"Lane contains a bare Git repository layout: {directory}.")
+
+
+def refuse_executable_lane_git(project: Path) -> Path:
+    """Check a project's repository before an unsandboxed reflector launch.
+
+    Read files only, with no-follow metadata handles. Gitfiles, redirects,
+    executable configuration and nested repositories are never accepted.
+    """
+    start = project.absolute()
+    for root in (start, *start.parents):
+        _refuse_bare_layout(root)
+        with _directory_fd(root) as directory:
+            try:
+                marker = os.stat(".git", dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(marker.st_mode):
+                raise SafeGitError(
+                    "Lane .git must be a directory, not a gitfile or link."
+                )
+        break
+    else:
+        raise SafeGitError("No lane Git repository found.")
+    metadata = root / ".git"
+    _check_lane_config(_read_metadata(metadata, "config") or b"")
+    with _directory_fd(metadata) as directory:
+        for name in ("hooks", "info", "objects", "objects/info", "refs"):
+            try:
+                info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(info.st_mode):
+                raise SafeGitError(f"Lane .git/{name} must be a directory, not a link.")
+        for name in _LANE_REDIRECTS:
+            try:
+                os.stat(name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            raise SafeGitError(f"Lane has unsupported Git metadata: .git/{name}.")
+    hooks = metadata / "hooks"
+    if hooks.exists():
+        with _directory_fd(hooks) as directory:
+            for name in os.listdir(directory):
+                if not name.endswith(".sample"):
+                    raise SafeGitError("Lane has an active Git hook.")
+                _read_metadata_at(directory, name, _METADATA_LIMIT)
+
+    def unreadable(error: OSError) -> None:
+        raise error
+
+    for directory, directories, files in os.walk(root, onerror=unreadable):
+        _refuse_bare_layout(Path(directory))
+        if Path(directory) == root:
+            directories.remove(".git")
+        if ".git" in directories or ".git" in files:
+            raise SafeGitError("Lane contains a nested Git repository.")
+    return root
+
+
 @dataclass(frozen=True)
 class Repository:
     root: Path
