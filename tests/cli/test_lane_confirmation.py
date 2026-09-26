@@ -51,7 +51,11 @@ def selection(monkeypatch, tmp_path):
 
     # These unit tests inject held-out scoring and its private authority; real
     # index/record lookup is covered by harness and lane CLI integration tests.
-    monkeypatch.setattr(harness_record, "for_run", lambda *_: object())
+    monkeypatch.setattr(
+        harness_record,
+        "for_run",
+        lambda *_: SimpleNamespace(read=lambda _: None, write=lambda *_: None),
+    )
     lanes = [
         LaneState(
             lane=f"lane-{index}",
@@ -323,3 +327,100 @@ def test_lane_proposal_must_match_the_scored_commit(selection, monkeypatch):
     with pytest.raises(typer.BadParameter, match="differs from the commit scored"):
         select._phase_promote(root, _state(), {})
     assert calls == ["lane-1:validation"]
+
+
+@pytest.mark.parametrize("lanes", [1, 3])
+@pytest.mark.parametrize("extra", [-1, 0, 3, 100])
+@pytest.mark.parametrize("paired", [False, True])
+def test_rebaseline_reserves_screening_and_full_confirmation(
+    selection, monkeypatch, lanes, extra, paired
+):
+    root, calls, scores = selection
+    initial, maximum = (1, 1) if paired else (3, 5)
+    monkeypatch.setattr(run, "_validation_schedule", lambda *_: (initial, maximum))
+    reserve = lanes + maximum
+    remaining = (lanes + 1) * initial + reserve + extra
+    state = _state(
+        lanes=lanes,
+        iterations=10,
+        max_iterations=10 + remaining,
+        acceptance_paired_min_cases=3 if paired else None,
+        best_validation_samples=(0.5,) if paired else (0.5, 0.5, 0.5),
+        best_validation_per_case_scores={f"case-{i}": 0.5 for i in range(3)}
+        if paired
+        else {},
+    )
+    baseline_calls = []
+    monkeypatch.setattr(
+        select, "ParetoLog", lambda *_: SimpleNamespace(count_budget_rows=lambda: 10)
+    )
+
+    def baseline(**kwargs):
+        baseline_calls.append(kwargs)
+        return EvalOutcome(
+            records=[EvaluationRecord(f"case-{i}", 0.5, None, {}) for i in range(3)],
+            summary={
+                "candidate_id": "incumbent",
+                "commit_sha": "incumbent",
+                "mean_score": 0.5,
+                "minibatch_id": "training",
+                "eval_id": str(len(baseline_calls)),
+                "iterations": 10 + len(baseline_calls),
+                "report_path": "training-report",
+                "trace_path": None,
+            },
+            report_path=None,
+            trace_path=None,
+        )
+
+    monkeypatch.setattr(select, "run_eval_once", baseline)
+    state, _, phase = select._phase_rebaseline(root, state, {})
+    if extra < 0:
+        assert phase == "finalize"
+        assert state.last_comparison["reason_code"] == "selection_budget_exhausted"
+        assert len(baseline_calls) == 1
+        assert calls == []
+        return
+    repetitions = min(maximum, (remaining - reserve) // (lanes + 1))
+    assert phase == "emit"
+    assert len(baseline_calls) == repetitions
+    assert len(state.reflection_baseline_samples) == repetitions
+    assert remaining - repetitions * (lanes + 1) >= reserve
+    # Spend each lane's full allowance and its screening row, then confirm
+    # an inconclusive finalist through the entire reserved schedule.
+    state = replace(state, iterations=state.iterations + lanes * (repetitions + 1))
+    monkeypatch.setattr(
+        run,
+        "_validation_improved",
+        lambda *_, **__: run._inconclusive_comparison("not_separated"),
+    )
+    scores["lane-1:confirmation"] = 0.8
+    state, outcomes, comparison = run._confirm_validation_candidate(
+        state, workspace_root=root, lane="lane-1:confirmation"
+    )
+    assert len(outcomes) == maximum
+    assert comparison["reason_code"] != "validation_budget_exhausted"
+    assert state.iterations <= state.max_iterations
+
+
+@pytest.mark.parametrize("lanes", [1, 3])
+def test_budget_warning_includes_finalist_confirmation(selection, monkeypatch, lanes):
+    root, _, _ = selection
+    state = _state(lanes=lanes)
+    remaining = lanes * (state.acceptance_max_repetitions + 1) + 5 - 1
+    monkeypatch.setattr(
+        select,
+        "ParetoLog",
+        lambda *_: SimpleNamespace(
+            count_budget_rows=lambda: state.max_iterations - remaining
+        ),
+    )
+    monkeypatch.setattr(select, "list_events", lambda *_: [])
+    events = []
+    monkeypatch.setattr(select, "emit", lambda *args, **_: events.append(args[2]))
+    _, ctx, phase = select._phase_journal(root, state, {})
+    assert phase == "refan"
+    assert ctx["overshoot"] == 0
+    assert len(events) == 1
+    assert events[0].type == "budget_low"
+    assert events[0].payload["remaining_evals"] == remaining

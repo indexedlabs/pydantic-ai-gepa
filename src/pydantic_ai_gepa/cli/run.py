@@ -12,7 +12,7 @@ from dataclasses import dataclass, field, replace
 import json
 import os
 from pathlib import Path
-from typing import Any, Literal, Sequence, cast
+from typing import Any, Callable, Literal, Sequence, cast
 
 import typer
 
@@ -929,16 +929,36 @@ def _confirm_validation_candidate(
     candidate_root: Path | None = None,
     workspace_root: Path | None = None,
     lane: str | None = None,
+    prior_outcomes: Sequence[EvalOutcome] = (),
+    before_sample: Callable[[], None] | None = None,
+    checkpoint: Callable[[RunState, list[EvalOutcome], dict[str, Any] | None], None]
+    | None = None,
 ) -> tuple[RunState, list[EvalOutcome], dict[str, Any]]:
+    """Confirm once, optionally continuing a privately checkpointed sequence.
+
+    Checkpoint each completed look before another draw. A caller can mark a
+    draw pending beforehand to fail closed if its result cannot be recovered.
+    """
     initial, maximum = _validation_schedule(state, workspace_root)
+    outcomes = list(prior_outcomes)
     if not state.best_validation_samples or (
         initial == 1 and not state.best_validation_per_case_scores
     ):
-        return state, [], _inconclusive_comparison("incumbent_evidence_missing")
-    if state.max_iterations - state.iterations < initial:
-        return state, [], _inconclusive_comparison("validation_budget_exhausted")
-    outcomes: list[EvalOutcome] = []
-    for _ in range(min(maximum, state.max_iterations - state.iterations)):
+        return state, outcomes, _inconclusive_comparison("incumbent_evidence_missing")
+    if state.max_iterations - state.iterations < initial - len(outcomes):
+        return state, outcomes, _inconclusive_comparison("validation_budget_exhausted")
+    comparison = _inconclusive_comparison("validation_budget_exhausted")
+    if len(outcomes) >= initial:
+        comparison = _validation_improved(
+            state, outcomes, initial=initial, maximum=maximum
+        )
+        if comparison["verdict"] != "inconclusive":
+            return state, outcomes, comparison
+    for _ in range(
+        min(maximum - len(outcomes), state.max_iterations - state.iterations)
+    ):
+        if before_sample is not None:
+            before_sample()
         state, outcome = _evaluate_validation_candidate(
             state,
             candidate_root=candidate_root,
@@ -953,13 +973,22 @@ def _confirm_validation_candidate(
             state, comparison = _pause_after_infrastructure_failure(
                 state, outcomes, phase="candidate", failures=failures
             )
+            if checkpoint is not None:
+                checkpoint(state, outcomes, comparison)
             return state, outcomes, comparison
         if len(outcomes) >= initial:
             comparison = _validation_improved(
                 state, outcomes, initial=initial, maximum=maximum
             )
-            if comparison["verdict"] != "inconclusive":
-                break
+        finished = len(outcomes) >= initial and (
+            comparison["verdict"] != "inconclusive"
+            or len(outcomes) == maximum
+            or state.iterations >= state.max_iterations
+        )
+        if checkpoint is not None:
+            checkpoint(state, outcomes, comparison if finished else None)
+        if finished:
+            break
     return state, outcomes, comparison
 
 
