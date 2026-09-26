@@ -17,6 +17,7 @@ import stat
 import tempfile
 from threading import RLock
 from typing import Any, Callable, Iterator, TypeVar
+from uuid import uuid4
 
 from ..vector_acceptance import (
     VectorRecord,
@@ -48,19 +49,18 @@ def _atomic_text(
 ) -> None:
     if not private:
         assert root is not None
-        check_view_path(root, path)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700 if private else 0o755)
-    if private:
-        path.parent.chmod(0o700)
+        with SafeDir.open(root, path.parent, create=True) as directory:
+            directory.write_text(path.name, content)
+        return
+    # Only harness-owned private storage uses pathnames.
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.parent.chmod(0o700)
     fd, temporary = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        if not private:
-            assert root is not None
-            check_view_path(root, path)
         os.replace(temporary, path)
         directory = os.open(path.parent, os.O_RDONLY)
         try:
@@ -68,14 +68,7 @@ def _atomic_text(
         finally:
             os.close(directory)
     except BaseException:
-        safe_cleanup = True
-        if not private:
-            assert root is not None
-            try:
-                check_view_path(root, Path(temporary))
-            except typer.BadParameter:
-                safe_cleanup = False
-        if safe_cleanup and os.path.exists(temporary):
+        if os.path.exists(temporary):
             os.unlink(temporary)
         raise
 
@@ -99,27 +92,195 @@ def _public_path(root: Path, path: Path) -> Path:
     return target
 
 
-def check_view_path(root: Path, path: Path, *, base: Path | None = None) -> None:
-    """Refuse redirected public paths before reading, listing, or changing them."""
-    from .layout import gepa_dir
+class SafeDir:
+    """Public I/O stays relative to an opened, non-link directory inode.
 
-    workspace = root.resolve()
-    base = _public_path(root, base or gepa_dir(workspace))
-    target = _public_path(root, path)
-    if not target.is_relative_to(base):
-        raise _unavailable()
-    anchor = workspace if base.is_relative_to(workspace) else Path(base.anchor)
-    current = anchor
-    for component in target.relative_to(anchor).parts:
-        current /= component
+    Trust the workspace root and its ancestors; for an external GEPA_DIR,
+    trust its parent and ancestors (including system /tmp and /var aliases).
+    Every component inside the workspace, or from the external GEPA_DIR's
+    final component onward, is opened with O_NOFOLLOW.
+    """
+
+    def __init__(self, fd: int):
+        self.fd = fd
+
+    @classmethod
+    @contextmanager
+    def open(
+        cls, root: Path, path: Path, *, create: bool = False, base: Path | None = None
+    ) -> Iterator[SafeDir]:
+        from .layout import gepa_dir
+
+        workspace = root.resolve()
+        base = _public_path(root, base or gepa_dir(workspace))
+        target = _public_path(root, path)
+        if not target.is_relative_to(base):
+            raise _unavailable()
+        if base.is_relative_to(workspace):
+            anchor = workspace
+            parts = target.relative_to(workspace).parts
+        else:
+            anchor = base.parent.resolve()
+            parts = (base.name, *target.relative_to(base).parts)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        fd = None
         try:
-            mode = current.lstat().st_mode
+            fd = os.open(anchor, flags)
+            for part in parts:
+                if create:
+                    try:
+                        os.mkdir(part, 0o755, dir_fd=fd)
+                    except FileExistsError:
+                        pass
+                child = os.open(part, flags, dir_fd=fd)
+                os.close(fd)
+                fd = child
         except FileNotFoundError:
-            continue
+            if fd is not None:
+                os.close(fd)
+            raise
+        except OSError:
+            if fd is not None:
+                os.close(fd)
+            raise _unavailable() from None
+        try:
+            yield cls(fd)
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _name(name: str) -> None:
+        if not name or name in {".", ".."} or "/" in name or "\0" in name:
+            raise _unavailable()
+
+    def check_leaf(self, name: str) -> bool:
+        self._name(name)
+        try:
+            info = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
         except OSError:
             raise _unavailable() from None
-        if stat.S_ISLNK(mode) or (current != target and not stat.S_ISDIR(mode)):
+        if stat.S_ISLNK(info.st_mode):
             raise _unavailable()
+        return True
+
+    @contextmanager
+    def file(self, name: str, flags: int = os.O_RDONLY) -> Iterator[Any]:
+        self._name(name)
+        try:
+            fd = os.open(
+                name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=self.fd
+            )
+        except FileNotFoundError:
+            raise
+        except OSError:
+            raise _unavailable() from None
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise _unavailable()
+            handle = os.fdopen(fd, "r+" if flags & os.O_RDWR else "r", encoding="utf-8")
+        except BaseException:
+            os.close(fd)
+            raise
+        with handle:
+            yield handle
+
+    def read_text(self, name: str, *, errors: str = "strict") -> str:
+        try:
+            with self.file(name) as handle:
+                handle.reconfigure(errors=errors)
+                return handle.read()
+        except FileNotFoundError:
+            raise
+        except OSError:
+            raise _unavailable() from None
+
+    def append_text(self, name: str, content: str) -> None:
+        with self.file(name, os.O_RDWR | os.O_CREAT | os.O_APPEND) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    def names(self) -> list[str]:
+        try:
+            return os.listdir(self.fd)
+        except OSError:
+            raise _unavailable() from None
+
+    def unlink(self, name: str) -> None:
+        self._name(name)
+        try:
+            os.unlink(name, dir_fd=self.fd)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise _unavailable() from None
+
+    def write_text(self, name: str, content: str, *, exclusive: bool = False) -> None:
+        self._name(name)
+        if not exclusive:
+            self.check_leaf(name)
+        temporary = f".{uuid4().hex}.tmp"
+        try:
+            fd = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=self.fd,
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(content)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                if exclusive:
+                    os.link(
+                        temporary,
+                        name,
+                        src_dir_fd=self.fd,
+                        dst_dir_fd=self.fd,
+                        follow_symlinks=False,
+                    )
+                else:
+                    os.replace(temporary, name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+                os.fsync(self.fd)
+            finally:
+                self.unlink(temporary)
+        except FileExistsError:
+            if exclusive:
+                raise
+            raise _unavailable() from None
+        except OSError:
+            raise _unavailable() from None
+
+
+def check_view_path(root: Path, path: Path, *, base: Path | None = None) -> None:
+    """Early refusal only; subsequent I/O must still use SafeDir, never a path."""
+    from .layout import gepa_dir
+
+    base = base or gepa_dir(root)
+    try:
+        if _public_path(root, path) == _public_path(root, base):
+            with SafeDir.open(root, path, base=base):
+                pass
+        else:
+            with SafeDir.open(root, path.parent, base=base) as directory:
+                directory.check_leaf(path.name)
+    except FileNotFoundError:
+        pass  # No operation follows from this probe; SafeDir reopens safely.
+
+
+@contextmanager
+def view_file(path: Path, *, root: Path | None = None) -> Iterator[Any]:
+    """Open a cooperative public lock without following links or modifying it."""
+    from .layout import repo_root
+
+    active = _active.get()
+    workspace = root or (active.root if active else repo_root())
+    with SafeDir.open(workspace, path.parent, create=True) as directory:
+        with directory.file(path.name, os.O_RDWR | os.O_CREAT) as handle:
+            yield handle
 
 
 def _index_path(dataset: str, root: Path, run_id: str) -> Path:
@@ -130,6 +291,7 @@ def _index_path(dataset: str, root: Path, run_id: str) -> Path:
         str(Path(dataset).parent / ".gepa-heldout" / f"{key}.index.json"),
         project_root=root,
         allow_missing=True,
+        check_history=False,
     )
 
 
@@ -161,13 +323,23 @@ def register_run(root: Path, run_id: str, pin: Path) -> None:
         os.close(directory)
 
 
-def _indexed_record_path(dataset: str, root: Path, run_id: str) -> Path:
+def _indexed_record_path(dataset: str, root: Path, run_id: str) -> Path | None:
     from .layout import gepa_dir, run_dir
 
     check_view_path(root, run_dir(run_id, root))
     index = _index_path(dataset, root, run_id)
     try:
         entry = json.loads(index.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        try:
+            with SafeDir.open(root, run_dir(run_id, root)):
+                pass
+        except FileNotFoundError:
+            return None
+        raise _unavailable() from None
+    except (OSError, ValueError):
+        raise _unavailable() from None
+    try:
         if (
             entry["workspace"] != str(root.resolve())
             or entry["run_id"] != run_id
@@ -214,15 +386,16 @@ class Record:
         if key.startswith("@"):
             return  # Private bookkeeping has no whole-file public counterpart.
         path = self.directory / key
-        check_view_path(self.root, path)
+        with SafeDir.open(self.root, path.parent, create=True) as directory:
+            self._restore_at(directory, path.name, content)
+
+    def _restore_at(self, directory: SafeDir, name: str, content: str | None) -> None:
         try:
-            actual = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
+            actual = directory.read_text(name)
+        except (FileNotFoundError, UnicodeError):
             actual = None
-        if (
-            actual == content
-            and not path.is_symlink()
-            and (content is not None or not path.exists())
+        if actual == content and (
+            content is not None or not directory.check_leaf(name)
         ):
             return
         public_echo(
@@ -231,11 +404,9 @@ class Record:
             err=True,
         )
         if content is None:
-            check_view_path(self.root, path)
-            path.unlink(missing_ok=True)
+            directory.unlink(name)
         else:
-            check_view_path(self.root, path)
-            _atomic_text(path, content, root=self.root)
+            directory.write_text(name, content)
 
     def read(self, key: str) -> str | None:
         with self.locked():
@@ -263,10 +434,12 @@ class Record:
             check_view_path(self.root, self.directory / "results")
             files = self.load()["files"]
             keys = {key for key in files if not key.startswith("@")}
-            keys.update(
-                f"results/{path.name}"
-                for path in (self.directory / "results").glob("*.json")
-            )
+            with SafeDir.open(
+                self.root, self.directory / "results", create=True
+            ) as results:
+                for name in results.names():
+                    if name.endswith(".json"):
+                        self._restore_at(results, name, files.get(f"results/{name}"))
             for key in sorted(keys):
                 self._restore(key, files.get(key))
 
@@ -288,6 +461,8 @@ def for_run(run_id: str, root: Path | None = None) -> Record | None:
     ):
         return active
     path = _indexed_record_path(dataset, workspace, run_id)
+    if path is None:
+        return None
     record = Record(workspace, run_id, path)
     record.load()
     _active.set(record)
@@ -300,6 +475,8 @@ def initialize(root: Path, run_id: str) -> None:
     dataset = heldout_dataset()
     assert dataset is not None
     path = _indexed_record_path(dataset, root, run_id)
+    if path is None:
+        raise _unavailable()
     record = Record(root.resolve(), run_id, path)
     with record.locked():
         if path.exists():
@@ -310,7 +487,7 @@ def initialize(root: Path, run_id: str) -> None:
                 {
                     "version": 1,
                     "run_id": run_id,
-                    "files": {"@config": config_path(root).read_text(encoding="utf-8")},
+                    "files": {"@config": _config_view(root, config_path(root))},
                 }
             ),
             private=True,
@@ -369,10 +546,39 @@ def _view(path: Path, root: Path | None = None) -> tuple[Record, str] | None:
     return (record, key) if record else None
 
 
-def read_text(path: Path, *, root: Path | None = None) -> str:
+def _public_workspace(path: Path, root: Path | None = None) -> Path | None:
+    from .layout import gepa_dir, repo_root
+
+    if not heldout_dataset(required=False):
+        return None
+    active = _active.get()
+    workspace = root or (active.root if active else repo_root())
+    if _public_path(workspace, path).is_relative_to(
+        _public_path(workspace, gepa_dir(workspace))
+    ):
+        return workspace
+    return None
+
+
+def list_paths(path: Path, *, root: Path | None = None) -> list[Path]:
+    workspace = _public_workspace(path, root)
+    if workspace is None:
+        return list(path.iterdir()) if path.is_dir() else []
+    try:
+        with SafeDir.open(workspace, path) as directory:
+            return [path / name for name in directory.names()]
+    except FileNotFoundError:
+        return []
+
+
+def read_text(path: Path, *, root: Path | None = None, errors: str = "strict") -> str:
     view = _view(path, root)
     if view is None:
-        return path.read_text(encoding="utf-8")
+        workspace = _public_workspace(path, root)
+        if workspace is not None:
+            with SafeDir.open(workspace, path.parent) as directory:
+                return directory.read_text(path.name, errors=errors)
+        return path.read_text(encoding="utf-8", errors=errors)
     content = view[0].read(view[1])
     if content is None:
         raise FileNotFoundError(f"No harness-written view at {path.name}")
@@ -381,7 +587,16 @@ def read_text(path: Path, *, root: Path | None = None) -> str:
 
 def exists(path: Path, *, root: Path | None = None) -> bool:
     view = _view(path, root)
-    return view[0].read(view[1]) is not None if view else path.exists()
+    if view:
+        return view[0].read(view[1]) is not None
+    workspace = _public_workspace(path, root)
+    if workspace is not None:
+        try:
+            with SafeDir.open(workspace, path.parent) as directory:
+                return directory.check_leaf(path.name)
+        except FileNotFoundError:
+            return False
+    return path.exists()
 
 
 def write_text(
@@ -390,9 +605,22 @@ def write_text(
     """Publish through the record; return False for an ordinary public file."""
     view = _view(path, root)
     if view is None:
+        workspace = _public_workspace(path, root)
+        if workspace is not None:
+            with SafeDir.open(workspace, path.parent, create=True) as directory:
+                if append:
+                    directory.append_text(path.name, content)
+                else:
+                    directory.write_text(path.name, content)
+            return True
         return False
     view[0].write(view[1], content, append=append)
     return True
+
+
+def _config_view(root: Path, path: Path) -> str:
+    with SafeDir.open(root, path.parent, base=path.parent) as directory:
+        return directory.read_text(path.name)
 
 
 def config_text(path: Path) -> str | None:
@@ -400,23 +628,16 @@ def config_text(path: Path) -> str | None:
 
     if not heldout_dataset(required=False):
         return None
-    # Candidate config validation may read a checkout-local copy outside the
-    # primary absolute GEPA_DIR. Check its ancestors without treating that
-    # untrusted candidate copy as the harness's pinned configuration.
-    check_view_path(repo_root(path.parent), path, base=path.parent)
     record = _active.get()
-    if (
-        not record
-        or not heldout_dataset(required=False)
-        or path.resolve() != config_path(record.root).resolve()
-    ):
-        return None
-    content = record.read("@config")
-    if content is None:
-        raise _unavailable()
-    # Configuration can be tracked candidate material: use the pinned value
-    # without rewriting the reflector's commit or working tree.
-    return content
+    root = repo_root(path.parent)
+    check_view_path(root, path, base=path.parent)
+    if record and _public_path(record.root, path) == config_path(record.root):
+        content = record.read("@config")
+        if content is None:
+            raise _unavailable()
+        return content
+    # Startup/candidate config reads also stay bound to the opened directory.
+    return _config_view(root, path)
 
 
 class VectorRecordStore(PublicVectorRecordStore):
@@ -454,7 +675,8 @@ def private_lock_path(root: Path | None, run_id: str) -> Path | None:
         and active.dataset == dataset
     ):
         return active.path.with_suffix(".lock")
-    return _indexed_record_path(dataset, workspace, run_id).with_suffix(".lock")
+    path = _indexed_record_path(dataset, workspace, run_id)
+    return path.with_suffix(".lock") if path is not None else None
 
 
 _ResultT = TypeVar("_ResultT")

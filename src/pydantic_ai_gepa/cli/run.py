@@ -449,7 +449,6 @@ class RunState:
         from . import harness_record
 
         path = run_state_path(self.run_id, root)
-        path.parent.mkdir(parents=True, exist_ok=True)
         # Atomic (tmpfile + os.replace): lane evals, select checkpoints, and
         # operator verbs all write this file; a kill mid-write must never
         # leave torn JSON for the resume logic to trip over.
@@ -457,6 +456,7 @@ class RunState:
 
         serialized = json.dumps(state_for_save(self).to_dict(), indent=2) + "\n"
         if not harness_record.write_text(path, serialized, root=root):
+            path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp_name = tempfile.mkstemp(
                 dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
             )
@@ -1641,7 +1641,6 @@ def _write_final_report(
     validation_rows = pareto.validation_rows()
     selectable_rows = validation_rows or pareto.selectable_rows()
     path = final_report_path(state.run_id, root)
-    path.parent.mkdir(parents=True, exist_ok=True)
 
     lines = [
         "# GEPA Run Final Report",
@@ -1736,6 +1735,7 @@ def _write_final_report(
     from . import harness_record
 
     if not harness_record.write_text(path, text, root=root):
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
     return path, text
 
@@ -2181,10 +2181,12 @@ def start(
                 raise typer.Exit(code=1)
     run_id = new_run_id()
     if heldout_required:
-        from .harness_record import check_view_path
+        from .harness_record import SafeDir
 
-        check_view_path(workspace_root, run_dir(run_id))
-    run_dir(run_id).mkdir(parents=True, exist_ok=True)
+        with SafeDir.open(workspace_root, run_dir(run_id), create=True):
+            pass
+    else:
+        run_dir(run_id).mkdir(parents=True, exist_ok=True)
     now = utc_now_iso()
     if heldout_required:
         pin_heldout(workspace_root, run_id)

@@ -201,6 +201,12 @@ def _journal_lane_outcome(workspace_root: Path, entry: dict[str, Any]) -> None:
     ):
         return
     path = journal_path(workspace_root)
+    from .harness_record import write_text
+
+    if write_text(
+        path, json.dumps(entry, sort_keys=True) + "\n", root=workspace_root, append=True
+    ):
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(entry, sort_keys=True) + "\n")
@@ -251,6 +257,12 @@ def _append_journal_once(
             "@select-journal", json.dumps(entry, sort_keys=True) + "\n", append=True
         )
     path = journal_path(workspace_root)
+    from .harness_record import write_text
+
+    if write_text(
+        path, json.dumps(entry, sort_keys=True) + "\n", root=workspace_root, append=True
+    ):
+        return entry
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(entry, sort_keys=True) + "\n")
@@ -2014,6 +2026,17 @@ def _select_lock(workspace_root: Path, run_id: str) -> Iterator[None]:
     import fcntl
 
     lock_path = run_dir(run_id, workspace_root) / "select.lock"
+    from .harness_record import view_file
+    from .validation import heldout_dataset
+
+    if heldout_dataset(required=False):
+        with view_file(lock_path, root=workspace_root) as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+        return
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
     try:

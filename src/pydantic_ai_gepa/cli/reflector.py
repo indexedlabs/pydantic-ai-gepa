@@ -81,7 +81,14 @@ def run_lock(
                 check_view_path(root or repo_root(), public)
             locks.enter_context(
                 _file_lock(
-                    path, run_id, wait=wait, deadline=deadline, private=path == private
+                    path,
+                    run_id,
+                    wait=wait,
+                    deadline=deadline,
+                    private=path == private,
+                    public_root=(root or repo_root())
+                    if path == public and heldout_dataset(required=False)
+                    else None,
                 )
             )
         token = _locks.set(_locks.get() | {key}) if private is not None else None
@@ -94,10 +101,24 @@ def run_lock(
 
 @contextmanager
 def _file_lock(
-    path: Path, run_id: str, *, wait: bool, deadline: float | None, private: bool
+    path: Path,
+    run_id: str,
+    *,
+    wait: bool,
+    deadline: float | None,
+    private: bool,
+    public_root: Path | None = None,
 ) -> Iterator[None]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as handle:
+    from .harness_record import view_file
+
+    if public_root is None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    context = (
+        view_file(path, root=public_root)
+        if public_root is not None
+        else path.open("a+", encoding="utf-8")
+    )
+    with context as handle:
         if private:
             os.chmod(path, 0o600)
         while True:
@@ -115,19 +136,22 @@ def _file_lock(
                         raise TimeoutError("Run lock acquisition timed out") from exc
                     time.sleep(min(0.05, remaining))
                     continue
-                handle.seek(0)
-                pid = handle.read().strip() or "unknown"
+                pid = "unknown"
+                if public_root is None:
+                    handle.seek(0)
+                    pid = handle.read().strip() or "unknown"
                 typer.echo(
                     f"Run {run_id} is locked by live process {pid}; retry after it finishes.",
                     err=True,
                 )
                 raise typer.Exit(code=1) from exc
         try:
-            handle.seek(0)
-            handle.truncate()
-            handle.write(str(os.getpid()))
-            handle.flush()
-            os.fsync(handle.fileno())
+            if public_root is None:
+                handle.seek(0)
+                handle.truncate()
+                handle.write(str(os.getpid()))
+                handle.flush()
+                os.fsync(handle.fileno())
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -440,6 +464,10 @@ def write_packet(run_id: str, root: Path | None = None) -> Path:
             "iterations_since_acceptance": state.iterations_since_acceptance,
         }
     path = run_dir(run_id, workspace_root) / "reflector_packet.json"
+    from .harness_record import write_text
+
+    if write_text(path, json.dumps(packet, indent=2) + "\n", root=workspace_root):
+        return path
     fd, tmp_name = tempfile.mkstemp(
         dir=path.parent, prefix=path.name + ".", suffix=".tmp"
     )

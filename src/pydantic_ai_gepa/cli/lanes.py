@@ -405,10 +405,12 @@ def create_lane_worktree(
 def _journal_tail(workspace_root: Path, limit: int) -> list[dict[str, Any]]:
     """Bounded journal tail for the reflection packet (workspace-explicit)."""
     path = journal_path(workspace_root)
-    if not path.exists():
+    from .harness_record import exists, read_text
+
+    if not exists(path, root=workspace_root):
         return []
     rows: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for line in read_text(path, root=workspace_root, errors="replace").splitlines():
         stripped = line.strip()
         if stripped:
             try:
@@ -423,6 +425,12 @@ def _journal_tail(workspace_root: Path, limit: int) -> list[dict[str, Any]]:
 def _append_journal(workspace_root: Path, entry: dict[str, Any]) -> None:
     """Durably append a CLI-authored journal row before returning to a reflector."""
     path = journal_path(workspace_root)
+    from .harness_record import write_text
+
+    if write_text(
+        path, json.dumps(entry, sort_keys=True) + "\n", root=workspace_root, append=True
+    ):
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = (json.dumps(entry, sort_keys=True) + "\n").encode("utf-8")
     # Terminate a torn append so it cannot swallow the next valid journal row.

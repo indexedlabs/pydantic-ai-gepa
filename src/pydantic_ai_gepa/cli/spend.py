@@ -42,8 +42,16 @@ def validate_cap(value: float | None) -> None:
 
 @contextmanager
 def _lock(path: Path) -> Iterator[None]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with harness_record.before_spend_lock(path), path.open("a") as handle:
+    from .validation import heldout_dataset
+
+    if not heldout_dataset(required=False):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    context = (
+        harness_record.view_file(path)
+        if heldout_dataset(required=False)
+        else path.open("a")
+    )
+    with harness_record.before_spend_lock(path), context as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         try:
             yield
@@ -371,10 +379,10 @@ class EvalSpendMeter(SpendMeter):
             directory = run_dir(self.run_id, self.root)
             with _lock(directory / "spend.lock"):
                 path = self.private_path or directory / "spend.jsonl"
-                path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
                 if not harness_record.write_text(
                     path, json.dumps(row) + "\n", root=self.root, append=True
                 ):
+                    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
                     with path.open("a") as handle:
                         handle.write(json.dumps(row) + "\n")
                         handle.flush()
@@ -646,14 +654,12 @@ def evaluation_spend(
         if validation_spend_path is not None:
             pointer = run_dir(run_id, root) / "validation-spend-registered"
             if not harness_record.exists(pointer, root=root):
-                temporary = pointer.with_suffix(".tmp")
-                with temporary.open("w") as handle:
-                    handle.write("registered\n")
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                if harness_record.write_text(pointer, "registered\n", root=root):
-                    temporary.unlink()
-                else:
+                if not harness_record.write_text(pointer, "registered\n", root=root):
+                    temporary = pointer.with_suffix(".tmp")
+                    with temporary.open("w") as handle:
+                        handle.write("registered\n")
+                        handle.flush()
+                        os.fsync(handle.fileno())
                     os.replace(temporary, pointer)
             # Register ownership for uncapped evals too. No spend or per-case
             # progress belongs in this reflector-readable manifest.

@@ -27,21 +27,20 @@ def test_redirect_during_publication_does_not_redirect_temporary_cleanup(
     directory.mkdir(parents=True)
     victim = tmp_path / "victim"
     victim.mkdir()
-    original = harness_record.tempfile.mkstemp
+    original = harness_record.os.replace
 
-    def redirect(**kwargs):
-        fd, temporary = original(**kwargs)
+    def redirect(source, destination, **kwargs):
         directory.rename(directory.with_name("original-results"))
         directory.symlink_to(victim, target_is_directory=True)
-        (victim / Path(temporary).name).write_text("keep")
-        return fd, temporary
+        (victim / source).write_text("keep")
+        return original(source, destination, **kwargs)
 
-    monkeypatch.setattr(harness_record.tempfile, "mkstemp", redirect)
-    with pytest.raises(typer.BadParameter, match="private record missing"):
-        harness_record._atomic_text(
-            directory / "result.json", "content", root=workspace
-        )
+    monkeypatch.setattr(harness_record.os, "replace", redirect)
+    harness_record._atomic_text(directory / "result.json", "content", root=workspace)
     assert [file.read_text() for file in victim.iterdir()] == ["keep"]
+    assert (
+        directory.with_name("original-results") / "result.json"
+    ).read_text() == "content"
 
 
 def _snapshot(path):
@@ -71,6 +70,10 @@ def test_redirected_view_directories_refuse_without_touching_targets(
     expected_victim = _snapshot(victim)
     monkeypatch.setattr(
         records.run_module, "run_eval_once", lambda **_: pytest.fail("must not score")
+    )
+    monkeypatch.setattr(
+        "pydantic_ai_gepa.cli.safe_git.SafeGit.bind",
+        lambda *_, **__: pytest.fail("must refuse before updating the Git cache"),
     )
     served = harness._serve(directory.name, dataset, monkeypatch)
     assert served.exit_code == 2, served.output

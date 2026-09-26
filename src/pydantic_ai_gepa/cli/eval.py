@@ -54,7 +54,7 @@ from ..evaluation import (
     evaluate_candidate_dataset,
 )
 from ..evaluation_health import (
-    append_infrastructure_failures_to_report,
+    format_infrastructure_failures,
     evaluation_infrastructure_failures,
 )
 from ._io import write_content_file
@@ -309,7 +309,13 @@ def _expose_trace_path(path: Path | None) -> Iterator[None]:
     if path is None:
         os.environ.pop(GEPA_TRACE_FILE_ENV, None)
     else:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        if heldout_dataset(required=False):
+            from .harness_record import SafeDir
+
+            with SafeDir.open(repo_root(), path.parent, create=True):
+                pass
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
         os.environ[GEPA_TRACE_FILE_ENV] = str(path)
     try:
         yield
@@ -362,6 +368,19 @@ def _write_trace_file(
             trace_record["metric_side_info"] = metric_side_info
         trace_rows.append(trace_record)
 
+    if heldout_dataset(required=False):
+        from .harness_record import exists, read_text, write_text
+
+        if trace_rows:
+            write_text(
+                path,
+                "".join(
+                    json.dumps(row, default=_json_default, sort_keys=True) + "\n"
+                    for row in trace_rows
+                ),
+                append=True,
+            )
+        return path if exists(path) and read_text(path) else None
     if trace_rows:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
@@ -592,7 +611,19 @@ def run_eval_once(
     iteration = prior_count + 1
     eval_id = new_eval_id()
 
-    run_dir(active_run_id, workspace_root).mkdir(parents=True, exist_ok=True)
+    if heldout_dataset(required=False):
+        from .harness_record import SafeDir, initialize
+        from .validation import pin_heldout
+
+        if record is None:
+            pin_heldout(primary_project_root, active_run_id)
+            initialize(primary_project_root, active_run_id)
+        with SafeDir.open(
+            primary_project_root, run_dir(active_run_id, workspace_root), create=True
+        ):
+            pass
+    else:
+        run_dir(active_run_id, workspace_root).mkdir(parents=True, exist_ok=True)
     minibatch_store = MinibatchStore(active_run_id, workspace_root)
     if dataset_role == "validation":
         if (
@@ -870,21 +901,20 @@ def run_eval_once(
     report_path: Path | None = None
     if persist_report:
         reports_dir = run_dir(active_run_id, workspace_root) / "reports"
-        reports_dir.mkdir(parents=True, exist_ok=True)
         report_path = reports_dir / f"{iteration:04d}-{eval_id}-{candidate.id}.md"
-        report_path.write_text(
-            _format_failures(
-                records,
-                threshold=threshold,
-                candidate_source=source,
-                redact_scores=cfg.acceptance.mode == "vector",
-            ),
-            encoding="utf-8",
+        report_text = _format_failures(
+            records,
+            threshold=threshold,
+            candidate_source=source,
+            redact_scores=cfg.acceptance.mode == "vector",
         )
         if infrastructure_failures:
-            append_infrastructure_failures_to_report(
-                report_path, infrastructure_failures
-            )
+            report_text += format_infrastructure_failures(infrastructure_failures)
+        from .harness_record import write_text
+
+        if not write_text(report_path, report_text, root=primary_project_root):
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(report_text, encoding="utf-8")
     trace_path = (
         _write_trace_file(
             path=planned_trace_path,

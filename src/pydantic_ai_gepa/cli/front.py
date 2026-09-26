@@ -94,7 +94,9 @@ def write_parent_packet(path: Path, state: Any, root: Path) -> None:
         or state.status != "paused_after_candidate_eval"
     ):
         return
-    packet = json.loads(path.read_text())
+    from .harness_record import read_text, write_text
+
+    packet = json.loads(read_text(path, root=root))
     packet["next_parent"] = {
         "candidate_id": state.next_parent_candidate_id,
         "commit_sha": state.next_parent_commit_sha,
@@ -105,6 +107,8 @@ def write_parent_packet(path: Path, state: Any, root: Path) -> None:
         f"{parent_restore_command(state, root)}, then run next_command to sample its training minibatch."
     )
     packet["discard_command"] = None
+    if write_text(path, json.dumps(packet, indent=2), root=root):
+        return
     fd, temporary = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as handle:

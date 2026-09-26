@@ -25,6 +25,7 @@ def validation_dataset_path(
     project_root: Path,
     candidate_root: Path | None = None,
     allow_missing: bool = False,
+    check_history: bool = True,
 ) -> Path:
     """Resolve a harness-owned dataset, refusing checkout and historical copies."""
     lexical_path = Path(os.path.abspath(project_root / configured_path))
@@ -71,7 +72,7 @@ def validation_dataset_path(
         raise typer.BadParameter(
             "Held-out validation must be outside the reflector checkout. " + fix
         )
-    if allow_missing and not path.exists():
+    if not check_history or (allow_missing and not path.exists()):
         return path
     try:
         contents = path.read_bytes()
@@ -126,6 +127,7 @@ def validation_evidence_path(dataset: str, *, project_root: Path, run_id: str) -
         str(dataset_path.parent / ".gepa-validation-evidence" / f"{key}.json"),
         project_root=project_root,
         allow_missing=True,
+        check_history=False,
     )
 
 
@@ -246,6 +248,7 @@ def _pin_path(dataset: str, root: Path, run_id: str) -> Path:
         str(Path(dataset).parent / ".gepa-heldout" / f"{key}.json"),
         project_root=root,
         allow_missing=True,
+        check_history=False,
     )
 
 

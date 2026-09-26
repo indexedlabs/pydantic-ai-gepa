@@ -99,6 +99,17 @@ def _tree(state: Any, *, nominating: bool = False) -> dict[str, Any]:
 
 
 def _requests(run_id: str) -> list[tuple[Path, dict[str, Any]]]:
+    if heldout_dataset(required=False):
+        directory = run_dir(run_id) / "nominations"
+        try:
+            with harness_record.SafeDir.open(repo_root(), directory) as opened:
+                return [
+                    (directory / name, json.loads(opened.read_text(name)))
+                    for name in sorted(opened.names())
+                    if name.endswith(".json")
+                ]
+        except FileNotFoundError:
+            return []
     return [
         (path, json.loads(path.read_text()))
         for path in sorted((run_dir(run_id) / "nominations").glob("*.json"))
@@ -333,6 +344,9 @@ def serve(
 
     heldout_dataset()
     while True:
+        # Record lookup verifies isolation through safe_git, which can update
+        # its private cache. Reject redirected views before that work begins.
+        harness_record.check_view_path(repo_root(), run_dir(run_id) / "results")
         state = _load_state(run_id)
         if not state.heldout_required:
             raise typer.BadParameter(

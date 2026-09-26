@@ -383,7 +383,13 @@ def emit(
             f"{_PRODUCER_ID_RE.pattern!r} (filename-safe)."
         )
     path = events_dir(run_id, root)
-    path.mkdir(parents=True, exist_ok=True)
+    from .harness_record import SafeDir
+    from .validation import heldout_dataset
+    from .layout import repo_root
+
+    private = heldout_dataset(required=False)
+    if not private:
+        path.mkdir(parents=True, exist_ok=True)
     ts_ms = f"{_now_ms():0{_TIMESTAMP_WIDTH}d}"
     body = {
         "type": draft.type,
@@ -391,6 +397,29 @@ def emit(
         "lane": draft.lane,
         "payload": dict(draft.payload),
     }
+    if private:
+        with SafeDir.open(root or repo_root(), path, create=True) as directory:
+            seq = max(
+                (
+                    int(match.group(3)) + 1
+                    for name in directory.names()
+                    if (match := _EVENT_ID_RE.match(name))
+                    and match.group(2) == producer_id
+                ),
+                default=0,
+            )
+            while True:
+                event_id = f"{ts_ms}-{producer_id}-{seq:0{_SEQ_WIDTH}d}"
+                try:
+                    directory.write_text(
+                        event_id,
+                        json.dumps({"id": event_id, **body}, indent=2, allow_nan=False)
+                        + "\n",
+                        exclusive=True,
+                    )
+                    return event_id
+                except FileExistsError:
+                    seq += 1
     while True:
         seq = _next_seq(path, producer_id)
         event_id = f"{ts_ms}-{producer_id}-{seq:0{_SEQ_WIDTH}d}"
