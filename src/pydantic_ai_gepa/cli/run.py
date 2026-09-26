@@ -12,7 +12,7 @@ from dataclasses import dataclass, field, replace
 import json
 import os
 from pathlib import Path
-from typing import Any, Literal, Sequence, cast
+from typing import Any, Callable, Literal, Sequence, cast
 
 import typer
 
@@ -881,6 +881,23 @@ def _validation_schedule(state: RunState, root: Path | None = None) -> tuple[int
     return _acceptance_schedule(state, len(cases))
 
 
+def _lane_baseline_budget(
+    state: RunState, remaining: int, root: Path | None = None
+) -> tuple[int, int]:
+    """Return affordable repetitions and rows reserved for scalar selection.
+
+    Reserve one screen per lane and the maximum confirmation schedule so every
+    statistical look remains affordable, then share rows among baseline and
+    lanes. Callers stop before fan-out if this cannot fund initial repetitions.
+    Startup excludes its already-paid failure-selected row from ``remaining``;
+    rebaseline includes its first row, which is usable baseline evidence.
+    """
+    reserve = 0
+    if harness_record.for_run(state.run_id, root) is not None:
+        reserve = state.lanes + _validation_schedule(state, root)[1]
+    return (remaining - reserve) // (state.lanes + 1), reserve
+
+
 def _case_scores(outcome: EvalOutcome) -> dict[str, float]:
     return {record.case_id: record.score for record in outcome.records}
 
@@ -942,16 +959,36 @@ def _confirm_validation_candidate(
     candidate_root: Path | None = None,
     workspace_root: Path | None = None,
     lane: str | None = None,
+    prior_outcomes: Sequence[EvalOutcome] = (),
+    before_sample: Callable[[], None] | None = None,
+    checkpoint: Callable[[RunState, list[EvalOutcome], dict[str, Any] | None], None]
+    | None = None,
 ) -> tuple[RunState, list[EvalOutcome], dict[str, Any]]:
+    """Confirm once, optionally continuing a privately checkpointed sequence.
+
+    Checkpoint each completed look before another draw. A caller can mark a
+    draw pending beforehand and retry just that draw if its result is lost.
+    """
     initial, maximum = _validation_schedule(state, workspace_root)
+    outcomes = list(prior_outcomes)
     if not state.best_validation_samples or (
         initial == 1 and not state.best_validation_per_case_scores
     ):
-        return state, [], _inconclusive_comparison("incumbent_evidence_missing")
-    if state.max_iterations - state.iterations < initial:
-        return state, [], _inconclusive_comparison("validation_budget_exhausted")
-    outcomes: list[EvalOutcome] = []
-    for _ in range(min(maximum, state.max_iterations - state.iterations)):
+        return state, outcomes, _inconclusive_comparison("incumbent_evidence_missing")
+    if state.max_iterations - state.iterations < initial - len(outcomes):
+        return state, outcomes, _inconclusive_comparison("validation_budget_exhausted")
+    comparison = _inconclusive_comparison("validation_budget_exhausted")
+    if len(outcomes) >= initial:
+        comparison = _validation_improved(
+            state, outcomes, initial=initial, maximum=maximum
+        )
+        if comparison["verdict"] != "inconclusive":
+            return state, outcomes, comparison
+    for _ in range(
+        min(maximum - len(outcomes), state.max_iterations - state.iterations)
+    ):
+        if before_sample is not None:
+            before_sample()
         state, outcome = _evaluate_validation_candidate(
             state,
             candidate_root=candidate_root,
@@ -966,13 +1003,22 @@ def _confirm_validation_candidate(
             state, comparison = _pause_after_infrastructure_failure(
                 state, outcomes, phase="candidate", failures=failures
             )
+            if checkpoint is not None:
+                checkpoint(state, outcomes, comparison)
             return state, outcomes, comparison
         if len(outcomes) >= initial:
             comparison = _validation_improved(
                 state, outcomes, initial=initial, maximum=maximum
             )
-            if comparison["verdict"] != "inconclusive":
-                break
+        finished = len(outcomes) >= initial and (
+            comparison["verdict"] != "inconclusive"
+            or len(outcomes) == maximum
+            or state.iterations >= state.max_iterations
+        )
+        if checkpoint is not None:
+            checkpoint(state, outcomes, comparison if finished else None)
+        if finished:
+            break
     return state, outcomes, comparison
 
 
@@ -1113,14 +1159,25 @@ def _capture_reflection_baseline(
 
     remaining_iterations = state.max_iterations - state.iterations
     initial, maximum = _acceptance_schedule(state, len(first_outcome.records))
-    validation_reserve = _validation_schedule(state)[0] if state.heldout_required else 0
     # The failure-selected outcome is already charged and is never evidence.
-    affordable_repetitions = (remaining_iterations - validation_reserve) // 2
+    reason_code = "baseline_budget_exhausted"
+    if (
+        state.lanes >= 1
+        and harness_record.for_run(state.run_id) is not None
+        and GepaConfig.load(config_path()).acceptance.mode != "vector"
+    ):
+        affordable_repetitions, _ = _lane_baseline_budget(state, remaining_iterations)
+        reason_code = "selection_budget_exhausted"
+    else:
+        validation_reserve = (
+            _validation_schedule(state)[0] if state.heldout_required else 0
+        )
+        affordable_repetitions = (remaining_iterations - validation_reserve) // 2
     if affordable_repetitions < initial:
         return _with_timestamp(
             state,
             status="done",
-            last_comparison=_inconclusive_comparison("baseline_budget_exhausted"),
+            last_comparison=_inconclusive_comparison(reason_code),
         ), []
     target_repetitions = min(maximum, affordable_repetitions)
     outcomes: list[EvalOutcome] = []

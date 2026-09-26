@@ -625,6 +625,138 @@ def _numeric_ranking_key(raw: Any, *, label: str) -> tuple[float, ...]:
     return tuple(ranking)
 
 
+def _confirm_finalist(
+    workspace_root: Path,
+    state: Any,
+    ctx: dict[str, Any],
+    winner: LaneState,
+    candidate_root: Path,
+    candidate_id: str,
+) -> tuple[Any, list[Any], dict[str, Any]]:
+    """Keep finalist draws and the verdict exclusively in the private record.
+
+    Normal state.json is also a public view, so its context holds only a key.
+    The reflector cannot see an in-flight validation result, so redrawing one
+    unobserved draw grants no second look at a verdict. Keep completed samples;
+    any orphan Pareto row remains budgeted but is never confirmation evidence.
+    """
+    from ..evaluation import EvaluationRecord
+    from .eval import EvalOutcome
+    from .run import _confirm_validation_candidate
+
+    record = harness_record.for_run(state.run_id, workspace_root)
+    assert record is not None
+    key = ctx.setdefault(
+        "confirmation_checkpoint", f"@select-confirmation/{winner.iteration}"
+    )
+    state = _checkpoint(state, workspace_root, "promote", ctx)
+    raw = record.read(key)
+    identity = {
+        "lane": winner.lane,
+        "candidate_id": candidate_id,
+        "commit_sha": winner.candidate_sha,
+    }
+    saved = (
+        json.loads(raw) if raw is not None else {"finalist": identity, "samples": []}
+    )
+    if saved["finalist"] != identity:
+        raise typer.BadParameter(
+            "Checkpointed confirmation finalist changed; refusing to redraw."
+        )
+    if saved.get("pending"):
+        saved["pending"] = False
+        # An interrupted evaluation may already have published its paid row.
+        # Reconcile accounting only; never recover its score as evidence.
+        saved["validation_evaluations"] = max(
+            saved.get("validation_evaluations", 0),
+            sum(
+                row.extra.get("row_scope") == "validation"
+                for row in ParetoLog(state.run_id, workspace_root).iter_rows()
+            ),
+        )
+        record.write(key, json.dumps(saved))
+    outcomes = [
+        EvalOutcome(
+            records=[
+                EvaluationRecord(case, score, None, {})
+                for case, score in sample["scores"].items()
+            ],
+            summary={
+                "dataset_role": "validation",
+                "minibatch_id": None,
+                **sample["summary"],
+            },
+            report_path=None,
+            trace_path=None,
+        )
+        for sample in saved["samples"]
+    ]
+    state = replace(
+        state,
+        iterations=max(state.iterations, saved.get("iterations", 0)),
+        validation_evaluations=max(
+            state.validation_evaluations, saved.get("validation_evaluations", 0)
+        ),
+    )
+    if saved.get("comparison") is not None:
+        return state, outcomes, saved["comparison"]
+
+    def before_sample() -> None:
+        saved["pending"] = True
+        record.write(key, json.dumps(saved))
+
+    def checkpoint(
+        fresh: Any, samples: list[Any], comparison: dict[str, Any] | None
+    ) -> None:
+        if (comparison or {}).get("outcome") == "infrastructure_failure":
+            samples = samples[:-1]
+            comparison = None
+        if any(
+            sample.summary["candidate_id"] != candidate_id
+            or sample.summary.get("commit_sha") != winner.candidate_sha
+            for sample in samples
+        ):
+            raise typer.BadParameter(
+                "The lane finalist changed between validation screening and confirmation; "
+                "refusing to promote mixed candidate evidence."
+            )
+        saved.update(
+            pending=False,
+            iterations=fresh.iterations,
+            validation_evaluations=fresh.validation_evaluations,
+            samples=[
+                {
+                    "summary": {
+                        key: sample.summary.get(key)
+                        for key in (
+                            "candidate_id",
+                            "commit_sha",
+                            "mean_score",
+                            "selectable",
+                        )
+                    },
+                    "scores": {item.case_id: item.score for item in sample.records},
+                }
+                for sample in samples
+            ],
+            comparison=comparison,
+        )
+        record.write(key, json.dumps(saved))
+
+    with _chdir(candidate_root):
+        state, outcomes, comparison = _confirm_validation_candidate(
+            state,
+            candidate_root=candidate_root,
+            workspace_root=workspace_root,
+            lane=f"{winner.lane}:confirmation",
+            prior_outcomes=outcomes,
+            before_sample=before_sample,
+            checkpoint=checkpoint,
+        )
+    checkpoint(state, outcomes, comparison)
+    return state, outcomes, comparison
+
+
 def _phase_promote(
     workspace_root: Path, state: Any, ctx: dict[str, Any]
 ) -> tuple[Any, dict[str, Any], str]:
@@ -662,6 +794,41 @@ def _phase_promote(
         raise typer.Exit(code=1)
 
     lane_states = load_all_lane_states(workspace_root, run_id)
+    confirmation_finished = False
+    if key := ctx.get("confirmation_checkpoint"):
+        record = harness_record.for_run(run_id, workspace_root)
+        if record is None:
+            raise typer.BadParameter(
+                "Checkpointed confirmation requires harness access."
+            )
+        raw = record.read(key)
+        if raw is not None:
+            saved_confirmation = json.loads(raw)
+            finalist = saved_confirmation["finalist"]
+            saved_comparison = saved_confirmation.get("comparison")
+            confirmation_finished = saved_comparison is not None
+            # Failures are diagnostics in ctx, never saved verdicts. Their
+            # valid samples remain available for a retry after this pause.
+            failed_confirmation = (
+                not confirmation_finished
+                and (ctx.get("validation_confirmation") or {}).get("outcome")
+                == "infrastructure_failure"
+            )
+            if not any(
+                lane.lane == finalist["lane"]
+                and lane.candidate_sha == finalist["commit_sha"]
+                and lane.status == "awaiting_selection"
+                and lane.verdict == "accepted"
+                for lane in lane_states
+            ):
+                raise typer.BadParameter(
+                    "Checkpointed confirmation finalist changed; refusing to redraw."
+                )
+            if (
+                failed_confirmation
+                and state.status == "paused_after_infrastructure_error"
+            ):
+                state = replace(state, status="running")
     from .lane_repositories import CandidateAncestryError, LaneSourceError, load
 
     repositories = load(workspace_root, run_id)
@@ -726,9 +893,7 @@ def _phase_promote(
     #    or vectors, so its evidence never enters a reflection packet.
     accepted = [lane_state for lane_state in valid if lane_state.verdict == "accepted"]
     config = GepaConfig.load(config_path(workspace_root))
-    from .harness_record import for_run
-
-    validation_enabled = for_run(run_id, workspace_root) is not None
+    validation_enabled = harness_record.for_run(run_id, workspace_root) is not None
     if state.heldout_required and not validation_enabled:
         raise typer.BadParameter("Held-out selection requires harness access.")
     vector_validation = validation_enabled and config.acceptance.mode == "vector"
@@ -746,9 +911,12 @@ def _phase_promote(
     )
     from .run import _evaluate_validation_candidate
 
-    if validation_enabled and not vector_validation:
+    if validation_enabled and not vector_validation and not confirmation_finished:
         from .run import _ensure_validation_seed
 
+        # A completed confirmation already owns its verdict. In paired mode,
+        # a kill inside the promotion save can replace the incumbent evidence
+        # sidecar before state.json advances; do not reseed that old incumbent.
         with _chdir(workspace_root):
             state, _ = _ensure_validation_seed(state)
         state = _checkpoint(state, workspace_root, "promote", ctx)
@@ -1061,16 +1229,15 @@ def _phase_promote(
             winner = sorted(selectable_candidates, key=training_rank)[0]
     confirmation_outcomes = []
     if winner is not None and validation_enabled and not vector_validation:
-        from .run import _confirm_validation_candidate
-
         candidate_root = candidate_roots[winner.lane]
-        with _chdir(candidate_root):
-            state, confirmation_outcomes, confirmation = _confirm_validation_candidate(
-                state,
-                candidate_root=candidate_root,
-                workspace_root=workspace_root,
-                lane=f"{winner.lane}:confirmation",
-            )
+        state, confirmation_outcomes, confirmation = _confirm_finalist(
+            workspace_root,
+            state,
+            ctx,
+            winner,
+            candidate_root,
+            validation_results[winner.lane]["candidate_id"],
+        )
         ctx["validation_confirmation"] = confirmation
         state = replace(state, last_comparison=confirmation)
         if confirmation.get("outcome") == "infrastructure_failure":
@@ -1095,10 +1262,6 @@ def _phase_promote(
             if confirmation.get("reason_code"):
                 typer.echo(f"Finalist not promoted: {confirmation['reason_code']}.")
             winner = None
-        else:
-            validation_results[winner.lane]["mean_score"] = confirmation[
-                "candidate_mean"
-            ]
 
     losers = [lane_state.lane for lane_state in valid if lane_state is not winner]
 
@@ -1147,7 +1310,11 @@ def _phase_promote(
     #    destroyed).
     comparison = _load_comparison(winner)
     if validation_enabled:
-        winner_mean = float(validation_results[winner.lane]["mean_score"])
+        winner_mean = float(
+            ctx["validation_confirmation"]["candidate_mean"]
+            if confirmation_outcomes
+            else validation_results[winner.lane]["mean_score"]
+        )
     else:
         winner_mean = comparison.get("candidate_mean", comparison.get("display_score"))
     if winner_mean is None and winner.eval_samples:
@@ -1277,7 +1444,8 @@ def _phase_journal(
     ctx["budget_rows"] = rows
     ctx["overshoot"] = max(0, rows - state.max_iterations)
     config = GepaConfig.load(config_path(workspace_root))
-    if state.heldout_required and config.acceptance.mode == "vector":
+    validation_enabled = harness_record.for_run(run_id, workspace_root) is not None
+    if validation_enabled and config.acceptance.mode == "vector":
         validation_rounds = int(ctx.get("validation_rounds", 0))
         overshoot_bound = (
             state.lanes * state.acceptance_max_repetitions
@@ -1290,6 +1458,11 @@ def _phase_journal(
     else:
         overshoot_bound = state.lanes * (state.acceptance_max_repetitions + 1)
         bound_detail = "lanes x (acceptance max-repetitions + validation)"
+        if validation_enabled:
+            from .run import _validation_schedule
+
+            overshoot_bound += _validation_schedule(state, workspace_root)[1]
+            bound_detail += ", plus maximum finalist confirmation"
     if ctx["overshoot"] > overshoot_bound:
         typer.echo(
             f"Warning: budget overshoot {ctx['overshoot']} exceeds the "
@@ -1617,8 +1790,19 @@ def _phase_rebaseline(
     when it carries the new best, otherwise the first lane's freshly re-fanned
     worktree (identical content). Baseline evals are paid once per iteration,
     not once per lane (spec-er3).
+
+    Scalar held-out runs reserve one screening row per lane and the maximum
+    confirmation schedule before splitting rows among baseline and lanes.
+    Reserving the maximum permits every statistical look, not merely the
+    first verdict. If the remainder cannot fund initial training repetitions,
+    finalize without emitting new lane work. Ample budgets keep the same cap.
     """
-    from .run import _mark_reflection_pause, _with_last_outcome, _with_timestamp
+    from .run import (
+        _lane_baseline_budget,
+        _mark_reflection_pause,
+        _with_last_outcome,
+        _with_timestamp,
+    )
 
     run_id = state.run_id
     if ctx.get("baseline_captured"):
@@ -1636,7 +1820,10 @@ def _phase_rebaseline(
     scalar_mode = (
         GepaConfig.load(config_path(workspace_root)).acceptance.mode != "vector"
     )
-
+    if scalar_mode:
+        affordable_repetitions, validation_reserve = _lane_baseline_budget(
+            state, remaining, workspace_root
+        )
     outcomes: list[Any] = []
 
     def fail_on_infrastructure_error(outcome: Any) -> None:
@@ -1694,12 +1881,13 @@ def _phase_rebaseline(
             from .run import _acceptance_schedule, _inconclusive_comparison
 
             initial, maximum = _acceptance_schedule(state, len(first.records))
-            affordable_repetitions = remaining // (state.lanes + 1)
             if affordable_repetitions < initial:
                 state = replace(
                     state,
                     last_comparison=_inconclusive_comparison(
-                        "baseline_budget_exhausted"
+                        "selection_budget_exhausted"
+                        if validation_reserve
+                        else "baseline_budget_exhausted"
                     ),
                 )
                 return state, ctx, "finalize"
