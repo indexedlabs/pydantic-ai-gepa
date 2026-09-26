@@ -19,14 +19,16 @@ dispatches the fixed training-reflection prompt, guards process exit, and calls
 or reflector may run for a driven run: the driver owns scoring timing.** The
 existing held-out lane refusal remains until standalone lane repositories land.
 
-The ordered JSON fallback list contains only allowed commands, for example:
+The JSON configuration contains only allowed commands, for example:
 
 ```json
-[{"label":"codex","argv":["codex","exec","--profile","gepa-reflector","-C","{checkout}","Read {prompt}; follow its instructions using {packet}."],"usage_limit":{"exit_codes":[9],"output_regexes":["(?i)usage limit"]}}]
+{"pass_env":[],"reflectors":[{"label":"codex","argv":["codex","exec","--profile","gepa-reflector","-C","{checkout}","Read {prompt}; follow its instructions using {packet}."],"usage_limit":{"exit_codes":[9],"output_regexes":["(?i)usage limit"]}}]}
 ```
 
 Configure detection for the actual command; exit 9 above is an example, not a
-Codex exit-code guarantee. Templates accept `{checkout}`, `{packet}`, `{prompt}`.
+Codex exit-code guarantee. Usage-limit matching applies only when no nomination
+or lane result exists. A legacy bare array means empty `pass_env`. Templates accept
+`{checkout}`, `{packet}`, `{prompt}`.
 The default is one Codex entry using `--profile gepa-reflector` and usage-limit
 output detection. In current `exec --help`, `--profile` loads a separate
 `$CODEX_HOME/gepa-reflector.config.toml` overlay; provision its actual permissions.
@@ -36,11 +38,20 @@ responsibility; never list unverified Claude Code or Pi profiles for held-out ru
 
 `--step-timeout` defaults to 900 seconds; `--max-attempts` to 2; `--max-steps`
 optionally bounds sessions. Lane nomination adds `--foreground`; single-checkout
-nomination adds `--wait-secs 0`. Subprocesses receive no held-out dataset variable,
-`GEPA_HARNESS_*`, pass-through harness secrets, scorer provider keys, or candidate
-components/trace variables. Preserve reflector subscription configuration only;
-keep other harness secrets out of its environment. Public step directories hold
-training-only prompts and logs. Held-out driver state lives beside the private pin.
+nomination adds `--wait-secs 0`. Keep harness credentials out of the reflector.
+Provider keys are scrubbed by default; `pass_env` accepts explicit **training-only**
+variable names such as `OPENAI_API_KEY`, never patterns. Do not pass scoring keys.
+`GEPA_HELDOUT_*`, `GEPA_HARNESS_*`, names in `GEPA_HARNESS_PASS_ENV`, candidate
+components and trace variables cannot be allowlisted. Subscription configuration
+is retained; keep other harness secrets out of the launch environment. Git config
+appends `gc.autoDetach=false` and `maintenance.autoDetach=false` to existing entries.
+Public step directories hold training-only prompts and logs. Held-out state lives
+beside the pin. Training-only state lives under
+`${XDG_STATE_HOME:-~/.local/state}/pydantic-ai-gepa/drive/<key>/drive.json`, keyed by
+resolved GEPA_DIR and run ID. State/lock files are 0600 in a current-user-owned
+0700 directory outside GEPA_DIR, project and lane worktrees. The reflector sandbox
+must not grant that directory. Legacy public `run_dir/drive.json` is refused,
+never loaded or migrated. Forging private state is outside the pin's threat model.
 
 Restart the same drive command after a kill: unfinished reflectors are guarded
 first, interrupted lanes reset, and scoring reuses existing durable checkpoints.
@@ -53,20 +64,48 @@ resume the managed run, then drive again.
 
 ### What the process guard does not detect
 
-On macOS libproc creation IDs retain ancestry despite reparenting. The guard kills
-attributed survivors only. Unrelated processes are ignored; unknown ancestry is
-never killed and causes a fail-closed pause after `--survivor-grace` (default 5
-seconds), with PIDs and command names printed. Unsupported platforms refuse to drive.
+The macOS guard uses libproc's immutable process and original-parent unique IDs,
+polls at 50 ms, and retains observed ancestry across restarts. After group cleanup
+and a final snapshot it persists a step-end ceiling. Only IDs between the starting
+watermark and that ceiling, or descendants linked through those IDs, count. A
+restart of an interrupted step without a ceiling freezes it at the first restart
+snapshot; unrelated later births cannot keep extending the window.
 
-Launchd/XPC/`launchctl`/`open` and another pre-existing same-UID process can start
-work that looks unrelated. Same-UID processes can hide or act before inspection;
-snapshots/signals are not atomic and PID reuse races remain (a future Linux
-PID-plus-start-time backend also needs to address reuse). Reads during the step
-are not prevented: raw `KERN_PROCARGS2` still reads other processes' argv on the
-README's tested profiles. This guard separates steps from scoring in time.
-Unattributable same-UID processes remain alive and can keep the drive paused,
-causing denial of service. A separate scoring UID would close these same-UID
-disclosure and interference channels.
+The guard kills attributed reflector descendants and ignores processes provably
+rooted in another pre-existing process. An otherwise unknown Apple job is unrelated
+**only when all three checks pass**: its original-parent unique ID is launchd's
+(not merely its current PPID); `proc_pidpath` is under `/System/` or `/usr/libexec/`
+and `csops` reports `CS_PLATFORM_BINARY`; and its responsible PID is available and
+differs from both the driver's and the reflector root's responsible PIDs. A missing
+or failed check leaves it unknown. Unknown processes are never killed: after
+`--survivor-grace` (default 5 seconds) they pause scoring with PID/command diagnostics.
+Unsupported platforms refuse to drive.
+
+- Launchd/XPC/`launchctl`/`open` work with unknown ancestry pauses the drive. The
+  Apple job exemption above is a gap if a reflector induces a job satisfying all
+  its checks to do work on its behalf. Orphaning a platform binary alone does not
+  qualify; the original-parent identity and responsibility checks still apply.
+- Work done by an already-running same-UID process (tmux server, another shell,
+  a loaded LaunchAgent, an ssh ControlMaster) escapes attribution.
+- Processes that change UID/GID through setuid/setgid execution can leave the
+  same-UID snapshot and escape inspection.
+- An ordinary double-fork can lose its intermediate before the 50 ms poll. That
+  reader remains unknown and alive, so ordinary daemonizing tools can stall the
+  drive. Git's no-detach settings reduce one benign source; no fork-event tracking
+  is installed. Unknown survivors can deny service by keeping the drive paused.
+- Start the driver with no reflector running. Pre-existing reflectors and
+  nominations are not guarded; a pending single-checkout nomination at startup is
+  scored without a step guard.
+- Same-UID processes can hide or act before inspection. Snapshots and signals are
+  not atomic; identity rechecks reduce but cannot eliminate PID reuse races. A
+  future Linux PID-plus-start-time backend would also need to address reuse.
+- Reads during the reflector step remain possible. The guard separates reflection
+  from scoring in time; it does not deny reads of other processes' argv while the
+  reflector runs. The dated table shows raw `KERN_PROCARGS2` reads remain possible;
+  this is why process lifetime separation is needed.
+
+A separate scoring UID would close these same-UID disclosure and interference
+channels; the driver does not provision one.
 
 ## Outer Omni protocol for code candidates
 

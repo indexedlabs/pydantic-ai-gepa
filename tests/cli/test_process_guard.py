@@ -229,3 +229,171 @@ time.sleep(30)
         if process.poll() is None:
             process.kill()
         process.wait(timeout=5)
+
+
+def test_finite_window_survives_restart_and_tracks_later_descendants():
+    backend = SnapshotProcesses()
+    record = {}
+    guard = ProcessGuard(backend, record, lambda: None)
+    guard.begin()
+    unknown = Process(10, 3, 2, (1, 0), "unknown during step")
+    backend.processes.append(unknown)
+    guard.close_window()
+    assert record["ceiling"] == 3
+    unrelated_birth = Process(11, 5, 4, (1, 0), "after step")
+    child = Process(12, 6, 3, (1, 0), "descendant after step")
+    backend.processes += [unrelated_birth, child]
+    guard.observe()
+    backend.processes.remove(unknown)
+    resumed = ProcessGuard(backend, record, lambda: None)
+    assert resumed.finish(0.01) == [child]
+    assert record["ceiling"] == 3
+    backend.processes.remove(child)
+    assert resumed.finish(0.01) == []
+    assert backend.killed == []
+
+
+def test_interrupted_window_closes_on_first_restart_snapshot():
+    backend = SnapshotProcesses()
+    record = {}
+    ProcessGuard(backend, record, lambda: None).begin()
+    unknown = Process(10, 3, 2, (1, 0), "before restart")
+    backend.processes.append(unknown)
+    resumed = ProcessGuard(backend, record, lambda: None)
+    assert resumed.finish(0.01) == [unknown]
+    assert record["ceiling"] == 3
+    backend.processes = [
+        backend.processes[0],
+        Process(11, 5, 4, (1, 0), "after restart"),
+    ]
+    assert resumed.finish(0.01) == []
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        None,
+        "parent",
+        "path",
+        "unsigned",
+        "csops",
+        "path_unavailable",
+        "responsibility_unavailable",
+        "driver",
+        "root",
+        "missing_driver",
+        "missing_root",
+        "identity_changed",
+        "launchd_unavailable",
+    ],
+)
+def test_platform_job_requires_every_proof(failure):
+    backend = DarwinProcesses.__new__(DarwinProcesses)
+    process = Process(20, 20, 7 if failure != "parent" else 8, (1, 0), "platform")
+
+    def read(pid, flavor, info):
+        assert pid == 1 and flavor == 17
+        info.unique_id = 7
+        if failure == "launchd_unavailable":
+            raise GuardError("denied")
+        return True
+
+    def path(pid, buffer, size):
+        buffer.value = b"/bin/sleep" if failure == "path" else b"/System/Library/job"
+        return 0 if failure == "path_unavailable" else len(buffer.value)
+
+    def csops(pid, operation, pointer, size):
+        pointer._obj.value = 0 if failure == "unsigned" else 0x04000000
+        return -1 if failure == "csops" else 0
+
+    backend._read = read
+    backend.lib = SimpleNamespace(proc_pidpath=path)
+    backend.libc = SimpleNamespace(csops=csops)
+    backend.responsible_pid = lambda pid: {
+        "responsibility_unavailable": None,
+        "driver": 100,
+        "root": 200,
+    }.get(failure, 300)
+    backend.identity = lambda pid: None if failure == "identity_changed" else process
+    driver = None if failure == "missing_driver" else 100
+    root = None if failure == "missing_root" else 200
+    assert backend.platform_job(process, driver, root) == (failure is None)
+
+
+def test_platform_proof_does_not_override_attributed_ancestry():
+    backend = SnapshotProcesses()
+    backend.platform_job = lambda *args: True
+    record = {}
+    guard = ProcessGuard(backend, record, lambda: None)
+    guard.begin()
+    record["root"] = 2
+    root = Process(20, 2, 1, (1, 0), "platform reflector")
+    backend.processes.append(root)
+    assert guard.classify(root) == "attributed"
+    assert guard.finish(0.1) == []
+    assert backend.killed == [20]
+
+
+def test_host_zombie_root_identity_is_available(tmp_path, host_processes):
+    marker = tmp_path / "exiting"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            f"from pathlib import Path; Path({str(marker)!r}).touch()",
+        ]
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert marker.exists()
+        # Do not poll/wait: keep the exited leader unreaped.
+        time.sleep(0.2)
+        assert host_processes.identity(process.pid) is None
+        assert host_processes.identity(process.pid, include_zombie=True) is not None
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+
+
+def test_host_fast_double_fork_platform_binary_is_unknown(tmp_path, host_processes):
+    marker = tmp_path / "reader"
+    script = tmp_path / "fork.py"
+    script.write_text("""import os, sys, time
+from pathlib import Path
+if os.fork() == 0:
+    os.setsid()
+    if os.fork() != 0: os._exit(0)
+    Path(sys.argv[1]).write_text(str(os.getpid()))
+    os.execl("/bin/sleep", "sleep", "60")
+time.sleep(0.3)
+""")
+    record = {}
+    guard = ProcessGuard(host_processes, record, lambda: None)
+    guard.begin()
+    process = subprocess.Popen(
+        [sys.executable, str(script), str(marker)], start_new_session=True
+    )
+    reader = None
+    try:
+        root = host_processes.identity(process.pid, include_zombie=True)
+        assert root is not None
+        record.update(
+            root=root.unique_id,
+            root_responsible=host_processes.responsible_pid(root.pid),
+        )
+        process.wait(timeout=5)  # Deliberately miss the intermediate's lifetime.
+        reader = host_processes.identity(int(marker.read_text()))
+        assert reader is not None
+        guard.observe()
+        assert guard.classify(reader) == "unknown"
+        assert reader in guard.finish(0.01)
+        assert host_processes.identity(reader.pid) == reader
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+        if reader is not None:
+            host_processes.kill(reader)

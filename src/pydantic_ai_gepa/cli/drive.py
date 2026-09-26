@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import asdict
 import fcntl
 import hashlib
 import json
@@ -45,13 +46,20 @@ DEFAULT_REFLECTORS = [
 ]
 
 
-def load_reflectors(path: Path | None) -> tuple[list[dict[str, Any]], str]:
+def load_reflectors(path: Path | None) -> tuple[list[dict[str, Any]], str, list[str]]:
     try:
         entries = json.loads(path.read_text()) if path else DEFAULT_REFLECTORS
     except (OSError, ValueError) as exc:
         raise typer.BadParameter(
             "Cannot read reflector configuration as JSON."
         ) from exc
+    pass_env = []
+    if isinstance(entries, dict):
+        if set(entries) - {"reflectors", "pass_env"}:
+            raise typer.BadParameter("Invalid reflector configuration.")
+        pass_env = entries.get("pass_env", [])
+        entries = entries.get("reflectors")
+    validate_pass_env(pass_env)
     if not isinstance(entries, list) or not entries:
         raise typer.BadParameter("Reflectors must be a nonempty JSON array.")
     labels = set()
@@ -96,32 +104,127 @@ def load_reflectors(path: Path | None) -> tuple[list[dict[str, Any]], str]:
                 "Invalid reflector template or usage-limit detection."
             ) from exc
     digest = hashlib.sha256(
-        json.dumps(entries, sort_keys=True, separators=(",", ":")).encode()
+        json.dumps(
+            {"reflectors": entries, "pass_env": pass_env} if pass_env else entries,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
     ).hexdigest()
-    return entries, digest
+    return entries, digest, pass_env
 
 
-def reflector_environment() -> dict[str, str]:
-    """Do not pass harness inputs or evaluator credentials to a reflector."""
-    private = (
-        set(PROVIDER_KEYS)
-        | {"GEPA_HELDOUT_DATASET", "GEPA_CANDIDATE_COMPONENTS_JSON", "GEPA_TRACE_FILE"}
+def reserved_environment() -> set[str]:
+    return (
+        {"GEPA_CANDIDATE_COMPONENTS_JSON", "GEPA_TRACE_FILE"}
         | {
             name.strip()
             for name in os.environ.get("GEPA_HARNESS_PASS_ENV", "").split(",")
         }
+        | {
+            name
+            for name in os.environ
+            if name.startswith(("GEPA_HELDOUT_", "GEPA_HARNESS_"))
+        }
     )
-    return {
+
+
+def validate_pass_env(names: Any) -> None:
+    if not isinstance(names, list) or any(
+        not isinstance(name, str)
+        or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None
+        or name.startswith(("GEPA_HELDOUT_", "GEPA_HARNESS_"))
+        or name in reserved_environment()
+        for name in names
+    ):
+        raise typer.BadParameter(
+            "pass_env must contain explicit training-only variable names; harness variables are forbidden."
+        )
+
+
+def reflector_environment(pass_env: list[str] | None = None) -> dict[str, str]:
+    """Do not pass harness inputs or evaluator credentials to a reflector."""
+    validate_pass_env(pass_env or [])
+    private = (set(PROVIDER_KEYS) - set(pass_env or [])) | reserved_environment()
+    environment = {
         key: value
         for key, value in os.environ.items()
-        if key not in private and not key.startswith("GEPA_HARNESS_")
+        if key not in private and not key.startswith(("GEPA_HELDOUT_", "GEPA_HARNESS_"))
     }
+    try:
+        count = int(environment.get("GIT_CONFIG_COUNT", "0"))
+        if count < 0:
+            raise ValueError
+    except ValueError as exc:
+        raise typer.BadParameter(
+            "GIT_CONFIG_COUNT must be a nonnegative integer."
+        ) from exc
+    for key in ("gc.autoDetach", "maintenance.autoDetach"):
+        environment[f"GIT_CONFIG_KEY_{count}"] = key
+        environment[f"GIT_CONFIG_VALUE_{count}"] = "false"
+        count += 1
+    environment["GIT_CONFIG_COUNT"] = str(count)
+    return environment
+
+
+def private_state_path(run_id: str) -> Path:
+    run = _load_state(run_id)
+    public = run_dir(run_id) / "drive.json"
+    if public.exists() or public.is_symlink():
+        raise typer.BadParameter(
+            "Public drive.json is untrusted; remove it explicitly before driving. It will not be loaded or migrated."
+        )
+    if run.heldout_required:
+        dataset, _ = check_heldout_pin(repo_root(), run_id)
+        pin = _pin_path(dataset, repo_root(), run_id)
+        path = pin.with_name(pin.stem + ".drive.json")
+    else:
+        key = hashlib.sha256(
+            f"{gepa_dir(repo_root()).resolve()}\0{run_id}".encode()
+        ).hexdigest()
+        base = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
+        path = base / "pydantic-ai-gepa" / "drive" / key / "drive.json"
+    roots = [gepa_dir(repo_root()), repo_root()]
+    if run.project_root:
+        roots.append(Path(run.project_root))
+    if run.lanes:
+        for lane in lanes.load_all_lane_states(repo_root(), run_id):
+            roots.extend(
+                Path(p) for p in (lane.worktree_path, lane.candidate_project_path) if p
+            )
+    if any(path.resolve().is_relative_to(root.resolve()) for root in roots):
+        raise typer.BadParameter(
+            "Driver-private state must be outside GEPA_DIR, project and lane worktrees."
+        )
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = path.parent.stat()
+    if info.st_uid != os.getuid() or info.st_mode & 0o777 != 0o700:
+        raise typer.BadParameter(
+            "Driver-private directory must be owned by the current user with mode 0700."
+        )
+    check_private_file(path)
+    return path
+
+
+def check_private_file(path: Path) -> None:
+    if path.is_symlink():
+        raise typer.BadParameter("Driver-private files must not be symlinks.")
+    if path.exists():
+        info = path.stat()
+        if (
+            not path.is_file()
+            or info.st_uid != os.getuid()
+            or info.st_mode & 0o777 != 0o600
+        ):
+            raise typer.BadParameter(
+                "Driver-private files must be owned by the current user with mode 0600."
+            )
 
 
 @contextmanager
 def driver_lock(path: Path) -> Iterator[None]:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    check_private_file(path)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -144,6 +247,7 @@ class Driver:
         max_steps: int | None,
         attempts: int,
         grace: float,
+        pass_env: list[str] | None = None,
     ) -> None:
         self.run_id, self.path, self.entries = run_id, path, entries
         self.timeout, self.max_steps, self.attempt_cap, self.grace = (
@@ -153,6 +257,7 @@ class Driver:
             grace,
         )
         self.steps = 0
+        self.pass_env = pass_env or []
         self.backend = DarwinProcesses()
         self.state = (
             json.loads(path.read_text())
@@ -239,7 +344,12 @@ class Driver:
         if not step or not step.get("guard"):
             return
         guard = ProcessGuard(self.backend, step["guard"], self.save)
-        survivors = guard.finish(self.grace)
+        try:
+            survivors = guard.finish(self.grace)
+        except GuardError:
+            self.state["pause_reason"] = "process_inspection_failed"
+            self.save()
+            raise
         if survivors:
             for process in survivors:
                 typer.echo(
@@ -360,7 +470,7 @@ class Driver:
             process = subprocess.Popen(
                 argv,
                 cwd=checkout,
-                env=reflector_environment(),
+                env=reflector_environment(self.pass_env),
                 stdin=subprocess.DEVNULL,
                 stdout=stdout,
                 stderr=stderr,
@@ -369,9 +479,11 @@ class Driver:
             self.steps += 1
             step["pid"] = process.pid
             self.phase("reflector_started")
-            identity = self.backend.identity(process.pid)
+            identity = self.backend.identity(process.pid, include_zombie=True)
             if identity:
                 step["guard"]["root"] = identity.unique_id
+                step["guard"]["seen"][str(identity.unique_id)] = asdict(identity)
+                step["guard"]["root_responsible"] = guard.responsible_pid(process.pid)
                 step["unique_id"] = identity.unique_id
                 step["start"] = identity.start
                 self.save()
@@ -389,7 +501,12 @@ class Driver:
                 for sig, delay in ((signal.SIGTERM, 0.2), (signal.SIGKILL, 0)):
                     process.poll()
                     try:
-                        self.signal_group(process.pid, guard, sig)
+                        if process.returncode is None:
+                            # An unreaped leader reserves this PID even if it
+                            # exited before publishing its kernel identity.
+                            os.killpg(process.pid, sig)
+                        else:
+                            self.signal_group(process.pid, guard, sig)
                     except ProcessLookupError:
                         pass
                     except PermissionError as exc:
@@ -398,7 +515,13 @@ class Driver:
                         ) from exc
                     if delay:
                         time.sleep(delay)
-                process.wait()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired as exc:
+                    raise GuardError(
+                        "Reflector did not exit after group cleanup."
+                    ) from exc
+                guard.close_window()
         output = "\n".join(
             (logs / name).read_text(errors="replace")
             for name in ("stdout.log", "stderr.log")
@@ -419,7 +542,14 @@ class Driver:
         lane = step["lane"]
         self.guard_pending()
         self.phase("guard_passed")
-        if step["usage_limit"]:
+        if lane:
+            nominated = (
+                lanes.load_lane_state(repo_root(), self.run_id, lane).status
+                == "awaiting_selection"
+            )
+        else:
+            nominated = bool(self.pending())
+        if not nominated and step["usage_limit"]:
             self.state["usage_limits"][str(self.state["sequence"])] = {
                 "label": step["reflector"],
                 "exit_code": step["exit_code"],
@@ -444,13 +574,6 @@ class Driver:
                 )
             self.phase("retry_ready", step=None)
             return
-        if lane:
-            nominated = (
-                lanes.load_lane_state(repo_root(), self.run_id, lane).status
-                == "awaiting_selection"
-            )
-        else:
-            nominated = bool(self.pending())
         if not nominated:
             self.fail_step(
                 lane,
@@ -591,16 +714,12 @@ def drive(
         raise typer.BadParameter(
             "Drive supports lane runs and single-checkout held-out runs."
         )
-    if run.heldout_required:
-        dataset, _ = check_heldout_pin(repo_root(), run_id)
-        pin = _pin_path(dataset, repo_root(), run_id)
-        path = pin.with_name(pin.stem + ".drive.json")
-    else:
-        path = run_dir(run_id) / "drive.json"
-    entries, digest = load_reflectors(reflectors)
+    path = private_state_path(run_id)
+    entries, digest, pass_env = load_reflectors(reflectors)
     with driver_lock(path.with_suffix(".lock")):
+        driver = None
         try:
-            Driver(
+            driver = Driver(
                 run_id,
                 path,
                 entries,
@@ -610,11 +729,12 @@ def drive(
                 max_steps,
                 max_attempts,
                 survivor_grace,
-            ).run()
+                pass_env,
+            )
+            driver.run()
         except GuardError as exc:
-            if path.exists():
-                saved = json.loads(path.read_text())
-                saved.update(pause_reason="process_inspection_failed")
-                harness._atomic_json(path, saved)
+            if driver is not None:
+                driver.state["pause_reason"] = "process_inspection_failed"
+                driver.save()
             typer.echo(f"Drive process guard refused: {exc}", err=True)
             raise typer.Exit(EXIT_SURVIVORS) from exc

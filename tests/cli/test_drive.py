@@ -26,7 +26,7 @@ class OwnProcesses:
     def __init__(self):
         self.pids = set()
 
-    def identity(self, pid):
+    def identity(self, pid, *, include_zombie=False):
         self.pids.add(pid)
         try:
             os.kill(pid, 0)
@@ -45,7 +45,8 @@ class OwnProcesses:
 
 
 @pytest.fixture(autouse=True)
-def driver_environment(monkeypatch):
+def driver_environment(monkeypatch, tmp_path_factory):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path_factory.mktemp("driver-private")))
     monkeypatch.setattr(drive, "DarwinProcesses", OwnProcesses)
     monkeypatch.setattr(layout, "_explicit_gepa_dirname", None)
     monkeypatch.delenv("GEPA_DIR", raising=False)
@@ -119,7 +120,7 @@ def invoke(run_id, path, *extra):
 
 
 def driver_state(repo, run_id):
-    return json.loads((repo / ".gepa/runs" / run_id / "drive.json").read_text())
+    return json.loads(drive.private_state_path(run_id).read_text())
 
 
 def test_lane_run_reaches_done_and_records_before_ack(git_repo, monkeypatch):
@@ -353,10 +354,11 @@ def wait_for(path, process):
 
 def driver_subprocess(repo, run_id, config_path, extra_source="", env=None):
     launcher = config_path.parent / "launch-driver.py"
-    state_path = repo / ".gepa/runs" / run_id / "drive.json"
     if env and env.get("GEPA_HELDOUT_DATASET"):
         pin = drive._pin_path(env["GEPA_HELDOUT_DATASET"], repo, run_id)
         state_path = pin.with_name(pin.stem + ".drive.json")
+    else:
+        state_path = drive.private_state_path(run_id)
     # Preserve real kernel identities and signaling, but provide only the test's
     # process tree to the guard. Uncontrolled launchd/XPC activity correctly
     # pauses production; it must not make this replay test nondeterministic.
@@ -506,3 +508,267 @@ run.run_eval_once = interrupted
                 if process.poll() is None:
                     process.kill()
                 process.wait(timeout=5)
+
+
+def test_nomination_takes_priority_over_usage_limit_output(git_repo):
+    run_id = start_lanes()
+    path = config(git_repo)
+    script = path.parent / "reflect.py"
+    script.write_text(script.read_text() + '\nprint("usage limit")\n')
+    entries = json.loads(path.read_text())
+    entries[0]["usage_limit"] = {"output_regexes": ["usage limit"]}
+    path.write_text(json.dumps(entries))
+    result = invoke(run_id, path)
+    assert result.exit_code == 0, (result.output, result.exception)
+    assert driver_state(git_repo, run_id)["usage_limits"] == {}
+
+
+def test_timeout_without_published_root_is_bounded(git_repo, monkeypatch):
+    class Unpublished(OwnProcesses):
+        def identity(self, pid, *, include_zombie=False):
+            if include_zombie:
+                self.pids.add(pid)
+                return None
+            return super().identity(pid)
+
+    monkeypatch.setattr(drive, "DarwinProcesses", Unpublished)
+    run_id = start_lanes()
+    path = config(git_repo, "import time\ntime.sleep(60)\n")
+    started = time.monotonic()
+    result = invoke(run_id, path, "--step-timeout", "0.1", "--max-attempts", "1")
+    assert result.exit_code == drive.EXIT_PAUSED, (result.output, result.exception)
+    assert time.monotonic() - started < 10
+    state = driver_state(git_repo, run_id)
+    assert state["step"]["guard"]["root"] is None
+    with pytest.raises(ProcessLookupError):
+        os.kill(state["step"]["pid"], 0)
+
+
+def test_training_credentials_explicit_passthrough(git_repo, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "training-only")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "user.name")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "Test")
+    path = config(git_repo)
+    path.write_text(
+        json.dumps(
+            {"reflectors": json.loads(path.read_text()), "pass_env": ["OPENAI_API_KEY"]}
+        )
+    )
+    _, _, names = drive.load_reflectors(path)
+    env = drive.reflector_environment(names)
+    assert env["OPENAI_API_KEY"] == "training-only"
+    assert env["GIT_CONFIG_COUNT"] == "3"
+    assert env["GIT_CONFIG_KEY_0"] == "user.name"
+    assert env["GIT_CONFIG_KEY_1"] == "gc.autoDetach"
+    assert env["GIT_CONFIG_KEY_2"] == "maintenance.autoDetach"
+    assert env["GIT_CONFIG_VALUE_1"] == env["GIT_CONFIG_VALUE_2"] == "false"
+    assert "OPENAI_API_KEY" not in drive.reflector_environment()
+    script = path.parent / "reflect.py"
+    script.write_text(
+        'import os\nassert os.environ["OPENAI_API_KEY"] == "training-only"\n'
+        + script.read_text()
+    )
+    run_id = start_lanes()
+    result = invoke(run_id, path)
+    assert result.exit_code == 0, (result.output, result.exception)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "SCORER_TOKEN",
+        "OPENAI_API_KEY",
+        "GEPA_HELDOUT_OTHER",
+        "GEPA_HARNESS_EXTRA",
+        "GEPA_CANDIDATE_COMPONENTS_JSON",
+        "GEPA_TRACE_FILE",
+        "*_KEY",
+    ],
+)
+def test_forbidden_credentials_cannot_be_allowlisted(git_repo, monkeypatch, name):
+    monkeypatch.setenv("GEPA_HARNESS_PASS_ENV", "SCORER_TOKEN,OPENAI_API_KEY")
+    monkeypatch.setenv(name, "harness-only")
+    path = config(git_repo)
+    path.write_text(
+        json.dumps({"reflectors": json.loads(path.read_text()), "pass_env": [name]})
+    )
+    with pytest.raises(drive.typer.BadParameter, match="explicit training-only"):
+        drive.load_reflectors(path)
+
+
+def test_public_forged_guard_is_never_loaded(git_repo):
+    run_id = start_lanes()
+    path = config(git_repo)
+    public = git_repo / ".gepa/runs" / run_id / "drive.json"
+    public.write_text('{"step":{"guard":{"root":1,"boot_id":"forged"}}}')
+    result = invoke(run_id, path)
+    assert result.exit_code == 2, result.output
+    assert "Public drive.json is untrusted" in result.output
+    assert json.loads(public.read_text())["step"]["guard"]["boot_id"] == "forged"
+
+
+@pytest.mark.parametrize("location", [".gepa/private", "project-private"])
+def test_private_state_inside_reflector_roots_refused(git_repo, monkeypatch, location):
+    run_id = start_lanes()
+    path = config(git_repo)
+    monkeypatch.setenv("XDG_STATE_HOME", str(git_repo / location))
+    result = invoke(run_id, path)
+    assert result.exit_code == 2, result.output
+    assert "outside GEPA_DIR" in result.output
+
+
+def test_private_state_permissions(git_repo):
+    run_id = start_lanes()
+    path = drive.private_state_path(run_id)
+    assert not path.is_relative_to(git_repo)
+    assert path.parent.stat().st_mode & 0o777 == 0o700
+    config_path = config(git_repo)
+    assert invoke(run_id, config_path).exit_code == 0
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert path.with_suffix(".lock").stat().st_mode & 0o777 == 0o600
+    path.parent.chmod(0o755)
+    result = invoke(run_id, config_path)
+    assert result.exit_code == 2
+    assert "0700" in result.output
+
+
+def test_guard_failure_saves_memory_without_reloading_disk(git_repo, monkeypatch):
+    run_id = start_lanes()
+    path = config(git_repo)
+    saved = {}
+
+    def failing_run(self):
+        saved.update(self.state)
+        self.path.write_text('{"step":{"guard":{"boot_id":"forged"}}}')
+        raise drive.GuardError("inspection failed")
+
+    monkeypatch.setattr(drive.Driver, "run", failing_run)
+    result = invoke(run_id, path)
+    assert result.exit_code == drive.EXIT_SURVIVORS
+    expected = dict(saved, pause_reason="process_inspection_failed")
+    assert driver_state(git_repo, run_id) == expected
+
+
+def test_host_unfiltered_minute_step_kills_readers_before_scoring(
+    git_repo, host_processes, monkeypatch
+):
+    from pydantic_ai_gepa.cli import select
+
+    run_id = start_lanes()
+    path = config(git_repo)
+    script = path.parent / "reflect.py"
+    original = script.read_text()
+    markers = path.parent
+    script.write_text(
+        f"""import os, time
+from pathlib import Path
+base = Path({str(markers)!r})
+started = time.monotonic()
+for kind in ("double", "session"):
+    if os.fork() == 0:
+        os.setsid()
+        if kind == "double" and os.fork() != 0:
+            (base / "intermediate.pid").write_text(str(os.getpid()))
+            while not (base / "release").exists(): time.sleep(0.01)
+            os._exit(0)
+        (base / (kind + ".pid")).write_text(str(os.getpid()))
+        time.sleep(180)
+        os._exit(0)
+while not (base / "release").exists(): time.sleep(0.01)
+while time.monotonic() - started < 60: time.sleep(0.05)
+"""
+        + original
+    )
+    owned = {}
+    ordering = []
+    original_observe = drive.ProcessGuard.observe
+    original_phase = drive.Driver.phase
+    original_kill, original_killpg = os.kill, os.killpg
+    original_select = select.run_select
+    reader_names = ("double", "session", "intermediate")
+
+    def phase(self, name, **kwargs):
+        original_phase(self, name, **kwargs)
+        if name == "reflector_started":
+            process = host_processes.identity(
+                self.state["step"]["pid"], include_zombie=True
+            )
+            assert process is not None
+            owned[process.pid] = process
+            ordering.append(("started", time.monotonic()))
+
+    def observe(self):
+        snapshot = original_observe(self)  # Full same-UID snapshot, no filtering.
+        for name in reader_names:
+            marker = markers / (name + ".pid")
+            if marker.exists() and marker.read_text():
+                pid = int(marker.read_text())
+                process = next((p for p in snapshot if p.pid == pid), None)
+                if process is not None:
+                    owned[pid] = process
+        if all((markers / (name + ".pid")).exists() for name in reader_names):
+            ids = [
+                int((markers / (name + ".pid")).read_text()) for name in reader_names
+            ]
+            if all(
+                pid in owned and str(owned[pid].unique_id) in self.record["seen"]
+                for pid in ids
+            ):
+                (markers / "release").touch()
+        return snapshot
+
+    def check_target(pid):
+        current = host_processes.identity(pid, include_zombie=True)
+        assert current is not None and pid in owned, f"Unowned signal target {pid}"
+        assert current.unique_id == owned[pid].unique_id
+        return current.unique_id
+
+    def kill(pid, sig):
+        if sig:
+            identity = check_target(pid)
+            ordering.append(("kill", pid, identity, time.monotonic()))
+        return original_kill(pid, sig)
+
+    def killpg(pgid, sig):
+        # The leader can be reaped; check every live member before the group call.
+        members = []
+        for process in host_processes.snapshot():
+            try:
+                if os.getpgid(process.pid) == pgid:
+                    members.append(process)
+            except ProcessLookupError:
+                continue
+        assert pgid in owned
+        for member in members:
+            check_target(member.pid)
+        ordering.append(
+            ("killpg", pgid, [p.unique_id for p in members], time.monotonic())
+        )
+        return original_killpg(pgid, sig)
+
+    def score(run_id):
+        assert time.monotonic() - ordering[0][1] >= 60
+        for name in ("double", "session"):
+            pid = int((markers / (name + ".pid")).read_text())
+            assert host_processes.identity(pid) is None
+            assert any(row[0] == "kill" and row[1] == pid for row in ordering)
+        ordering.append(("scoring", time.monotonic()))
+        return original_select(run_id)
+
+    monkeypatch.setattr(drive, "DarwinProcesses", lambda: host_processes)
+    monkeypatch.setattr(drive.Driver, "phase", phase)
+    monkeypatch.setattr(drive.ProcessGuard, "observe", observe)
+    monkeypatch.setattr(os, "kill", kill)
+    monkeypatch.setattr(os, "killpg", killpg)
+    monkeypatch.setattr(select, "run_select", score)
+    try:
+        result = invoke(run_id, path, "--step-timeout", "90", "--survivor-grace", "5")
+        assert result.exit_code == 0, (result.output, result.exception)
+        assert any(row[0] == "scoring" for row in ordering)
+        assert drive._load_state(run_id).status == "done"
+    finally:
+        # Persist timing and signal targets for review, even on assertion failure.
+        (markers / "signal-order.json").write_text(json.dumps(ordering))
+        for process in owned.values():
+            host_processes.kill(process)
