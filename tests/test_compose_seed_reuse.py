@@ -390,12 +390,14 @@ async def test_proposer_cannot_mutate_the_incumbent_away_from_its_score() -> Non
     # Two slices ran; each slice's proposer received the unmutated incumbent.
     assert len(result.results) == 2
     assert seen_seeds == ["candidate-0", "candidate-0"]
-    # Inside each slice the reused seed score still describes the original
-    # incumbent (0.5), while the helper's honest re-evaluation of the mutated
-    # candidate the engine returned scores 0.0 and is never adopted.
+    # Inside each slice the reused seed score still describes candidate zero,
+    # which the proposer's in-place edit could not reach, so each engine
+    # returns the unmutated seed with the score it actually has.
     for item in result.results:
-        assert item.history[-1].data["candidate_scores"][0] == 0.5
-    assert result.fair_scores == [0.0, 0.0]
+        assert item.history[-1].data["candidate_scores"] == [0.5, 0.1]
+        assert item.best_candidate == _candidate("candidate-0")
+        assert item.best_score == 0.5
+    assert result.fair_scores == [0.5, 0.5]
     assert result.best.engine == "seed"
     assert result.best.best_candidate == _candidate("candidate-0")
     assert result.best.best_score == 0.5
