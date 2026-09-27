@@ -1247,8 +1247,8 @@ async def evaluate(case):
         json.loads(line)["total_dollars"] for line in lane_rows.splitlines()
     ) == pytest.approx(0.045)
     before = spend_report(run_id, lane_repo)
-    # The private ledger counts only harness-authorized evaluations. The lane's
-    # three training repetitions cannot add their public $0.045 to that ledger.
+    # Select consumes the verdict and computes its own aggregate estimate;
+    # the reflector's public $0.045 is never imported as budget authority.
     assert before["total_dollars"] == pytest.approx(0.36)
     selected = test_select_cli._select(lane_repo, run_id)
     assert selected.exit_code == 70, selected.output
@@ -1259,7 +1259,10 @@ async def evaluate(case):
     assert state.best_candidate_id == incumbent
     assert state.last_comparison["reason_code"] == "cost_budget_exhausted"
     report = spend_report(run_id, lane_repo)
-    assert report["total_dollars"] == before["total_dollars"]
+    assert report["estimated_lane_training_dollars"] == pytest.approx(1.8)
+    assert report["total_dollars"] == pytest.approx(before["total_dollars"] + 1.8)
+    # First fan-out is already in flight: overshoot is bounded by its charge.
+    assert report["total_dollars"] <= 0.45 + report["estimated_lane_training_dollars"]
     assert report["validation_dollars"] == pytest.approx(0.30)
     assert "secret-holdout" not in selected.output
 
