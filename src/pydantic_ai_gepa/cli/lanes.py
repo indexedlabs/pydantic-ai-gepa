@@ -30,6 +30,7 @@ import os
 import re
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -37,7 +38,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Sequence, get_args
 
 import typer
 
@@ -354,10 +355,32 @@ def load_lane_state(workspace_root: Path, run_id: str, lane: str) -> LaneState:
     return LaneState.from_dict(data)
 
 
-def load_all_lane_states(workspace_root: Path, run_id: str) -> list[LaneState]:
+def _lane_state_entries(
+    workspace_root: Path, run_id: str, *, expected: set[str] | None = None
+) -> set[Path]:
+    """Ignore stray non-directories without following links or hiding lane slots."""
     base = lanes_dir(workspace_root, run_id)
+    entries = set()
+    try:
+        with harness_record.SafeDir.open(workspace_root, base) as directory:
+            for name in directory.names():
+                if expected is not None and name in expected:
+                    entries.add(base / name)
+                    continue
+                try:
+                    info = os.stat(name, dir_fd=directory.fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISDIR(info.st_mode):
+                    entries.add(base / name)
+    except FileNotFoundError:
+        pass
+    return entries
+
+
+def load_all_lane_states(workspace_root: Path, run_id: str) -> list[LaneState]:
     states: list[LaneState] = []
-    for entry in sorted(harness_record.list_paths(base, root=workspace_root)):
+    for entry in sorted(_lane_state_entries(workspace_root, run_id)):
         state_path = entry / "state.json"
         if harness_record.exists(state_path, root=workspace_root):
             states.append(
@@ -367,6 +390,72 @@ def load_all_lane_states(workspace_root: Path, run_id: str) -> list[LaneState]:
                     )
                 )
             )
+    return states
+
+
+class LaneStateProblem(ValueError):
+    """A fixed harness diagnostic, never text taken from a lane file."""
+
+
+def selection_fanout_complete(state: Any) -> bool:
+    """Initial fan-out saves running + its start time only after every slot exists."""
+    return state.select_phase == "promote" or (
+        state.status == "running" and state.iteration_started_at is not None
+    )
+
+
+def validate_selection_lanes(
+    states: Sequence[LaneState], count: int, *, require_complete: bool = True
+) -> None:
+    if any(state.status not in get_args(LaneStatus) for state in states):
+        raise LaneStateProblem("lane state is unreadable")
+    names = [state.lane for state in states]
+    if len(names) != len(set(names)):
+        raise LaneStateProblem("lane state names a duplicate lane")
+    if not set(names) <= set(lane_ids(count)):
+        raise LaneStateProblem("lane state names an unexpected lane")
+    if require_complete and set(names) != set(lane_ids(count)):
+        raise LaneStateProblem("lane state is missing")
+
+
+def load_selection_lane_states(
+    workspace_root: Path, run_id: str, count: int, *, require_complete: bool = True
+) -> list[LaneState]:
+    """Validate the complete verdict set before select or drive uses any lane.
+
+    Missing slots are recoverable until fan-out completes. Run-directory and
+    lanes-directory refusals remain structural errors; refusals within a lane
+    become a fixed terminal diagnostic. Lane files are always public, so open
+    them directly with SafeDir rather than importing any private-record view.
+    """
+    base = lanes_dir(workspace_root, run_id)
+    entries = _lane_state_entries(workspace_root, run_id, expected=set(lane_ids(count)))
+    expected = {base / lane for lane in lane_ids(count)}
+    states = []
+    missing = False
+    try:
+        for entry in sorted(entries | expected):
+            try:
+                with harness_record.SafeDir.open(workspace_root, entry) as directory:
+                    content = directory.read_text("state.json")
+            except FileNotFoundError:
+                missing |= entry in expected
+                continue
+            states.append(LaneState.from_dict(json.loads(content)))
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+        AttributeError,
+        OverflowError,
+        RecursionError,
+        typer.BadParameter,
+    ):
+        raise LaneStateProblem("lane state is unreadable") from None
+    validate_selection_lanes(states, count, require_complete=require_complete)
+    if missing and require_complete:
+        raise LaneStateProblem("lane state is missing")
     return states
 
 
@@ -1671,7 +1760,9 @@ def _load_run_state(workspace_root: Path, run_id: str) -> Any:
     )
 
 
-def _resolve_lane_run(run_id: str | None) -> tuple[Path, Any]:
+def _resolve_lane_run(
+    run_id: str | None, *, allow_done: bool = False
+) -> tuple[Path, Any]:
     """Resolve (workspace_root, RunState) explicitly; reject non-lane runs."""
     workspace_root = _resolve_workspace_root(run_id)
     if run_id is None:
@@ -1682,7 +1773,7 @@ def _resolve_lane_run(run_id: str | None) -> tuple[Path, Any]:
             typer.echo("No runs found. Start one with `gepa run start`.", err=True)
             raise typer.Exit(code=1)
     run_state = _load_run_state(workspace_root, run_id)
-    if run_state.status == "done":
+    if run_state.status == "done" and not allow_done:
         typer.echo(
             f"Run {run_state.run_id} is done; lane verbs no longer apply "
             "(a lane is re-fanned at select or removed when the run completes).",

@@ -759,9 +759,15 @@ def _confirm_finalist(
 
 
 def _phase_promote(
-    workspace_root: Path, state: Any, ctx: dict[str, Any]
+    workspace_root: Path,
+    state: Any,
+    ctx: dict[str, Any],
+    *,
+    lane_states: list[LaneState] | None = None,
 ) -> tuple[Any, dict[str, Any], str]:
     """Invalidate stragglers/cross-baseline lanes, pick + promote the winner."""
+    if lane_states is None:
+        lane_states = load_all_lane_states(workspace_root, state.run_id)
     if "accepted_promotion_count" in ctx:
         # The promotion checkpoint includes the new incumbent evidence. Do
         # not compare the winner with itself when resuming that checkpoint.
@@ -769,7 +775,7 @@ def _phase_promote(
             results = ctx.get("validation_results", {})
             accepted = [
                 lane
-                for lane in load_all_lane_states(workspace_root, state.run_id)
+                for lane in lane_states
                 if lane.verdict == "accepted"
                 and lane.lane not in ctx.get("invalidated", [])
                 and (
@@ -794,7 +800,6 @@ def _phase_promote(
         )
         raise typer.Exit(code=1)
 
-    lane_states = load_all_lane_states(workspace_root, run_id)
     confirmation_finished = False
     if key := ctx.get("confirmation_checkpoint"):
         record = harness_record.for_run(run_id, workspace_root)
@@ -2088,9 +2093,38 @@ def _phase_finalize(
 # ----------------------------- entry point -------------------------------
 
 
+def _selection_lanes(workspace_root: Path, state: Any) -> list[LaneState]:
+    from .lanes import (
+        LaneStateProblem,
+        load_selection_lane_states,
+        selection_fanout_complete,
+    )
+    from .spend import _finish_run_stop
+
+    try:
+        return load_selection_lane_states(
+            workspace_root,
+            state.run_id,
+            state.lanes,
+            require_complete=selection_fanout_complete(state),
+        )
+    except LaneStateProblem as exc:
+        reason = str(exc)
+    # Leave the parsing exception context before stopping: even a traceback
+    # must not carry the reflector's JSON or invalid field values.
+    _finish_run_stop(state, workspace_root, reason, "lane_state_invalid")
+    raise typer.Exit(code=70)
+
+
 def _preselect_check(workspace_root: Path, state: Any) -> None:
     """Fresh-invocation preconditions: reaper pass + selection due-ness."""
     run_id = state.run_id
+    _selection_lanes(workspace_root, state)
+    from .lanes import selection_fanout_complete
+
+    if not selection_fanout_complete(state):
+        typer.echo("Lane fan-out is incomplete; selection is not ready.", err=True)
+        raise typer.Exit(code=1)
     reaper_pass_for_run(workspace_root, state)
     scan = scan_lane_states(workspace_root, run_id, state)
     lane_states = load_all_lane_states(workspace_root, run_id)
@@ -2150,7 +2184,7 @@ def _select_lock(workspace_root: Path, run_id: str) -> Iterator[None]:
 
 def run_select(run_id: str | None) -> Any:
     """Execute `gepa run select` (see module docstring for the phase model)."""
-    workspace_root, run_state = _resolve_lane_run(run_id)
+    workspace_root, run_state = _resolve_lane_run(run_id, allow_done=True)
     from .lane_repositories import load
     from .reflector import run_lock
     from .harness_record import for_run
@@ -2188,6 +2222,19 @@ def run_select(run_id: str | None) -> Any:
 
 def _run_select_locked(workspace_root: Path, run_state: Any) -> Any:
     if run_state.status == "done":
+        comparison = getattr(run_state, "last_comparison", None) or {}
+        if comparison.get("reason_code") in {
+            "lane_state_invalid",
+            "cost_budget_exhausted",
+        }:
+            from .spend import _finish_run_stop
+
+            _finish_run_stop(
+                run_state,
+                workspace_root,
+                comparison["stop_reason"],
+                comparison["reason_code"],
+            )
         typer.echo(
             f"Run {run_state.run_id} is done; there is nothing to select.",
             err=True,
@@ -2262,12 +2309,13 @@ def _run_select_locked(workspace_root: Path, run_state: Any) -> Any:
         from .lane_accounting import check_budget, consume
 
         if phase == "promote":
-            consume(
-                state,
-                workspace_root,
-                load_all_lane_states(workspace_root, state.run_id),
+            lane_states = _selection_lanes(workspace_root, state)
+            consume(state, workspace_root, lane_states)
+            state, ctx, next_phase = _phase_promote(
+                workspace_root, state, ctx, lane_states=lane_states
             )
-        state, ctx, next_phase = handler(workspace_root, state, ctx)
+        else:
+            state, ctx, next_phase = handler(workspace_root, state, ctx)
         check_budget(state, workspace_root)
         state = _checkpoint(
             state, workspace_root, next_phase, ctx if next_phase else None

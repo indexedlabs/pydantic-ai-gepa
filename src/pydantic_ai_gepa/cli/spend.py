@@ -583,9 +583,7 @@ def _finish_cost_stop(
     reason: str,
     cap: float | None,
 ) -> None:
-    from .events import EventDraft, emit, list_events
-    from .run import RunState, _public_state, _write_final_report
-    from .runs import ParetoLog, utc_now_iso
+    from .run import RunState
 
     path = run_state_path(run_id, root)
     if not harness_record.exists(path):
@@ -596,17 +594,34 @@ def _finish_cost_stop(
         )
         return
     state = state or RunState.from_dict(json.loads(harness_record.read_text(path)))
-    state = replace(
-        state,
-        status="done",
-        continuation=None,
-        select_phase=None,
-        select_context=None,
-        iterations=ParetoLog(run_id, root).count_budget_rows()
-        + state.gate_consumed_iterations,
-        updated_at=utc_now_iso(),
-        last_comparison={"reason_code": "cost_budget_exhausted", "stop_reason": reason},
-    )
+    _finish_run_stop(state, root, reason, "cost_budget_exhausted")
+
+
+def _finish_run_stop(
+    state: RunState, root: Path | None, reason: str, reason_code: str
+) -> None:
+    """Persist a terminal decision first; replay repairs its report and event.
+
+    Callers hold the run/select lock and supply harness-owned run state. Never
+    inspect lane files here: the stopped run retains its authoritative incumbent.
+    """
+    from .events import EventDraft, emit, list_events
+    from .run import _public_state, _write_final_report
+    from .runs import ParetoLog, utc_now_iso
+
+    run_id = state.run_id
+    if state.status != "done":
+        state = replace(
+            state,
+            status="done",
+            continuation=None,
+            select_phase=None,
+            select_context=None,
+            iterations=ParetoLog(run_id, root).count_budget_rows()
+            + state.gate_consumed_iterations,
+            updated_at=utc_now_iso(),
+            last_comparison={"reason_code": reason_code, "stop_reason": reason},
+        )
     state.save(root)
     final_path, _ = _write_final_report(state, root=root)
     if not any(event.type == "run_done" for event in list_events(run_id, root)):

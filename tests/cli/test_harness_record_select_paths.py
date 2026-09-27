@@ -155,6 +155,16 @@ def test_heldout_select_refuses_or_matches_control(lane_run, attack, tmp_path):
             if not name.endswith(".record.json")
             for p in [record.path.parent / name]
         )
+    elif attack == "lane-dir":
+        assert result.exit_code == 70, (result.output, result.exception)
+        state = json.loads(record.read("state.json"))
+        assert state["status"] == "done"
+        assert state["best_commit_sha"] == old_best
+        assert state["last_comparison"] == {
+            "reason_code": "lane_state_invalid",
+            "stop_reason": "lane state is unreadable",
+        }
+        assert len(flows._events(record.root, record.run_id, "run_done")) == 1
     else:
         assert result.exit_code == 2, (result.output, result.exception)
         assert (
