@@ -374,7 +374,16 @@ class LaneStateProblem(ValueError):
     """A fixed harness diagnostic, never text taken from a lane file."""
 
 
-def validate_selection_lanes(states: Sequence[LaneState], count: int) -> None:
+def selection_fanout_complete(state: Any) -> bool:
+    """Initial fan-out saves running + its start time only after every slot exists."""
+    return state.select_phase == "promote" or (
+        state.status == "running" and state.iteration_started_at is not None
+    )
+
+
+def validate_selection_lanes(
+    states: Sequence[LaneState], count: int, *, require_complete: bool = True
+) -> None:
     if any(state.status not in get_args(LaneStatus) for state in states):
         raise LaneStateProblem("lane state is unreadable")
     names = [state.lane for state in states]
@@ -382,39 +391,38 @@ def validate_selection_lanes(states: Sequence[LaneState], count: int) -> None:
         raise LaneStateProblem("lane state names a duplicate lane")
     if not set(names) <= set(lane_ids(count)):
         raise LaneStateProblem("lane state names an unexpected lane")
-    if set(names) != set(lane_ids(count)):
+    if require_complete and set(names) != set(lane_ids(count)):
         raise LaneStateProblem("lane state is missing")
 
 
 def load_selection_lane_states(
-    workspace_root: Path, run_id: str, count: int
+    workspace_root: Path, run_id: str, count: int, *, require_complete: bool = True
 ) -> list[LaneState]:
     """Validate the complete verdict set before select or drive uses any lane.
 
-    Every slot is created by fan-out before selection can start. Keep the
-    general-purpose loader's behavior unchanged for status, probes and reaping.
+    Missing slots are recoverable until fan-out completes. Run-directory and
+    lanes-directory refusals remain structural errors; refusals within a lane
+    become a fixed terminal diagnostic. Lane files are always public, so open
+    them directly with SafeDir rather than importing any private-record view.
     """
+    base = lanes_dir(workspace_root, run_id)
     try:
-        for lane in lane_ids(count):
-            if not harness_record.exists(
-                lane_state_path(workspace_root, run_id, lane), root=workspace_root
-            ):
-                raise LaneStateProblem("lane state is missing")
-        states = []
-        base = lanes_dir(workspace_root, run_id)
-        for entry in sorted(harness_record.list_paths(base, root=workspace_root)):
-            path = entry / "state.json"
-            if not harness_record.exists(path, root=workspace_root):
-                continue
-            content = harness_record.read_text(path, root=workspace_root)
+        with harness_record.SafeDir.open(workspace_root, base) as directory:
+            entries = {base / name for name in directory.names()}
+    except FileNotFoundError:
+        entries = set()
+    expected = {base / lane for lane in lane_ids(count)}
+    states = []
+    missing = False
+    try:
+        for entry in sorted(entries | expected):
             try:
-                states.append(LaneState.from_dict(json.loads(content)))
-            except typer.BadParameter:
-                # Invalid IDs in JSON are unreadable lane states. SafeDir's
-                # path refusals above retain their existing fail-closed behavior.
-                raise LaneStateProblem("lane state is unreadable") from None
-    except LaneStateProblem:
-        raise
+                with harness_record.SafeDir.open(workspace_root, entry) as directory:
+                    content = directory.read_text("state.json")
+            except FileNotFoundError:
+                missing |= entry in expected
+                continue
+            states.append(LaneState.from_dict(json.loads(content)))
     except (
         OSError,
         ValueError,
@@ -423,9 +431,12 @@ def load_selection_lane_states(
         AttributeError,
         OverflowError,
         RecursionError,
+        typer.BadParameter,
     ):
         raise LaneStateProblem("lane state is unreadable") from None
-    validate_selection_lanes(states, count)
+    validate_selection_lanes(states, count, require_complete=require_complete)
+    if missing and require_complete:
+        raise LaneStateProblem("lane state is missing")
     return states
 
 

@@ -1,9 +1,12 @@
 """Broken reflector verdicts terminate with the private incumbent, without leaks."""
 
 import json
+import os
+import shutil
 from dataclasses import replace
 
 import pytest
+import typer
 
 from pydantic_ai_gepa.cli import drive, events, harness_record, run, select
 from pydantic_ai_gepa.cli.lanes import LaneStateProblem, load_selection_lane_states
@@ -19,6 +22,9 @@ CASES = [
     ("corrupt", "lane state is unreadable"),
     ("invalid", "lane state is unreadable"),
     ("missing", "lane state is missing"),
+    ("symlink", "lane state is unreadable"),
+    ("hardlink", "lane state is unreadable"),
+    ("directory", "lane state is unreadable"),
 ]
 
 
@@ -61,6 +67,16 @@ def _plant(repo, monkeypatch, case):
     elif case == "invalid":
         data = {"lane": MARKER}
     path.write_text(json.dumps(data) if case != "corrupt" else MARKER + "{")
+    if case in {"symlink", "hardlink", "directory"}:
+        target = repo.parent / MARKER
+        target.write_text(json.dumps(data))
+        path.unlink()
+        if case == "symlink":
+            path.symlink_to(target)
+        elif case == "hardlink":
+            os.link(target, path)
+        else:
+            path.mkdir()
     if case == "missing":
         path.unlink()
         # The remaining lane is also untrusted and must not nominate a winner.
@@ -127,7 +143,13 @@ def test_bad_lane_state_finalizes(lane_repo, monkeypatch, case, reason, resume):
     run_id, started = _plant(lane_repo, monkeypatch, case)
     if resume:
         with harness_environment():
-            state = run._load_state(run_id)
+            # The promote checkpoint itself establishes selection readiness,
+            # even if the initial fan-out completion fields are unavailable.
+            state = replace(
+                run._load_state(run_id),
+                status="paused_for_reflection",
+                iteration_started_at=None,
+            )
             select._checkpoint(state, lane_repo, "promote", {})
     result = test_select_cli._select(lane_repo, run_id)
     assert result.exit_code == 70, (result.output, result.exception)
@@ -135,8 +157,9 @@ def test_bad_lane_state_finalizes(lane_repo, monkeypatch, case, reason, resume):
     _assert_stopped(lane_repo, run_id, started, reason, result.output)
 
 
-def test_drive_returns_final_report_for_bad_lane_state(lane_repo, monkeypatch):
-    run_id, started = _plant(lane_repo, monkeypatch, "corrupt")
+@pytest.mark.parametrize("case", ["corrupt", "symlink", "hardlink", "directory"])
+def test_drive_returns_final_report_for_bad_lane_state(lane_repo, monkeypatch, case):
+    run_id, started = _plant(lane_repo, monkeypatch, case)
     monkeypatch.setattr(drive, "DarwinProcesses", test_drive.OwnProcesses)
     path = test_drive.config(lane_repo, source="raise AssertionError('no reflection')")
     result = test_drive.invoke(run_id, path)
@@ -206,3 +229,121 @@ def test_report_returns_incumbent_even_with_higher_unaccepted_row(
         "lane state names an unexpected lane",
         result.output,
     )
+
+
+@pytest.mark.parametrize("redirect", ["run", "lanes"])
+def test_selection_preserves_refusal_above_lane_entries(
+    tmp_path, monkeypatch, redirect
+):
+    from pydantic_ai_gepa.cli import layout
+
+    monkeypatch.setattr(layout, "_explicit_gepa_dirname", str(tmp_path / ".gepa"))
+    target = tmp_path / MARKER
+    target.mkdir()
+    path = tmp_path / ".gepa/runs/test"
+    if redirect == "lanes":
+        path /= "lanes"
+    path.parent.mkdir(parents=True)
+    path.symlink_to(target, target_is_directory=True)
+    with pytest.raises(typer.BadParameter):
+        load_selection_lane_states(tmp_path, "test", 1)
+    assert list(target.iterdir()) == []
+
+
+@pytest.mark.parametrize("remaining", [0, 1])
+@pytest.mark.parametrize("heldout", [False, True])
+def test_incomplete_fanout_is_not_finalized_by_select_or_drive(
+    lane_repo, monkeypatch, remaining, heldout
+):
+    from pydantic_ai_gepa.cli import lanes
+
+    fan_out = lanes.fan_out_lanes
+    if heldout:
+        dataset = lane_repo.parent / "heldout.jsonl"
+        dataset.write_text(
+            json.dumps({"name": "secret", "inputs": "x", "expected_output": "v"}) + "\n"
+        )
+        monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(dataset))
+
+    def interrupted_fan_out(state, root):
+        # Let the real initial fan-out build its slots, then simulate a kill
+        # halfway through or a rollback before its completion state is saved.
+        fan_out(state, root)
+        for lane in lanes.lane_ids(state.lanes)[remaining:]:
+            shutil.rmtree(lanes.lanes_dir(root, state.run_id) / lane)
+        raise RuntimeError("simulated interrupted fan-out")
+
+    with monkeypatch.context() as interrupted:
+        interrupted.setattr(lanes, "fan_out_lanes", interrupted_fan_out)
+        result = test_select_cli._run("run", "start", "--lanes", "2", "--size", "3")
+    assert isinstance(result.exception, RuntimeError)
+    assert str(result.exception) == "simulated interrupted fan-out"
+    from pydantic_ai_gepa.cli.layout import latest_run_id
+
+    run_id = latest_run_id(lane_repo)
+    assert run_id is not None
+    before = test_select_cli._state(lane_repo, run_id)
+    assert before.status == "paused_for_reflection"
+    assert before.iteration_started_at is None
+    result = test_select_cli._select(lane_repo, run_id)
+    assert result.exit_code == 1, (result.output, result.exception)
+    assert "fan-out is incomplete" in result.output
+    monkeypatch.setattr(drive, "DarwinProcesses", test_drive.OwnProcesses)
+    config = test_drive.config(
+        lane_repo, source="raise AssertionError('no reflection')"
+    )
+    result = test_drive.invoke(run_id, config)
+    assert result.exit_code == drive.EXIT_PAUSED, (result.output, result.exception)
+    assert (
+        test_drive.driver_state(lane_repo, run_id)["pause_reason"]
+        == "lane_fanout_incomplete"
+    )
+    assert test_select_cli._state(lane_repo, run_id) == before
+    assert test_select_cli._events(lane_repo, run_id, "run_done") == []
+    assert not (lane_repo / ".gepa/runs" / run_id / "final_report.md").exists()
+
+
+@pytest.mark.parametrize("case,reason", CASES[:4])
+def test_bad_state_is_terminal_even_before_fanout_completes(
+    lane_repo, monkeypatch, case, reason
+):
+    run_id, started = _plant(lane_repo, monkeypatch, case)
+    with harness_environment():
+        state = run._load_state(run_id)
+        replace(state, status="paused_for_reflection", iteration_started_at=None).save(
+            lane_repo
+        )
+    result = test_select_cli._select(lane_repo, run_id)
+    assert result.exit_code == 70, (result.output, result.exception)
+    _assert_stopped(lane_repo, run_id, started, reason, result.output)
+
+
+def test_cost_stop_select_replay_preserves_state_events_and_reason(
+    lane_repo, monkeypatch
+):
+    started = test_lane_accounting._start(lane_repo, monkeypatch, 2, "2")
+    run_id = str(started["run_id"])
+    for lane in ("lane-1", "lane-2"):
+        test_lane_accounting._drive(lane_repo, run_id, lane)
+    result = test_select_cli._select(lane_repo, run_id)
+    assert result.exit_code == 70, (result.output, result.exception)
+    directory = lane_repo / ".gepa/runs" / run_id
+    state_bytes = (directory / "state.json").read_bytes()
+    state = test_select_cli._state(lane_repo, run_id)
+    assert state.status == "done"
+    assert state.last_comparison["reason_code"] == "cost_budget_exhausted"
+    report = (directory / "final_report.md").read_bytes()
+    assert f"- stop_reason: {state.last_comparison['stop_reason']}\n" in report.decode()
+    events_before = test_select_cli._events(lane_repo, run_id)
+    with harness_environment():
+        record = harness_record.for_run(run_id, lane_repo)
+        assert record is not None
+        private_before = record.read("state.json")
+    again = test_select_cli._select(lane_repo, run_id)
+    assert again.exit_code == 1, (again.output, again.exception)
+    assert (directory / "state.json").read_bytes() == state_bytes
+    assert (directory / "final_report.md").read_bytes() == report
+    assert test_select_cli._events(lane_repo, run_id) == events_before
+    assert len(test_select_cli._events(lane_repo, run_id, "run_done")) == 1
+    with harness_environment():
+        assert record.read("state.json") == private_before

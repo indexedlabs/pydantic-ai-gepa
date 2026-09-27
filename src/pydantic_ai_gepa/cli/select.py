@@ -2094,11 +2094,20 @@ def _phase_finalize(
 
 
 def _selection_lanes(workspace_root: Path, state: Any) -> list[LaneState]:
-    from .lanes import LaneStateProblem, load_selection_lane_states
+    from .lanes import (
+        LaneStateProblem,
+        load_selection_lane_states,
+        selection_fanout_complete,
+    )
     from .spend import _finish_run_stop
 
     try:
-        return load_selection_lane_states(workspace_root, state.run_id, state.lanes)
+        return load_selection_lane_states(
+            workspace_root,
+            state.run_id,
+            state.lanes,
+            require_complete=selection_fanout_complete(state),
+        )
     except LaneStateProblem as exc:
         reason = str(exc)
     # Leave the parsing exception context before stopping: even a traceback
@@ -2111,6 +2120,11 @@ def _preselect_check(workspace_root: Path, state: Any) -> None:
     """Fresh-invocation preconditions: reaper pass + selection due-ness."""
     run_id = state.run_id
     _selection_lanes(workspace_root, state)
+    from .lanes import selection_fanout_complete
+
+    if not selection_fanout_complete(state):
+        typer.echo("Lane fan-out is incomplete; selection is not ready.", err=True)
+        raise typer.Exit(code=1)
     reaper_pass_for_run(workspace_root, state)
     scan = scan_lane_states(workspace_root, run_id, state)
     lane_states = load_all_lane_states(workspace_root, run_id)

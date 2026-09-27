@@ -727,13 +727,18 @@ class Driver:
                 continue
             try:
                 lane_states = lanes.load_selection_lane_states(
-                    repo_root(), self.run_id, run.lanes
+                    repo_root(),
+                    self.run_id,
+                    run.lanes,
+                    require_complete=lanes.selection_fanout_complete(run),
                 )
             except lanes.LaneStateProblem:
                 # Let select own the terminal decision under its run lock,
                 # before the reaper or event dispatch reads the broken file.
                 self.score(True)
                 continue
+            if not lanes.selection_fanout_complete(run):
+                self.pause("lane_fanout_incomplete")
             event = self.state.get("event")
             if event is None:
                 events.run_reaper_pass(self.run_id)
