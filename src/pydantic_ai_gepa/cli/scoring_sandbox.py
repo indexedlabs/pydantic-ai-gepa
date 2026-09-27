@@ -69,6 +69,12 @@ def required() -> bool:
 
 def require_supported(config: GepaConfig, source: str) -> None:
     acceptance = config.acceptance
+    if acceptance.scoring not in ("seatbelt", "trusted_in_process"):
+        raise ScoringSandboxError("Unknown held-out scoring mode.")
+    if acceptance.scoring == "trusted_in_process":
+        from .scoring_scope import require_text_scope
+
+        require_text_scope(config)
     if (
         source != "git"
         or acceptance.mode != "scalar"
@@ -258,6 +264,7 @@ def child_environment(scratch: Path, port: int) -> dict[str, str]:
         "GEPA_HARNESS_SCORER_REVISION",
         "GEPA_HARNESS_FROZEN_FILES",
         "GEPA_CANDIDATE_COMPONENTS_JSON",
+        "GEPA_HARNESS_PRIVATE_SCRATCH",
     }
     for item in os.environ.get("GEPA_HARNESS_PASS_ENV", "").split(","):
         name = item.strip()
@@ -771,12 +778,36 @@ def score_cases(
     revision = scorer_revision() if config.acceptance.trusted_scorer else sha
     # Fail before opening the proxy or creating candidate storage on hosts
     # without a backend. There is deliberately no environment override.
-    sandbox_command("", [])
+    trusted_process = config.acceptance.scoring == "trusted_in_process"
+    if not trusted_process:
+        sandbox_command("", [])
     components = (
         candidate_components(project, sha, config.acceptance.component_files)
-        if config.acceptance.trusted_scorer
+        if config.acceptance.trusted_scorer and not trusted_process
         else None
     )
+    blocked_roots: list[Path] = []
+    if trusted_process:
+        from .scoring_scope import (
+            candidate_baseline,
+            check_private_storage,
+            private_roots,
+            verify_candidate,
+        )
+
+        components = verify_candidate(
+            config,
+            project,
+            sha,
+            scorer_project or project,
+            revision,
+            candidate_baseline(scorer_project or project, meter),
+        )
+        blocked_roots = private_roots(project, scorer_project or project, meter)
+        # Check the harness-owned parent before private_checkout creates anything.
+        check_private_storage(
+            Path(str(heldout_dataset())).resolve().parent, blocked_roots
+        )
     try:
         addresses = allowed_addresses(os.environ.get("GEPA_HARNESS_ALLOWED_HOSTS", ""))
     except ValueError:
@@ -800,13 +831,22 @@ def score_cases(
         # -I excludes cwd, PYTHONPATH and the user site from interpreter startup.
         library = str(Path(__file__).resolve().parents[2])
         bootstrap = f"import sys; sys.path.insert(0, {library!r}); from pydantic_ai_gepa.cli.scoring_child import main; main()"
-        profile = seatbelt_profile(private, checkout, scratch, port)
         env = child_environment(scratch, port)
-        check_tls(profile, scratch, port, env)
-        command = sandbox_command(
-            profile, [sys.executable, "-I", "-B", "-c", bootstrap]
-        )
-        cleanup = _process_cleanup(scratch)
+        worker_command = [sys.executable, "-I", "-B", "-c", bootstrap]
+        if trusted_process:
+            from .scoring_scope import check_private_storage
+
+            check_private_storage(scratch, blocked_roots)
+            env["GEPA_HARNESS_PRIVATE_SCRATCH"] = str(scratch)
+            env["NO_PROXY"] = "localhost,127.0.0.1,::1"
+            env["no_proxy"] = env["NO_PROXY"]
+            command = worker_command
+            cleanup = None
+        else:
+            profile = seatbelt_profile(private, checkout, scratch, port)
+            check_tls(profile, scratch, port, env)
+            command = sandbox_command(profile, worker_command)
+            cleanup = _process_cleanup(scratch)
         process = subprocess.Popen(
             command,
             cwd=checkout,
@@ -825,11 +865,19 @@ def score_cases(
                     "config": asdict(config),
                     "validation": validation,
                     "components": components,
+                    "blocked_roots": [str(p) for p in blocked_roots],
+                    "scorer_root": str(git_root(scorer_project or project))
+                    if trusted_process
+                    else None,
+                    "pinned_root": str(scratch.parent / "checkout")
+                    if trusted_process
+                    else None,
                 }
             )
             if channel.receive() != {"type": "ready"}:
                 raise ScoringSandboxError("Sandboxed scorer could not initialize.")
-            cleanup.verify_worker(process.pid)
+            if cleanup is not None:
+                cleanup.verify_worker(process.pid)
 
             async def evaluate() -> list[EvaluationRecord]:
                 records = []
@@ -932,7 +980,7 @@ def score_cases(
                 # setsid descendants escape killpg but inherit the profile.
                 # Sweep before retiring private paths and the model proxy.
                 try:
-                    survivors = cleanup.sweep()
+                    survivors = cleanup.sweep() if cleanup is not None else False
                 finally:
                     for stream in (process.stdin, process.stdout):
                         if stream is not None:
