@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from pydantic_evals import Case
@@ -57,13 +58,14 @@ def metric(case, output):
 """
 
 
-def raw_result(**updates):
+def raw_result(**updates) -> dict[str, Any]:
     return dict(
         type="result",
         score=0.5,
         feedback="feedback",
         failed=False,
         cached=False,
+        diagnostic=None,
         material={
             "output": {"answer": "review"},
             "side_info": None,

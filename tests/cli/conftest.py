@@ -14,6 +14,8 @@ def legacy_scoring_flow_backend(request, monkeypatch):
     if request.node.path.name not in {
         "test_scoring_sandbox.py",
         "test_scoring_material.py",
+        "test_scoring_diagnostics.py",
+        "test_scoring_tls.py",
         "test_safe_git.py",
     }:
         monkeypatch.setattr(

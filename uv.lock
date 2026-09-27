@@ -969,6 +969,7 @@ name = "pydantic-ai-gepa"
 version = "0.3.0.dev6"
 source = { editable = "." }
 dependencies = [
+    { name = "certifi" },
     { name = "cloudpickle" },
     { name = "logfire" },
     { name = "opentelemetry-sdk" },
@@ -997,6 +998,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "certifi", specifier = ">=2025.8.3" },
     { name = "cloudpickle", specifier = ">=3.0.0" },
     { name = "logfire", specifier = ">=4.14.2" },
     { name = "opentelemetry-sdk", specifier = ">=1.44.0,<2" },
