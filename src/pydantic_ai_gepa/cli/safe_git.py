@@ -711,6 +711,16 @@ def run_git(root: Path, *args: str, **kwargs: Any) -> subprocess.CompletedProces
 @contextmanager
 def _directory_fd(path: Path) -> Iterator[int]:
     """Open an absolute directory without following any symlink component."""
+    if not path.is_absolute():
+        raise ValueError("Directory path must be absolute.")
+    if sys.platform == "darwin" and hasattr(os, "O_NOFOLLOW_ANY"):
+        # Seatbelt denies reads of ungranted ancestors; one lookup still refuses all symlinks.
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW_ANY)
+        try:
+            yield fd
+        finally:
+            os.close(fd)
+        return
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     fd = os.open(path.anchor, flags)
     try:
