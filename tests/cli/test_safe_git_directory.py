@@ -76,8 +76,10 @@ def test_real_reflector_sandbox_discovers_lane_without_ancestor_reads():
         lane = root / "run.lanes" / "id" / "lane-1"
         heldout = root / "run.heldout"
         home = root / "codex-home"
+        user_home = root / "user-home"
         for directory in (run, lane / ".git" / "objects", lane / "sub", heldout, home):
             directory.mkdir(parents=True)
+        user_home.mkdir()
         # Load the actual stdlib-only module without importing the full package.
         shutil.copyfile(safe_git.__file__, lane / "safe_git.py")
         runtime = Path(sys.base_prefix).resolve()
@@ -96,7 +98,9 @@ def test_real_reflector_sandbox_discovers_lane_without_ancestor_reads():
             )
             + "\n[permissions.gepa-reflector.network]\nenabled = false\n"
         )
-        denied = [root, Path.home().resolve(), heldout]
+        # The suite's isolated HOME is under temp, which :minimal allows.
+        # Probe a synthetic HOME outside that grant, never the operator's home.
+        denied = [root, user_home, heldout]
         if Path("/Users").is_dir():
             denied.append(Path("/Users"))
         probe = f"""
@@ -135,7 +139,7 @@ print('lane discovered; run opened; ancestor, home and heldout reads denied')
                 "-c",
                 probe,
             ],
-            env={**os.environ, "CODEX_HOME": str(home)},
+            env={**os.environ, "CODEX_HOME": str(home), "HOME": str(user_home)},
             capture_output=True,
             text=True,
             timeout=30,
