@@ -72,16 +72,18 @@ def refresh(run_id: str, root: Path | None) -> None:
     expensive behavior, extra/unconsumed evaluations and direct provider access require
     mandatory harness-owned admission or a provider-side budget to bound.
 
-    Only aggregate dollars leave the private record. In particular, never put
-    the observed maximum, rollout multiplier, or held-out counts in a charge row.
+    Public charges use only already-public training prices. Publishing the full
+    charge would reveal the held-out maximum by division by the known schedule.
+    The private remainder affects admission only: observers can see its cost
+    stop, as with validation today, but no amount derived from its price.
     """
     from .spend import _lock, _rows
 
     record = harness_record.for_run(run_id, root)
     if record is None or (raw := record.read(_KEY)) is None:
         return
-    charges = json.loads(raw)
     with _lock(record.directory / "spend.lock"):
+        charges = json.loads(record.read(_KEY) or raw)
         highest = _highest(_rows(run_id, root))
         # Uncapped, unmetered test/evaluation callables still consume iterations.
         # Capped selection fails closed in check_budget when no estimate exists.
@@ -89,6 +91,19 @@ def refresh(run_id: str, root: Path | None) -> None:
         rows = [
             json.loads(line) for line in (record.read("spend.jsonl") or "").splitlines()
         ]
+        # Allowlist visible training kinds, before _rows can fill in any private
+        # checkpoint data. Confirmation is validation today; future held-out
+        # kinds must not silently become public price observations either.
+        public_highest = (
+            _highest(
+                [
+                    row
+                    for row in rows
+                    if row["kind"] in {"baseline", "training", "gate", "probe"}
+                ]
+            )
+            or 0.0
+        )
         indexed = {row["eval_id"]: row for row in rows if row["kind"] == KIND}
         for key, charge in charges.items():
             row = indexed.get(key)
@@ -97,11 +112,37 @@ def refresh(run_id: str, root: Path | None) -> None:
                 rows.append(row)
             if charge["active"]:
                 row["total_dollars"] = max(
-                    row["total_dollars"], charge["rollouts"] * highest
+                    row["total_dollars"], charge["rollouts"] * public_highest
                 )
+                charge["total_dollars"] = max(
+                    charge.get("total_dollars", 0.0), charge["rollouts"] * highest
+                )
+        # Persist the enforced total first. Admission subtracts the actual
+        # public row, so a crash between these writes cannot lose the remainder.
+        record.write(_KEY, json.dumps(charges))
         content = "".join(json.dumps(row) + "\n" for row in rows)
         if content != record.read("spend.jsonl"):
             record.write("spend.jsonl", content)
+
+
+def private_rows(
+    run_id: str, root: Path | None, public_rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Unpublished charge remainders, for harness admission under spend.lock."""
+    record = harness_record.for_run(run_id, root)
+    if record is None or (raw := record.read(_KEY)) is None:
+        return []
+    published = {row["eval_id"]: row["total_dollars"] for row in public_rows}
+    return [
+        {
+            "eval_id": key + "-private",
+            "kind": KIND,
+            "total_dollars": max(
+                0.0, charge.get("total_dollars", 0.0) - published.get(key, 0.0)
+            ),
+        }
+        for key, charge in json.loads(raw).items()
+    ]
 
 
 def consume(state: RunState, root: Path, lanes: Sequence[LaneState]) -> None:
@@ -116,8 +157,11 @@ def consume(state: RunState, root: Path, lanes: Sequence[LaneState]) -> None:
     charges = json.loads(record.read(_KEY) or "{}")
     evaluations, rollouts = _schedule(state, root)
     expected = set(lane_ids(state.lanes))
+    names = [lane.lane for lane in lanes]
+    if len(names) != len(set(names)) or not set(names) <= expected:
+        raise typer.BadParameter("Duplicate or unexpected lane names in selection.")
     for lane in lanes:
-        if lane.lane not in expected or lane.status != "awaiting_selection":
+        if lane.status != "awaiting_selection":
             continue
         # Lane iteration numbers and sample lists are reflector-writable. The
         # frozen baseline eval IDs identify a generation exclusively in the harness.
@@ -164,8 +208,10 @@ def consume(state: RunState, root: Path, lanes: Sequence[LaneState]) -> None:
 def check_budget(state: RunState, root: Path, *, next_iteration: bool = False) -> None:
     """Keep the incumbent on an exhausted or unaffordable estimated budget.
 
-    Re-fan admits at the observed high, so at that price the next lane charges
-    fit the remaining cap. A newly more expensive candidate may raise charges
+    Pre-rebaseline refan projection is a heuristic using the previous B and N.
+    The binding check at emit uses the new frozen schedule before dispatch, so
+    at that price the next lane charges fit the remaining cap.
+    A newly more expensive candidate may raise charges
     at select: the residual overshoot is at most one iteration's revised lane
     charges plus the existing metered-rollout overshoot. This assumes work stays
     within consumed verdict schedules and the observed high bounds its rollout
@@ -175,7 +221,12 @@ def check_budget(state: RunState, root: Path, *, next_iteration: bool = False) -
     from .spend import _finish_cost_stop, _lock, _report, _rows
     from ..spend import COST_STOP_REASON
 
-    if not state.heldout_required or not state.lanes or state.max_token_cost is None:
+    if (
+        state.status == "done"
+        or not state.heldout_required
+        or not state.lanes
+        or state.max_token_cost is None
+    ):
         return
     record = harness_record.for_run(state.run_id, root)
     if record is None:

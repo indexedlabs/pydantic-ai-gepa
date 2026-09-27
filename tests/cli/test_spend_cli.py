@@ -1259,10 +1259,19 @@ async def evaluate(case):
     assert state.best_candidate_id == incumbent
     assert state.last_comparison["reason_code"] == "cost_budget_exhausted"
     report = spend_report(run_id, lane_repo)
-    assert report["estimated_lane_training_dollars"] == pytest.approx(1.8)
-    assert report["total_dollars"] == pytest.approx(before["total_dollars"] + 1.8)
+    assert report["estimated_lane_training_dollars"] == pytest.approx(0.09)
+    assert report["total_dollars"] == pytest.approx(before["total_dollars"] + 0.09)
+    from pydantic_ai_gepa.cli.spend import _report, _rows
+    from pydantic_ai_gepa.cli.validation import harness_environment
+
+    with harness_environment():
+        enforced = _report(_rows(run_id, lane_repo), 0.45)
+    assert enforced["estimated_lane_training_dollars"] == pytest.approx(1.8)
+    assert enforced["total_dollars"] == pytest.approx(before["total_dollars"] + 1.8)
     # First fan-out is already in flight: overshoot is bounded by its charge.
-    assert report["total_dollars"] <= 0.45 + report["estimated_lane_training_dollars"]
+    assert (
+        enforced["total_dollars"] <= 0.45 + enforced["estimated_lane_training_dollars"]
+    )
     assert report["validation_dollars"] == pytest.approx(0.30)
     assert "secret-holdout" not in selected.output
 

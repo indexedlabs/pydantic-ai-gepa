@@ -1760,7 +1760,11 @@ def _refan_lane(
 def _phase_refan(
     workspace_root: Path, state: Any, ctx: dict[str, Any]
 ) -> tuple[Any, dict[str, Any], str]:
-    """Reset all lanes onto the new best and delete journaled branches."""
+    """Reset lanes after a heuristic budget projection using the old baseline.
+
+    Rebaseline can change B/N and spend; _phase_emit makes the binding budget
+    check against that new schedule before any fresh packet is dispatched.
+    """
     from .lane_accounting import check_budget, seal
 
     check_budget(state, workspace_root, next_iteration=True)

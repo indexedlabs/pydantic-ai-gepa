@@ -97,6 +97,12 @@ def _rows(
 ) -> list[dict[str, Any]]:
     directory = ledger_directory(run_id, root)
     rows = _read_rows(directory / "spend.jsonl", warnings)
+    if warnings is None and not lane_training_active(run_id):
+        from .lane_accounting import private_rows as private_charge_rows
+
+        # All admission paths include the hidden price remainder. Reports pass
+        # a warnings dict and must never publish an invertible held-out charge.
+        rows.extend(private_charge_rows(run_id, root, rows))
     pointer = directory / "validation-spend-registered"
     if harness_record.exists(pointer, root=root):
         from .lanes import _pid_alive
