@@ -81,9 +81,7 @@ def _masked(source: str, symbols: list[str]) -> str:
     return ast.dump(tree, include_attributes=False)
 
 
-def candidate_baseline(
-    project: Path, scorer_project: Path, revision: str, meter: Any
-) -> str:
+def candidate_baseline(scorer_project: Path, meter: Any) -> str:
     from .harness_record import for_run
     from .lane_repositories import load
 
@@ -91,8 +89,9 @@ def candidate_baseline(
     state = json.loads(record.read("state.json") or "{}") if record else {}
     if state.get("lane_repository_version") == 1:
         return load(meter.root or scorer_project, meter.run_id).seed
-    if git_root(project) == git_root(scorer_project):
-        return revision
+    baseline = record.read("@trusted_text_base") if record else None
+    if baseline:
+        return baseline
     raise ScoringSandboxError(
         "Trusted scoring requires a privately recorded candidate repository seed."
     )

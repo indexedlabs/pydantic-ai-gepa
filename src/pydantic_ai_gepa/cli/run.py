@@ -2300,6 +2300,19 @@ def start(
         from .harness_record import initialize
 
         initialize(workspace_root, run_id)
+        if cfg.acceptance.scoring == "trusted_in_process" and not lanes:
+            from .harness_record import for_run
+            from .safe_git import safe_repository
+
+            with safe_repository(seed_project) as git:
+                scope_baseline = git.head_oid
+            if scope_baseline is None:
+                raise typer.BadParameter(
+                    "Trusted scoring requires a committed candidate baseline."
+                )
+            record = for_run(run_id, workspace_root)
+            assert record is not None
+            record.write("@trusted_text_base", scope_baseline)
     repositories = (
         lane_repositories.initialize(workspace_root, run_id, seed_project)
         if lanes

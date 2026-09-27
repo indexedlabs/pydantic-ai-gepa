@@ -746,12 +746,12 @@ This mode requires scalar git candidates, both trusted/pinned flags, nonempty
 components, and the full harness-owned `GEPA_HARNESS_SCORER_REVISION`.
 Before every evaluation, changed paths and modes are checked against the
 harness-private lane repository's original `Repositories.seed` export commit.
-Thus history-free exports may omit scorer files. Same-repository runs use the
-pinned scorer revision as their candidate baseline. Changes outside components
+Thus history-free exports may omit scorer files. Single-checkout runs use the
+initial candidate HEAD recorded privately by `run start`. Changes outside components
 and untracked files (Git's normal non-ignored-file semantics) refuse scoring.
 Each Python component is separately checked against the pinned scorer revision,
-even if unchanged since export. Other separate repositories without a private
-lane seed are refused.
+even if unchanged since export. Runs without a private candidate baseline are
+refused; start a new run to enable this mode on legacy records.
 
 Despite its config name, scoring runs in a **fresh trusted subprocess outside
 Seatbelt**, from the same private pinned checkout. It retains the child protocol,

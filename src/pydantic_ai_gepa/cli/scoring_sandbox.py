@@ -801,7 +801,7 @@ def score_cases(
             sha,
             scorer_project or project,
             revision,
-            candidate_baseline(project, scorer_project or project, revision, meter),
+            candidate_baseline(scorer_project or project, meter),
         )
         blocked_roots = private_roots(project, scorer_project or project, meter)
         # Check the harness-owned parent before private_checkout creates anything.

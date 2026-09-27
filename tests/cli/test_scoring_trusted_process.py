@@ -15,7 +15,7 @@ from pydantic_ai_gepa.cli.scoring_scope import (
     check_private_storage,
     verify_candidate,
 )
-from tests.cli.test_git_candidate_cli import _git
+from tests.cli.test_git_candidate_cli import _git, _run, _run_payload
 from tests.cli import test_scoring_sandbox
 from tests.cli.test_scoring_sandbox import (
     commit_evaluator,
@@ -50,6 +50,11 @@ def pin(repo, monkeypatch, source=None):
     )
     monkeypatch.setenv("GEPA_HARNESS_SCORER_REVISION", sha)
     initialize_private_run(repo, "sandbox-test")
+    from pydantic_ai_gepa.cli.harness_record import for_run
+
+    record = for_run("sandbox-test", repo)
+    assert record is not None
+    record.write("@trusted_text_base", sha)
     return sha
 
 
@@ -477,3 +482,44 @@ def test_private_storage_excludes_lane_roots(git_repo, private, monkeypatch):
     )
     with pytest.raises(sandbox.ScoringSandboxError, match="outside"):
         check_private_storage(private.parent, roots)
+
+
+def test_run_start_records_candidate_baseline_separately(
+    git_repo, private, monkeypatch
+):
+    from pydantic_ai_gepa.cli.harness_record import for_run
+
+    scorer = pin(git_repo, monkeypatch)
+    config_path = git_repo / ".gepa/gepa.toml"
+    candidate = change(
+        git_repo,
+        ".gepa/gepa.toml",
+        config_path.read_text()
+        + """
+[acceptance]
+pinned_scorer = true
+trusted_scorer = true
+scoring = "trusted_in_process"
+component_files = ["score.txt"]
+text_files = ["score.txt"]
+""",
+    )
+    assert candidate != scorer
+    result = _run(
+        "run",
+        "start",
+        "--size",
+        "1",
+        "--max-iterations",
+        "16",
+        "--acceptance-repetitions",
+        "1",
+        "--acceptance-paired-min-cases",
+        "2",
+    )
+    assert result.exit_code == 0, (result.output, result.exception)
+    run_id = _run_payload(result.output)["run_id"]
+    record = for_run(run_id, git_repo)
+    assert record is not None
+    assert record.read("@trusted_text_base") == candidate
+    assert not (git_repo / ".gepa/runs" / run_id / "@trusted_text_base").exists()
