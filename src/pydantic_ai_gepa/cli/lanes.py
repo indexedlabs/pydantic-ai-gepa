@@ -37,7 +37,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Sequence, get_args
 
 import typer
 
@@ -367,6 +367,65 @@ def load_all_lane_states(workspace_root: Path, run_id: str) -> list[LaneState]:
                     )
                 )
             )
+    return states
+
+
+class LaneStateProblem(ValueError):
+    """A fixed harness diagnostic, never text taken from a lane file."""
+
+
+def validate_selection_lanes(states: Sequence[LaneState], count: int) -> None:
+    if any(state.status not in get_args(LaneStatus) for state in states):
+        raise LaneStateProblem("lane state is unreadable")
+    names = [state.lane for state in states]
+    if len(names) != len(set(names)):
+        raise LaneStateProblem("lane state names a duplicate lane")
+    if not set(names) <= set(lane_ids(count)):
+        raise LaneStateProblem("lane state names an unexpected lane")
+    if set(names) != set(lane_ids(count)):
+        raise LaneStateProblem("lane state is missing")
+
+
+def load_selection_lane_states(
+    workspace_root: Path, run_id: str, count: int
+) -> list[LaneState]:
+    """Validate the complete verdict set before select or drive uses any lane.
+
+    Every slot is created by fan-out before selection can start. Keep the
+    general-purpose loader's behavior unchanged for status, probes and reaping.
+    """
+    try:
+        for lane in lane_ids(count):
+            if not harness_record.exists(
+                lane_state_path(workspace_root, run_id, lane), root=workspace_root
+            ):
+                raise LaneStateProblem("lane state is missing")
+        states = []
+        base = lanes_dir(workspace_root, run_id)
+        for entry in sorted(harness_record.list_paths(base, root=workspace_root)):
+            path = entry / "state.json"
+            if not harness_record.exists(path, root=workspace_root):
+                continue
+            content = harness_record.read_text(path, root=workspace_root)
+            try:
+                states.append(LaneState.from_dict(json.loads(content)))
+            except typer.BadParameter:
+                # Invalid IDs in JSON are unreadable lane states. SafeDir's
+                # path refusals above retain their existing fail-closed behavior.
+                raise LaneStateProblem("lane state is unreadable") from None
+    except LaneStateProblem:
+        raise
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+        AttributeError,
+        OverflowError,
+        RecursionError,
+    ):
+        raise LaneStateProblem("lane state is unreadable") from None
+    validate_selection_lanes(states, count)
     return states
 
 
@@ -1671,7 +1730,9 @@ def _load_run_state(workspace_root: Path, run_id: str) -> Any:
     )
 
 
-def _resolve_lane_run(run_id: str | None) -> tuple[Path, Any]:
+def _resolve_lane_run(
+    run_id: str | None, *, allow_done: bool = False
+) -> tuple[Path, Any]:
     """Resolve (workspace_root, RunState) explicitly; reject non-lane runs."""
     workspace_root = _resolve_workspace_root(run_id)
     if run_id is None:
@@ -1682,7 +1743,7 @@ def _resolve_lane_run(run_id: str | None) -> tuple[Path, Any]:
             typer.echo("No runs found. Start one with `gepa run start`.", err=True)
             raise typer.Exit(code=1)
     run_state = _load_run_state(workspace_root, run_id)
-    if run_state.status == "done":
+    if run_state.status == "done" and not allow_done:
         typer.echo(
             f"Run {run_state.run_id} is done; lane verbs no longer apply "
             "(a lane is re-fanned at select or removed when the run completes).",

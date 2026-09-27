@@ -1745,7 +1745,13 @@ def _write_final_report(
             f"--max-iterations (in-flight lane evals; bounded by "
             f"lanes x --acceptance-max-repetitions, pydanticaigepa-dec-msy)"
         )
-    if selectable_rows:
+    if (state.last_comparison or {}).get("reason_code") == "lane_state_invalid":
+        # A malformed verdict set cannot nominate even a previously scored
+        # finalist. This stop returns only the harness's accepted incumbent.
+        lines.append(f"- best_candidate_id: {state.best_candidate_id}")
+        if state.best_mean_score is not None:
+            lines.append(f"- best_mean_score: {state.best_mean_score:.6f}")
+    elif selectable_rows:
         best = max(selectable_rows, key=lambda row: row.mean_score)
         latest = rows[-1]
         lines.extend(
@@ -1766,6 +1772,8 @@ def _write_final_report(
             )
     if state.last_comparison:
         comparison = state.last_comparison
+        if comparison.get("stop_reason"):
+            lines.append(f"- stop_reason: {comparison['stop_reason']}")
         lines.extend(
             [
                 "",

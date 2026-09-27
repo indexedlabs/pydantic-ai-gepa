@@ -8,7 +8,7 @@ import typer
 
 from pydantic_ai_gepa.cli import harness_record
 from pydantic_ai_gepa.cli.lane_accounting import KIND, check_budget, consume, refresh
-from pydantic_ai_gepa.cli.lanes import load_all_lane_states
+from pydantic_ai_gepa.cli.lanes import LaneStateProblem, load_all_lane_states
 from pydantic_ai_gepa.cli.layout import config_path
 from pydantic_ai_gepa.cli.runs import ParetoLog
 from pydantic_ai_gepa.cli.spend import _private_spend_path, _report, _rows, spend_report
@@ -223,7 +223,7 @@ def test_training_budget_rows_are_resume_safe(lane_repo, monkeypatch):
             [lanes[0], replace(lanes[1], lane=lanes[0].lane)],
             [lanes[0], replace(lanes[1], lane="lane-unexpected")],
         ):
-            with pytest.raises(typer.BadParameter, match="Duplicate or unexpected"):
+            with pytest.raises(LaneStateProblem, match="lane state names"):
                 consume(state, lane_repo, invalid)
             assert record.read("@lane-training-charges") is None
         before = ParetoLog(run_id, lane_repo).count_budget_rows()

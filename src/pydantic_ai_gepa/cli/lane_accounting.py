@@ -147,19 +147,16 @@ def private_rows(
 
 def consume(state: RunState, root: Path, lanes: Sequence[LaneState]) -> None:
     """Account once per harness generation/lane, before scoring any proposal."""
-    from .lanes import lane_ids
+    from .lanes import validate_selection_lanes
 
     if not state.heldout_required or not state.lanes:
         return
     record = harness_record.for_run(state.run_id, root)
     if record is None:
         raise typer.BadParameter("Lane training accounting requires harness access.")
+    validate_selection_lanes(lanes, state.lanes)
     charges = json.loads(record.read(_KEY) or "{}")
     evaluations, rollouts = _schedule(state, root)
-    expected = set(lane_ids(state.lanes))
-    names = [lane.lane for lane in lanes]
-    if len(names) != len(set(names)) or not set(names) <= expected:
-        raise typer.BadParameter("Duplicate or unexpected lane names in selection.")
     for lane in lanes:
         if lane.status != "awaiting_selection":
             continue

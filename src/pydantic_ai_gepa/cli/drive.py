@@ -192,7 +192,15 @@ def private_state_path(run_id: str) -> Path:
     roots = [gepa_dir(repo_root()), repo_root()]
     if run.project_root:
         roots.append(Path(run.project_root))
-    if run.lanes:
+    if run.lanes and run.lane_repository_version == 1:
+        # Private driver storage must be checked before select can diagnose a
+        # broken lane file. Owned lane roots come from the harness layout;
+        # candidate project directories are contained inside those roots.
+        roots.extend(
+            lanes.lane_worktree_path(repo_root(), run_id, lane)
+            for lane in lanes.lane_ids(run.lanes)
+        )
+    elif run.lanes:
         for lane in lanes.load_all_lane_states(repo_root(), run_id):
             roots.extend(
                 Path(p) for p in (lane.worktree_path, lane.candidate_project_path) if p
@@ -717,6 +725,15 @@ class Driver:
                 else:
                     self.step(None)
                 continue
+            try:
+                lane_states = lanes.load_selection_lane_states(
+                    repo_root(), self.run_id, run.lanes
+                )
+            except lanes.LaneStateProblem:
+                # Let select own the terminal decision under its run lock,
+                # before the reaper or event dispatch reads the broken file.
+                self.score(True)
+                continue
             event = self.state.get("event")
             if event is None:
                 events.run_reaper_pass(self.run_id)
@@ -736,8 +753,7 @@ class Driver:
                 # A completed select advances the lane iteration. Its event can
                 # remain unacked if the driver dies after the final checkpoint.
                 if run.select_phase is None and all(
-                    lane.status == "paused_for_reflection"
-                    for lane in lanes.load_all_lane_states(repo_root(), self.run_id)
+                    lane.status == "paused_for_reflection" for lane in lane_states
                 ):
                     self.recorded()
                 else:
