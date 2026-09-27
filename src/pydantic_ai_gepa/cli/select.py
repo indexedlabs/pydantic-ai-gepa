@@ -37,9 +37,10 @@ phase on the next invocation:
 
 ``finalize`` replaces re-fan when the pareto ledger reaches
 ``--max-iterations``: lane-run budget enforcement lives at select, not
-per-eval (pydanticaigepa-dec-msy). The run is marked done, any overshoot
-(in-flight lane evals beyond the cap, bounded by N x
-``--acceptance-max-repetitions``) is recorded in the final report,
+per-eval (pydanticaigepa-dec-msy). Held-out runs charge a harness-computed
+upper acceptance schedule per consumed verdict rather than trusting
+reflector-written rows. The run is marked done, any overshoot (one in-flight
+lane iteration plus its admitted selection work) is recorded in the final report,
 ``run_done`` is emitted, and lane worktrees are removed — a lane is re-fanned
 at select or removed when the run completes (spec-1do).
 
@@ -1445,14 +1446,20 @@ def _phase_journal(
     ctx["overshoot"] = max(0, rows - state.max_iterations)
     config = GepaConfig.load(config_path(workspace_root))
     validation_enabled = harness_record.for_run(run_id, workspace_root) is not None
+    if validation_enabled:
+        training_bound = state.lanes * (
+            state.acceptance_repetitions + 2
+            if config.acceptance.mode == "vector"
+            else max(3, state.acceptance_max_repetitions)
+        )
     if validation_enabled and config.acceptance.mode == "vector":
         validation_rounds = int(ctx.get("validation_rounds", 0))
         overshoot_bound = (
-            state.lanes * state.acceptance_max_repetitions
+            training_bound
             + validation_rounds * (state.lanes + 1) * state.acceptance_max_repetitions
         )
         bound_detail = (
-            "lanes x acceptance max-repetitions, plus completed vector "
+            "estimated lane training evaluations, plus completed vector "
             "validation rounds x (lanes + incumbent) x max-repetitions"
         )
     else:
@@ -1461,8 +1468,14 @@ def _phase_journal(
         if validation_enabled:
             from .run import _validation_schedule
 
-            overshoot_bound += _validation_schedule(state, workspace_root)[1]
-            bound_detail += ", plus maximum finalist confirmation"
+            overshoot_bound = (
+                training_bound
+                + state.lanes
+                + _validation_schedule(state, workspace_root)[1]
+            )
+            bound_detail = (
+                "estimated lane training, screening, and maximum finalist confirmation"
+            )
     if ctx["overshoot"] > overshoot_bound:
         typer.echo(
             f"Warning: budget overshoot {ctx['overshoot']} exceeds the "
@@ -1747,7 +1760,15 @@ def _refan_lane(
 def _phase_refan(
     workspace_root: Path, state: Any, ctx: dict[str, Any]
 ) -> tuple[Any, dict[str, Any], str]:
-    """Reset all lanes onto the new best and delete journaled branches."""
+    """Reset lanes after a heuristic budget projection using the old baseline.
+
+    Rebaseline can change B/N and spend; _phase_emit makes the binding budget
+    check against that new schedule before any fresh packet is dispatched.
+    """
+    from .lane_accounting import check_budget, seal
+
+    check_budget(state, workspace_root, next_iteration=True)
+    seal(state, workspace_root)
     run_id = state.run_id
     new_best = state.best_commit_sha
     if not new_best:
@@ -1941,6 +1962,17 @@ def _phase_emit(
     workspace_root: Path, state: Any, ctx: dict[str, Any]
 ) -> tuple[Any, dict[str, Any], str | None]:
     """Write fresh packets and emit lane_ready once per lane."""
+    from .lane_accounting import check_budget, _schedule
+
+    # Rebaselining also spends dollars and may change the affordable schedule.
+    # Check again before any reflector is dispatched with the fresh packet.
+    check_budget(state, workspace_root, next_iteration=True)
+    if state.heldout_required and (
+        ParetoLog(state.run_id, workspace_root).count_budget_rows()
+        + state.lanes * _schedule(state, workspace_root)[0]
+        > state.max_iterations
+    ):
+        return state, ctx, "finalize"
     run_id = state.run_id
     started_ms = int(ctx.get("started_ms", 0))
     existing = list_events(run_id, workspace_root)
@@ -2227,7 +2259,16 @@ def _run_select_locked(workspace_root: Path, run_state: Any) -> Any:
                 err=True,
             )
             raise typer.Exit(code=1)
+        from .lane_accounting import check_budget, consume
+
+        if phase == "promote":
+            consume(
+                state,
+                workspace_root,
+                load_all_lane_states(workspace_root, state.run_id),
+            )
         state, ctx, next_phase = handler(workspace_root, state, ctx)
+        check_budget(state, workspace_root)
         state = _checkpoint(
             state, workspace_root, next_phase, ctx if next_phase else None
         )
