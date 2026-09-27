@@ -928,6 +928,7 @@ def test_harness_pass_env_requires_a_present_variable(tmp_path, monkeypatch):
     ],
 )
 def test_result_parser_refuses_unbounded_or_executable_shapes(raw):
+    raw["diagnostic"] = None
     with pytest.raises(sandbox.ScoringSandboxError):
         sandbox._result(raw, "case", True)
 
@@ -940,6 +941,7 @@ def test_validation_discards_feedback():
         "failed": False,
         "cached": False,
         "material": None,
+        "diagnostic": None,
     }
     record = sandbox._result(raw, "case", True)
     assert record.feedback is None

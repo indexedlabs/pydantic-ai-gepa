@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Generic, Literal, Protocol, TypeVar, runtime_checkable
 
@@ -15,6 +16,12 @@ from pydantic_evals import Case
 
 DEFAULT_MAX_SPAWNED_AGENTS = 5
 DEFAULT_REFLECTION_REQUEST_LIMIT = 50
+
+# The scoring child observes errors before conversion discards their class.
+# This never becomes part of a RolloutOutput or its serialized public payload.
+_rollout_error_observer: ContextVar[Callable[[Exception], None] | None] = ContextVar(
+    "rollout_error_observer", default=None
+)
 
 
 @dataclass(frozen=True)
@@ -169,6 +176,9 @@ class RolloutOutput(Generic[OutputT]):
         trace_completeness: Literal["root-only", "full"] | None = None,
     ) -> "RolloutOutput[OutputT]":
         """Create from failed execution."""
+        observer = _rollout_error_observer.get()
+        if observer is not None:
+            observer(error)
         return cls(
             result=None,
             success=False,

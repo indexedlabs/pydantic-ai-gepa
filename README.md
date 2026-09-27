@@ -728,6 +728,44 @@ Reserved harness/runtime names (including `GEPA_HELDOUT_DATASET` and
 `GEPA_HARNESS_ALLOWED_HOSTS`, `GEPA_HARNESS_SCORER_REVISION`,
 `GEPA_HARNESS_FROZEN_FILES` and `GEPA_CANDIDATE_COMPONENTS_JSON`) and values
 containing the held-out path are refused.
+
+The sandbox blocks the macOS system trust service (`trustd`); its IPC permissions
+are not opened for TLS. The child sets `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` to
+the certifi CA bundle. An explicit harness value passed through
+`GEPA_HARNESS_PASS_ENV` overrides either default, subject to the same held-out-path
+refusal. httpx2's default client honors `SSL_CERT_FILE` and uses OpenSSL verification:
+a real Seatbelt test succeeds with it and fails without it (`OSStatus -26276`).
+An explicit `truststore.SSLContext` still fails with that variable set. Clients
+that bypass the environment (for example `trust_env=False`) should explicitly use
+`ssl.create_default_context(cafile=certifi.where())` and configure the CONNECT proxy.
+
+Before the first sandboxed rollout, a separate sandboxed child checks one TLS
+handshake to the first allowlisted host on port 443.
+TLS hosts on other ports aren't probed at start; trust-store failures there appear
+only in private per-rollout diagnostics.
+The check uses the same profile, environment and proxy, with no candidate or case
+material. It uses httpx2's default SSL context when importable, otherwise OpenSSL's
+default context. Success and
+non-verification failures are cached for the
+harness process and TLS environment. If no port-443 host is listed, the check is
+skipped, preserving plaintext model endpoints. Certificate verification failure
+refuses scoring before rollouts with the exception class and CA-bundle guidance.
+Other probe failures (including timeouts and proxy refusal) warn once on stderr
+and continue scoring. There is no separate truststore warning probe.
+
+Operators can inspect rollout exception classes and messages in the
+`@scoring-diagnostics` JSONL entry inside
+`<heldout dataset parent>/.gepa-heldout/<run pin hash>.record.json`. These entries
+are never published to the reflector, run status, packets, reports or traces.
+Messages are limited to 512 characters after scrubbing; validation entries redact
+case strings (including repr/JSON escapes) and numeric values, and omit case IDs,
+while training entries retain case IDs. Each entry has an ISO timestamp and phase.
+The first 50 failures are retained, with further
+failures counted in `@scoring-diagnostics-dropped`, flushed once at eval end.
+Exceptions escaping the dataset evaluator still abort the eval immediately.
+Unavailable private diagnostics storage drops diagnostics without failing scoring
+or writing a public fallback.
+
 Held-out harness commands skip candidate-owned `.env` files. Install the harness and its Python dependencies
 in storage the reflector cannot modify, and keep provider credentials out of the
 reflector environment.
