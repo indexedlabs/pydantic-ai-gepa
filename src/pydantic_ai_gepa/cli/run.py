@@ -1720,7 +1720,12 @@ def _write_final_report(
     state: RunState, *, overshoot: int | None = None, root: Path | None = None
 ) -> tuple[Path, str]:
     pareto = ParetoLog(state.run_id, root)
-    rows = pareto.iter_rows()
+    # Estimated budget rows carry no candidate quality evidence.
+    rows = [
+        row
+        for row in pareto.iter_rows()
+        if row.extra.get("row_scope") != "lane_training_estimate"
+    ]
     validation_rows = pareto.validation_rows()
     selectable_rows = validation_rows or pareto.selectable_rows()
     path = final_report_path(state.run_id, root)
@@ -1773,10 +1778,18 @@ def _write_final_report(
             ]
         )
         if comparison.get("outcome", "valid") == "valid" and "delta" in comparison:
+            # Finalist confirmations use AcceptanceComparison's mean keys;
+            # the single-checkout path also supplies legacy *_mean_score keys.
+            baseline_mean = comparison.get(
+                "baseline_mean_score", comparison.get("baseline_mean")
+            )
+            candidate_mean = comparison.get(
+                "candidate_mean_score", comparison.get("candidate_mean")
+            )
             lines.extend(
                 [
-                    f"- baseline_mean_score: {comparison['baseline_mean_score']:.6f}",
-                    f"- candidate_mean_score: {comparison['candidate_mean_score']:.6f}",
+                    f"- baseline_mean_score: {baseline_mean:.6f}",
+                    f"- candidate_mean_score: {candidate_mean:.6f}",
                     f"- delta: {comparison['delta']:.6f}",
                 ]
             )
