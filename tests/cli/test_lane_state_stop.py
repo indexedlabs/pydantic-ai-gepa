@@ -25,6 +25,7 @@ CASES = [
     ("symlink", "lane state is unreadable"),
     ("hardlink", "lane state is unreadable"),
     ("directory", "lane state is unreadable"),
+    ("lane-file", "lane state is unreadable"),
 ]
 
 
@@ -84,6 +85,10 @@ def _plant(repo, monkeypatch, case):
         data = json.loads(other.read_text())
         data["candidate_sha"] = MARKER
         other.write_text(json.dumps(data))
+    if case == "lane-file":
+        slot = directory / "lanes/lane-1"
+        shutil.rmtree(slot)
+        slot.write_text(MARKER)
     # A public incumbent forgery must not become the stop's accepted best.
     public = directory / "state.json"
     data = json.loads(public.read_text())
@@ -157,7 +162,9 @@ def test_bad_lane_state_finalizes(lane_repo, monkeypatch, case, reason, resume):
     _assert_stopped(lane_repo, run_id, started, reason, result.output)
 
 
-@pytest.mark.parametrize("case", ["corrupt", "symlink", "hardlink", "directory"])
+@pytest.mark.parametrize(
+    "case", ["corrupt", "symlink", "hardlink", "directory", "lane-file"]
+)
 def test_drive_returns_final_report_for_bad_lane_state(lane_repo, monkeypatch, case):
     run_id, started = _plant(lane_repo, monkeypatch, case)
     monkeypatch.setattr(drive, "DarwinProcesses", test_drive.OwnProcesses)
@@ -347,3 +354,62 @@ def test_cost_stop_select_replay_preserves_state_events_and_reason(
     assert len(test_select_cli._events(lane_repo, run_id, "run_done")) == 1
     with harness_environment():
         assert record.read("state.json") == private_before
+
+
+@pytest.mark.parametrize("kind", ["file", "symlink"])
+@pytest.mark.parametrize("heldout", [False, True])
+def test_stray_non_lane_entry_does_not_stop_select_or_drive(
+    lane_repo, monkeypatch, kind, heldout
+):
+    if heldout:
+        dataset = lane_repo.parent / "heldout.jsonl"
+        dataset.write_text(
+            json.dumps({"name": "secret", "inputs": "x", "expected_output": "v"}) + "\n"
+        )
+        monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(dataset))
+    started = test_select_cli._start_lane_run(lane_repo, 1)
+    run_id = str(started["run_id"])
+    directory = lane_repo / ".gepa/runs" / run_id
+    if kind == "file":
+        stray = directory / "lanes/.DS_Store"
+        stray.write_text(MARKER)
+    else:
+        target = lane_repo.parent / f"{lane_repo.name}-{MARKER}"
+        target.mkdir()
+        (target / "state.json").write_text(MARKER)
+        stray = directory / "lanes/stray"
+        stray.symlink_to(target, target_is_directory=True)
+
+    def reached_reflection(driver, lane):
+        assert lane == "lane-1"
+        driver.pause("test_reached_reflection")
+
+    monkeypatch.setattr(drive, "DarwinProcesses", test_drive.OwnProcesses)
+    with monkeypatch.context() as driver:
+        driver.setattr(drive.Driver, "step", reached_reflection)
+        config = test_drive.config(lane_repo, source="raise AssertionError('unused')")
+        result = test_drive.invoke(run_id, config)
+    assert result.exit_code == drive.EXIT_PAUSED, (result.output, result.exception)
+    assert (
+        test_drive.driver_state(lane_repo, run_id)["pause_reason"]
+        == "test_reached_reflection"
+    )
+    verdict = test_select_cli._drive_lane(
+        lane_repo,
+        run_id,
+        "lane-1",
+        {"out_case-2.txt": "b\n", "out_secret.txt": "v\n"},
+    )
+    assert verdict.verdict == "accepted"
+    result = test_select_cli._select(lane_repo, run_id)
+    assert result.exit_code == 0, (result.output, result.exception)
+    state = test_select_cli._state(lane_repo, run_id)
+    assert state.status == "running"
+    assert state.best_commit_sha == verdict.candidate_sha
+    assert test_select_cli._events(lane_repo, run_id, "run_done") == []
+    assert not (directory / "final_report.md").exists()
+    if kind == "symlink":
+        assert stray.is_symlink()
+        assert (target / "state.json").read_text() == MARKER
+    else:
+        assert stray.read_text() == MARKER

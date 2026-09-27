@@ -30,6 +30,7 @@ import os
 import re
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -354,10 +355,32 @@ def load_lane_state(workspace_root: Path, run_id: str, lane: str) -> LaneState:
     return LaneState.from_dict(data)
 
 
-def load_all_lane_states(workspace_root: Path, run_id: str) -> list[LaneState]:
+def _lane_state_entries(
+    workspace_root: Path, run_id: str, *, expected: set[str] | None = None
+) -> set[Path]:
+    """Ignore stray non-directories without following links or hiding lane slots."""
     base = lanes_dir(workspace_root, run_id)
+    entries = set()
+    try:
+        with harness_record.SafeDir.open(workspace_root, base) as directory:
+            for name in directory.names():
+                if expected is not None and name in expected:
+                    entries.add(base / name)
+                    continue
+                try:
+                    info = os.stat(name, dir_fd=directory.fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISDIR(info.st_mode):
+                    entries.add(base / name)
+    except FileNotFoundError:
+        pass
+    return entries
+
+
+def load_all_lane_states(workspace_root: Path, run_id: str) -> list[LaneState]:
     states: list[LaneState] = []
-    for entry in sorted(harness_record.list_paths(base, root=workspace_root)):
+    for entry in sorted(_lane_state_entries(workspace_root, run_id)):
         state_path = entry / "state.json"
         if harness_record.exists(state_path, root=workspace_root):
             states.append(
@@ -406,11 +429,7 @@ def load_selection_lane_states(
     them directly with SafeDir rather than importing any private-record view.
     """
     base = lanes_dir(workspace_root, run_id)
-    try:
-        with harness_record.SafeDir.open(workspace_root, base) as directory:
-            entries = {base / name for name in directory.names()}
-    except FileNotFoundError:
-        entries = set()
+    entries = _lane_state_entries(workspace_root, run_id, expected=set(lane_ids(count)))
     expected = {base / lane for lane in lane_ids(count)}
     states = []
     missing = False
