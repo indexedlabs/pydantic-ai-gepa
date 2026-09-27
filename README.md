@@ -705,16 +705,86 @@ directories shadowing a frozen `.py` module. In unpinned code-engine mode,
 frozen hashes detect edits; they do not isolate the scorer from candidate code
 running in the same interpreter. **Trusted mode is the scorer isolation boundary.**
 
-The current backend is macOS Seatbelt (`/usr/bin/sandbox-exec`). It denies writes
+The default backend is macOS Seatbelt (`/usr/bin/sandbox-exec`). It denies writes
 outside private scratch, reads of the held-out directory outside the child's own
 checkout/scratch, and network connections except to the harness's loopback CONNECT
 proxy. The proxy listens on `127.0.0.1`; Seatbelt's `localhost:<port>` rule covers
 loopback addresses on that TCP port. Fork/exec is allowed for per-case evaluator
 subprocesses; descendants
 inherit the same Seatbelt restrictions. Linux and hosts with an unusable backend
-**refuse held-out scoring**; there is no unsandboxed fallback or disable flag. macOS CI requires real OS adversarial
+**refuse Seatbelt scoring**; there is no unsandboxed fallback or disable flag. macOS CI requires real OS adversarial
 tests. Seatbelt is deprecated; repeat those tests on each deployment OS. Local
 Codex may prohibit nested Seatbelt, so a local skip is not enforcement evidence.
+
+### Trusted text scoring with local services
+
+For a frozen text-only scope whose trusted evaluator needs embedded local services,
+explicitly opt in to `acceptance.scoring = "trusted_in_process"`:
+
+```toml
+[acceptance]
+mode = "scalar"
+pinned_scorer = true
+trusted_scorer = true
+scoring = "trusted_in_process"
+component_files = ["prompts.py", "skills/SKILL.md"]
+text_files = ["skills/SKILL.md"]
+scope_verifier = "evals.freeze:verify_components" # optional
+
+[acceptance.python_string_symbols]
+"prompts.py" = ["INSTRUCTIONS", "chat_receipt_instructions", "Email.__doc__"]
+```
+
+The explicit text files (only `.md` and `.txt`) and Python symbol mappings must
+partition `component_files`. Python symbols name top-level functions, async
+functions, classes, assignments with Name targets, or annotated assignments.
+A named symbol masks every string constant in its AST node; `X.__doc__` masks
+only X's existing docstring. Every declared symbol must exist. All remaining AST
+structure must equal the pinned scorer's copy. Candidate source is parsed only.
+
+This mode requires scalar git candidates, both trusted/pinned flags, nonempty
+components, and the full harness-owned `GEPA_HARNESS_SCORER_REVISION`.
+Before every evaluation, changed paths and modes are checked against the
+harness-private lane repository's original `Repositories.seed` export commit.
+Thus history-free exports may omit scorer files. Single-checkout runs use the
+initial candidate HEAD recorded privately by `run start`. Changes outside components
+and untracked files (Git's normal non-ignored-file semantics) refuse scoring.
+Each Python component is separately checked against the pinned scorer revision,
+even if unchanged since export. Runs without a private candidate baseline are
+refused; start a new run to enable this mode on legacy records.
+
+Despite its config name, scoring runs in a **fresh trusted subprocess outside
+Seatbelt**, from the same private pinned checkout. It retains the child protocol,
+timeouts, output/material caps, parent spend admission and private diagnostics.
+Candidate data arrives only through `GEPA_CANDIDATE_COMPONENTS_JSON`. Candidate,
+project and lane source paths are excluded from imports, including the operator's
+original scorer working tree. The private checkout's roots take precedence over
+editable installs. A meta-path guard and loaded-module checks refuse unpinned
+project imports, including modules loaded by startup `.pth` files. Interpreter
+site-packages dependencies remain allowed, even in an operator-local venv;
+editable source targets do not receive that exemption. Keep the harness and its
+dependencies outside reflector write grants. The optional pinned `scope_verifier` is synchronous and
+called as `verify_components(components=dict[str, str])` before evaluator imports;
+it must return exactly `True`. Wrap an existing verifier to match that contract.
+Exceptions and refusals produce static public errors.
+
+`GEPA_HARNESS_PRIVATE_SCRATCH` names a current-user-owned 0700 directory outside
+GEPA_DIR, project and lane roots. Put local Postgres/Redis/moto state there.
+It is removed after each evaluation phase, including failures. Both `NO_PROXY`
+and `no_proxy` are `localhost,127.0.0.1,::1`; local binds, Unix sockets and
+loopback connections work while provider clients retain the CONNECT proxy.
+Validation feedback, traces and diagnostics remain private; only aggregates
+are public. The worker process group is terminated on exit. Trusted services
+must clean up their resources and must not daemonize or escape that group;
+this mode has no Seatbelt descendant sweep.
+
+**Accepted residual risk:** there is no OS sandbox on this trusted worker.
+Text candidates can still steer the model under test, and real external effects
+from scorer tools could leak held-out content. Use this mode only with local fake
+tools and an already-approved model route; the proxy is not an OS network boundary.
+The scorer must consume candidate text as data and never execute it.
+Every other held-out configuration continues to require Seatbelt with its
+unchanged profile; unsupported hosts never silently fall back to this mode.
 
 Set `GEPA_HARNESS_ALLOWED_HOSTS=api.openai.com:443,api.anthropic.com:443` in the
 **harness environment** to allow exact CONNECT destinations. The default is empty
