@@ -71,7 +71,12 @@ def main() -> None:
     if config.acceptance.scoring == "trusted_in_process":
         from .scoring_imports import CandidateImportGuard
 
-        guard = CandidateImportGuard(initialization["blocked_roots"])
+        guard = CandidateImportGuard(
+            initialization["blocked_roots"],
+            scorer_root=initialization["scorer_root"],
+            pinned_root=initialization["pinned_root"],
+            project=root,
+        )
     insert_repo_root_on_path(root)
     if guard is not None and config.acceptance.scope_verifier:
         verifier = resolve_module_attr(

@@ -38,7 +38,6 @@ def require_text_scope(config: GepaConfig) -> None:
             or not isinstance(names, (list, tuple))
             or not names
             or any(not valid_string_symbol(n) for n in names)
-            or len(set(names)) != len(names)
             for p, names in python.items()
         )
     ):
@@ -49,34 +48,30 @@ def require_text_scope(config: GepaConfig) -> None:
 
 def _masked(source: str, symbols: list[str]) -> str:
     tree = ast.parse(source)
-    found: set[str] = set()
+    pending = set(symbols)
     for node in tree.body:
         names = []
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             names = [node.name]
             doc_symbol = node.name + ".__doc__"
-            if (
-                doc_symbol in symbols
-                and ast.get_docstring(node, clean=False) is not None
-            ):
-                doc = node.body[0]
-                assert isinstance(doc, ast.Expr) and isinstance(doc.value, ast.Constant)
-                doc.value.value = "<approved string>"
-                found.add(doc_symbol)
+            if doc_symbol in pending:
+                if ast.get_docstring(node) is None:
+                    raise ValueError
+                node.body[0] = ast.Expr(value=ast.Constant(value="<docstring>"))
+                pending.remove(doc_symbol)
         elif isinstance(node, ast.Assign):
             names = [
                 target.id for target in node.targets if isinstance(target, ast.Name)
             ]
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             names = [node.target.id]
-        selected = set(names) & set(symbols)
-        if not selected:
+        if not pending.intersection(names):
             continue
-        found.update(selected)
         for child in ast.walk(node):
             if isinstance(child, ast.Constant) and isinstance(child.value, str):
-                child.value = "<approved string>"
-    if found != set(symbols):
+                child.value = "<instruction>"
+        pending.difference_update(names)
+    if pending:
         raise ValueError
     return ast.dump(tree, include_attributes=False)
 

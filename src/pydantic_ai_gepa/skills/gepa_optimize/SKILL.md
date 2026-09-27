@@ -414,9 +414,13 @@ Despite its config name, scoring runs in a **fresh trusted subprocess outside
 Seatbelt**, from the same private pinned checkout. It retains the child protocol,
 timeouts, output/material caps, parent spend admission and private diagnostics.
 Candidate data arrives only through `GEPA_CANDIDATE_COMPONENTS_JSON`. Candidate,
-project and lane paths are excluded from imports; a meta-path guard and loaded
-module checks refuse candidate imports. Install the harness and dependencies
-outside those roots. The optional pinned `scope_verifier` is synchronous and
+project and lane source paths are excluded from imports, including the operator's
+original scorer working tree. The private checkout's roots take precedence over
+editable installs. A meta-path guard and loaded-module checks refuse unpinned
+project imports, including modules loaded by startup `.pth` files. Interpreter
+site-packages dependencies remain allowed, even in an operator-local venv;
+editable source targets do not receive that exemption. Keep the harness and its
+dependencies outside reflector write grants. The optional pinned `scope_verifier` is synchronous and
 called as `verify_components(components=dict[str, str])` before evaluator imports;
 it must return exactly `True`. Wrap an existing verifier to match that contract.
 Exceptions and refusals produce static public errors.

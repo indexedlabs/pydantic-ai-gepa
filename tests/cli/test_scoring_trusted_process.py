@@ -2,7 +2,11 @@
 
 from dataclasses import asdict, replace
 import json
+from pathlib import Path
+import site
 import stat
+import subprocess
+import sys
 import textwrap
 from types import SimpleNamespace
 
@@ -81,7 +85,7 @@ def test_config_roundtrip():
         ("scoring", "off"),
         ("text_files", "score.txt"),
         ("python_string_symbols", {"x.py": []}),
-        ("python_string_symbols", {"x.py": ["x", "x"]}),
+        ("python_string_symbols", {"x.py": [1]}),
         ("python_string_symbols", {"x.py": ["x.y"]}),
         ("scope_verifier", "missing_colon"),
     ],
@@ -360,6 +364,20 @@ class Email:
     assert _masked('X = Y = "old"', ["Y"]) == _masked('X = Y = "new"', ["Y"])
 
 
+def test_mask_matches_indexed_first_declaration_and_docstring_rules():
+    assert AcceptanceConfig.from_dict(
+        {"python_string_symbols": {"x.py": ["X", "X"]}}
+    ).python_string_symbols == {"x.py": ["X", "X"]}
+    baseline = 'X = "first"\nX = "second"'
+    assert _masked(baseline, ["X"]) == _masked('X = "edited"\nX = "second"', ["X"])
+    assert _masked(baseline, ["X"]) != _masked('X = "first"\nX = "edited"', ["X"])
+    assert _masked('def f():\n    u"old doc"\n    return 1', ["f.__doc__"]) == _masked(
+        'def f():\n    "new doc"\n    return 1', ["f.__doc__"]
+    )
+    with pytest.raises(ValueError):
+        _masked('def f():\n    pass\ndef f():\n    "later doc"', ["f.__doc__"])
+
+
 @pytest.mark.parametrize("attack", ["import", "loaded_module"])
 def test_candidate_import_guard_refuses_result(git_repo, private, monkeypatch, attack):
     (git_repo / "forbidden.py").write_text('raise RuntimeError("candidate executed")')
@@ -397,6 +415,97 @@ def test_untracked_file_refuses_score(git_repo, private, monkeypatch):
     (git_repo / "untracked.py").write_text("raise RuntimeError")
     with pytest.raises(sandbox.ScoringSandboxError, match="untracked"):
         score(git_repo, sha, config=config())
+
+
+@pytest.mark.parametrize("contamination", [None, "startup", "evaluation"])
+def test_operator_editable_install_cannot_supply_scorer_modules(
+    git_repo, private, monkeypatch, contamination
+):
+    from pydantic_evals import Case
+    from pydantic_ai_gepa.cli.harness_record import for_run
+    from pydantic_ai_gepa.cli.spend import EvalSpendMeter
+
+    source = git_repo / "src" / "scorer_source"
+    source.mkdir(parents=True)
+    module = source / "__init__.py"
+    module.write_text('VALUE = "good"\n')
+    _git(git_repo, "add", "src")
+    injection = (
+        f"    injected = types.ModuleType('injected')\n"
+        f"    injected.__file__ = {str(module)!r}\n"
+        "    sys.modules['injected'] = injected\n"
+        if contamination == "evaluation"
+        else ""
+    )
+    pin(
+        git_repo,
+        monkeypatch,
+        "import sys, types\nfrom pathlib import Path\n"
+        "import scorer_source, installed_dependency\n"
+        "assert Path(scorer_source.__file__).is_relative_to(Path.cwd())\n"
+        "assert installed_dependency.VALUE == 'dependency'\n"
+        "async def evaluate(case):\n" + injection + "    return scorer_source.VALUE\n",
+    )
+    module.write_text('VALUE = "operator checkout must not win"\n')
+
+    # An operator-local venv is valid; only its installed dependencies are trusted,
+    # not the source tree referenced by its editable-install .pth file.
+    venv = git_repo / ".venv"
+    subprocess.run(
+        [sys.executable, "-m", "venv", "--without-pip", str(venv)], check=True
+    )
+    python = venv / "bin/python"
+    packages = Path(
+        subprocess.check_output(
+            [str(python), "-I", "-c", "import site; print(site.getsitepackages()[0])"],
+            text=True,
+        ).strip()
+    )
+    (packages / "dependencies.pth").write_text(
+        "\n".join(
+            f"import site; site.addsitedir({p!r})" for p in site.getsitepackages()
+        )
+        + "\n"
+    )
+    (packages / "installed_dependency.py").write_text('VALUE = "dependency"\n')
+    (packages / "operator.pth").write_text(
+        str(git_repo / "src")
+        + "\n"
+        + ("import scorer_source\n" if contamination == "startup" else "")
+    )
+
+    export = git_repo.parent / (git_repo.name + "-export")
+    export.mkdir()
+    (export / "score.txt").write_text("good")
+    _git(export, "init")
+    _git(export, "config", "user.email", "tests@example.com")
+    _git(export, "config", "user.name", "Tests")
+    _git(export, "add", ".")
+    _git(export, "commit", "-m", "History-free export")
+    sha = _git(export, "rev-parse", "HEAD")
+    record = for_run("sandbox-test", git_repo)
+    assert record is not None
+    record.write("@trusted_text_base", sha)
+    monkeypatch.setattr(sandbox.sys, "executable", str(python))
+
+    def evaluate():
+        return sandbox.score_cases(
+            config=config(),
+            project=export,
+            scorer_project=git_repo,
+            sha=sha,
+            cases=[Case(name="test", inputs="test", expected_output="good")],
+            validation=True,
+            meter=EvalSpendMeter(
+                "sandbox-test", git_repo, "eval-test", "training", None, None, 1, 1
+            ),
+        )
+
+    if contamination:
+        with pytest.raises(sandbox.ScoringSandboxError):
+            evaluate()
+    else:
+        assert evaluate()[0].score == 1
 
 
 def test_export_seed_allows_omitted_scorer_files(git_repo, private, monkeypatch):

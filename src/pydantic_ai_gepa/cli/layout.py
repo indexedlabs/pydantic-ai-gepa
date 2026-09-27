@@ -157,7 +157,6 @@ class AcceptanceConfig:
             or not isinstance(names, list)
             or not names
             or any(not valid_string_symbol(n) for n in names)
-            or len(set(names)) != len(names)
             for p, names in symbols.items()
         ):
             raise GepaConfigError(

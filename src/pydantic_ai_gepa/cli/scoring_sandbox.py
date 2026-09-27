@@ -866,6 +866,12 @@ def score_cases(
                     "validation": validation,
                     "components": components,
                     "blocked_roots": [str(p) for p in blocked_roots],
+                    "scorer_root": str(git_root(scorer_project or project))
+                    if trusted_process
+                    else None,
+                    "pinned_root": str(scratch.parent / "checkout")
+                    if trusted_process
+                    else None,
                 }
             )
             if channel.receive() != {"type": "ready"}:
