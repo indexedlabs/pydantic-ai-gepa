@@ -172,6 +172,7 @@ def verify_candidate(
 def private_roots(project: Path, scorer_project: Path, meter: Any) -> list[Path]:
     """Use the driver's project/lane exclusions and private-record lane reads."""
     from .lanes import load_all_lane_states
+    from .lane_repositories import lanes_root
 
     roots = {
         project.resolve(),
@@ -180,7 +181,13 @@ def private_roots(project: Path, scorer_project: Path, meter: Any) -> list[Path]
         git_root(scorer_project),
     }
     workspace = meter.root or scorer_project
-    roots.update((workspace.resolve(), gepa_dir(workspace).resolve()))
+    roots.update(
+        (
+            workspace.resolve(),
+            gepa_dir(workspace).resolve(),
+            lanes_root(workspace).resolve(),
+        )
+    )
     for lane in load_all_lane_states(workspace, meter.run_id):
         roots.update(
             Path(p).resolve()
