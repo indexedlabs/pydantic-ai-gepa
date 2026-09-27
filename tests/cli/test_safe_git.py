@@ -579,13 +579,13 @@ def test_heldout_lane_start_uses_owned_repositories(
     assert "restored from the harness record" not in result.output
     assert {lane: path.read_bytes() for lane, path in lane_ledgers.items()} == before
     assert _run_payload(result.output)["best_commit_sha"] == candidate_sha
-    # Reflector-written training rows cannot exhaust the private harness budget.
-    assert _run_payload(result.output)["status"] == "running"
+    # Harness-computed training charges exhaust the budget without trusting
+    # or modifying the reflector's rows, and preserve the promoted candidate.
+    assert _run_payload(result.output)["status"] == "done"
     from pydantic_ai_gepa.cli.run import _load_state
-    from pydantic_ai_gepa.cli.select import _phase_finalize
 
     with harness_environment(), record.route():
-        state, _, _ = _phase_finalize(git_repo, _load_state(run_id), {})
+        state = _load_state(run_id)
         assert state.status == "done"
     assert _git(record.repository, "rev-parse", "HEAD") == candidate_sha
     assert _git(git_repo, "rev-parse", "HEAD") == source_sha

@@ -366,7 +366,8 @@ class ParetoLog:
         """Count training and validation evaluations charged to run budget."""
 
         return sum(
-            self.count_rows(scope=scope) for scope in ("acceptance", "validation")
+            self.count_rows(scope=scope)
+            for scope in ("acceptance", "validation", "lane_training_estimate")
         )
 
     def front(self, *, mode: str = "instance") -> list[ParetoRow]:

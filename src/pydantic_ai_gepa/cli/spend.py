@@ -97,6 +97,12 @@ def _rows(
 ) -> list[dict[str, Any]]:
     directory = ledger_directory(run_id, root)
     rows = _read_rows(directory / "spend.jsonl", warnings)
+    if warnings is None and not lane_training_active(run_id):
+        from .lane_accounting import private_rows as private_charge_rows
+
+        # All admission paths include the hidden price remainder. Reports pass
+        # a warnings dict and must never publish an invertible held-out charge.
+        rows.extend(private_charge_rows(run_id, root, rows))
     pointer = directory / "validation-spend-registered"
     if harness_record.exists(pointer, root=root):
         from .lanes import _pid_alive
@@ -186,7 +192,7 @@ def _report(rows: list[dict[str, Any]], cap: float | None) -> dict[str, Any]:
         "stop_reason": None,
     }
     for row in rows:
-        if cap is None:
+        if cap is None and "max_token_cost" in row:
             result["max_token_cost"] = row.get("max_token_cost")
         result["unmetered_rollouts"] += row.get("unmetered_rollouts", 0)
         result["cached_rollouts"] += row.get("cached_rollouts", 0)
@@ -194,9 +200,13 @@ def _report(rows: list[dict[str, Any]], cap: float | None) -> dict[str, Any]:
         result["total_dollars"] += dollars
         side = "validation" if row["kind"] == "validation" else "training"
         result[f"{side}_dollars"] += dollars
-        _add_models(result["by_model"], row["by_model"])
-        _add_models(result["unpriced_usage"], row["unpriced_usage"])
-        if row["stop_reason"]:
+        if row["kind"] == "lane_training_estimate":
+            result["estimated_lane_training_dollars"] = (
+                result.get("estimated_lane_training_dollars", 0.0) + dollars
+            )
+        _add_models(result["by_model"], row.get("by_model", {}))
+        _add_models(result["unpriced_usage"], row.get("unpriced_usage", {}))
+        if row.get("stop_reason"):
             result["stopped_by_cost"] = True
             result["stop_reason"] = row["stop_reason"]
     return result
@@ -436,6 +446,11 @@ class EvalSpendMeter(SpendMeter):
                         handle.flush()
                         os.fsync(handle.fileno())
         self._finished = True
+        # Reprice consumed lane verdicts with this candidate's own metered
+        # cost before a cost-stop report is published, including partial evals.
+        from .lane_accounting import refresh
+
+        refresh(self.run_id, self.root)
 
     def declare_cached_rollout(self) -> None:
         usage = self._requests.get()
