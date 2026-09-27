@@ -49,11 +49,18 @@ def _entry(value: Any, case: Any, validation: bool) -> dict[str, str]:
             [case.name, case.inputs, case.expected_output, case.metadata]
         )
         if strings:
+            # Dots keep filenames such as _ssl.c and decimal numbers intact.
             pattern = "|".join(
-                re.escape(item) for item in sorted(strings, key=len, reverse=True)
+                re.escape(item)
+                if len(item) >= 4
+                else rf"(?<![0-9A-Za-z_])(?<![0-9A-Za-z_]\.){re.escape(item)}(?![0-9A-Za-z_]|\.[0-9A-Za-z_])"
+                for item in sorted(strings, key=len, reverse=True)
             )
             message = re.sub(pattern, "[redacted]", message)
-            if any(item in exception_class for item in strings):
+            if any(
+                item == exception_class or (len(item) >= 4 and item in exception_class)
+                for item in strings
+            ):
                 exception_class = "EvaluationError"
     entry = {
         "time": datetime.now(timezone.utc).isoformat(),

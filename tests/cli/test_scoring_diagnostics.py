@@ -218,6 +218,69 @@ def test_scrub_does_not_collect_booleans():
     assert diagnostics._strings([True, False]) == set()
 
 
+@pytest.mark.parametrize(
+    "suffix, scrubbed_suffix",
+    [("", ""), (" 1 ", " [redacted] "), (" attempt=1", " [redacted]=[redacted]")],
+)
+def test_short_values_preserve_tls_diagnostic(
+    git_repo, private, private_run, protocol_backend, suffix, scrubbed_suffix
+):
+    message = (
+        "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+        "unable to get local issuer certificate (_ssl.c:1006)"
+    )
+    sha = commit_evaluator(
+        git_repo,
+        f"def evaluate(case):\n    raise ConnectionError({message + suffix!r})\n",
+    )
+    score(git_repo, sha, cases=[Case(name="c", inputs={"attempt": 1})])
+    record = harness_record.for_run("sandbox-test", git_repo)
+    assert record is not None
+    content = record.read("@scoring-diagnostics")
+    assert content is not None
+    entry = json.loads(content)
+    assert entry["class"] == "ConnectionError"
+    assert entry["message"] == message + scrubbed_suffix
+    assert "case_id" not in entry
+
+
+@pytest.mark.parametrize(
+    "value, exception_class, expected",
+    [
+        ("c", "ConnectionError", "ConnectionError"),
+        ("Con", "ConnectionError", "ConnectionError"),
+        ("Conn", "ConnectionError", "EvaluationError"),
+        ("ConnectionError", "ConnectionError", "EvaluationError"),
+        ("connectionerror", "ConnectionError", "ConnectionError"),
+        ("c", "c", "EvaluationError"),
+    ],
+)
+def test_exception_class_redaction_requires_exact_or_long_value(
+    value, exception_class, expected
+):
+    entry = diagnostics._entry(
+        {"class": exception_class, "message": "failure"}, Case(inputs=value), True
+    )
+    assert entry["class"] == expected
+
+
+@pytest.mark.parametrize(
+    "value, message, expected",
+    [
+        (1, "1 1006 1.1 attempt=1", "[redacted] 1006 1.1 attempt=[redacted]"),
+        ("abc", "abc abcdef _abc abc.def", "[redacted] abcdef _abc abc.def"),
+        ("abcd", "abcd abcdef", "[redacted] [redacted]ef"),
+        (1.1, "1.1 11.1", "[redacted] 11.1"),
+        (1, "attempt=1. Retry 1!", "attempt=[redacted]. Retry [redacted]!"),
+    ],
+)
+def test_short_message_values_require_token_boundaries(value, message, expected):
+    entry = diagnostics._entry(
+        {"class": "ValueError", "message": message}, Case(inputs=value), True
+    )
+    assert entry["message"] == expected
+
+
 def test_escaping_evaluator_exception_aborts(
     git_repo, private, private_run, protocol_backend, monkeypatch
 ):

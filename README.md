@@ -740,9 +740,12 @@ that bypass the environment (for example `trust_env=False`) should explicitly us
 `ssl.create_default_context(cafile=certifi.where())` and configure the CONNECT proxy.
 
 Before the first sandboxed rollout, a separate sandboxed child checks one TLS
-handshake to the first allowlisted host on port 443, using the same profile,
-environment and proxy, with no candidate or case material. It uses httpx2's default
-SSL context when importable, otherwise OpenSSL's default context. Success and
+handshake to the first allowlisted host on port 443.
+TLS hosts on other ports aren't probed at start; trust-store failures there appear
+only in private per-rollout diagnostics.
+The check uses the same profile, environment and proxy, with no candidate or case
+material. It uses httpx2's default SSL context when importable, otherwise OpenSSL's
+default context. Success and
 non-verification failures are cached for the
 harness process and TLS environment. If no port-443 host is listed, the check is
 skipped, preserving plaintext model endpoints. Certificate verification failure
