@@ -1,4 +1,4 @@
-"""Untrusted scoring worker. Only launched after the OS sandbox is applied."""
+"""Bounded scoring worker for Seatbelt or explicitly trusted text scoring."""
 
 from __future__ import annotations
 
@@ -67,7 +67,18 @@ def main() -> None:
             initialization["components"], sort_keys=True
         )
     root = Path.cwd()
+    guard = None
+    if config.acceptance.scoring == "trusted_in_process":
+        from .scoring_imports import CandidateImportGuard
+
+        guard = CandidateImportGuard(initialization["blocked_roots"])
     insert_repo_root_on_path(root)
+    if guard is not None and config.acceptance.scope_verifier:
+        verifier = resolve_module_attr(
+            config.acceptance.scope_verifier, expected_root=root
+        )
+        if verifier(components=initialization["components"]) is not True:
+            raise RuntimeError("Trusted text scope verification failed.")
     evaluate = resolve_evaluate(config, expected_root=root)
     agent = resolve_agent(config, expected_root=root) if config.agent else None
     metric = resolve_metric(config, expected_root=root) or default_substring_metric
@@ -102,6 +113,8 @@ def main() -> None:
             if receive() != {"type": "ack"}:
                 raise RuntimeError("Parent refused response")
 
+    if guard is not None:
+        guard.check()
     send({"type": "ready"})
     while True:
         request = receive()
@@ -179,6 +192,8 @@ def main() -> None:
                 # A missing/invalid material payload is a fixed parent note,
                 # never a failed rollout or child exception text.
                 pass
+        if guard is not None:
+            guard.check()
         send(
             {
                 "type": "result",

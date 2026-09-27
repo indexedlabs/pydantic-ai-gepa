@@ -46,6 +46,13 @@ JOURNAL_FILENAME = "journal.jsonl"
 CandidateSource = Literal["components", "git"]
 
 
+def valid_string_symbol(value: Any) -> bool:
+    return isinstance(value, str) and (
+        value.isidentifier()
+        or (value.endswith(".__doc__") and value[:-8].isidentifier())
+    )
+
+
 @dataclass(frozen=True)
 class AcceptanceConfig:
     """Scalar sampling and optional assertion-vector acceptance configuration.
@@ -66,7 +73,11 @@ class AcceptanceConfig:
     require_probe_receipt: bool = False
     pinned_scorer: bool = False
     trusted_scorer: bool = False
+    scoring: Literal["seatbelt", "trusted_in_process"] = "seatbelt"
     component_files: tuple[str, ...] = ()
+    text_files: tuple[str, ...] = ()
+    python_string_symbols: dict[str, list[str]] = field(default_factory=dict)
+    scope_verifier: str | None = None
     meta_files: tuple[str, ...] = ("prediction.json",)
     reviewer: str | None = None
     reviewer_kind: Literal["module", "agent", "command"] = "module"
@@ -130,6 +141,35 @@ class AcceptanceConfig:
                 "acceptance.component_files must be an array of paths."
             )
         raw_meta_files = data.get("meta_files", ["prediction.json"])
+        scoring = data.get("scoring", "seatbelt")
+        if scoring not in ("seatbelt", "trusted_in_process"):
+            raise GepaConfigError(
+                "acceptance.scoring must be seatbelt or trusted_in_process."
+            )
+        text_files = data.get("text_files", [])
+        symbols = data.get("python_string_symbols", {})
+        if not isinstance(text_files, list) or not all(
+            isinstance(p, str) for p in text_files
+        ):
+            raise GepaConfigError("acceptance.text_files must be an array of paths.")
+        if not isinstance(symbols, dict) or any(
+            not isinstance(p, str)
+            or not isinstance(names, list)
+            or not names
+            or any(not valid_string_symbol(n) for n in names)
+            or len(set(names)) != len(names)
+            for p, names in symbols.items()
+        ):
+            raise GepaConfigError(
+                "acceptance.python_string_symbols must map paths to non-empty symbol arrays."
+            )
+        scope_verifier = data.get("scope_verifier")
+        if scope_verifier is not None and (
+            not isinstance(scope_verifier, str) or ":" not in scope_verifier
+        ):
+            raise GepaConfigError(
+                "acceptance.scope_verifier must be a module:function reference."
+            )
         trusted_scorer = data.get("trusted_scorer", False)
         if not isinstance(trusted_scorer, bool):
             raise GepaConfigError("acceptance.trusted_scorer must be a boolean.")
@@ -191,7 +231,11 @@ class AcceptanceConfig:
             require_probe_receipt=bool(data.get("require_probe_receipt", False)),
             pinned_scorer=bool(data.get("pinned_scorer", False)),
             trusted_scorer=trusted_scorer,
+            scoring=scoring,
             component_files=tuple(files),
+            text_files=tuple(text_files),
+            python_string_symbols=dict(symbols),
+            scope_verifier=scope_verifier,
             meta_files=tuple(meta_files),
             reviewer=reviewer,
             reviewer_kind=reviewer_kind,
