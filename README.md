@@ -644,7 +644,19 @@ the external harness scored, and sandboxed `continue` returned the accepted
 verdict. Repeat this read-denial and scoring probe for the actual deployment's
 paths and grants; system-temp placement does not protect held-out data.
 
-Candidate code is scored in a **sandboxed child from a harness-owned detached
+**Which process scores a held-out run.** `GEPA_HELDOUT_DATASET` alone gives
+held-out selection: winners are still confirmed on the held-out set, and every
+rollout, training and validation, is scored in the controller process, as in a
+training-only run. The harness-owned scoring child below, Seatbelt or
+`trusted_in_process`, runs only when the launching harness also sets
+`GEPA_HARNESS_SCORING_SANDBOX=1`; any other value is refused, so a misspelled
+request never drops the sandbox. In-process scoring imports the scorer (and,
+with an unpinned scorer, the candidate) into the process that holds the held-out
+path, so use it only on a trusted operator machine with a reflector that cannot
+reach that process. Validation feedback, traces and per-case scores stay private
+either way. The variable is reserved and never forwarded to a reflector.
+
+When the harness requests it, candidate code is scored in a **sandboxed child from a harness-owned detached
 checkout**. The parent reads the held-out dataset and sends one case at a time
 over a pipe; the child returns bounded JSON results. Candidate agent, evaluator,
 metric, case-factory and pricing imports happen only in that child. Training
@@ -712,7 +724,7 @@ proxy. The proxy listens on `127.0.0.1`; Seatbelt's `localhost:<port>` rule cove
 loopback addresses on that TCP port. Fork/exec is allowed for per-case evaluator
 subprocesses; descendants
 inherit the same Seatbelt restrictions. Linux and hosts with an unusable backend
-**refuse Seatbelt scoring**; there is no unsandboxed fallback or disable flag. macOS CI requires real OS adversarial
+**refuse Seatbelt scoring**; a requested sandbox has no unsandboxed fallback. macOS CI requires real OS adversarial
 tests. Seatbelt is deprecated; repeat those tests on each deployment OS. Local
 Codex may prohibit nested Seatbelt, so a local skip is not enforcement evidence.
 
@@ -783,7 +795,7 @@ Text candidates can still steer the model under test, and real external effects
 from scorer tools could leak held-out content. Use this mode only with local fake
 tools and an already-approved model route; the proxy is not an OS network boundary.
 The scorer must consume candidate text as data and never execute it.
-Every other held-out configuration continues to require Seatbelt with its
+Every other requested scoring child continues to require Seatbelt with its
 unchanged profile; unsupported hosts never silently fall back to this mode.
 
 Set `GEPA_HARNESS_ALLOWED_HOSTS=api.openai.com:443,api.anthropic.com:443` in the
@@ -795,7 +807,7 @@ the fixed provider keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
 setting, set `GEPA_HARNESS_PASS_ENV=TYPESAFE_API_KEY,OTHER_NAME` in the harness
 environment. Names are never read from a nomination, `gepa.toml` or `.env`.
 Reserved harness/runtime names (including `GEPA_HELDOUT_DATASET` and
-`GEPA_HARNESS_ALLOWED_HOSTS`, `GEPA_HARNESS_SCORER_REVISION`,
+`GEPA_HARNESS_ALLOWED_HOSTS`, `GEPA_HARNESS_SCORING_SANDBOX`, `GEPA_HARNESS_SCORER_REVISION`,
 `GEPA_HARNESS_FROZEN_FILES` and `GEPA_CANDIDATE_COMPONENTS_JSON`) and values
 containing the held-out path are refused.
 

@@ -2,22 +2,30 @@
 
 These tests exercise controller state transitions, often monkeypatching Python
 callables that cannot cross an exec boundary. OS isolation and the actual child
-protocol are covered separately in test_scoring_sandbox.py. This injection is
-Python-only; no production CLI/environment setting can select this backend.
+protocol are covered separately in test_scoring_sandbox.py, whose files set
+the harness's GEPA_HARNESS_SCORING_SANDBOX request. The lane-mutation injection
+below is Python-only; no production setting can select it.
 """
 
 import pytest
 
 
+# These files exercise the harness-owned scoring child, which a held-out run
+# uses only when its harness requests it.
+SCORING_CHILD_TESTS = {
+    "test_scoring_sandbox.py",
+    "test_scoring_material.py",
+    "test_scoring_diagnostics.py",
+    "test_scoring_tls.py",
+    "test_safe_git.py",
+}
+
+
 @pytest.fixture(autouse=True)
 def legacy_scoring_flow_backend(request, monkeypatch):
-    if request.node.path.name not in {
-        "test_scoring_sandbox.py",
-        "test_scoring_material.py",
-        "test_scoring_diagnostics.py",
-        "test_scoring_tls.py",
-        "test_safe_git.py",
-    }:
+    if request.node.path.name in SCORING_CHILD_TESTS:
+        monkeypatch.setenv("GEPA_HARNESS_SCORING_SANDBOX", "1")
+    else:
         monkeypatch.setattr(
             "pydantic_ai_gepa.cli.scoring_sandbox.required", lambda: False
         )

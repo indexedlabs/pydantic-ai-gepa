@@ -133,6 +133,25 @@ def score(repo, sha, *, validation=True, config=None, cases=None):
     )
 
 
+def test_heldout_alone_scores_in_process(private, monkeypatch):
+    monkeypatch.delenv(sandbox.SANDBOX_REQUEST_ENV)
+    assert sandbox.required() is False
+
+
+def test_harness_request_selects_the_scoring_child(private, monkeypatch):
+    assert sandbox.required() is True
+    # A training-only run never uses the child, requested or not.
+    monkeypatch.delenv("GEPA_HELDOUT_DATASET")
+    assert sandbox.required() is False
+
+
+@pytest.mark.parametrize("value", ["", "0", "true", "yes"])
+def test_malformed_harness_request_is_refused(private, monkeypatch, value):
+    monkeypatch.setenv(sandbox.SANDBOX_REQUEST_ENV, value)
+    with pytest.raises(sandbox.ScoringSandboxError, match="must be 1 or unset"):
+        sandbox.required()
+
+
 def test_no_backend_fails_closed_without_private_path(git_repo, private, monkeypatch):
     monkeypatch.setattr(sandbox.sys, "platform", "linux")
     result = _run("run", "start", "--size", "1")
@@ -843,6 +862,7 @@ def test_harness_can_pass_named_extra_environment(private, tmp_path, monkeypatch
         "GEPA_HARNESS_SCORER_REVISION",
         "GEPA_HARNESS_FROZEN_FILES",
         "GEPA_CANDIDATE_COMPONENTS_JSON",
+        "GEPA_HARNESS_SCORING_SANDBOX",
         "PYTHONPATH",
         "DYLD_INSERT_LIBRARIES",
         "HOME",
@@ -1674,3 +1694,59 @@ async def evaluate(case):
         control.wait()
         for native in inspections:
             native.sweep()
+
+
+def test_heldout_run_without_harness_request_selects_in_process(
+    git_repo, private, monkeypatch
+):
+    """Held-out selection still decides the winner; rollouts stay in-process."""
+    monkeypatch.delenv(sandbox.SANDBOX_REQUEST_ENV)
+
+    def forbidden(**_kwargs):
+        raise AssertionError("scoring child used without the harness request")
+
+    monkeypatch.setattr(sandbox, "score_cases", forbidden)
+    commit_evaluator(
+        git_repo,
+        "from pathlib import Path\nasync def evaluate(case): return Path('score.txt').read_text().strip()\n",
+    )
+    started = _run(
+        "run",
+        "start",
+        "--size",
+        "1",
+        "--max-iterations",
+        "16",
+        "--acceptance-repetitions",
+        "1",
+        "--acceptance-paired-min-cases",
+        "2",
+    )
+    assert started.exit_code == 0, (started.output, started.exception)
+    run_id = _run_payload(started.output)["run_id"]
+    monkeypatch.delenv("GEPA_HELDOUT_DATASET")
+    (git_repo / "score.txt").write_text("good")
+    _git(git_repo, "add", "score.txt")
+    _git(git_repo, "commit", "-m", "Improved candidate")
+    queued = _run("run", "continue", "--run-id", run_id, "--wait-secs", "0")
+    assert queued.exit_code == 0, queued.output
+    monkeypatch.setenv("GEPA_HELDOUT_DATASET", str(private))
+    served = _run("harness", "serve", "--run-id", run_id, "--once")
+    assert served.exit_code == 0, (served.output, served.exception)
+    monkeypatch.delenv("GEPA_HELDOUT_DATASET")
+    delivered = _run("run", "continue", "--run-id", run_id, "--wait-secs", "0")
+    assert delivered.exit_code == 0, delivered.output
+    state = _run_payload(delivered.output)
+    assert state["last_reflector_comparison"]["validation_improved"]
+    assert state["best_mean_score"] == 1
+    public = (
+        started.output
+        + delivered.output
+        + "".join(
+            path.read_text(errors="replace")
+            for path in (git_repo / ".gepa").rglob("*")
+            if path.is_file()
+        )
+    )
+    assert "CASE_SENTINEL_4833" not in public
+    assert "INPUT_SENTINEL_4833" not in public

@@ -63,8 +63,21 @@ class ScoringSandboxError(typer.BadParameter):
     """Static messages only: errors are visible to the reflector."""
 
 
+SANDBOX_REQUEST_ENV = "GEPA_HARNESS_SCORING_SANDBOX"
+
+
 def required() -> bool:
-    return heldout_dataset(required=False) is not None
+    """Whether rollouts are scored in the harness-owned scoring child.
+
+    A held-out dataset alone gives held-out selection with rollouts scored in
+    this process. The scoring child (Seatbelt or ``trusted_in_process``) runs
+    only when the launching harness also sets ``GEPA_HARNESS_SCORING_SANDBOX=1``.
+    Any other value is refused, so a misspelled request never drops the sandbox.
+    """
+    request = os.environ.get(SANDBOX_REQUEST_ENV)
+    if request not in (None, "1"):
+        raise ScoringSandboxError("GEPA_HARNESS_SCORING_SANDBOX must be 1 or unset.")
+    return heldout_dataset(required=False) is not None and request == "1"
 
 
 def require_supported(config: GepaConfig, source: str) -> None:
@@ -265,6 +278,7 @@ def child_environment(scratch: Path, port: int) -> dict[str, str]:
         "GEPA_HARNESS_FROZEN_FILES",
         "GEPA_CANDIDATE_COMPONENTS_JSON",
         "GEPA_HARNESS_PRIVATE_SCRATCH",
+        SANDBOX_REQUEST_ENV,
     }
     for item in os.environ.get("GEPA_HARNESS_PASS_ENV", "").split(","):
         name = item.strip()
