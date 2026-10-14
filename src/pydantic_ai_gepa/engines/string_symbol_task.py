@@ -53,8 +53,11 @@ Engines call it once per case, and calls overlap, often on the same SHA, so it
 must be reentrant: materialize each commit once (for example a per-SHA worktree
 created under an ``asyncio.Lock``) or per call, never at a shared fixed path.
 Attach ``current_rollout_capability()`` to model calls so they are metered.
-Retry transient errors inside it: an exception makes the evaluation
-non-selectable, and with ``cache=True`` that result is cached like any other.
+Return a low-score ``MetricResult`` with feedback when the candidate itself
+fails a case (for example it breaks the application); raise only for
+infrastructure faults, and retry transient ones inside it. An exception makes
+the evaluation non-selectable and is never counted against the candidate, and
+with ``cache=True`` that result is cached like any other.
 ``side_info['scores']`` feeds objective selection as usual.
 """
 

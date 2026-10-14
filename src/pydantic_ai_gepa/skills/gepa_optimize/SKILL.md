@@ -800,8 +800,10 @@ best_sha = await task.commit_for(result.best_candidate)
   failed rollout (its `RolloutOutput.selectable` is False). The `gepa` engine
   never promotes such a candidate, training comparisons and reflection leave
   those cases out, and a fair vote discards that candidate; Omni still
-  raises when the frozen seed or incumbent baseline is non-selectable. Retry
-  transient errors inside the evaluator.
+  raises when the frozen seed or incumbent baseline is non-selectable. When
+  the candidate itself breaks a case, return a low-score `MetricResult` with
+  feedback instead of raising; keep exceptions for infrastructure faults and
+  retry transient ones inside the evaluator.
 - Proposals must keep to the declared `py:<path>:<NAME>` keys; an undeclared
   key raises `StringSymbolError`.
 - Candidate commits are unreferenced and `git gc` eventually prunes them.
