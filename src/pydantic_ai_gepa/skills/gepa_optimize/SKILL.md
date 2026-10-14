@@ -771,7 +771,8 @@ best_sha = await task.commit_for(result.best_candidate)
   Version 1 accepts only `NAME = "..."` / `NAME: T = "..."` at module level
   (implicit concatenation included), bound exactly once in module scope
   (`del`, `except … as`, `match` captures, walrus and `global` count). Anything
-  else (f-strings, bytes, expressions, `X.__doc__`, nested blocks) is refused.
+  else (f-strings, bytes, expressions, `X.__doc__`, nested blocks, comments
+  between concatenated parts) is refused.
 - `commit_from_candidate` rewrites only those constants' source spans and
   commits on top of the base with plumbing and a private index; your working
   tree, index and branches are untouched, and commits are unsigned. Each
@@ -787,7 +788,10 @@ best_sha = await task.commit_for(result.best_candidate)
   behind an `asyncio.Lock` (or per call), never at one fixed path. Attach
   `pydantic_ai_gepa.spend.current_rollout_capability()` to its model calls so
   `max_token_cost` and pipeline caps meter them. An exception scores that
-  case 0.0.
+  case 0.0 and marks the evaluation non-selectable, as the CLI does for a
+  failed rollout.
+- Proposals must keep to the declared `py:<path>:<NAME>` keys; an undeclared
+  key raises `StringSymbolError`.
 - Candidate commits are unreferenced and `git gc` eventually prunes them.
   Point a ref at the one you keep: `git update-ref refs/heads/<name> <sha>`.
 

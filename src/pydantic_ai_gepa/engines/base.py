@@ -377,11 +377,18 @@ def _objective_scores(
         if not isinstance(info, dict):
             objective_key_sets.append(None)
             continue
-        if info.get("selectable") is False or info.get("infrastructure_valid") is False:
+        failed = (
+            info.get("selectable") is False or info.get("infrastructure_valid") is False
+        )
+        if failed:
             selectable = False
         raw_scores = info.get("scores")
         if raw_scores is None:
-            objective_key_sets.append(None)
+            # A non-selectable case (e.g. an evaluator crash) may carry no
+            # objectives; it already disqualifies the evaluation, so it must not
+            # also fail the identical-keys check.
+            if not failed:
+                objective_key_sets.append(None)
             continue
         if not isinstance(raw_scores, dict):
             raise ValueError(

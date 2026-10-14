@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import ast
 import codecs
+import io
 import os
 import subprocess
 import tempfile
+import tokenize
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -178,6 +180,7 @@ def commit_from_candidate(
     changed: dict[str, tuple[str, bytes]] = {}
     for path, names in declared.items():
         mode, source = git.blob(base, path)
+        crlf = b"\r\n" in source
         spans = _string_spans(source, path, names)
         edits: list[tuple[int, int, bytes]] = []
         for name in names:
@@ -191,6 +194,10 @@ def commit_from_candidate(
             value = _reframe(span.value, component.text)
             # Keep a ``u`` prefix: the masked-AST scope check compares it.
             literal = (span.kind or "") + _literal(value)
+            if crlf:
+                # Raw newlines in a triple-quoted literal follow the file's
+                # line endings; the parser reads both as "\n".
+                literal = literal.replace("\n", "\r\n")
             edits.append((span.start, span.end, literal.encode()))
         if edits:
             for start, end, literal in sorted(edits, reverse=True):
@@ -415,8 +422,25 @@ def _string_spans(source: bytes, path: str, names: Sequence[str]) -> dict[str, _
                 f"{path}:{name}: could not locate the constant's source span "
                 "(only UTF-8 sources are supported)."
             )
+        if _has_comment(source[start:end].decode()):
+            # A rewrite replaces the whole span and would drop the comment.
+            raise StringSymbolError(
+                f"{path}:{name} has a comment between its concatenated parts; "
+                "move the comment outside the constant."
+            )
         spans[name] = _Span(start=start, end=end, value=value.value, kind=value.kind)
     return spans
+
+
+def _has_comment(fragment: str) -> bool:
+    readline = io.StringIO(f"({fragment})").readline
+    try:
+        return any(
+            token.type == tokenize.COMMENT
+            for token in tokenize.generate_tokens(readline)
+        )
+    except (tokenize.TokenError, SyntaxError):
+        return True
 
 
 def _outside(source: bytes, spans: Mapping[str, _Span]) -> list[bytes]:
@@ -509,7 +533,11 @@ class _Git:
         entry = self.run("ls-tree", "-z", commit, "--", path).rstrip(b"\0")
         meta, _, name = entry.partition(b"\t")
         fields = meta.split()
-        if name.decode() != path or len(fields) != 3 or fields[1] != b"blob":
+        if (
+            name.decode(errors="surrogateescape") != path
+            or len(fields) != 3
+            or fields[1] != b"blob"
+        ):
             raise StringSymbolError(f"{relative} is not a file at {commit[:12]}.")
         mode, _, oid = (field.decode() for field in fields)
         if mode not in ("100644", "100755"):
@@ -540,7 +568,8 @@ class _Git:
         entries: list[tuple[str, str, str, str]] = []
         for index in range(0, len(fields) - 1, 2):
             meta = fields[index].decode().lstrip(":").split()
-            entries.append((meta[4], meta[0], meta[1], fields[index + 1].decode()))
+            path = fields[index + 1].decode(errors="surrogateescape")
+            entries.append((meta[4], meta[0], meta[1], path))
         return entries
 
     def commit_tree(

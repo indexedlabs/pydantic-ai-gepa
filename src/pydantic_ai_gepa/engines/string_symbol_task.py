@@ -68,6 +68,101 @@ def _agentless_metric(*_: Any) -> MetricResult:
     raise TypeError("StringSymbolTask scores commits through its evaluator.")
 
 
+_FAILED_CASE_SIDE_INFO = {"selectable": False, "infrastructure_valid": False}
+
+
+class _CommitScorer:
+    """Commit materialization and scoring, with no access to any dataset.
+
+    The graph adapter holds only this, so an engine holding the adapter cannot
+    reach the task's held-out ``test_set`` around the trusted task view.
+    """
+
+    def __init__(
+        self,
+        *,
+        repo: Path,
+        base_commit: str,
+        symbols: Mapping[str, Sequence[str]],
+        evaluator: CommitEvaluator,
+        concurrency: int,
+        commit_message: str,
+    ) -> None:
+        self.repo = repo
+        self.base_commit = base_commit
+        self.symbols = symbols
+        self.evaluator = evaluator
+        self.concurrency = concurrency
+        self.commit_message = commit_message
+        self.seed = candidate_from_commit(repo, base_commit, symbols)
+        self._commits: dict[tuple[tuple[str, str], ...], str] = {}
+        self._commit_lock = asyncio.Lock()
+
+    async def commit_for(self, candidate: CandidateMap) -> str:
+        key = tuple(sorted((name, value.text) for name, value in candidate.items()))
+        async with self._commit_lock:
+            sha = self._commits.get(key)
+            if sha is None:
+                sha = await asyncio.to_thread(
+                    commit_from_candidate,
+                    self.repo,
+                    self.base_commit,
+                    self.symbols,
+                    candidate,
+                    self.commit_message,
+                )
+                self._commits[key] = sha
+        return sha
+
+    async def score_commit(
+        self,
+        commit: str,
+        cases: Sequence[Case[Any, Any, Any]],
+        *,
+        meter: SpendMeter | None = None,
+    ) -> list[CommitScore]:
+        active = current_rollout_capability()
+        meter = meter or (active.meter if active is not None else None)
+        semaphore = asyncio.Semaphore(max(1, self.concurrency))
+
+        async def score(case: Case[Any, Any, Any]) -> CommitScore:
+            async with semaphore:
+                with rollout_spend(meter) if meter is not None else nullcontext():
+                    async with _rollout_scope():
+                        try:
+                            result = await self.evaluator(commit, case)
+                        except Exception as error:
+                            if isinstance(
+                                error, UsageBudgetExceeded
+                            ) or is_provider_stop_error(error):
+                                raise
+                            # An infrastructure failure, not a measured 0.0:
+                            # the evaluation becomes non-selectable.
+                            return CommitScore(
+                                MetricResult(
+                                    score=0.0,
+                                    feedback=f"Commit evaluator failed: {error}",
+                                    side_info=dict(_FAILED_CASE_SIDE_INFO),
+                                ),
+                                RolloutOutput.from_error(error, kind="system"),
+                            )
+            if not (
+                isinstance(result, MetricResult)
+                and not isinstance(result.score, bool)
+                and isinstance(result.score, (int, float))
+                and math.isfinite(result.score)
+            ):
+                raise ValueError(
+                    "A CommitEvaluator must return a MetricResult with a finite "
+                    "numeric score."
+                )
+            return CommitScore(result, RolloutOutput.from_success(commit))
+
+        return list(
+            await gather_cancelling_on_provider_stop(*(score(case) for case in cases))
+        )
+
+
 class StringSymbolTask(OptimizationTask):
     """Optimize declared Python string constants of a Git commit.
 
@@ -76,6 +171,8 @@ class StringSymbolTask(OptimizationTask):
     as one commit on top of ``base_commit`` (memoized per candidate; the seed
     is ``base_commit`` itself) and passed to ``evaluator``. Use
     :meth:`commit_for` to materialize a result's ``best_candidate``.
+    Proposals must keep to the declared component keys; an undeclared key
+    raises :class:`~pydantic_ai_gepa.string_symbols.StringSymbolError`.
 
     Candidate commits are not referenced by any ref, so ``git gc`` eventually
     prunes them; point a ref at the commit you keep
@@ -108,37 +205,27 @@ class StringSymbolTask(OptimizationTask):
         )
         self.repo = Path(repo)
         self.symbols = normalize_string_symbols(symbols)
-        self.evaluator = evaluator
-        self.commit_message = commit_message
         self.base_commit = resolve_commit(self.repo, base_commit)
-        self._seed = candidate_from_commit(self.repo, self.base_commit, self.symbols)
-        self._commits: dict[tuple[tuple[str, str], ...], str] = {}
-        self._commit_lock = asyncio.Lock()
+        self._scorer = _CommitScorer(
+            repo=self.repo,
+            base_commit=self.base_commit,
+            symbols=self.symbols,
+            evaluator=evaluator,
+            concurrency=concurrency,
+            commit_message=commit_message,
+        )
 
     async def seed_candidate(self) -> CandidateMap:
         """Return the base commit's declared constants."""
-        return {name: value.model_copy() for name, value in self._seed.items()}
+        return {name: value.model_copy() for name, value in self._scorer.seed.items()}
 
     async def commit_for(self, candidate: CandidateMap) -> str:
         """Return the verified commit holding ``candidate``'s texts."""
-        key = tuple(sorted((name, value.text) for name, value in candidate.items()))
-        async with self._commit_lock:
-            sha = self._commits.get(key)
-            if sha is None:
-                sha = await asyncio.to_thread(
-                    commit_from_candidate,
-                    self.repo,
-                    self.base_commit,
-                    self.symbols,
-                    candidate,
-                    self.commit_message,
-                )
-                self._commits[key] = sha
-        return sha
+        return await self._scorer.commit_for(candidate)
 
     def create_adapter(self) -> StringSymbolAdapter:
         """Return the GEPA graph adapter that scores candidates as commits."""
-        return StringSymbolAdapter(self)
+        return StringSymbolAdapter(self._scorer)
 
     async def score_commit(
         self,
@@ -152,46 +239,12 @@ class StringSymbolTask(OptimizationTask):
         Calls run concurrently (up to ``concurrency``), each as one metered
         rollout: ``current_rollout_capability()`` inside the evaluator returns
         ``meter`` or, when it is None, the enclosing evaluation's meter. An
-        evaluator exception scores that case 0.0 with a failed output, as the
-        CLI's evaluate hook does; budget and provider stops propagate.
+        evaluator exception scores that case 0.0 with a failed output and
+        ``side_info`` marking it non-selectable, so the evaluation cannot be
+        selected, as the CLI treats a failed rollout. Budget and provider
+        stops propagate.
         """
-        active = current_rollout_capability()
-        meter = meter or (active.meter if active is not None else None)
-        semaphore = asyncio.Semaphore(max(1, self.concurrency))
-
-        async def score(case: Case[Any, Any, Any]) -> CommitScore:
-            async with semaphore:
-                with rollout_spend(meter) if meter is not None else nullcontext():
-                    async with _rollout_scope():
-                        try:
-                            result = await self.evaluator(commit, case)
-                        except Exception as error:
-                            if isinstance(
-                                error, UsageBudgetExceeded
-                            ) or is_provider_stop_error(error):
-                                raise
-                            return CommitScore(
-                                MetricResult(
-                                    score=0.0,
-                                    feedback=f"Commit evaluator failed: {error}",
-                                ),
-                                RolloutOutput.from_error(error, kind="system"),
-                            )
-            if not (
-                isinstance(result, MetricResult)
-                and not isinstance(result.score, bool)
-                and isinstance(result.score, (int, float))
-                and math.isfinite(result.score)
-            ):
-                raise ValueError(
-                    "A CommitEvaluator must return a MetricResult with a finite "
-                    "numeric score."
-                )
-            return CommitScore(result, RolloutOutput.from_success(commit))
-
-        return list(
-            await gather_cancelling_on_provider_stop(*(score(case) for case in cases))
-        )
+        return await self._scorer.score_commit(commit, cases, meter=meter)
 
     async def _evaluate_cases(
         self,
@@ -201,11 +254,12 @@ class StringSymbolTask(OptimizationTask):
         capture_traces: bool,
     ) -> tuple[list[EvaluationRecord], list[EvaluationRecord]]:
         sha = await self.commit_for(candidate)
-        results = [item.result for item in await self.score_commit(sha, cases)]
+        scored = await self.score_commit(sha, cases)
         withheld = validation_active()
         records: list[EvaluationRecord] = []
         selection: list[EvaluationRecord] = []
-        for index, (case, result) in enumerate(zip(cases, results)):
+        for index, (case, item) in enumerate(zip(cases, scored)):
+            result = item.result
             case_id = case.name or f"case-{index}"
             info = result.side_info or {}
             if withheld:
@@ -232,7 +286,7 @@ class StringSymbolTask(OptimizationTask):
                     )
                 )
                 continue
-            payload: dict[str, Any] = {"commit": sha}
+            payload: dict[str, Any] = {"commit": sha, "output": item.output}
             if result.side_info is not None:
                 payload["side_info"] = result.side_info
             record = EvaluationRecord(
@@ -270,8 +324,8 @@ class StringSymbolAdapter:
 
     trace_collector = None
 
-    def __init__(self, task: StringSymbolTask) -> None:
-        self.task = task
+    def __init__(self, scorer: _CommitScorer) -> None:
+        self._scorer = scorer
         self.spend_meter: Any = None
 
     def close(self) -> None:
@@ -284,8 +338,8 @@ class StringSymbolAdapter:
         capture_traces: bool,
         example_bank: InMemoryExampleBank | None = None,
     ) -> EvaluationBatch:
-        sha = await self.task.commit_for(candidate)
-        scored = await self.task.score_commit(sha, batch, meter=self.spend_meter)
+        sha = await self._scorer.commit_for(candidate)
+        scored = await self._scorer.score_commit(sha, batch, meter=self.spend_meter)
         # Withheld validation rollouts never reach reflection.
         traced = capture_traces and not validation_active()
         return EvaluationBatch(
@@ -338,7 +392,7 @@ class StringSymbolAdapter:
         return SharedReflectiveDataset(records=records)
 
     def get_components(self) -> CandidateMap:
-        return {name: value.model_copy() for name, value in self.task._seed.items()}
+        return {name: value.model_copy() for name, value in self._scorer.seed.items()}
 
 
 __all__ = [

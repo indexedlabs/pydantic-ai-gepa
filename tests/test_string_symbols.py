@@ -197,6 +197,29 @@ def test_round_trip_keeps_a_u_prefix_and_handles_a_bom(repo: Path) -> None:
     assert _git(repo, "show", f"{sha}:legacy.py").startswith("\ufeffX = u'improved'")
 
 
+def test_round_trip_keeps_crlf_line_endings(repo: Path) -> None:
+    (repo / "crlf.py").write_bytes(b'X = "one"\r\nY = 1\r\n')
+    _git(repo, "config", "core.autocrlf", "false")
+    base = _commit(repo, "crlf")
+    symbols = {"crlf.py": ["X"]}
+    x = string_symbol_component("crlf.py", "X")
+
+    sha = commit_from_candidate(
+        repo, base, symbols, _candidate(**{x: "line one\nline two"}), "crlf"
+    )
+
+    blob = subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "blob", f"{sha}:crlf.py"],
+        env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
+        check=True,
+        capture_output=True,
+    ).stdout
+    assert blob == b'X = """line one\r\nline two"""\r\nY = 1\r\n'
+    assert _texts(candidate_from_commit(repo, sha, symbols)) == {
+        x: "line one\nline two"
+    }
+
+
 def test_a_function_local_name_is_not_a_module_binding(repo: Path) -> None:
     (repo / "local.py").write_text(
         'X = "module"\n\n\ndef f():\n    X = "local"\n    return X\n'
@@ -246,6 +269,7 @@ def test_symbols_in_a_subdirectory_project_are_relative_to_it(repo: Path) -> Non
         ("X = 'a'\nmatch 1:\n    case 1 as X:\n        pass\n", "X", "more than once"),
         ("X = 'a'\nmatch {}:\n    case {**X}:\n        pass\n", "X", "more than once"),
         ("X = 'a'\ndel X\n", "X", "more than once"),
+        ("X = (\n    'a'  # note\n    'b'\n)\n", "X", "comment"),
         ("X = 'a'\ndef f(arg=(X := 'fixed')):\n    pass\n", "X", "more than once"),
         ("X = 'a'\nY = [(X := i) for i in 'b']\n", "X", "more than once"),
         ("X = 'a'\ndef f():\n    global X\n    X = 'b'\n", "X", "more than once"),
@@ -419,7 +443,7 @@ async def test_task_scores_an_evaluator_failure_as_a_failed_case(repo: Path) -> 
     async def flaky(commit: str, case: Case[Any, Any, Any]) -> MetricResult:
         if case.name == "b":
             raise RuntimeError("checkout broke")
-        return MetricResult(score=1.0)
+        return MetricResult(score=1.0, side_info={"scores": {"quality": 1.0}})
 
     task = StringSymbolTask(
         repo=repo,
@@ -433,6 +457,22 @@ async def test_task_scores_an_evaluator_failure_as_a_failed_case(repo: Path) -> 
 
     assert evaluation.per_case_scores == {"a": 1.0, "b": 0.0}
     assert evaluation.records[1].feedback == "Commit evaluator failed: checkout broke"
+    assert not evaluation.records[1].payload["output"].success
+    # An infrastructure failure disqualifies the candidate instead of
+    # tripping the identical-objective-keys check or counting as a real 0.0.
+    assert evaluation.selectable is False
+    assert evaluation.objective_scores == {"quality": 1.0}
+
+
+@pytest.mark.asyncio
+async def test_gepa_engine_rejects_agent_only_options_for_the_task(
+    repo: Path,
+) -> None:
+    task = _task(repo, _FakeEvaluator(repo))
+    config = EngineConfig(engine="gepa", engine_config={"optimize_tools": True})
+
+    with pytest.raises(ValueError, match="agent tasks only"):
+        await get_engine("gepa", config).run(task, config, BudgetTracker(10))
 
 
 @pytest.mark.asyncio

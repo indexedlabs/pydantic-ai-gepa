@@ -71,6 +71,21 @@ class GepaEngine:
         # A task that scores candidates without an agent (StringSymbolTask)
         # supplies its own graph adapter.
         task_adapter = getattr(task, "create_adapter", None)
+        ignored = [
+            name
+            for name in (
+                "optimize_tools",
+                "optimize_output_type",
+                "agent_usage_limits",
+                "gepa_usage_limits",
+            )
+            if self._engine_config.get(name)
+        ]
+        if task_adapter is not None and ignored:
+            raise ValueError(
+                f"engine_config {ignored} apply to agent tasks only; this task "
+                "supplies its own adapter."
+            )
         adapter = (
             task_adapter()
             if task_adapter is not None
