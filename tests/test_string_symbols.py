@@ -1483,3 +1483,34 @@ def test_reflection_never_sees_excluded_model_fields() -> None:
     assert serialized["photo"] == photo
     assert "token" not in serialized
     assert "hunter2" not in repr(serialized)
+
+
+def test_reflection_media_respects_root_models_and_serializers() -> None:
+    from typing import Any as AnyType
+
+    from pydantic import RootModel, field_serializer, model_serializer
+
+    from pydantic_ai_gepa.adapters.agent_adapter import _serialize_for_reflection
+
+    photo = ImageUrl(url="https://example.com/a.png")
+
+    class Redacted(BaseModel):
+        payload: dict[str, AnyType]
+
+        @field_serializer("payload")
+        def _drop_token(self, payload: dict[str, AnyType]) -> dict[str, AnyType]:
+            return {key: value for key, value in payload.items() if key != "token"}
+
+    class Summary(BaseModel):
+        photo: ImageUrl
+
+        @model_serializer
+        def _summary(self) -> str:
+            return "a photo"
+
+    redacted = _serialize_for_reflection(
+        Redacted(payload={"photo": photo, "token": "tok-123"})
+    )
+    assert redacted == {"payload": {"photo": photo}}
+    assert _serialize_for_reflection(RootModel[list[ImageUrl]]([photo])) == [photo]
+    assert _serialize_for_reflection(Summary(photo=photo)) == "a photo"

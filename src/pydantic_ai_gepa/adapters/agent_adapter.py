@@ -20,7 +20,7 @@ from uuid import uuid4
 
 import logfire
 
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter, ValidationError
 from pydantic_ai import capture_run_messages, usage as _usage
 from pydantic_ai.agent import AgentRunResult
 from pydantic_ai.messages import (
@@ -176,6 +176,28 @@ def _contains_media(obj: Any, depth: int = 0) -> bool:
     return False
 
 
+_MEDIA_KINDS = frozenset(
+    {"image-url", "audio-url", "video-url", "document-url", "binary"}
+)
+_MEDIA_ADAPTER: TypeAdapter[Any] = TypeAdapter(
+    ImageUrl | AudioUrl | VideoUrl | DocumentUrl | BinaryContent
+)
+
+
+def _restore_media(value: Any) -> Any:
+    """Rebuild media objects from their JSON dumps, leaving all else as is."""
+    if isinstance(value, dict):
+        if value.get("kind") in _MEDIA_KINDS:
+            try:
+                return _MEDIA_ADAPTER.validate_json(json.dumps(value))
+            except (ValidationError, TypeError, ValueError):
+                pass
+        return {key: _restore_media(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_restore_media(item) for item in value]
+    return value
+
+
 def _serialize_for_reflection(obj: Any) -> Any:
     """Serialize an object for inclusion in reflection records.
 
@@ -187,18 +209,10 @@ def _serialize_for_reflection(obj: Any) -> Any:
         return obj
     if isinstance(obj, BaseModel):
         dumped = obj.model_dump(mode="json")
-        if not _contains_media(obj):
-            return dumped
-        # The dump applies the model's exclusions and serializers; only fields
-        # it kept that hold media are re-read, so images stay attachable
-        # instead of base64 text and excluded fields never appear.
-        fields = type(obj).model_fields
-        return {
-            name: _serialize_for_reflection(getattr(obj, name))
-            if name in fields and _contains_media(getattr(obj, name))
-            else value
-            for name, value in dumped.items()
-        }
+        # The dump applies every exclusion and serializer (and may be a list
+        # or scalar). Media it still contains is rebuilt from its JSON form so
+        # it stays attachable instead of base64 text.
+        return _restore_media(dumped) if _contains_media(obj) else dumped
     if hasattr(obj, "__dataclass_fields__"):
         if _contains_media(obj):
             return {
