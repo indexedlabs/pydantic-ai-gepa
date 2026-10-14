@@ -103,7 +103,9 @@ class _CommitScorer:
         self._evaluator_slots = asyncio.Semaphore(max(1, concurrency))
 
     async def commit_for(self, candidate: CandidateMap) -> str:
-        key = tuple(sorted((name, value.text) for name, value in candidate.items()))
+        key = tuple(
+            sorted((name, value.text.strip()) for name, value in candidate.items())
+        )
         async with self._commit_lock:
             sha = self._commits.get(key)
             if sha is None:

@@ -188,10 +188,15 @@ def commit_from_candidate(
             key = string_symbol_component(path, name)
             component = candidate.get(key)
             expected[key] = span.value.strip()
-            if component is None or component.text == span.value.strip():
+            if component is None:
                 continue
-            expected[key] = component.text
-            value = _reframe(span.value, component.text)
+            # ComponentValue strips on construction but not on mutation;
+            # normalize here so read-back compares like with like.
+            text = component.text.strip()
+            if text == span.value.strip():
+                continue
+            expected[key] = text
+            value = _reframe(span.value, text)
             # Keep a ``u`` prefix: the masked-AST scope check compares it.
             literal = (span.kind or "") + _literal(value)
             if crlf:

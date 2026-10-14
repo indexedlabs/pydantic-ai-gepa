@@ -233,6 +233,14 @@ def _skills_tools_enabled(
     )
 
 
+def _safe_json(value: Any, indent: int | None = None) -> str:
+    """JSON for prompt evidence, falling back to repr for non-JSON keys."""
+    try:
+        return json.dumps(value, indent=indent, default=str)
+    except (TypeError, ValueError):
+        return repr(value)
+
+
 def _trace_tools_enabled(
     component_toolsets: Sequence[AbstractToolset[object]],
 ) -> bool:
@@ -1268,7 +1276,7 @@ class InstructionProposalGenerator:
                 if value not in (None, ""):
                     formatted_label = field.replace("_", " ").title()
                     rendered = (
-                        json.dumps(value, default=str)
+                        _safe_json(value)
                         if isinstance(value, (dict, list))
                         else self._format_scalar(value)
                     )
@@ -1293,14 +1301,14 @@ class InstructionProposalGenerator:
                 )
                 lines.append("- **Messages:**")
                 lines.append("```json")
-                lines.append(json.dumps(sanitized_messages, indent=2, default=str))
+                lines.append(_safe_json(sanitized_messages, indent=2))
                 lines.append("```")
 
             run_usage = record.get("run_usage")
             if run_usage:
                 lines.append("- **Usage:**")
                 lines.append("```json")
-                lines.append(json.dumps(run_usage, indent=2, default=str))
+                lines.append(_safe_json(run_usage, indent=2))
                 lines.append("```")
 
             lines.append("")

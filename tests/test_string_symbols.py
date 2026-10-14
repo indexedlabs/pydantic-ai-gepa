@@ -162,6 +162,21 @@ def test_round_trip_rewrites_only_declared_strings(repo: Path) -> None:
     verify_string_symbol_commit(repo, base, sha, SYMBOLS)
 
 
+def test_mutated_component_text_is_normalized_like_construction(
+    repo: Path,
+) -> None:
+    base = _head(repo)
+    candidate = candidate_from_commit(repo, base, SYMBOLS)
+    # A proposer may mutate a copied ComponentValue, bypassing its stripping.
+    candidate[INSTRUCTIONS].text = "\nimproved prompt\nline two\n"
+
+    sha = commit_from_candidate(repo, base, SYMBOLS, candidate, "mutated")
+
+    assert _texts(candidate_from_commit(repo, sha, SYMBOLS))[INSTRUCTIONS] == (
+        "improved prompt\nline two"
+    )
+
+
 def test_unchanged_candidate_returns_the_base_commit(repo: Path) -> None:
     base = _head(repo)
     seed = candidate_from_commit(repo, base, SYMBOLS)
