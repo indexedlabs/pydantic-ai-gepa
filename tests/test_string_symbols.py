@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import subprocess
+from dataclasses import InitVar, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -1417,3 +1418,26 @@ async def test_trace_free_reflection_attaches_media_inputs(
     assert image in attachments and url in attachments
     # A Pydantic input model keeps its media attachable, not base64 text.
     assert modelled in attachments
+
+
+@dataclass
+class _Captioned:
+    caption: str
+    seed: InitVar[int]
+    photo: BinaryContent | None = None
+
+
+@pytest.mark.parametrize(
+    "photo", [None, BinaryContent(data=b"x", media_type="image/png")]
+)
+def test_reflection_serializes_dataclasses_with_init_vars(
+    photo: BinaryContent | None,
+) -> None:
+    from pydantic_ai_gepa.adapters.agent_adapter import _serialize_for_reflection
+
+    value = _Captioned(caption="a cat", seed=1, photo=photo)
+
+    serialized = _serialize_for_reflection(value)
+
+    assert serialized == {"caption": "a cat", "photo": photo}
+    assert "seed" not in serialized

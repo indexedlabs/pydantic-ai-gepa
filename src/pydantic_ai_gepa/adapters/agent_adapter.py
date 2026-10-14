@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import asyncio
 import hashlib
 import inspect
@@ -161,10 +163,11 @@ def _contains_media(obj: Any, depth: int = 0) -> bool:
             _contains_media(getattr(obj, name), depth + 1)
             for name in type(obj).model_fields
         )
-    if hasattr(obj, "__dataclass_fields__") and not isinstance(obj, type):
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        # fields() leaves out InitVar/ClassVar pseudo-fields, as asdict() does.
         return any(
-            _contains_media(getattr(obj, name), depth + 1)
-            for name in obj.__dataclass_fields__
+            _contains_media(getattr(obj, field.name), depth + 1)
+            for field in dataclasses.fields(obj)
         )
     if isinstance(obj, Mapping):
         return any(_contains_media(value, depth + 1) for value in obj.values())
@@ -193,8 +196,8 @@ def _serialize_for_reflection(obj: Any) -> Any:
     if hasattr(obj, "__dataclass_fields__"):
         if _contains_media(obj):
             return {
-                name: _serialize_for_reflection(getattr(obj, name))
-                for name in obj.__dataclass_fields__
+                field.name: _serialize_for_reflection(getattr(obj, field.name))
+                for field in dataclasses.fields(obj)
             }
         return asdict(obj)
     if isinstance(obj, Mapping):
