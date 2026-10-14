@@ -508,6 +508,8 @@ class _Git:
             if key not in _REPOSITORY_ENV
             and not key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
         }
+        # refs/replace would let a commit's reads differ from its real objects.
+        self.env["GIT_NO_REPLACE_OBJECTS"] = "1"
         prefix = self.run("rev-parse", "--show-prefix").decode().strip()
         self.prefix = prefix.rstrip("/")
         self.root = Path(self.run("rev-parse", "--show-toplevel").decode().strip())

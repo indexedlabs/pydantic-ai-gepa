@@ -369,6 +369,28 @@ def test_scope_verification_accepts_a_declared_string_edit(repo: Path) -> None:
     verify_string_symbol_commit(repo, base, sha, SYMBOLS)
 
 
+def test_replace_refs_never_change_what_is_read_or_verified(repo: Path) -> None:
+    base = _head(repo)
+    (repo / "README.md").write_text("replaced\n")
+    impostor = _commit(repo, "impostor")
+    _git(repo, "reset", "-q", "--hard", base)
+    _git(repo, "replace", base, impostor)
+
+    sha = commit_from_candidate(
+        repo, base, SYMBOLS, _candidate(**{INSTRUCTIONS: "Be brief."}), "edit"
+    )
+
+    changed = _git(repo, "--no-replace-objects", "diff", "--name-only", base, sha)
+    assert changed.split() == ["prompts.py"]
+
+    _git(repo, "replace", "-d", base)
+    (repo / "README.md").write_text("outside scope\n")
+    outside = _commit(repo, "outside")
+    _git(repo, "replace", outside, sha)
+    with pytest.raises(StringSymbolError, match="outside the declared"):
+        verify_string_symbol_commit(repo, base, outside, SYMBOLS)
+
+
 def test_scope_verification_requires_descent_from_base(repo: Path) -> None:
     base = _head(repo)
     _git(repo, "checkout", "-q", "--orphan", "other")
@@ -600,6 +622,29 @@ async def test_task_seeds_from_and_evaluates_the_base_commit(repo: Path) -> None
     assert [record.feedback for record in withheld.records] == [None, None]
     assert withheld.objective_scores == {"quality": 0.25}
     assert all("side_info" not in record.payload for record in withheld.records)
+
+
+@pytest.mark.asyncio
+async def test_task_keeps_its_repository_after_a_working_directory_change(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(repo)
+    task = StringSymbolTask(
+        repo=".",
+        base_commit="HEAD",
+        symbols=SYMBOLS,
+        evaluator=_FakeEvaluator(repo),
+        trainset=[Case(name="a", inputs="a")],
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    sha = await task.commit_for(_candidate(**{INSTRUCTIONS: "Say improved."}))
+
+    assert _texts(candidate_from_commit(repo, sha, SYMBOLS))[INSTRUCTIONS] == (
+        "Say improved."
+    )
 
 
 @pytest.mark.asyncio

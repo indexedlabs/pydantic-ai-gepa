@@ -378,6 +378,38 @@ def test_mask_matches_indexed_first_declaration_and_docstring_rules():
         _masked('def f():\n    pass\ndef f():\n    "later doc"', ["f.__doc__"])
 
 
+@pytest.mark.parametrize("attack", ["import", "loaded_module"])
+def test_candidate_import_guard_refuses_result(git_repo, private, monkeypatch, attack):
+    (git_repo / "forbidden.py").write_text('raise RuntimeError("candidate executed")')
+    _git(git_repo, "add", "forbidden.py")
+    if attack == "import":
+        attempt = f"""
+    sys.path.insert(0, {str(git_repo)!r})
+    try:
+        import forbidden
+    except ImportError:
+        pass
+    finally:
+        sys.path.pop(0)
+"""
+    else:
+        attempt = f"""
+    module = types.ModuleType("forbidden")
+    module.__file__ = {str(git_repo / "forbidden.py")!r}
+    sys.modules["forbidden"] = module
+"""
+    sha = pin(
+        git_repo,
+        monkeypatch,
+        "import sys, types\nasync def evaluate(case):\n"
+        + attempt
+        + '    return "good"\n',
+    )
+    with pytest.raises(sandbox.ScoringSandboxError):
+        score(git_repo, sha, config=config())
+    assert not list((private.parent / ".gepa-heldout/work").iterdir())
+
+
 def test_mask_treats_a_bare_annotation_as_the_first_declaration():
     # Matches Indexed's first-declaration rule: the annotation is masked, so
     # a later value edit is outside the declared scope.

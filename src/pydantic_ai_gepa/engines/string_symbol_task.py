@@ -214,7 +214,8 @@ class StringSymbolTask(OptimizationTask):
             concurrency=concurrency,
             evaluation_cache_identity=evaluation_cache_identity,
         )
-        self.repo = Path(repo)
+        # Later commits run from whatever the working directory is then.
+        self.repo = Path(repo).resolve()
         self.symbols = normalize_string_symbols(symbols)
         self.base_commit = resolve_commit(self.repo, base_commit)
         self._scorer = _CommitScorer(
