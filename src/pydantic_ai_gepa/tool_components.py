@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import contextvars
 import logging
 from contextlib import contextmanager
@@ -56,11 +58,15 @@ def _output_description_key(tool_name: str) -> str:
 def _format_path(path: tuple[str, ...]) -> str:
     formatted: list[str] = []
     for segment in path:
-        if segment.startswith("=") and formatted:
+        if isinstance(segment, _OptionStep):
             # A described option (an anyOf/oneOf entry with a const) of the
-            # previous field, e.g. ``title=true``.
-            formatted[-1] = f"{formatted[-1]}{segment}"
+            # previous field, e.g. ``title=true`` or ``title="true"``.
+            # Options are only yielded beneath a field, so a previous step exists.
+            formatted[-1] = f"{formatted[-1]}={segment}"
             continue
+        if segment != "[]":
+            # Property names may contain "=", which marks options in keys.
+            segment = segment.replace("\\", "\\\\").replace("=", "\\=")
         if segment == "[]":
             if not formatted:
                 formatted.append("[]")
@@ -79,11 +85,17 @@ def _output_parameter_key(tool_name: str, path: tuple[str, ...]) -> str:
     return f"output:{tool_name}:param:{_format_path(path)}"
 
 
-def _option_segment(const: Any) -> str:
-    """Path segment for a described ``anyOf``/``oneOf`` option with this const."""
-    if isinstance(const, bool):
-        return "=true" if const else "=false"
-    return f"={const}"
+class _OptionStep(str):
+    """A path step selecting a described ``anyOf``/``oneOf`` option by its JSON const.
+
+    Distinct from property steps, which are plain ``str``: a property name or
+    alias may itself contain ``=`` and must never be read as an option.
+    """
+
+
+def _option_step(const: Any) -> _OptionStep:
+    # JSON keeps the const's type: True -> true, "true" -> "true" (quoted), 1 -> 1.
+    return _OptionStep(json.dumps(const, sort_keys=True, ensure_ascii=False))
 
 
 def _const_options(schema: dict[str, Any]) -> Iterable[dict[str, Any]]:
@@ -112,7 +124,7 @@ def _iter_schema_descriptions(
         for option in _const_options(schema):
             option_description = option.get("description")
             if isinstance(option_description, str) and option_description.strip():
-                yield path + (_option_segment(option["const"]),), option_description
+                yield path + (_option_step(option["const"]),), option_description
 
     schema_type = schema.get("type")
     if schema_type == "object":
@@ -135,12 +147,12 @@ def _set_schema_description(
     for segment in path:
         if target is None:
             return False
-        if segment.startswith("="):
+        if isinstance(segment, _OptionStep):
             next_target = next(
                 (
                     o
                     for o in _const_options(target)
-                    if _option_segment(o["const"]) == segment
+                    if _option_step(o["const"]) == segment
                 ),
                 None,
             )

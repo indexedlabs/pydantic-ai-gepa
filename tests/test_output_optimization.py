@@ -150,8 +150,8 @@ async def test_candidate_rewrites_described_options():
     tool_defs = list(
         getattr(getattr(agent, "_output_toolset", None), "_tool_defs", []) or []
     )
-    yes_key = _output_parameter_key(tool_defs[0].name, ("title", "=true"))
-    no_key = _output_parameter_key(tool_defs[0].name, ("title", "=false"))
+    yes_key = "output:final_result:param:title=true"
+    no_key = "output:final_result:param:title=false"
 
     prepared = await optimizer.prepare_output_tools(
         None,  # type: ignore[arg-type]
@@ -168,3 +168,94 @@ async def test_candidate_rewrites_described_options():
         True: "new yes criterion",
         False: "new no criterion",
     }
+
+
+async def _prepare(agent, candidate_text: dict[str, str]):
+    optimizer = get_or_create_output_tool_optimizer(agent)
+    tool_defs = list(
+        getattr(getattr(agent, "_output_toolset", None), "_tool_defs", []) or []
+    )
+    prepared = await optimizer.prepare_output_tools(
+        None,  # type: ignore[arg-type]
+        tool_defs,
+        candidate={
+            k: ComponentValue(name=k, text=v) for k, v in candidate_text.items()
+        },
+    )
+    assert prepared is not None
+    return prepared[0].parameters_json_schema
+
+
+class MixedTypeOutput(BaseModel):
+    """Options whose consts differ only by JSON type."""
+
+    choice: (
+        Annotated[Literal[True], Field(description="boolean yes")]
+        | Annotated[Literal["true"], Field(description="string yes")]
+    ) = Field(description="Pick one")
+
+
+@pytest.mark.asyncio
+async def test_options_keep_their_json_type():
+    agent = Agent(
+        TestModel(custom_output_args=MixedTypeOutput(choice=True)),
+        output_type=MixedTypeOutput,
+        name="mixed-test",
+    )
+    get_or_create_output_tool_optimizer(agent)
+    seed = extract_seed_candidate(agent, optimize_output_type=True)
+    assert seed["output:final_result:param:choice=true"].text == "boolean yes"
+    assert seed['output:final_result:param:choice="true"'].text == "string yes"
+
+    schema = await _prepare(
+        agent,
+        {
+            "output:final_result:param:choice=true": "new boolean yes",
+            'output:final_result:param:choice="true"': "new string yes",
+        },
+    )
+    options = schema["properties"]["choice"]["anyOf"]
+    assert {repr(o["const"]): o["description"] for o in options} == {
+        "True": "new boolean yes",
+        "'true'": "new string yes",
+    }
+
+
+class AliasedOutput(BaseModel):
+    """A boolean field with criteria, and aliases that contain '='."""
+
+    title: (
+        Annotated[Literal[True], Field(description="yes criterion")]
+        | Annotated[Literal[False], Field(description="no criterion")]
+    ) = Field(description="Does the title follow the rules?")
+    other: str = Field(alias="title=true", description="an unrelated field")
+    decision: str = Field(alias="=decision", description="original")
+
+
+@pytest.mark.asyncio
+async def test_aliases_with_equals_are_properties_not_options():
+    agent = Agent(
+        TestModel(
+            custom_output_args={"title": True, "title=true": "x", "=decision": "y"}
+        ),
+        output_type=AliasedOutput,
+        name="alias-test",
+    )
+    get_or_create_output_tool_optimizer(agent)
+    seed = extract_seed_candidate(agent, optimize_output_type=True)
+    assert seed["output:final_result:param:title=true"].text == "yes criterion"
+    assert seed["output:final_result:param:title\\=true"].text == "an unrelated field"
+    assert seed["output:final_result:param:\\=decision"].text == "original"
+
+    schema = await _prepare(
+        agent,
+        {
+            "output:final_result:param:title=true": "new yes criterion",
+            "output:final_result:param:\\=decision": "rewritten",
+        },
+    )
+    props = schema["properties"]
+    yes = next(o for o in props["title"]["anyOf"] if o["const"] is True)
+    assert yes["description"] == "new yes criterion"
+    assert props["title=true"]["description"] == "an unrelated field"
+    assert props["=decision"]["description"] == "rewritten"
