@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from ...exceptions import UsageBudgetExceeded
 
 import json
@@ -1088,6 +1090,10 @@ class InstructionProposalGenerator:
                 function_block["description"] = text
             elif key.startswith("param:"):
                 path = key[len("param:") :]
+                if re.search(r"@\d+$", path):
+                    # A described option of a parameter (``approved@0``), not a
+                    # parameter; the rebuilt schema has no const to attach it to.
+                    continue
                 parameters = function_block.setdefault(
                     "parameters",
                     {"type": "object", "properties": {}},

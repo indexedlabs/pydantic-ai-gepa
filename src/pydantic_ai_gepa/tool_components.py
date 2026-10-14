@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 
 import contextvars
 import logging
@@ -59,14 +58,10 @@ def _format_path(path: tuple[str, ...]) -> str:
     formatted: list[str] = []
     for segment in path:
         if isinstance(segment, _OptionStep):
-            # A described option (an anyOf/oneOf entry with a const) of the
-            # previous field, e.g. ``title=true`` or ``title="true"``.
-            # Options are only yielded beneath a field, so a previous step exists.
-            formatted[-1] = f"{formatted[-1]}={segment}"
+            # A described anyOf/oneOf option of the previous field, by its
+            # position: ``title@0``. Options are only yielded beneath a field.
+            formatted[-1] = f"{formatted[-1]}@{segment}"
             continue
-        if segment != "[]":
-            # Property names may contain "=", which marks options in keys.
-            segment = segment.replace("\\", "\\\\").replace("=", "\\=")
         if segment == "[]":
             if not formatted:
                 formatted.append("[]")
@@ -86,25 +81,21 @@ def _output_parameter_key(tool_name: str, path: tuple[str, ...]) -> str:
 
 
 class _OptionStep(str):
-    """A path step selecting a described ``anyOf``/``oneOf`` option by its JSON const.
+    """A path step selecting an ``anyOf``/``oneOf`` entry by its position.
 
-    Distinct from property steps, which are plain ``str``: a property name or
-    alias may itself contain ``=`` and must never be read as an option.
+    Positions, not const values, identify options: consts may repeat, and
+    free-text values (``"N/A"``) are not safe in component file names.
     """
 
 
-def _option_step(const: Any) -> _OptionStep:
-    # JSON keeps the const's type: True -> true, "true" -> "true" (quoted), 1 -> 1.
-    return _OptionStep(json.dumps(const, sort_keys=True, ensure_ascii=False))
-
-
-def _const_options(schema: dict[str, Any]) -> Iterable[dict[str, Any]]:
+def _const_options(schema: dict[str, Any]) -> Iterable[tuple[int, dict[str, Any]]]:
+    """Yield (position, option) for the const entries of a union schema."""
     for key in ("anyOf", "oneOf"):
         options = schema.get(key)
         if isinstance(options, list):
-            for option in options:
+            for index, option in enumerate(options):
                 if isinstance(option, dict) and "const" in option:
-                    yield option
+                    yield index, option
 
 
 def _iter_schema_descriptions(
@@ -121,10 +112,10 @@ def _iter_schema_descriptions(
     # Described options, such as Literal[True] / Literal[False] each annotated
     # with a description, are criteria a decision model reads; expose each one.
     if path:
-        for option in _const_options(schema):
+        for index, option in _const_options(schema):
             option_description = option.get("description")
             if isinstance(option_description, str) and option_description.strip():
-                yield path + (_option_step(option["const"]),), option_description
+                yield path + (_OptionStep(index),), option_description
 
     schema_type = schema.get("type")
     if schema_type == "object":
@@ -139,6 +130,16 @@ def _iter_schema_descriptions(
             yield from _iter_schema_descriptions(items, path + ("[]",))
 
 
+def _add_parameter_path(
+    parameter_paths: dict[str, tuple[str, ...]], key: str, path: tuple[str, ...]
+) -> None:
+    # A property literally named like an option key (``title@0``) would make
+    # one of the two unaddressable; refuse it rather than drop updates.
+    if parameter_paths.get(key, path) != path:
+        raise ValueError(f"Component key {key!r} names two schema paths")
+    parameter_paths[key] = path
+
+
 def _set_schema_description(
     schema: dict[str, Any], path: tuple[str, ...], value: str
 ) -> bool:
@@ -148,14 +149,7 @@ def _set_schema_description(
         if target is None:
             return False
         if isinstance(segment, _OptionStep):
-            next_target = next(
-                (
-                    o
-                    for o in _const_options(target)
-                    if _option_step(o["const"]) == segment
-                ),
-                None,
-            )
+            next_target = dict(_const_options(target)).get(int(segment))
             if next_target is None:
                 return False
             target = next_target
@@ -218,7 +212,7 @@ class ToolComponentCatalog:
 
         for path, desc in _iter_schema_descriptions(tool_def.parameters_json_schema):
             key = _parameter_key(tool_def.name, path)
-            parameter_paths[key] = path
+            _add_parameter_path(parameter_paths, key, path)
             self._seed_components.setdefault(key, desc)
 
         if not description_key and not parameter_paths:
@@ -257,7 +251,7 @@ class OutputToolComponentCatalog(ToolComponentCatalog):
 
         for path, desc in _iter_schema_descriptions(tool_def.parameters_json_schema):
             key = _output_parameter_key(tool_def.name, path)
-            parameter_paths[key] = path
+            _add_parameter_path(parameter_paths, key, path)
             self._seed_components.setdefault(key, desc)
 
         if not description_key and not parameter_paths:

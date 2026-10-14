@@ -774,3 +774,66 @@ class TestSearchExamplesToolCapturedDuringAgentRun:
             components_after["tool:search_examples:description"].text
             == "Find similar examples"
         )
+
+
+def _approve_tool() -> ToolDefinition:
+    return ToolDefinition(
+        name="approve",
+        description="Approve or reject.",
+        parameters_json_schema={
+            "type": "object",
+            "properties": {
+                "approved": {
+                    "description": "Is it approved?",
+                    "anyOf": [
+                        {"const": True, "description": "yes when complete"},
+                        {"const": False, "description": "no when anything is missing"},
+                    ],
+                }
+            },
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_function_tool_options_are_components() -> None:
+    manager = ToolOptimizationManager(cast(AbstractAgent[Any, Any], _DummyAgent()))
+    tool_def = _approve_tool()
+    await manager.prepare_tools(None, [tool_def], candidate=None)  # type: ignore[arg-type]
+    seeds = manager.get_seed_components()
+    assert seeds["tool:approve:param:approved@0"] == "yes when complete"
+    assert seeds["tool:approve:param:approved@1"] == "no when anything is missing"
+
+    prepared = await manager.prepare_tools(
+        None,  # type: ignore[arg-type]
+        [tool_def],
+        candidate={"tool:approve:param:approved@1": "no when a field is missing"},
+    )
+    options = prepared[0].parameters_json_schema["properties"]["approved"]["anyOf"]
+    assert [o["description"] for o in options] == [
+        "yes when complete",
+        "no when a field is missing",
+    ]
+
+
+def test_reflection_schema_skips_option_slots() -> None:
+    from pydantic_ai_gepa.gepa_graph.models import CandidateProgram, ComponentValue
+    from pydantic_ai_gepa.gepa_graph.proposal.instruction import (
+        InstructionProposalGenerator,
+    )
+
+    generator = InstructionProposalGenerator.__new__(InstructionProposalGenerator)
+    texts = {
+        "tool:approve:description": "Approve or reject.",
+        "tool:approve:param:approved": "Is it approved?",
+        "tool:approve:param:approved@0": "yes when complete",
+    }
+    candidate = CandidateProgram(
+        idx=0,
+        components={k: ComponentValue(name=k, text=v) for k, v in texts.items()},
+        discovered_at_iteration=0,
+        discovered_at_evaluation=0,
+    )
+    defs = generator._build_tool_definitions_from_candidate(candidate)
+    properties = defs["approve"]["function"]["parameters"]["properties"]
+    assert list(properties) == ["approved"]
