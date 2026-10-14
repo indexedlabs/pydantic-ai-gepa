@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 
 import asyncio
 import hashlib
@@ -20,7 +21,7 @@ from uuid import uuid4
 
 import logfire
 
-from pydantic import BaseModel, RootModel
+from pydantic import BaseModel, RootModel, TypeAdapter
 from pydantic_ai import capture_run_messages, usage as _usage
 from pydantic_ai.agent import AgentRunResult
 from pydantic_ai.messages import (
@@ -180,6 +181,11 @@ def _contains_media(obj: Any, depth: int = 0) -> bool:
     return False
 
 
+@functools.cache
+def _media_adapter(media_type: type[Any]) -> TypeAdapter[Any]:
+    return TypeAdapter(media_type)
+
+
 def _restore_media(original: Any, dumped: Any, depth: int = 0) -> Any:
     """Put ``original``'s media objects back where its JSON dump has them.
 
@@ -192,8 +198,15 @@ def _restore_media(original: Any, dumped: Any, depth: int = 0) -> Any:
     if depth > 20:
         return dumped
     if isinstance(original, _MEDIA_TYPES):
+        # Only an untouched dump is restored: a serializer that changed the
+        # media (a redacted URL, reordered items) keeps its serialized form.
         if isinstance(dumped, dict) and dumped.get("kind") == original.kind:
-            return original
+            try:
+                own = _media_adapter(type(original)).dump_python(original, mode="json")
+            except Exception:
+                return dumped
+            if own == dumped:
+                return original
         return dumped
     if isinstance(original, RootModel):
         return _restore_media(original.root, dumped, depth + 1)

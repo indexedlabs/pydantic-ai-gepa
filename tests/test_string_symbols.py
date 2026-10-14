@@ -1599,3 +1599,74 @@ def test_reflection_media_never_serializes_removed_media_or_collides() -> None:
     )
     assert serialized["photo"] == photo
     assert serialized["metadata"] == {"copy": same_as_dump}
+
+
+def test_reflection_media_keeps_media_shaped_serializer_output() -> None:
+    from pydantic import field_serializer
+
+    from pydantic_ai_gepa.adapters.agent_adapter import _serialize_for_reflection
+
+    private = ImageUrl(url="https://example.com/private.png")
+    first = ImageUrl(url="https://example.com/1.png")
+    second = ImageUrl(url="https://example.com/2.png")
+
+    class Redacts(BaseModel):
+        photo: ImageUrl
+
+        @field_serializer("photo")
+        def _redact(self, photo: ImageUrl) -> dict[str, str]:
+            return {"kind": "image-url", "url": "https://example.com/redacted.png"}
+
+    class Reorders(BaseModel):
+        photos: list[ImageUrl]
+
+        @field_serializer("photos")
+        def _reverse(self, photos: list[ImageUrl]) -> list[Any]:
+            return [photo.url for photo in reversed(photos)]
+
+    assert _serialize_for_reflection(Redacts(photo=private)) == {
+        "photo": {"kind": "image-url", "url": "https://example.com/redacted.png"}
+    }
+    assert _serialize_for_reflection(Reorders(photos=[first, second])) == {
+        "photos": [second.url, first.url]
+    }
+
+
+@pytest.mark.asyncio
+async def test_composed_coding_engine_meters_training_evaluations(
+    repo: Path,
+) -> None:
+    student = Agent(TestModel(custom_output_text="ok"))
+    capabilities: list[tuple[str, bool]] = []
+
+    async def evaluator(commit: str, case: Case[Any, Any, Any]) -> MetricResult:
+        capability = current_rollout_capability()
+        capabilities.append((case.name or "", capability is not None))
+        if capability is not None:
+            await student.run(str(case.inputs), capabilities=[capability])
+        text = candidate_from_commit(repo, commit, SYMBOLS)[INSTRUCTIONS].text
+        return MetricResult(score=1.0 if "improved" in text else 0.25)
+
+    async def propose(context: ReflectionContext) -> CandidateMap:
+        return {
+            **context.candidate,
+            INSTRUCTIONS: ComponentValue(name=INSTRUCTIONS, text="Say improved."),
+        }
+
+    config = EngineConfig(
+        engine="coding_agent",
+        max_metric_calls=20,
+        max_iterations=1,
+        engine_config={"propose": propose, "minibatch_size": 2},
+    )
+
+    result = await optimize_sequential(
+        _task(repo, evaluator),
+        [config],
+        max_metric_calls=20,
+        price_fn=lambda response: 0.01,
+    )
+
+    assert any(name.startswith("train-") for name, _ in capabilities)
+    assert all(metered for _, metered in capabilities)
+    assert result.spend_report.total_dollars == pytest.approx(0.01 * len(capabilities))

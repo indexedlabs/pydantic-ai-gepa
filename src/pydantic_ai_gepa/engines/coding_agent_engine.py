@@ -16,6 +16,7 @@ from ..acceptance import compare_candidate_samples
 from ..evaluation import EvaluationRecord, evaluate_candidate_dataset
 from ..gepa_graph.models import CandidateMap
 from ..inspection import InspectionAborted
+from ..spend import _pipeline_meter
 from .base import (
     BudgetExhausted,
     BudgetTracker,
@@ -816,6 +817,11 @@ async def _adapter_records(
     agent path and the GEPA graph's evaluator do.
     """
     semaphore = asyncio.Semaphore(max(1, concurrency))
+    # Meter training rollouts like validation ones: under a composed run the
+    # evaluator's model calls belong to the pipeline's spend.
+    meter = _pipeline_meter.get()
+    if meter is not None and getattr(adapter, "spend_meter", None) is None:
+        adapter.spend_meter = meter
 
     async def one(case: Case[Any, Any, Any]) -> Any:
         async with semaphore:
