@@ -1557,3 +1557,45 @@ def test_reflection_attaches_media_from_extra_model_fields() -> None:
         "question": "?",
         "photo": photo,
     }
+
+
+def test_reflection_media_never_serializes_removed_media_or_collides() -> None:
+    from typing import Any as AnyType
+
+    from pydantic import Field, TypeAdapter, field_serializer
+
+    from pydantic_ai_gepa.adapters.agent_adapter import _serialize_for_reflection
+
+    handle = object()
+    hidden = ImageUrl(
+        url="https://example.com/hidden.png", vendor_metadata={"handle": handle}
+    )
+
+    class Excluded(BaseModel):
+        question: str
+        photo: ImageUrl = Field(exclude=True)
+
+    class Redacted(BaseModel):
+        photo: ImageUrl
+
+        @field_serializer("photo")
+        def _redact(self, photo: ImageUrl) -> str:
+            return "redacted"
+
+    assert _serialize_for_reflection(Excluded(question="what?", photo=hidden)) == {
+        "question": "what?"
+    }
+    assert _serialize_for_reflection(Redacted(photo=hidden)) == {"photo": "redacted"}
+
+    photo = ImageUrl(url="https://example.com/a.png")
+    same_as_dump = TypeAdapter(ImageUrl).dump_python(photo, mode="json")
+
+    class Collides(BaseModel):
+        photo: ImageUrl
+        metadata: dict[str, AnyType]
+
+    serialized = _serialize_for_reflection(
+        Collides(photo=photo, metadata={"copy": dict(same_as_dump)})
+    )
+    assert serialized["photo"] == photo
+    assert serialized["metadata"] == {"copy": same_as_dump}

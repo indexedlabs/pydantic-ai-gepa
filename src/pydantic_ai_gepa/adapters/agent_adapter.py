@@ -20,7 +20,7 @@ from uuid import uuid4
 
 import logfire
 
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel, RootModel
 from pydantic_ai import capture_run_messages, usage as _usage
 from pydantic_ai.agent import AgentRunResult
 from pydantic_ai.messages import (
@@ -180,53 +180,57 @@ def _contains_media(obj: Any, depth: int = 0) -> bool:
     return False
 
 
-_MEDIA_ADAPTER: TypeAdapter[Any] = TypeAdapter(
-    ImageUrl | AudioUrl | VideoUrl | DocumentUrl | BinaryContent
-)
+def _restore_media(original: Any, dumped: Any, depth: int = 0) -> Any:
+    """Put ``original``'s media objects back where its JSON dump has them.
 
-
-def _media_in(obj: Any, found: list[Any], depth: int = 0) -> None:
-    """Collect the media objects an object actually holds."""
-    if depth > 20:
-        return
-    if isinstance(obj, _MEDIA_TYPES):
-        found.append(obj)
-    elif isinstance(obj, BaseModel):
-        for value in _model_values(obj):
-            _media_in(value, found, depth + 1)
-    elif dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-        for item in dataclasses.fields(obj):
-            _media_in(getattr(obj, item.name), found, depth + 1)
-    elif isinstance(obj, Mapping):
-        for value in obj.values():
-            _media_in(value, found, depth + 1)
-    elif isinstance(obj, (list, tuple, set, frozenset)):
-        for value in obj:
-            _media_in(value, found, depth + 1)
-
-
-def _restore_media(obj: BaseModel, dumped: Any) -> Any:
-    """Swap the JSON dumps of ``obj``'s own media objects back to the objects.
-
-    Only a value equal to the dump of a media object the model really holds
-    is restored, so media-shaped application data is left alone, and anything
-    a serializer changed or removed stays changed or removed.
+    The dump stays the authority: it walks the dump and the source object in
+    parallel and swaps in a media object only at a position the source
+    really holds one, and only while the dump still has a media dict there.
+    Application data that merely looks like (or equals) a media dump is left
+    as data; excluded or serializer-changed values are never re-serialized.
     """
-    media: list[Any] = []
-    _media_in(obj, media)
-    dumps = [(_MEDIA_ADAPTER.dump_python(item, mode="json"), item) for item in media]
+    if depth > 20:
+        return dumped
+    if isinstance(original, _MEDIA_TYPES):
+        if isinstance(dumped, dict) and dumped.get("kind") == original.kind:
+            return original
+        return dumped
+    if isinstance(original, RootModel):
+        return _restore_media(original.root, dumped, depth + 1)
+    if isinstance(original, BaseModel):
+        values: dict[str, Any] = {
+            name: getattr(original, name) for name in type(original).model_fields
+        }
+        values.update(original.model_extra or {})
+        return _restore_mapping(values, dumped, depth)
+    if dataclasses.is_dataclass(original) and not isinstance(original, type):
+        values = {
+            item.name: getattr(original, item.name)
+            for item in dataclasses.fields(original)
+        }
+        return _restore_mapping(values, dumped, depth)
+    if isinstance(original, Mapping):
+        by_key = {str(key): value for key, value in original.items()}
+        if len(by_key) != len(original):
+            return dumped
+        return _restore_mapping(by_key, dumped, depth)
+    if isinstance(original, (list, tuple)):
+        if not isinstance(dumped, list) or len(dumped) != len(original):
+            return dumped
+        return [
+            _restore_media(item, entry, depth + 1)
+            for item, entry in zip(original, dumped)
+        ]
+    return dumped
 
-    def restore(value: Any) -> Any:
-        if isinstance(value, dict):
-            for media_dump, item in dumps:
-                if value == media_dump:
-                    return item
-            return {key: restore(entry) for key, entry in value.items()}
-        if isinstance(value, list):
-            return [restore(entry) for entry in value]
-        return value
 
-    return restore(dumped)
+def _restore_mapping(values: Mapping[str, Any], dumped: Any, depth: int) -> Any:
+    if not isinstance(dumped, dict):
+        return dumped
+    return {
+        key: _restore_media(values[key], entry, depth + 1) if key in values else entry
+        for key, entry in dumped.items()
+    }
 
 
 def _serialize_for_reflection(obj: Any) -> Any:
