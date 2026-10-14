@@ -56,6 +56,11 @@ def _output_description_key(tool_name: str) -> str:
 def _format_path(path: tuple[str, ...]) -> str:
     formatted: list[str] = []
     for segment in path:
+        if segment.startswith("=") and formatted:
+            # A described option (an anyOf/oneOf entry with a const) of the
+            # previous field, e.g. ``title=true``.
+            formatted[-1] = f"{formatted[-1]}{segment}"
+            continue
         if segment == "[]":
             if not formatted:
                 formatted.append("[]")
@@ -74,6 +79,22 @@ def _output_parameter_key(tool_name: str, path: tuple[str, ...]) -> str:
     return f"output:{tool_name}:param:{_format_path(path)}"
 
 
+def _option_segment(const: Any) -> str:
+    """Path segment for a described ``anyOf``/``oneOf`` option with this const."""
+    if isinstance(const, bool):
+        return "=true" if const else "=false"
+    return f"={const}"
+
+
+def _const_options(schema: dict[str, Any]) -> Iterable[dict[str, Any]]:
+    for key in ("anyOf", "oneOf"):
+        options = schema.get(key)
+        if isinstance(options, list):
+            for option in options:
+                if isinstance(option, dict) and "const" in option:
+                    yield option
+
+
 def _iter_schema_descriptions(
     schema: Any, path: tuple[str, ...] = ()
 ) -> Iterable[tuple[tuple[str, ...], str]]:
@@ -84,6 +105,14 @@ def _iter_schema_descriptions(
     description = schema.get("description")
     if isinstance(description, str) and description.strip() and path:
         yield path, description
+
+    # Described options, such as Literal[True] / Literal[False] each annotated
+    # with a description, are criteria a decision model reads; expose each one.
+    if path:
+        for option in _const_options(schema):
+            option_description = option.get("description")
+            if isinstance(option_description, str) and option_description.strip():
+                yield path + (_option_segment(option["const"]),), option_description
 
     schema_type = schema.get("type")
     if schema_type == "object":
@@ -106,6 +135,19 @@ def _set_schema_description(
     for segment in path:
         if target is None:
             return False
+        if segment.startswith("="):
+            next_target = next(
+                (
+                    o
+                    for o in _const_options(target)
+                    if _option_segment(o["const"]) == segment
+                ),
+                None,
+            )
+            if next_target is None:
+                return False
+            target = next_target
+            continue
         if segment == "[]":
             next_target = target.get("items")
             if not isinstance(next_target, dict):

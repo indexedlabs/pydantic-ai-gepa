@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Annotated, Literal
+
 
 import pytest
 from pydantic import BaseModel, Field
@@ -106,3 +108,63 @@ async def test_candidate_applies_to_output_tool_definitions():
             kind="output",
         )
     )
+
+
+class DecisionOutput(BaseModel):
+    """Output whose yes/no field carries described options (criteria)."""
+
+    title: (
+        Annotated[Literal[True], Field(description="title follows the rules")]
+        | Annotated[Literal[False], Field(description="title breaks a rule")]
+    ) = Field(description="Does the title follow the rules?")
+
+
+def _make_decision_agent() -> Agent[object, DecisionOutput]:
+    return Agent(
+        TestModel(custom_output_args=DecisionOutput(title=True)),
+        output_type=DecisionOutput,
+        name="decision-test",
+    )
+
+
+def test_described_options_are_output_components():
+    agent = _make_decision_agent()
+    get_or_create_output_tool_optimizer(agent)
+
+    seed = extract_seed_candidate(agent, optimize_output_type=True)
+
+    assert (
+        seed["output:final_result:param:title"].text
+        == "Does the title follow the rules?"
+    )
+    assert (
+        seed["output:final_result:param:title=true"].text == "title follows the rules"
+    )
+    assert seed["output:final_result:param:title=false"].text == "title breaks a rule"
+
+
+@pytest.mark.asyncio
+async def test_candidate_rewrites_described_options():
+    agent = _make_decision_agent()
+    optimizer = get_or_create_output_tool_optimizer(agent)
+    tool_defs = list(
+        getattr(getattr(agent, "_output_toolset", None), "_tool_defs", []) or []
+    )
+    yes_key = _output_parameter_key(tool_defs[0].name, ("title", "=true"))
+    no_key = _output_parameter_key(tool_defs[0].name, ("title", "=false"))
+
+    prepared = await optimizer.prepare_output_tools(
+        None,  # type: ignore[arg-type]
+        tool_defs,
+        candidate={
+            yes_key: ComponentValue(name=yes_key, text="new yes criterion"),
+            no_key: ComponentValue(name=no_key, text="new no criterion"),
+        },
+    )
+
+    assert prepared is not None
+    options = prepared[0].parameters_json_schema["properties"]["title"]["anyOf"]
+    assert {o["const"]: o["description"] for o in options} == {
+        True: "new yes criterion",
+        False: "new no criterion",
+    }
