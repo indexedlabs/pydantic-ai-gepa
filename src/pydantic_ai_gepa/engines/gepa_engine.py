@@ -270,6 +270,10 @@ async def _matching_seed_scores(
     the graph's own seed evaluation rather than trusting mismatched ids.
     """
     scores = seed_evaluation.per_case_scores
+    if not seed_evaluation.selectable:
+        # Per-case scores cannot carry ineligibility; let the graph re-score
+        # the seed so its own validation guard applies.
+        return None
     if not scores or len(scores) != seed_evaluation.num_cases:
         return None
     loader = state.validation_set

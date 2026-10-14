@@ -181,6 +181,7 @@ class CodingAgentEngine:
         ):
             if (
                 config.stop_at_score is not None
+                and best_entry.evaluation.selectable
                 and best_entry.evaluation.score >= config.stop_at_score
             ):
                 stop_reason = "stop_at_score"
@@ -483,7 +484,11 @@ class CodingAgentEngine:
         return EngineResult(
             engine=self.name,
             best_candidate=_copy_candidate(best_entry.candidate),
-            best_score=best_entry.evaluation.score,
+            best_score=(
+                best_entry.evaluation.score
+                if best_entry.evaluation.selectable
+                else None
+            ),
             num_metric_calls=budget.spent - starting_spend,
             history=history,
         )
@@ -720,8 +725,11 @@ def _best_validation_entry(
     """Return the highest aggregate selectable validation candidate."""
 
     selectable = [entry for entry in pool if entry.evaluation.selectable]
-    candidates = selectable or list(pool)
-    return max(candidates, key=lambda entry: (entry.evaluation.score, -entry.index))
+    if not selectable:
+        # No eligible validation: keep the seed rather than promote a rejected
+        # proposal; the result then reports no score.
+        return pool[0]
+    return max(selectable, key=lambda entry: (entry.evaluation.score, -entry.index))
 
 
 def _validation_event_data(entry: _CandidatePoolEntry, *, stage: str) -> dict[str, Any]:

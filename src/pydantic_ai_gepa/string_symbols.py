@@ -85,7 +85,12 @@ def masked_string_symbols(source: str, symbols: list[str]) -> str:
             names = [
                 target.id for target in node.targets if isinstance(target, ast.Name)
             ]
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.value is not None
+        ):
+            # A bare ``X: str`` holds no value; mask the assignment that does.
             names = [node.target.id]
         if not pending.intersection(names):
             continue
@@ -308,15 +313,18 @@ def _scope_header(node: ast.AST) -> list[ast.AST]:
     return header
 
 
-def _bound_names(node: ast.AST) -> set[str]:
+def _bound_names(node: ast.AST) -> list[str]:
     """Names a module-level statement binds or deletes in module scope.
+
+    A name appears once per binding, so a statement that binds it twice
+    (``X: (X := "a") = "b"``) is seen as a rebinding.
 
     Nested function, class and lambda bodies are skipped, but their headers
     run in module scope. Comprehensions leak only assignment expressions.
     Over-counting is safe: it refuses a symbol rather than optimizing a
     constant the module may rebind.
     """
-    names: set[str] = set()
+    names: list[str] = []
     stack: list[ast.AST] = [node]
     while stack:
         current = stack.pop()
@@ -324,11 +332,11 @@ def _bound_names(node: ast.AST) -> set[str]:
             current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
         ):
             if not isinstance(current, ast.Lambda):
-                names.add(current.name)
+                names.append(current.name)
             stack.extend(_scope_header(current))
             continue
         if isinstance(current, _COMPREHENSIONS):
-            names.update(
+            names.extend(
                 child.target.id
                 for child in ast.walk(current)
                 if isinstance(child, ast.NamedExpr)
@@ -343,15 +351,15 @@ def _bound_names(node: ast.AST) -> set[str]:
         if isinstance(current, ast.Name) and isinstance(
             current.ctx, (ast.Store, ast.Del)
         ):
-            names.add(current.id)
+            names.append(current.id)
         elif isinstance(current, ast.alias):
-            names.add(current.asname or current.name.split(".")[0])
+            names.append(current.asname or current.name.split(".")[0])
         elif isinstance(current, ast.ExceptHandler) and current.name:
-            names.add(current.name)
+            names.append(current.name)
         elif isinstance(current, (ast.MatchAs, ast.MatchStar)) and current.name:
-            names.add(current.name)
+            names.append(current.name)
         elif isinstance(current, ast.MatchMapping) and current.rest:
-            names.add(current.rest)
+            names.append(current.rest)
         stack.extend(ast.iter_child_nodes(current))
     return names
 

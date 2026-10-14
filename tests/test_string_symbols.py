@@ -14,7 +14,7 @@ from pydantic_ai.models.test import TestModel
 from pydantic_evals import Case
 
 from pydantic_ai_gepa._validation import validation_evaluation
-from pydantic_ai_gepa.compose import OmniPlan, optimize_omni
+from pydantic_ai_gepa.compose import OmniPlan, optimize_omni, optimize_sequential
 from pydantic_ai_gepa.engines import (
     BudgetTracker,
     EngineConfig,
@@ -178,6 +178,11 @@ def test_a_bare_annotation_does_not_count_as_a_second_binding(repo: Path) -> Non
     candidate = candidate_from_commit(repo, base, {"typed.py": ["X"]})
 
     assert _texts(candidate) == {"py:typed.py:X": "value"}
+    edited = _candidate(**{"py:typed.py:X": "improved"})
+    sha = commit_from_candidate(repo, base, {"typed.py": ["X"]}, edited, "typed")
+    assert _texts(candidate_from_commit(repo, sha, {"typed.py": ["X"]})) == {
+        "py:typed.py:X": "improved"
+    }
 
 
 def test_round_trip_keeps_a_u_prefix_and_handles_a_bom(repo: Path) -> None:
@@ -270,6 +275,7 @@ def test_symbols_in_a_subdirectory_project_are_relative_to_it(repo: Path) -> Non
         ("X = 'a'\nmatch {}:\n    case {**X}:\n        pass\n", "X", "more than once"),
         ("X = 'a'\ndel X\n", "X", "more than once"),
         ("X = 'a'\nY: (X := 'fixed')\n", "X", "more than once"),
+        ("X: (X := 'fixed') = 'seed'\n", "X", "more than once"),
         ("X = (\n    'a'  # note\n    'b'\n)\n", "X", "comment"),
         ("X = 'a'\ndef f(arg=(X := 'fixed')):\n    pass\n", "X", "more than once"),
         ("X = 'a'\nY = [(X := i) for i in 'b']\n", "X", "more than once"),
@@ -446,6 +452,72 @@ async def test_gepa_engine_never_promotes_a_candidate_whose_validation_failed(
     assert any(name == "val-1" for _, name in scores.calls[4:])
     assert result.best_score == 0.25
     assert _texts(result.best_candidate) == _texts(await task.seed_candidate())
+
+
+async def _val_1_always_fails(
+    scores: _FakeEvaluator, commit: str, case: Case[Any, Any, Any]
+) -> MetricResult:
+    if case.name == "val-1":
+        raise RuntimeError("judge unavailable")
+    return await scores(commit, case)
+
+
+@pytest.mark.asyncio
+async def test_coding_engine_keeps_the_seed_when_no_validation_is_eligible(
+    repo: Path,
+) -> None:
+    scores = _FakeEvaluator(repo)
+
+    async def evaluator(commit: str, case: Case[Any, Any, Any]) -> MetricResult:
+        return await _val_1_always_fails(scores, commit, case)
+
+    async def propose(context: ReflectionContext) -> CandidateMap:
+        return {
+            **context.candidate,
+            INSTRUCTIONS: ComponentValue(name=INSTRUCTIONS, text="improved"),
+        }
+
+    task = _task(repo, evaluator)
+    config = EngineConfig(
+        engine="coding_agent",
+        max_metric_calls=40,
+        max_iterations=1,
+        stop_at_score=0.1,
+        engine_config={"propose": propose, "minibatch_size": 2},
+    )
+
+    result = await get_engine("coding_agent", config).run(
+        task, config, BudgetTracker(40)
+    )
+
+    # Neither validation is eligible: no stop on the seed's invalid 0.125, and
+    # no promotion of the proposal's invalid 0.5.
+    assert any(event.kind == "validation_rejected" for event in result.history)
+    assert result.best_score is None
+    assert _texts(result.best_candidate) == _texts(await task.seed_candidate())
+
+
+@pytest.mark.asyncio
+async def test_composed_gepa_rescores_an_ineligible_seed(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _improving_proposal(monkeypatch)
+    scores = _FakeEvaluator(repo)
+
+    async def evaluator(commit: str, case: Case[Any, Any, Any]) -> MetricResult:
+        return await _val_1_always_fails(scores, commit, case)
+
+    task = _task(repo, evaluator)
+    config = _gepa_config().model_copy(update={"stop_at_score": 0.1})
+
+    result = await optimize_sequential(task, [config], max_metric_calls=20)
+
+    # The helper's non-selectable seed evaluation is not reused as a score, so
+    # stop_at_score cannot end the stage before it tries a proposal.
+    gepa = result.results[-1]
+    assert gepa.engine == "gepa"
+    assert gepa.num_metric_calls > 0
+    assert gepa.best_score is None
 
 
 @pytest.mark.asyncio
