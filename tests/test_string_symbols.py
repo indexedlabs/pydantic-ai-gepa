@@ -1304,3 +1304,38 @@ async def test_declared_failure_with_empty_scores_is_non_selectable(
 
     assert evaluation.selectable is False
     assert evaluation.objective_scores == {"quality": 1.0}
+
+
+@pytest.mark.asyncio
+async def test_coding_agent_proposal_inspection_reaches_the_caller(
+    repo: Path,
+) -> None:
+    async def map_messages(*args: Any) -> list[Any]:
+        return [{"role": "user", "content": "captured"}]
+
+    inspected = Agent(InspectingModel(TestModel(), map_messages=map_messages))
+
+    async def evaluator(commit: str, case: Case[Any, Any, Any]) -> MetricResult:
+        text = candidate_from_commit(repo, commit, SYMBOLS)[INSTRUCTIONS].text
+        if "improved" in text:
+            await inspected.run(str(case.inputs))
+        return MetricResult(score=0.25, feedback="improve")
+
+    async def propose(context: ReflectionContext) -> CandidateMap:
+        return {
+            **context.candidate,
+            INSTRUCTIONS: ComponentValue(name=INSTRUCTIONS, text="Say improved."),
+        }
+
+    config = EngineConfig(
+        engine="coding_agent",
+        max_metric_calls=40,
+        max_iterations=1,
+        engine_config={"propose": propose, "minibatch_size": 2},
+    )
+
+    with pytest.raises(InspectionAborted) as caught:
+        await get_engine("coding_agent", config).run(
+            _task(repo, evaluator), config, BudgetTracker(40)
+        )
+    assert caught.value.snapshot is not None

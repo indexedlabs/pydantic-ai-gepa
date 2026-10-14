@@ -118,6 +118,10 @@ class _CommitScorer:
         key = tuple(
             sorted((name, value.text.strip()) for name, value in candidate.items())
         )
+        # Memo hits (every per-case call after the first) skip the lock, so
+        # they never wait behind another candidate's commit being built.
+        if (sha := self._commits.get(key)) is not None:
+            return sha
         self._bind_loop()
         async with self._commit_lock:
             sha = self._commits.get(key)

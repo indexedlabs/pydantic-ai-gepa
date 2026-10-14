@@ -15,6 +15,7 @@ from .._concurrency import gather_cancelling_on_provider_stop
 from ..acceptance import compare_candidate_samples
 from ..evaluation import EvaluationRecord, evaluate_candidate_dataset
 from ..gepa_graph.models import CandidateMap
+from ..inspection import InspectionAborted
 from .base import (
     BudgetExhausted,
     BudgetTracker,
@@ -385,6 +386,9 @@ class CodingAgentEngine:
                 except BudgetExhausted:
                     stop_reason = "budget_exhausted"
                     break
+                except InspectionAborted:
+                    # The caller inspects the intercepted request; never wrap it.
+                    raise
                 except Exception as exc:
                     raise RuntimeError(
                         "Coding-agent proposal evaluation failed."
