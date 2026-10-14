@@ -152,6 +152,13 @@ def _truncate_text(value: str, limit: int = 2000) -> str:
 _MEDIA_TYPES = (ImageUrl, AudioUrl, VideoUrl, DocumentUrl, BinaryContent)
 
 
+def _model_values(obj: BaseModel) -> list[Any]:
+    """Declared field values plus any ``extra="allow"`` values."""
+    values = [getattr(obj, name) for name in type(obj).model_fields]
+    values.extend((obj.model_extra or {}).values())
+    return values
+
+
 def _contains_media(obj: Any, depth: int = 0) -> bool:
     """Whether ``obj`` holds media objects reflection should attach."""
     if depth > 20:
@@ -159,10 +166,7 @@ def _contains_media(obj: Any, depth: int = 0) -> bool:
     if isinstance(obj, _MEDIA_TYPES):
         return True
     if isinstance(obj, BaseModel):
-        return any(
-            _contains_media(getattr(obj, name), depth + 1)
-            for name in type(obj).model_fields
-        )
+        return any(_contains_media(value, depth + 1) for value in _model_values(obj))
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
         # fields() leaves out InitVar/ClassVar pseudo-fields, as asdict() does.
         return any(
@@ -188,8 +192,8 @@ def _media_in(obj: Any, found: list[Any], depth: int = 0) -> None:
     if isinstance(obj, _MEDIA_TYPES):
         found.append(obj)
     elif isinstance(obj, BaseModel):
-        for name in type(obj).model_fields:
-            _media_in(getattr(obj, name), found, depth + 1)
+        for value in _model_values(obj):
+            _media_in(value, found, depth + 1)
     elif dataclasses.is_dataclass(obj) and not isinstance(obj, type):
         for item in dataclasses.fields(obj):
             _media_in(getattr(obj, item.name), found, depth + 1)

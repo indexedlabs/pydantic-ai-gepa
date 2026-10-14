@@ -1540,3 +1540,20 @@ def test_reflection_media_respects_root_models_and_serializers() -> None:
         "photo": photo,
         "details": details,
     }
+
+
+def test_reflection_attaches_media_from_extra_model_fields() -> None:
+    from pydantic import ConfigDict
+
+    from pydantic_ai_gepa.adapters.agent_adapter import _serialize_for_reflection
+
+    class Open(BaseModel):
+        model_config = ConfigDict(extra="allow")
+        question: str
+
+    photo = ImageUrl(url="https://example.com/extra.png")
+
+    assert _serialize_for_reflection(Open(question="?", photo=photo)) == {
+        "question": "?",
+        "photo": photo,
+    }
