@@ -187,7 +187,8 @@ _MEDIA_ADAPTER: TypeAdapter[Any] = TypeAdapter(
 def _restore_media(value: Any) -> Any:
     """Rebuild media objects from their JSON dumps, leaving all else as is."""
     if isinstance(value, dict):
-        if value.get("kind") in _MEDIA_KINDS:
+        kind = value.get("kind")
+        if isinstance(kind, str) and kind in _MEDIA_KINDS:
             try:
                 return _MEDIA_ADAPTER.validate_json(json.dumps(value))
             except (ValidationError, TypeError, ValueError):

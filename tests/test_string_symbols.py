@@ -1514,3 +1514,13 @@ def test_reflection_media_respects_root_models_and_serializers() -> None:
     assert redacted == {"payload": {"photo": photo}}
     assert _serialize_for_reflection(RootModel[list[ImageUrl]]([photo])) == [photo]
     assert _serialize_for_reflection(Summary(photo=photo)) == "a photo"
+
+    class WithDetails(BaseModel):
+        photo: ImageUrl
+        details: dict[str, AnyType]
+
+    details = {"kind": ["a", "b"], "nested": {"kind": {"x": 1}}}
+    assert _serialize_for_reflection(WithDetails(photo=photo, details=details)) == {
+        "photo": photo,
+        "details": details,
+    }
