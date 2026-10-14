@@ -71,7 +71,6 @@ def masked_string_symbols(source: str, symbols: list[str]) -> str:
     """
     tree = ast.parse(source)
     pending = set(symbols)
-    bare: dict[str, ast.AnnAssign] = {}
     for node in tree.body:
         names = []
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -87,28 +86,16 @@ def masked_string_symbols(source: str, symbols: list[str]) -> str:
                 target.id for target in node.targets if isinstance(target, ast.Name)
             ]
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            if node.value is None:
-                # A bare ``X: str`` holds no value: prefer the assignment that
-                # does, and fall back to it only if none follows.
-                bare.setdefault(node.target.id, node)
-                continue
             names = [node.target.id]
         if not pending.intersection(names):
             continue
-        _mask_strings(node)
+        for child in ast.walk(node):
+            if isinstance(child, ast.Constant) and isinstance(child.value, str):
+                child.value = "<instruction>"
         pending.difference_update(names)
-    for name in pending.intersection(bare):
-        _mask_strings(bare[name])
-        pending.remove(name)
     if pending:
         raise ValueError
     return ast.dump(tree, include_attributes=False)
-
-
-def _mask_strings(node: ast.AST) -> None:
-    for child in ast.walk(node):
-        if isinstance(child, ast.Constant) and isinstance(child.value, str):
-            child.value = "<instruction>"
 
 
 def normalize_string_symbols(
@@ -261,7 +248,7 @@ def verify_string_symbol_commit(
             or relative not in declared
             or status != "M"
             or old_mode != new_mode
-            or new_mode not in ("100644", "100755")
+            or new_mode != "100644"
         ):
             raise StringSymbolError(
                 f"Commit changes {path} outside the declared string symbols."
@@ -338,7 +325,8 @@ def _bound_names(node: ast.AST) -> list[str]:
 
     Nested function, class and lambda bodies are skipped, but their headers
     run in module scope. Comprehensions leak only assignment expressions.
-    Over-counting is safe: it refuses a symbol rather than optimizing a
+    A bare annotation (``X: str``) counts, as it is the declaration trusted
+    scoring masks first. Over-counting is safe: it refuses a symbol rather than optimizing a
     constant the module may rebind.
     """
     names: list[str] = []
@@ -359,11 +347,6 @@ def _bound_names(node: ast.AST) -> list[str]:
                 if isinstance(child, ast.NamedExpr)
                 and isinstance(child.target, ast.Name)
             )
-            continue
-        if isinstance(current, ast.AnnAssign) and current.value is None:
-            # A bare annotation (``X: str``) binds no value, but its annotation
-            # expression is evaluated and may contain an assignment expression.
-            stack.append(current.annotation)
             continue
         if isinstance(current, ast.Name) and isinstance(
             current.ctx, (ast.Store, ast.Del)
@@ -573,8 +556,11 @@ class _Git:
         ):
             raise StringSymbolError(f"{relative} is not a file at {commit[:12]}.")
         mode, _, oid = (field.decode() for field in fields)
-        if mode not in ("100644", "100755"):
-            raise StringSymbolError(f"{relative} is not a regular file.")
+        if mode != "100644":
+            # Trusted text scoring accepts only regular, non-executable files.
+            raise StringSymbolError(
+                f"{relative} must be a regular non-executable file (mode 100644)."
+            )
         return mode, self.run("cat-file", "blob", oid)
 
     def is_ancestor(self, base: str, commit: str) -> bool:

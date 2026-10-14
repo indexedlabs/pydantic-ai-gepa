@@ -21,6 +21,7 @@ from pydantic_ai_gepa.compose import OmniPlan, optimize_omni, optimize_sequentia
 from pydantic_ai_gepa.engines import (
     BudgetTracker,
     EngineConfig,
+    OptimizationTask,
     ReflectionContext,
     StringSymbolTask,
     get_engine,
@@ -174,18 +175,13 @@ def test_unchanged_candidate_returns_the_base_commit(repo: Path) -> None:
     }
 
 
-def test_a_bare_annotation_does_not_count_as_a_second_binding(repo: Path) -> None:
-    (repo / "typed.py").write_text('X: str\nX = "value"\n')
-    base = _commit(repo, "typed")
+def test_refuses_an_executable_declared_file(repo: Path) -> None:
+    (repo / "tool.py").write_text('X = "seed"\n')
+    (repo / "tool.py").chmod(0o755)
+    base = _commit(repo, "executable")
 
-    candidate = candidate_from_commit(repo, base, {"typed.py": ["X"]})
-
-    assert _texts(candidate) == {"py:typed.py:X": "value"}
-    edited = _candidate(**{"py:typed.py:X": "improved"})
-    sha = commit_from_candidate(repo, base, {"typed.py": ["X"]}, edited, "typed")
-    assert _texts(candidate_from_commit(repo, sha, {"typed.py": ["X"]})) == {
-        "py:typed.py:X": "improved"
-    }
+    with pytest.raises(StringSymbolError, match="non-executable"):
+        candidate_from_commit(repo, base, {"tool.py": ["X"]})
 
 
 def test_round_trip_keeps_a_u_prefix_and_handles_a_bom(repo: Path) -> None:
@@ -277,6 +273,9 @@ def test_symbols_in_a_subdirectory_project_are_relative_to_it(repo: Path) -> Non
         ("X = 'a'\nmatch 1:\n    case 1 as X:\n        pass\n", "X", "more than once"),
         ("X = 'a'\nmatch {}:\n    case {**X}:\n        pass\n", "X", "more than once"),
         ("X = 'a'\ndel X\n", "X", "more than once"),
+        ("X: str\nX = 'value'\n", "X", "more than once"),
+        ("X: str\n", "X", "plain string constant"),
+        ("X = 'a'\nt = {}\nt[(X := 'fixed')]: str\n", "X", "more than once"),
         ("X = 'a'\nfrom os.path import *\n", "X", "wildcard import"),
         ("X = 'a'\nY: (X := 'fixed')\n", "X", "more than once"),
         ("X: (X := 'fixed') = 'seed'\n", "X", "more than once"),
@@ -872,3 +871,69 @@ async def test_real_reflector_sees_training_evidence_but_not_held_out_cases(
     assert "held 0" not in prompt and "val-0" not in prompt
     assert "No execution traces exist for this run" in prompt
     assert "run_python_repl" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_agent_task_reflection_without_traces_renders_its_records(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # GepaEngine writes no span files, so agent tasks take the trace-less
+    # prompt too: the minibatch records are rendered, compactly.
+    monkeypatch.chdir(tmp_path)
+    prompts: list[str] = []
+
+    async def reflector(messages: Any, info: Any) -> ModelResponse:
+        for message in messages:
+            for part in message.parts:
+                content = getattr(part, "content", None)
+                if isinstance(content, str):
+                    prompts.append(content)
+                elif isinstance(content, list):
+                    prompts.extend(item for item in content if isinstance(item, str))
+        return ModelResponse(
+            parts=[
+                TextPart(
+                    content=json.dumps(
+                        {
+                            "reasoning": {
+                                "pattern_discovery": "p",
+                                "creative_hypothesis": "h",
+                                "experimental_approach": "e",
+                            },
+                            "updated_components": [
+                                {
+                                    "component_name": "instructions",
+                                    "optimized_value": "Reply with ok, always.",
+                                }
+                            ],
+                        }
+                    )
+                )
+            ]
+        )
+
+    agent = Agent(TestModel(custom_output_text="nope"), instructions="Reply.")
+    task = OptimizationTask(
+        agent=agent,
+        trainset=[Case(name=f"t-{i}", inputs=f"agent question {i}") for i in range(2)],
+        metric=lambda case, output: MetricResult(
+            score=0.0, feedback=f"{case.name}: wrong answer"
+        ),
+    )
+    config = EngineConfig(
+        engine="gepa",
+        max_metric_calls=10,
+        max_iterations=1,
+        engine_config={
+            "reflection_minibatch_size": 2,
+            "reflection_config": ReflectionConfig(model=FunctionModel(reflector)),
+        },
+    )
+
+    await get_engine("gepa", config).run(task, config, BudgetTracker(10))
+
+    prompt = "\n".join(prompts)
+    assert "No execution traces exist for this run" in prompt
+    assert "t-0: wrong answer" in prompt and "t-1: wrong answer" in prompt
+    assert "agent question 0" in prompt
+    assert len(prompt) < 20_000

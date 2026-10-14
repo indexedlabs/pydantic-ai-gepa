@@ -408,8 +408,8 @@ The explicit text files (only `.md` and `.txt`) and Python symbol mappings must
 partition `component_files`. Python symbols name top-level functions, async
 functions, classes, assignments with Name targets, or annotated assignments.
 A named symbol masks every string constant in its AST node; `X.__doc__` masks
-only X's existing docstring. A bare annotation (`X: str`) holds no value, so a
-later assignment to X is what is masked; an annotation-only X masks its annotation. Every declared symbol must exist. All remaining AST
+only X's existing docstring. A bare annotation (`X: str`) is X's first
+declaration, so it is what is masked. Every declared symbol must exist. All remaining AST
 structure must equal the pinned scorer's copy. Candidate source is parsed only.
 
 This mode requires scalar git candidates, both trusted/pinned flags, nonempty
@@ -753,7 +753,9 @@ When a Git candidate's editable surface is top-level string constants (the
 `coding_agent` engines and `optimize_omni` can optimize it directly:
 
 ```python
-from pydantic_ai_gepa import EngineConfig, MetricResult, StringSymbolTask, get_engine
+from pydantic_ai_gepa import (
+    EngineConfig, MetricResult, ReflectionConfig, StringSymbolTask, get_engine,
+)
 from pydantic_ai_gepa.engines import BudgetTracker
 
 async def evaluate(commit: str, case) -> MetricResult:
@@ -763,7 +765,11 @@ task = StringSymbolTask(
     repo=".", base_commit="HEAD", symbols={"prompts.py": ["INSTRUCTIONS"]},
     evaluator=evaluate, trainset=train, valset=validation,
 )
-config = EngineConfig(engine="gepa", max_metric_calls=60)
+config = EngineConfig(
+    engine="gepa",
+    max_metric_calls=60,
+    engine_config={"reflection_config": ReflectionConfig(model="openai:gpt-5")},
+)
 result = await get_engine("gepa", config).run(task, config, BudgetTracker(60))
 best_sha = await task.commit_for(result.best_candidate)
 ```
@@ -771,7 +777,8 @@ best_sha = await task.commit_for(result.best_candidate)
 - Components are keyed `py:<path>:<NAME>`; paths are relative to `repo`.
   Version 1 accepts only `NAME = "..."` / `NAME: T = "..."` at module level
   (implicit concatenation included), bound exactly once in module scope
-  (`del`, `except … as`, `match` captures, walrus and `global` count). Anything
+  (`del`, `except … as`, `match` captures, walrus, `global` and a bare
+  `X: T` annotation count). Anything
   else (f-strings, bytes, expressions, `X.__doc__`, nested blocks, wildcard imports, comments
   between concatenated parts) is refused.
 - `commit_from_candidate` rewrites only those constants' source spans and

@@ -1293,14 +1293,14 @@ class InstructionProposalGenerator:
                 )
                 lines.append("- **Messages:**")
                 lines.append("```json")
-                lines.append(json.dumps(sanitized_messages, indent=2))
+                lines.append(json.dumps(sanitized_messages, indent=2, default=str))
                 lines.append("```")
 
             run_usage = record.get("run_usage")
             if run_usage:
                 lines.append("- **Usage:**")
                 lines.append("```json")
-                lines.append(json.dumps(run_usage, indent=2))
+                lines.append(json.dumps(run_usage, indent=2, default=str))
                 lines.append("```")
 
             lines.append("")
