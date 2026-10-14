@@ -612,6 +612,8 @@ introspection or component seeding.
 
 **Slot names use colons** — you type them with colons everywhere: `instructions`, `tool:foo:description`, `tool:foo:param:query`, etc. The CLI handles disk encoding for you (the on-disk filename uses `__` instead of `:`, but you never have to type that — `gepa components set tool:foo:description --content-file ...` and `gepa components show tool:foo:description` both Just Work).
 
+A field whose options carry their own descriptions (`Annotated[Literal[True], Field(description=...)] | Annotated[Literal[False], Field(description=...)]`, the yes/no criteria a decision model reads) gets one slot per option: `output:final_result:param:title@0`, `title@1`, numbered by the option's position across the field's `anyOf` then `oneOf` entries. Positions, not values, name them, so reordering or inserting options moves saved text onto a different option: re-check confirmed option slots after changing a union.
+
 `gepa` auto-loads `.env` from the repo root, so `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / etc. are picked up automatically. Pass `--no-dotenv` to skip.
 
 ## Git-native candidates

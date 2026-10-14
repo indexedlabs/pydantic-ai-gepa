@@ -298,23 +298,81 @@ async def test_property_keys_are_unchanged_by_options():
     assert props["=decision"]["description"] == "rewritten"
 
 
-def test_property_named_like_an_option_key_is_refused():
+def test_property_named_like_an_option_key_keeps_its_key():
     catalog = OutputToolComponentCatalog()
-    tool_def = ToolDefinition(
-        name="final_result",
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "title": {
-                    "anyOf": [{"const": True, "description": "yes"}],
-                    "description": "Title ok?",
+    catalog.ingest(
+        [
+            ToolDefinition(
+                name="final_result",
+                parameters_json_schema={
+                    "type": "object",
+                    "properties": {
+                        "title": {
+                            "anyOf": [{"const": True, "description": "yes"}],
+                            "description": "Title ok?",
+                        },
+                        "title@0": {"type": "string", "description": "a real property"},
+                    },
                 },
-                "title@0": {"type": "string", "description": "a real property"},
-            },
-        },
+            )
+        ]
     )
-    with pytest.raises(ValueError, match="names two schema paths"):
-        catalog.ingest([tool_def])
+    metadata = catalog.metadata_for("final_result")
+    assert metadata is not None
+    assert metadata.parameter_paths["output:final_result:param:title@0"] == ("title@0",)
+
+
+def test_properties_formatting_alike_keep_the_later_path():
+    # Unchanged from before options existed: no error, the later path wins.
+    catalog = OutputToolComponentCatalog()
+    catalog.ingest(
+        [
+            ToolDefinition(
+                name="final_result",
+                parameters_json_schema={
+                    "type": "object",
+                    "properties": {
+                        "a.b": {"type": "string", "description": "flat"},
+                        "a": {
+                            "type": "object",
+                            "properties": {
+                                "b": {"type": "string", "description": "nested"}
+                            },
+                        },
+                    },
+                },
+            )
+        ]
+    )
+    metadata = catalog.metadata_for("final_result")
+    assert metadata is not None
+    assert metadata.parameter_paths["output:final_result:param:a.b"] == ("a", "b")
+
+
+def test_options_in_any_of_and_one_of_get_distinct_positions():
+    schema = {
+        "type": "object",
+        "properties": {
+            "x": {
+                "anyOf": [{"const": True, "description": "any yes"}],
+                "oneOf": [{"const": True, "description": "one yes"}],
+            }
+        },
+    }
+    keys = {
+        _output_parameter_key("final_result", p): (p, d)
+        for p, d in _iter_schema_descriptions(schema)
+    }
+    assert {k: d for k, (_, d) in keys.items()} == {
+        "output:final_result:param:x@0": "any yes",
+        "output:final_result:param:x@1": "one yes",
+    }
+    updated = copy.deepcopy(schema)
+    assert _set_schema_description(
+        updated, keys["output:final_result:param:x@1"][0], "NEW"
+    )
+    assert updated["properties"]["x"]["anyOf"][0]["description"] == "any yes"
+    assert updated["properties"]["x"]["oneOf"][0]["description"] == "NEW"
 
 
 def test_option_slots_round_trip_through_the_store(tmp_path):

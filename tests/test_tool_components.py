@@ -837,3 +837,22 @@ def test_reflection_schema_skips_option_slots() -> None:
     defs = generator._build_tool_definitions_from_candidate(candidate)
     properties = defs["approve"]["function"]["parameters"]["properties"]
     assert list(properties) == ["approved"]
+
+
+def test_reflection_schema_keeps_a_real_parameter_named_like_an_option() -> None:
+    from pydantic_ai_gepa.gepa_graph.models import CandidateProgram, ComponentValue
+    from pydantic_ai_gepa.gepa_graph.proposal.instruction import (
+        InstructionProposalGenerator,
+    )
+
+    generator = InstructionProposalGenerator.__new__(InstructionProposalGenerator)
+    texts = {"tool:lookup:param:answer@0": "a real parameter"}
+    candidate = CandidateProgram(
+        idx=0,
+        components={k: ComponentValue(name=k, text=v) for k, v in texts.items()},
+        discovered_at_iteration=0,
+        discovered_at_evaluation=0,
+    )
+    defs = generator._build_tool_definitions_from_candidate(candidate)
+    properties = defs["lookup"]["function"]["parameters"]["properties"]
+    assert list(properties) == ["answer@0"]

@@ -89,13 +89,19 @@ class _OptionStep(str):
 
 
 def _const_options(schema: dict[str, Any]) -> Iterable[tuple[int, dict[str, Any]]]:
-    """Yield (position, option) for the const entries of a union schema."""
+    """Yield (position, option) for the const entries of a union schema.
+
+    Positions run across ``anyOf`` then ``oneOf``, so a field with both
+    keywords still gives every option its own position.
+    """
+    position = 0
     for key in ("anyOf", "oneOf"):
         options = schema.get(key)
         if isinstance(options, list):
-            for index, option in enumerate(options):
+            for option in options:
                 if isinstance(option, dict) and "const" in option:
-                    yield index, option
+                    yield position, option
+                position += 1
 
 
 def _iter_schema_descriptions(
@@ -133,10 +139,21 @@ def _iter_schema_descriptions(
 def _add_parameter_path(
     parameter_paths: dict[str, tuple[str, ...]], key: str, path: tuple[str, ...]
 ) -> None:
-    # A property literally named like an option key (``title@0``) would make
-    # one of the two unaddressable; refuse it rather than drop updates.
-    if parameter_paths.get(key, path) != path:
-        raise ValueError(f"Component key {key!r} names two schema paths")
+    existing = parameter_paths.get(key)
+    if existing is not None and existing != path:
+        # A real property literally named like an option key (``title@0``):
+        # the property keeps the key and the option is not optimized.
+        if isinstance(path[-1], _OptionStep):
+            logger.warning(
+                "Component key %r names a property; skipping the option", key
+            )
+            return
+        if not isinstance(existing[-1], _OptionStep):
+            # Two properties formatting alike (``a.b`` and ``a`` -> ``b``):
+            # unchanged from before options, the later path wins.
+            parameter_paths[key] = path
+            return
+        logger.warning("Component key %r names a property; skipping the option", key)
     parameter_paths[key] = path
 
 
