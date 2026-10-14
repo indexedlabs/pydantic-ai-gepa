@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 from pydantic_ai import Agent
 from pydantic_ai.messages import BinaryContent, ImageUrl, ModelResponse, TextPart
 from pydantic_ai.models.function import FunctionModel
@@ -43,6 +44,12 @@ from pydantic_ai_gepa.spend import current_rollout_capability
 from pydantic_ai_gepa.types import ExampleBankConfig, MetricResult, ReflectionConfig
 
 MEDIA = (BinaryContent, ImageUrl)
+
+
+class _PhotoQuestion(BaseModel):
+    photo: BinaryContent
+    question: str
+
 
 PROMPTS = '''"""Prompts for the fixture agent."""
 
@@ -1381,6 +1388,7 @@ async def test_trace_free_reflection_attaches_media_inputs(
         )
 
     image = BinaryContent(data=b"\x89PNG\r\n\x1a\n", media_type="image/png")
+    modelled = BinaryContent(data=b"\x89PNG\r\n\x1a\nmodel", media_type="image/png")
     url = ImageUrl(url="https://example.com/photo.png")
     task = StringSymbolTask(
         repo=repo,
@@ -1390,6 +1398,7 @@ async def test_trace_free_reflection_attaches_media_inputs(
         trainset=[
             Case(name="train-0", inputs=image),
             Case(name="train-1", inputs={"photos": [url], "caption": "a cat"}),
+            Case(name="train-2", inputs=_PhotoQuestion(photo=modelled, question="?")),
         ],
         valset=[Case(name="val-0", inputs="held")],
     )
@@ -1398,7 +1407,7 @@ async def test_trace_free_reflection_attaches_media_inputs(
         max_metric_calls=20,
         max_iterations=1,
         engine_config={
-            "reflection_minibatch_size": 2,
+            "reflection_minibatch_size": 3,
             "reflection_config": ReflectionConfig(model=FunctionModel(reflector)),
         },
     )
@@ -1406,3 +1415,5 @@ async def test_trace_free_reflection_attaches_media_inputs(
     await get_engine("gepa", config).run(task, config, BudgetTracker(20))
 
     assert image in attachments and url in attachments
+    # A Pydantic input model keeps its media attachable, not base64 text.
+    assert modelled in attachments

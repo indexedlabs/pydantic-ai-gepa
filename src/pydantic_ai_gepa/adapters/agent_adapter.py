@@ -147,6 +147,32 @@ def _truncate_text(value: str, limit: int = 2000) -> str:
     return f"{trimmed}... [truncated {omitted} chars]"
 
 
+_MEDIA_TYPES = (ImageUrl, AudioUrl, VideoUrl, DocumentUrl, BinaryContent)
+
+
+def _contains_media(obj: Any, depth: int = 0) -> bool:
+    """Whether ``obj`` holds media objects reflection should attach."""
+    if depth > 20:
+        return False
+    if isinstance(obj, _MEDIA_TYPES):
+        return True
+    if isinstance(obj, BaseModel):
+        return any(
+            _contains_media(getattr(obj, name), depth + 1)
+            for name in type(obj).model_fields
+        )
+    if hasattr(obj, "__dataclass_fields__") and not isinstance(obj, type):
+        return any(
+            _contains_media(getattr(obj, name), depth + 1)
+            for name in obj.__dataclass_fields__
+        )
+    if isinstance(obj, Mapping):
+        return any(_contains_media(value, depth + 1) for value in obj.values())
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        return any(_contains_media(item, depth + 1) for item in obj)
+    return False
+
+
 def _serialize_for_reflection(obj: Any) -> Any:
     """Serialize an object for inclusion in reflection records.
 
@@ -157,8 +183,19 @@ def _serialize_for_reflection(obj: Any) -> Any:
     if isinstance(obj, (ImageUrl, AudioUrl, VideoUrl, DocumentUrl, BinaryContent)):
         return obj
     if isinstance(obj, BaseModel):
+        if _contains_media(obj):
+            # A JSON dump would turn media into base64 text; keep it attachable.
+            return {
+                name: _serialize_for_reflection(getattr(obj, name))
+                for name in type(obj).model_fields
+            }
         return obj.model_dump(mode="json")
     if hasattr(obj, "__dataclass_fields__"):
+        if _contains_media(obj):
+            return {
+                name: _serialize_for_reflection(getattr(obj, name))
+                for name in obj.__dataclass_fields__
+            }
         return asdict(obj)
     if isinstance(obj, Mapping):
         return {k: _serialize_for_reflection(v) for k, v in obj.items()}
