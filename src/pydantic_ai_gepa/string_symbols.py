@@ -52,7 +52,14 @@ _REPOSITORY_ENV = frozenset(
 )
 # Hooks (e.g. post-index-change, which fires even for a private index) must
 # never run: materialization may not touch the caller's checkout.
-_GIT = ("git", "-c", f"core.hooksPath={os.devnull}")
+_GIT = (
+    "git",
+    "-c",
+    f"core.hooksPath={os.devnull}",
+    # An fsmonitor hook runs in the checkout too.
+    "-c",
+    "core.fsmonitor=false",
+)
 _FALLBACK_IDENTITY = ("pydantic-ai-gepa", "pydantic-ai-gepa@localhost")
 _SELECTION_DOC = "v1 supports only top-level NAME = '...' string assignments"
 

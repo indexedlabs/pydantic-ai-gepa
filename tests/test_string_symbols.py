@@ -1452,6 +1452,10 @@ def test_materialization_runs_no_git_hooks(repo: Path) -> None:
         hook = hooks / name
         hook.write_text(f"#!/bin/sh\necho {name} >> README.md\n")
         hook.chmod(0o755)
+    monitor = repo / ".git" / "fsmonitor-hook"
+    monitor.write_text("#!/bin/sh\necho fsmonitor >> README.md\n")
+    monitor.chmod(0o755)
+    _git(repo, "config", "core.fsmonitor", str(monitor))
 
     sha = commit_from_candidate(
         repo, base, SYMBOLS, _candidate(**{INSTRUCTIONS: "Be brief."}), "hooks"
@@ -1461,7 +1465,10 @@ def test_materialization_runs_no_git_hooks(repo: Path) -> None:
     assert (repo / "README.md").read_text() == "fixture\n"
     # The fixture's own status must not fire the hook either.
     no_hooks = f"core.hooksPath={os.devnull}"
-    assert _git(repo, "-c", no_hooks, "status", "--porcelain") == status
+    status_now = _git(
+        repo, "-c", no_hooks, "-c", "core.fsmonitor=false", "status", "--porcelain"
+    )
+    assert status_now == status
     assert _head(repo) == base
 
 
@@ -1519,7 +1526,16 @@ def test_reflection_media_respects_root_models_and_serializers() -> None:
         photo: ImageUrl
         details: dict[str, AnyType]
 
-    details = {"kind": ["a", "b"], "nested": {"kind": {"x": 1}}}
+    details = {
+        "kind": ["a", "b"],
+        "nested": {"kind": {"x": 1}},
+        # Media-shaped application data is data, not an attachment.
+        "resource": {
+            "kind": "image-url",
+            "url": "https://example.com/metadata.png",
+            "caption": "required answer",
+        },
+    }
     assert _serialize_for_reflection(WithDetails(photo=photo, details=details)) == {
         "photo": photo,
         "details": details,

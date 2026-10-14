@@ -20,7 +20,7 @@ from uuid import uuid4
 
 import logfire
 
-from pydantic import BaseModel, TypeAdapter, ValidationError
+from pydantic import BaseModel, TypeAdapter
 from pydantic_ai import capture_run_messages, usage as _usage
 from pydantic_ai.agent import AgentRunResult
 from pydantic_ai.messages import (
@@ -176,27 +176,53 @@ def _contains_media(obj: Any, depth: int = 0) -> bool:
     return False
 
 
-_MEDIA_KINDS = frozenset(
-    {"image-url", "audio-url", "video-url", "document-url", "binary"}
-)
 _MEDIA_ADAPTER: TypeAdapter[Any] = TypeAdapter(
     ImageUrl | AudioUrl | VideoUrl | DocumentUrl | BinaryContent
 )
 
 
-def _restore_media(value: Any) -> Any:
-    """Rebuild media objects from their JSON dumps, leaving all else as is."""
-    if isinstance(value, dict):
-        kind = value.get("kind")
-        if isinstance(kind, str) and kind in _MEDIA_KINDS:
-            try:
-                return _MEDIA_ADAPTER.validate_json(json.dumps(value))
-            except (ValidationError, TypeError, ValueError):
-                pass
-        return {key: _restore_media(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_restore_media(item) for item in value]
-    return value
+def _media_in(obj: Any, found: list[Any], depth: int = 0) -> None:
+    """Collect the media objects an object actually holds."""
+    if depth > 20:
+        return
+    if isinstance(obj, _MEDIA_TYPES):
+        found.append(obj)
+    elif isinstance(obj, BaseModel):
+        for name in type(obj).model_fields:
+            _media_in(getattr(obj, name), found, depth + 1)
+    elif dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        for item in dataclasses.fields(obj):
+            _media_in(getattr(obj, item.name), found, depth + 1)
+    elif isinstance(obj, Mapping):
+        for value in obj.values():
+            _media_in(value, found, depth + 1)
+    elif isinstance(obj, (list, tuple, set, frozenset)):
+        for value in obj:
+            _media_in(value, found, depth + 1)
+
+
+def _restore_media(obj: BaseModel, dumped: Any) -> Any:
+    """Swap the JSON dumps of ``obj``'s own media objects back to the objects.
+
+    Only a value equal to the dump of a media object the model really holds
+    is restored, so media-shaped application data is left alone, and anything
+    a serializer changed or removed stays changed or removed.
+    """
+    media: list[Any] = []
+    _media_in(obj, media)
+    dumps = [(_MEDIA_ADAPTER.dump_python(item, mode="json"), item) for item in media]
+
+    def restore(value: Any) -> Any:
+        if isinstance(value, dict):
+            for media_dump, item in dumps:
+                if value == media_dump:
+                    return item
+            return {key: restore(entry) for key, entry in value.items()}
+        if isinstance(value, list):
+            return [restore(entry) for entry in value]
+        return value
+
+    return restore(dumped)
 
 
 def _serialize_for_reflection(obj: Any) -> Any:
@@ -213,7 +239,7 @@ def _serialize_for_reflection(obj: Any) -> Any:
         # The dump applies every exclusion and serializer (and may be a list
         # or scalar). Media it still contains is rebuilt from its JSON form so
         # it stays attachable instead of base64 text.
-        return _restore_media(dumped) if _contains_media(obj) else dumped
+        return _restore_media(obj, dumped) if _contains_media(obj) else dumped
     if hasattr(obj, "__dataclass_fields__"):
         if _contains_media(obj):
             return {
