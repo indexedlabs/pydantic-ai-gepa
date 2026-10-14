@@ -801,13 +801,13 @@ async def test_function_tool_options_are_components() -> None:
     tool_def = _approve_tool()
     await manager.prepare_tools(None, [tool_def], candidate=None)  # type: ignore[arg-type]
     seeds = manager.get_seed_components()
-    assert seeds["tool:approve:param:approved@0"] == "yes when complete"
-    assert seeds["tool:approve:param:approved@1"] == "no when anything is missing"
+    assert seeds["tool:approve:option:approved@0"] == "yes when complete"
+    assert seeds["tool:approve:option:approved@1"] == "no when anything is missing"
 
     prepared = await manager.prepare_tools(
         None,  # type: ignore[arg-type]
         [tool_def],
-        candidate={"tool:approve:param:approved@1": "no when a field is missing"},
+        candidate={"tool:approve:option:approved@1": "no when a field is missing"},
     )
     options = prepared[0].parameters_json_schema["properties"]["approved"]["anyOf"]
     assert [o["description"] for o in options] == [
@@ -826,7 +826,7 @@ def test_reflection_schema_skips_option_slots() -> None:
     texts = {
         "tool:approve:description": "Approve or reject.",
         "tool:approve:param:approved": "Is it approved?",
-        "tool:approve:param:approved@0": "yes when complete",
+        "tool:approve:option:approved@0": "yes when complete",
     }
     candidate = CandidateProgram(
         idx=0,
@@ -846,7 +846,10 @@ def test_reflection_schema_keeps_a_real_parameter_named_like_an_option() -> None
     )
 
     generator = InstructionProposalGenerator.__new__(InstructionProposalGenerator)
-    texts = {"tool:lookup:param:answer@0": "a real parameter"}
+    texts = {
+        "tool:lookup:param:answer": "a real parameter",
+        "tool:lookup:param:answer@0": "another real parameter",
+    }
     candidate = CandidateProgram(
         idx=0,
         components={k: ComponentValue(name=k, text=v) for k, v in texts.items()},
@@ -855,4 +858,4 @@ def test_reflection_schema_keeps_a_real_parameter_named_like_an_option() -> None
     )
     defs = generator._build_tool_definitions_from_candidate(candidate)
     properties = defs["lookup"]["function"]["parameters"]["properties"]
-    assert list(properties) == ["answer@0"]
+    assert list(properties) == ["answer", "answer@0"]

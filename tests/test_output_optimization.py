@@ -142,8 +142,8 @@ def test_described_options_are_output_components():
         seed["output:final_result:param:title"].text
         == "Does the title follow the rules?"
     )
-    assert seed["output:final_result:param:title@0"].text == "title follows the rules"
-    assert seed["output:final_result:param:title@1"].text == "title breaks a rule"
+    assert seed["output:final_result:option:title@0"].text == "title follows the rules"
+    assert seed["output:final_result:option:title@1"].text == "title breaks a rule"
 
 
 @pytest.mark.asyncio
@@ -153,8 +153,8 @@ async def test_candidate_rewrites_described_options():
     tool_defs = list(
         getattr(getattr(agent, "_output_toolset", None), "_tool_defs", []) or []
     )
-    yes_key = "output:final_result:param:title@0"
-    no_key = "output:final_result:param:title@1"
+    yes_key = "output:final_result:option:title@0"
+    no_key = "output:final_result:option:title@1"
 
     prepared = await optimizer.prepare_output_tools(
         None,  # type: ignore[arg-type]
@@ -209,7 +209,7 @@ async def test_options_are_addressed_by_position():
     )
     get_or_create_output_tool_optimizer(agent)
     seed = extract_seed_candidate(agent, optimize_output_type=True)
-    keys = [f"output:final_result:param:answer@{i}" for i in range(4)]
+    keys = [f"output:final_result:option:answer@{i}" for i in range(4)]
     assert [seed[k].text for k in keys] == [
         "criterion A",
         "criterion B",
@@ -243,14 +243,14 @@ def test_nested_and_array_options_are_components():
     paths = dict(_iter_schema_descriptions(schema))
     keys = {_output_parameter_key("final_result", p): p for p in paths}
     assert set(keys) == {
-        "output:final_result:param:item.ok@0",
-        "output:final_result:param:item.ok@1",
-        "output:final_result:param:items[].ok@0",
-        "output:final_result:param:items[].ok@1",
+        "output:final_result:option:item.ok@0",
+        "output:final_result:option:item.ok@1",
+        "output:final_result:option:items[].ok@0",
+        "output:final_result:option:items[].ok@1",
     }
     updated = copy.deepcopy(schema)
     assert _set_schema_description(
-        updated, keys["output:final_result:param:items[].ok@1"], "array no"
+        updated, keys["output:final_result:option:items[].ok@1"], "array no"
     )
     array_options = updated["properties"]["items"]["items"]["properties"]["ok"]
     assert [o["description"] for o in array_options["anyOf"]] == [
@@ -280,14 +280,14 @@ async def test_property_keys_are_unchanged_by_options():
     )
     get_or_create_output_tool_optimizer(agent)
     seed = extract_seed_candidate(agent, optimize_output_type=True)
-    assert seed["output:final_result:param:title@0"].text == "yes criterion"
+    assert seed["output:final_result:option:title@0"].text == "yes criterion"
     assert seed["output:final_result:param:a=b"].text == "an unrelated field"
     assert seed["output:final_result:param:=decision"].text == "original"
 
     schema = await _prepare(
         agent,
         {
-            "output:final_result:param:title@0": "new yes criterion",
+            "output:final_result:option:title@0": "new yes criterion",
             "output:final_result:param:=decision": "rewritten",
         },
     )
@@ -298,28 +298,34 @@ async def test_property_keys_are_unchanged_by_options():
     assert props["=decision"]["description"] == "rewritten"
 
 
-def test_property_named_like_an_option_key_keeps_its_key():
-    catalog = OutputToolComponentCatalog()
-    catalog.ingest(
-        [
-            ToolDefinition(
-                name="final_result",
-                parameters_json_schema={
-                    "type": "object",
-                    "properties": {
-                        "title": {
-                            "anyOf": [{"const": True, "description": "yes"}],
-                            "description": "Title ok?",
-                        },
-                        "title@0": {"type": "string", "description": "a real property"},
-                    },
-                },
-            )
-        ]
+@pytest.mark.parametrize("option_first", [True, False])
+def test_property_named_like_an_option_never_shares_its_key(option_first):
+    title = {
+        "anyOf": [{"const": True, "description": "yes criterion"}],
+        "description": "Title ok?",
+    }
+    real = {"type": "string", "description": "a real property"}
+    properties = (
+        {"title": title, "title@0": real}
+        if option_first
+        else {"title@0": real, "title": title}
     )
+    tool_def = ToolDefinition(
+        name="final_result",
+        parameters_json_schema={"type": "object", "properties": properties},
+    )
+    catalog = OutputToolComponentCatalog()
+    catalog.ingest([tool_def])
+    seeds = catalog.seed_snapshot()
+    assert seeds["output:final_result:param:title@0"] == "a real property"
+    assert seeds["output:final_result:option:title@0"] == "yes criterion"
+
     metadata = catalog.metadata_for("final_result")
     assert metadata is not None
-    assert metadata.parameter_paths["output:final_result:param:title@0"] == ("title@0",)
+    schema = copy.deepcopy(tool_def.parameters_json_schema)
+    for key, path in metadata.parameter_paths.items():
+        _set_schema_description(schema, path, seeds[key])
+    assert schema == tool_def.parameters_json_schema
 
 
 def test_properties_formatting_alike_keep_the_later_path():
@@ -364,12 +370,12 @@ def test_options_in_any_of_and_one_of_get_distinct_positions():
         for p, d in _iter_schema_descriptions(schema)
     }
     assert {k: d for k, (_, d) in keys.items()} == {
-        "output:final_result:param:x@0": "any yes",
-        "output:final_result:param:x@1": "one yes",
+        "output:final_result:option:x@0": "any yes",
+        "output:final_result:option:x@1": "one yes",
     }
     updated = copy.deepcopy(schema)
     assert _set_schema_description(
-        updated, keys["output:final_result:param:x@1"][0], "NEW"
+        updated, keys["output:final_result:option:x@1"][0], "NEW"
     )
     assert updated["properties"]["x"]["anyOf"][0]["description"] == "any yes"
     assert updated["properties"]["x"]["oneOf"][0]["description"] == "NEW"
@@ -379,7 +385,7 @@ def test_option_slots_round_trip_through_the_store(tmp_path):
     from pydantic_ai_gepa.cli.store import ComponentStore
 
     store = ComponentStore(tmp_path)
-    slot = "output:final_result:param:status@1"
+    slot = "output:final_result:option:status@1"
     store.stage(slot, "not applicable")
     store.confirm_staged(slot)
     assert slot in store.list_confirmed_slots()

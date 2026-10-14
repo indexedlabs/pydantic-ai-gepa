@@ -72,12 +72,19 @@ def _format_path(path: tuple[str, ...]) -> str:
     return ".".join(formatted)
 
 
+def _path_key(kind: str, tool_name: str, path: tuple[str, ...]) -> str:
+    # Described options get their own namespace (``option:title@0``), so an
+    # option key can never collide with a property's ``param:`` key.
+    namespace = "option" if path and isinstance(path[-1], _OptionStep) else "param"
+    return f"{kind}:{tool_name}:{namespace}:{_format_path(path)}"
+
+
 def _parameter_key(tool_name: str, path: tuple[str, ...]) -> str:
-    return f"tool:{tool_name}:param:{_format_path(path)}"
+    return _path_key("tool", tool_name, path)
 
 
 def _output_parameter_key(tool_name: str, path: tuple[str, ...]) -> str:
-    return f"output:{tool_name}:param:{_format_path(path)}"
+    return _path_key("output", tool_name, path)
 
 
 class _OptionStep(str):
@@ -134,27 +141,6 @@ def _iter_schema_descriptions(
         items = schema.get("items")
         if isinstance(items, dict):
             yield from _iter_schema_descriptions(items, path + ("[]",))
-
-
-def _add_parameter_path(
-    parameter_paths: dict[str, tuple[str, ...]], key: str, path: tuple[str, ...]
-) -> None:
-    existing = parameter_paths.get(key)
-    if existing is not None and existing != path:
-        # A real property literally named like an option key (``title@0``):
-        # the property keeps the key and the option is not optimized.
-        if isinstance(path[-1], _OptionStep):
-            logger.warning(
-                "Component key %r names a property; skipping the option", key
-            )
-            return
-        if not isinstance(existing[-1], _OptionStep):
-            # Two properties formatting alike (``a.b`` and ``a`` -> ``b``):
-            # unchanged from before options, the later path wins.
-            parameter_paths[key] = path
-            return
-        logger.warning("Component key %r names a property; skipping the option", key)
-    parameter_paths[key] = path
 
 
 def _set_schema_description(
@@ -229,7 +215,7 @@ class ToolComponentCatalog:
 
         for path, desc in _iter_schema_descriptions(tool_def.parameters_json_schema):
             key = _parameter_key(tool_def.name, path)
-            _add_parameter_path(parameter_paths, key, path)
+            parameter_paths[key] = path
             self._seed_components.setdefault(key, desc)
 
         if not description_key and not parameter_paths:
@@ -268,7 +254,7 @@ class OutputToolComponentCatalog(ToolComponentCatalog):
 
         for path, desc in _iter_schema_descriptions(tool_def.parameters_json_schema):
             key = _output_parameter_key(tool_def.name, path)
-            _add_parameter_path(parameter_paths, key, path)
+            parameter_paths[key] = path
             self._seed_components.setdefault(key, desc)
 
         if not description_key and not parameter_paths:

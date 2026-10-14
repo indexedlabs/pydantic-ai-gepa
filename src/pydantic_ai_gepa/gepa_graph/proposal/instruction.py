@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import re
-
 from ...exceptions import UsageBudgetExceeded
 
 import json
@@ -290,29 +288,6 @@ class ComponentUpdate(BaseModel):
     optimized_value: str = Field(
         description="Fully rewritten text for the component.",
     )
-
-
-_OPTION_SUFFIX = re.compile(r"^(?P<base>.+)@(?P<index>\d+)$")
-
-
-def _is_option_slot(path: str, tool_name: str, components: Mapping[str, Any]) -> bool:
-    """Tell an option slot (``approved@0``) from a property named like one.
-
-    Options come with their field's slot or a sibling option; a lone
-    ``answer@0`` is taken to be a real property.
-    """
-    match = _OPTION_SUFFIX.match(path)
-    if match is None:
-        return False
-    prefix = f"tool:{tool_name}:param:{match['base']}"
-    siblings = [
-        name
-        for name in components
-        if name.startswith(prefix + "@")
-        and name[len(prefix) + 1 :].isdigit()
-        and name != f"{prefix}@{match['index']}"
-    ]
-    return prefix in components or bool(siblings)
 
 
 class InstructionProposalOutput(BaseModel):
@@ -1113,10 +1088,6 @@ class InstructionProposalGenerator:
                 function_block["description"] = text
             elif key.startswith("param:"):
                 path = key[len("param:") :]
-                if _is_option_slot(path, tool_name, candidate.components):
-                    # A described option of a parameter (``approved@0``), not a
-                    # parameter; the rebuilt schema has no const to attach it to.
-                    continue
                 parameters = function_block.setdefault(
                     "parameters",
                     {"type": "object", "properties": {}},
