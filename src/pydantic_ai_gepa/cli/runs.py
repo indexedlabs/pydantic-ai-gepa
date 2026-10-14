@@ -1,11 +1,12 @@
 """Per-run on-disk state: minibatch persistence + Pareto append-only log.
 
 Each `gepa eval` invocation reads/writes through `MinibatchStore` and
-`ParetoLog`. The Pareto row schema records the tuple required by
-dec-pydantic-ai-gepa-the-pareto-ledger-is-the-sole-budget-authority — `(candidate_id, commit_sha, component_overrides_id,
-minibatch_id, per_case_scores, mean_score, status, summary, timestamp)` — so
-historical runs can be reconstructed by checking out the commit and replaying
-the component overrides file.
+`ParetoLog`. The Pareto row records `(candidate_id, commit_sha,
+component_overrides_id, minibatch_id, per_case_scores, mean_score, status,
+summary, timestamp)`. `commit_sha` is there because a candidate is identified
+by its commit, under dec-pydantic-ai-gepa-git-native-candidates-are-identified-by-commit, so historical runs
+can be reconstructed by checking out that commit and replaying the component
+overrides file.
 """
 
 from __future__ import annotations
