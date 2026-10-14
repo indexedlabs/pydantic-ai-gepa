@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 from pydantic_ai import Agent
-from pydantic_ai.messages import ModelResponse, TextPart
+from pydantic_ai.messages import BinaryContent, ImageUrl, ModelResponse, TextPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_evals import Case
@@ -41,6 +41,8 @@ from pydantic_ai_gepa.string_symbols import (
 from pydantic_ai_gepa.inspection import InspectingModel, InspectionAborted
 from pydantic_ai_gepa.spend import current_rollout_capability
 from pydantic_ai_gepa.types import ExampleBankConfig, MetricResult, ReflectionConfig
+
+MEDIA = (BinaryContent, ImageUrl)
 
 PROMPTS = '''"""Prompts for the fixture agent."""
 
@@ -1339,3 +1341,68 @@ async def test_coding_agent_proposal_inspection_reaches_the_caller(
             _task(repo, evaluator), config, BudgetTracker(40)
         )
     assert caught.value.snapshot is not None
+
+
+@pytest.mark.asyncio
+async def test_trace_free_reflection_attaches_media_inputs(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    attachments: list[Any] = []
+
+    async def reflector(messages: Any, info: Any) -> ModelResponse:
+        for message in messages:
+            for part in message.parts:
+                content = getattr(part, "content", None)
+                if isinstance(content, list):
+                    attachments.extend(
+                        item for item in content if isinstance(item, MEDIA)
+                    )
+        return ModelResponse(
+            parts=[
+                TextPart(
+                    content=json.dumps(
+                        {
+                            "reasoning": {
+                                "pattern_discovery": "p",
+                                "creative_hypothesis": "h",
+                                "experimental_approach": "e",
+                            },
+                            "updated_components": [
+                                {
+                                    "component_name": INSTRUCTIONS,
+                                    "optimized_value": "Say improved.",
+                                }
+                            ],
+                        }
+                    )
+                )
+            ]
+        )
+
+    image = BinaryContent(data=b"\x89PNG\r\n\x1a\n", media_type="image/png")
+    url = ImageUrl(url="https://example.com/photo.png")
+    task = StringSymbolTask(
+        repo=repo,
+        base_commit="HEAD",
+        symbols=SYMBOLS,
+        evaluator=_FakeEvaluator(repo),
+        trainset=[
+            Case(name="train-0", inputs=image),
+            Case(name="train-1", inputs={"photos": [url], "caption": "a cat"}),
+        ],
+        valset=[Case(name="val-0", inputs="held")],
+    )
+    config = EngineConfig(
+        engine="gepa",
+        max_metric_calls=20,
+        max_iterations=1,
+        engine_config={
+            "reflection_minibatch_size": 2,
+            "reflection_config": ReflectionConfig(model=FunctionModel(reflector)),
+        },
+    )
+
+    await get_engine("gepa", config).run(task, config, BudgetTracker(20))
+
+    assert image in attachments and url in attachments

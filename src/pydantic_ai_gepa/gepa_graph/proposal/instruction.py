@@ -233,6 +233,19 @@ def _skills_tools_enabled(
     )
 
 
+_MEDIA_TYPES = (ImageUrl, AudioUrl, VideoUrl, DocumentUrl, BinaryContent)
+
+
+def _contains_media(value: Any) -> bool:
+    if isinstance(value, _MEDIA_TYPES):
+        return True
+    if isinstance(value, dict):
+        return any(_contains_media(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_media(item) for item in value)
+    return False
+
+
 def _safe_json(value: Any, indent: int | None = None) -> str:
     """JSON for prompt evidence, falling back to repr for non-JSON keys."""
     try:
@@ -1258,7 +1271,7 @@ class InstructionProposalGenerator:
             lines.append(f"=== start {label.lower()} {idx} ===")
             lines.append("")
 
-            summary_lines: list[str] = []
+            summary_lines: list[Any] = []
             summary_fields = (
                 "case",
                 "inputs",
@@ -1275,6 +1288,14 @@ class InstructionProposalGenerator:
                 value = record.get(field)
                 if value not in (None, ""):
                     formatted_label = field.replace("_", " ").title()
+                    if _contains_media(value):
+                        # Keep images/audio/documents as attachments, not reprs.
+                        summary_lines.append(f"- **{formatted_label}:**")
+                        if isinstance(value, _MEDIA_TYPES):
+                            summary_lines.append(value)
+                        else:
+                            summary_lines.extend(self._format_side_info(value))
+                        continue
                     rendered = (
                         _safe_json(value)
                         if isinstance(value, (dict, list))
