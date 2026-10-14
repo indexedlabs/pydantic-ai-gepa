@@ -99,15 +99,26 @@ class _CommitScorer:
         self.commit_message = commit_message
         self.seed = candidate_from_commit(repo, base_commit, symbols)
         self._commits: dict[tuple[tuple[str, str], ...], str] = {}
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._commit_lock = asyncio.Lock()
-        # One limit across every caller: the GEPA graph scores each case
-        # through a separate adapter call.
         self._evaluator_slots = asyncio.Semaphore(max(1, concurrency))
+
+    def _bind_loop(self) -> None:
+        # asyncio primitives bind to the loop that first contends them; make
+        # fresh ones per loop so a task can serve consecutive asyncio.run calls.
+        loop = asyncio.get_running_loop()
+        if self._loop is not loop:
+            self._loop = loop
+            self._commit_lock = asyncio.Lock()
+            # One limit across every caller: the GEPA graph scores each case
+            # through a separate adapter call.
+            self._evaluator_slots = asyncio.Semaphore(max(1, self.concurrency))
 
     async def commit_for(self, candidate: CandidateMap) -> str:
         key = tuple(
             sorted((name, value.text.strip()) for name, value in candidate.items())
         )
+        self._bind_loop()
         async with self._commit_lock:
             sha = self._commits.get(key)
             if sha is None:
@@ -129,6 +140,7 @@ class _CommitScorer:
         *,
         meter: SpendMeter | None = None,
     ) -> list[CommitScore]:
+        self._bind_loop()
         active = current_rollout_capability()
         meter = meter or (active.meter if active is not None else None)
 
@@ -389,7 +401,10 @@ class StringSymbolAdapter:
         for trajectory, output, score in zip(
             eval_batch.trajectories or (), eval_batch.outputs, eval_batch.scores
         ):
-            if not isinstance(trajectory, StringSymbolTrajectory):
+            if not isinstance(trajectory, StringSymbolTrajectory) or not getattr(
+                output, "selectable", True
+            ):
+                # An evaluator crash is not evidence about the candidate.
                 continue
             record = trajectory.to_reflective_record()
             record["score"] = score

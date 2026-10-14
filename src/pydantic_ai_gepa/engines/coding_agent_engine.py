@@ -261,10 +261,12 @@ class CodingAgentEngine:
             iterations += 1
             selection_score = _mean_score(selection_records)
 
+            # An infrastructure-invalid case is not a failure to fix.
             failures = [
                 record
                 for record in selection_records
                 if record.score < failure_threshold
+                and getattr(record.payload.get("output"), "selectable", True)
             ]
             if not failures:
                 history.append(

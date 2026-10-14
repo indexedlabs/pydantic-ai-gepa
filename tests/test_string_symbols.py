@@ -1102,3 +1102,56 @@ async def test_failed_training_cases_are_not_acceptance_evidence(
         assert result.best_score == 1.0
     if engine == "coding_agent" and seed_fails and proposal_fails:
         assert any(event.kind == "infrastructure_invalid" for event in result.history)
+
+
+def test_task_can_serve_consecutive_event_loops(repo: Path) -> None:
+    task = _task(repo, _FakeEvaluator(repo), concurrency=1)
+
+    async def evaluate() -> float:
+        # Two cases with one slot contend the evaluator semaphore.
+        return (await task.evaluate(await task.seed_candidate())).score
+
+    assert asyncio.run(evaluate()) == 0.25
+    assert asyncio.run(evaluate()) == 0.25
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine", ["gepa", "coding_agent"])
+async def test_an_evaluator_crash_alone_does_not_trigger_reflection(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, engine: str
+) -> None:
+    proposals: list[Any] = []
+
+    async def propose_texts(self: Any, **kwargs: Any) -> ProposalResult:
+        proposals.append(kwargs)
+        return ProposalResult(texts={}, component_metadata={}, reasoning=None)
+
+    monkeypatch.setattr(InstructionProposalGenerator, "propose_texts", propose_texts)
+
+    async def evaluator(commit: str, case: Case[Any, Any, Any]) -> MetricResult:
+        if case.name == "train-1":
+            raise RuntimeError("judge unavailable")
+        return MetricResult(score=1.0)
+
+    async def propose(context: ReflectionContext) -> CandidateMap:
+        proposals.append(context)
+        return context.candidate
+
+    config = (
+        _gepa_config()
+        if engine == "gepa"
+        else EngineConfig(
+            engine="coding_agent",
+            max_metric_calls=20,
+            max_iterations=1,
+            engine_config={"propose": propose, "minibatch_size": 2},
+        )
+    )
+
+    result = await get_engine(engine, config).run(
+        _task(repo, evaluator), config, BudgetTracker(config.max_metric_calls)
+    )
+
+    assert proposals == []
+    if engine == "coding_agent":
+        assert any(event.kind == "clean_minibatch" for event in result.history)

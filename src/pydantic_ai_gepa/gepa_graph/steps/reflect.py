@@ -121,7 +121,10 @@ async def _reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteratio
         state.last_accepted = False
         return "continue"
 
-    if _should_skip_perfect(parent_results.scores, state):
+    # Infrastructure-invalid cases are not failures to reflect on.
+    if _should_skip_perfect(
+        [score for _, score, output in parent_results if output.selectable], state
+    ):
         logfire.info(
             "ReflectStep skipping reflection due to perfect minibatch",
             parent_idx=parent_idx,
