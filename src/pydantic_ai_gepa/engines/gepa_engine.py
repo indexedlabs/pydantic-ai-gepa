@@ -81,6 +81,9 @@ class GepaEngine:
             )
             if self._engine_config.get(name)
         ]
+        if reflection_config is not None and reflection_config.example_bank:
+            # Example banks feed the student agent; a task adapter ignores them.
+            ignored.append("reflection_config.example_bank")
         if task_adapter is not None and ignored:
             raise ValueError(
                 f"engine_config {ignored} apply to agent tasks only; this task "

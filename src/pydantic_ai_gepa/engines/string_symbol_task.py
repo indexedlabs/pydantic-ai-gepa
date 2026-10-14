@@ -26,6 +26,7 @@ from ..adapter import SharedReflectiveDataset
 from ..adapters.agent_adapter import _serialize_for_reflection
 from ..evaluation import EvaluationRecord, _rollout_scope
 from ..exceptions import UsageBudgetExceeded
+from ..inspection import InspectionAborted
 from ..evaluation_models import EvaluationBatch
 from ..gepa_graph.datasets import DatasetInput
 from ..gepa_graph.models import CandidateMap
@@ -135,7 +136,7 @@ class _CommitScorer:
                             result = await self.evaluator(commit, case)
                         except Exception as error:
                             if isinstance(
-                                error, UsageBudgetExceeded
+                                error, (UsageBudgetExceeded, InspectionAborted)
                             ) or is_provider_stop_error(error):
                                 raise
                             # An infrastructure failure, not a measured 0.0:
@@ -255,7 +256,7 @@ class StringSymbolTask(OptimizationTask):
         evaluator exception scores that case 0.0 with a failed output and
         ``side_info`` marking it non-selectable, so the evaluation cannot be
         selected, as the CLI treats a failed rollout. Budget and provider
-        stops propagate.
+        stops and ``InspectionAborted`` propagate.
         """
         return await self._scorer.score_commit(commit, cases, meter=meter)
 

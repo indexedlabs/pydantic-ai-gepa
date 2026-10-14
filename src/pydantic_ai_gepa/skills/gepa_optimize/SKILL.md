@@ -797,7 +797,8 @@ best_sha = await task.commit_for(result.best_candidate)
   `pydantic_ai_gepa.spend.current_rollout_capability()` to its model calls so
   `max_token_cost` and pipeline caps meter them. An exception scores that
   case 0.0 and marks the evaluation non-selectable, as the CLI does for a
-  failed rollout; the `gepa` engine never promotes such a candidate.
+  failed rollout; the `gepa` engine never promotes such a candidate, so retry
+  transient errors inside the evaluator.
 - Proposals must keep to the declared `py:<path>:<NAME>` keys; an undeclared
   key raises `StringSymbolError`.
 - Candidate commits are unreferenced and `git gc` eventually prunes them.

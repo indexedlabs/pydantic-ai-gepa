@@ -38,8 +38,9 @@ from pydantic_ai_gepa.string_symbols import (
     string_symbol_component,
     verify_string_symbol_commit,
 )
+from pydantic_ai_gepa.inspection import InspectingModel, InspectionAborted
 from pydantic_ai_gepa.spend import current_rollout_capability
-from pydantic_ai_gepa.types import MetricResult, ReflectionConfig
+from pydantic_ai_gepa.types import ExampleBankConfig, MetricResult, ReflectionConfig
 
 PROMPTS = '''"""Prompts for the fixture agent."""
 
@@ -691,14 +692,53 @@ async def test_task_scores_an_evaluator_failure_as_a_failed_case(repo: Path) -> 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "engine_config",
+    [
+        {"optimize_tools": True},
+        {"reflection_config": ReflectionConfig(example_bank=ExampleBankConfig())},
+    ],
+)
 async def test_gepa_engine_rejects_agent_only_options_for_the_task(
-    repo: Path,
+    repo: Path, engine_config: dict[str, Any]
 ) -> None:
     task = _task(repo, _FakeEvaluator(repo))
-    config = EngineConfig(engine="gepa", engine_config={"optimize_tools": True})
+    config = EngineConfig(engine="gepa", engine_config=engine_config)
 
     with pytest.raises(ValueError, match="agent tasks only"):
         await get_engine("gepa", config).run(task, config, BudgetTracker(10))
+
+
+@pytest.mark.asyncio
+async def test_inspection_interception_reaches_the_caller(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proposals: list[Any] = []
+
+    async def propose(self: Any, **kwargs: Any) -> ProposalResult:
+        proposals.append(kwargs)
+        return ProposalResult(texts={}, component_metadata={}, reasoning=None)
+
+    monkeypatch.setattr(InstructionProposalGenerator, "propose_texts", propose)
+
+    async def map_messages(*args: Any) -> list[Any]:
+        return [{"role": "user", "content": "captured"}]
+
+    student = Agent(InspectingModel(TestModel(), map_messages=map_messages))
+
+    async def evaluator(commit: str, case: Case[Any, Any, Any]) -> MetricResult:
+        await student.run(str(case.inputs))
+        return MetricResult(score=1.0)
+
+    task = _task(repo, evaluator)
+    with pytest.raises(InspectionAborted) as caught:
+        await task.evaluate(await task.seed_candidate())
+    assert caught.value.snapshot is not None
+
+    config = _gepa_config()
+    with pytest.raises(InspectionAborted):
+        await get_engine("gepa", config).run(task, config, BudgetTracker(20))
+    assert proposals == []
 
 
 @pytest.mark.asyncio
