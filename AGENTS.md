@@ -29,3 +29,9 @@
 - Commit messages follow a concise imperative style (e.g., "Fix cache key", "Include optimization results as an example"); keep to ~50 characters in the summary where possible.
 - Pull requests should describe the agent scenario being improved, list key commands used for validation, and link related issues or experiment IDs under `optimization_results/`.
 - Include screenshots or textual diffs for major GEPA runs, especially when changing prompt templates or optimization budgets.
+
+## Review and merge
+- Open pull requests with the `mighty-review` label (`gh pr create --label mighty-review`). It starts the two hosted reviews, `mighty review / claude` and `mighty review / codex`, on every pushed head.
+- A pull request merges only when CI is green and both hosted review checks pass, or each of their findings is fixed or answered with a reason in a PR comment. Read the review bodies (`gh api repos/indexedlabs/pydantic-ai-gepa/pulls/<n>/reviews`) after every push before calling a PR ready.
+- A hosted check that ended without a verdict (for example "Review did not finish") is re-run by removing and re-adding the `mighty-review` label, never waived.
+- Squash-merge at the head you checked: `gh pr merge <n> --squash --match-head-commit <sha>`.
