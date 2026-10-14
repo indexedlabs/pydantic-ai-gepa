@@ -336,7 +336,9 @@ def _bound_names(node: ast.AST) -> set[str]:
             )
             continue
         if isinstance(current, ast.AnnAssign) and current.value is None:
-            # A bare annotation (``X: str``) declares a type, not a value.
+            # A bare annotation (``X: str``) binds no value, but its annotation
+            # expression is evaluated and may contain an assignment expression.
+            stack.append(current.annotation)
             continue
         if isinstance(current, ast.Name) and isinstance(
             current.ctx, (ast.Store, ast.Del)

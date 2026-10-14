@@ -269,6 +269,7 @@ def test_symbols_in_a_subdirectory_project_are_relative_to_it(repo: Path) -> Non
         ("X = 'a'\nmatch 1:\n    case 1 as X:\n        pass\n", "X", "more than once"),
         ("X = 'a'\nmatch {}:\n    case {**X}:\n        pass\n", "X", "more than once"),
         ("X = 'a'\ndel X\n", "X", "more than once"),
+        ("X = 'a'\nY: (X := 'fixed')\n", "X", "more than once"),
         ("X = (\n    'a'  # note\n    'b'\n)\n", "X", "comment"),
         ("X = 'a'\ndef f(arg=(X := 'fixed')):\n    pass\n", "X", "more than once"),
         ("X = 'a'\nY = [(X := i) for i in 'b']\n", "X", "more than once"),
@@ -363,13 +364,19 @@ class _FakeEvaluator:
         self.calls: list[tuple[str, str]] = []
         self.in_flight: dict[str, int] = {}
         self.max_overlap = 0
+        self.active: dict[str, int] = {}
+        self.max_active: dict[str, int] = {}
 
     async def __call__(self, commit: str, case: Case[Any, Any, Any]) -> MetricResult:
         self.calls.append((commit, case.name or ""))
+        split = (case.name or "").split("-")[0]
         self.in_flight[commit] = self.in_flight.get(commit, 0) + 1
         self.max_overlap = max(self.max_overlap, self.in_flight[commit])
+        self.active[split] = self.active.get(split, 0) + 1
+        self.max_active[split] = max(self.max_active.get(split, 0), self.active[split])
         await asyncio.sleep(0.01)
         self.in_flight[commit] -= 1
+        self.active[split] -= 1
         text = candidate_from_commit(self.repo, commit, SYMBOLS)[INSTRUCTIONS].text
         improved = "improved" in text
         return MetricResult(
@@ -379,7 +386,7 @@ class _FakeEvaluator:
         )
 
 
-def _task(repo: Path, evaluator: _FakeEvaluator) -> StringSymbolTask:
+def _task(repo: Path, evaluator: Any, *, concurrency: int = 20) -> StringSymbolTask:
     return StringSymbolTask(
         repo=repo,
         base_commit="HEAD",
@@ -388,7 +395,92 @@ def _task(repo: Path, evaluator: _FakeEvaluator) -> StringSymbolTask:
         trainset=[Case(name=f"train-{i}", inputs=f"question {i}") for i in range(2)],
         valset=[Case(name=f"val-{i}", inputs=f"held {i}") for i in range(2)],
         test_set=[Case(name="test-0", inputs="report")],
+        concurrency=concurrency,
     )
+
+
+def _improving_proposal(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def propose(self: Any, **kwargs: Any) -> ProposalResult:
+        return ProposalResult(
+            texts={INSTRUCTIONS: "Be terse. Say improved."},
+            component_metadata={},
+            reasoning=None,
+        )
+
+    monkeypatch.setattr("pydantic_ai.models.ALLOW_MODEL_REQUESTS", False)
+    monkeypatch.setattr(InstructionProposalGenerator, "propose_texts", propose)
+
+
+def _gepa_config(budget: int = 20) -> EngineConfig:
+    return EngineConfig(
+        engine="gepa",
+        max_metric_calls=budget,
+        max_iterations=1,
+        engine_config={
+            "reflection_minibatch_size": 2,
+            "reflection_config": ReflectionConfig(model=TestModel()),
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_gepa_engine_never_promotes_a_candidate_whose_validation_failed(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _improving_proposal(monkeypatch)
+    scores = _FakeEvaluator(repo)
+
+    async def evaluator(commit: str, case: Case[Any, Any, Any]) -> MetricResult:
+        result = await scores(commit, case)
+        if result.score == 1.0 and case.name == "val-1":
+            raise RuntimeError("judge unavailable")
+        return result
+
+    task = _task(repo, evaluator)
+    config = _gepa_config()
+
+    result = await get_engine("gepa", config).run(task, config, BudgetTracker(20))
+
+    # The proposal scored 1.0 on val-0 (0.5 average with the failure) but its
+    # validation is infrastructure-invalid, so the 0.25 seed stays best.
+    assert any(name == "val-1" for _, name in scores.calls[4:])
+    assert result.best_score == 0.25
+    assert _texts(result.best_candidate) == _texts(await task.seed_candidate())
+
+
+@pytest.mark.asyncio
+async def test_evaluator_concurrency_is_bounded_across_engine_calls(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _improving_proposal(monkeypatch)
+    evaluator = _FakeEvaluator(repo)
+    task = _task(repo, evaluator, concurrency=1)
+    config = _gepa_config()
+
+    await get_engine("gepa", config).run(task, config, BudgetTracker(20))
+
+    assert evaluator.max_active == {"train": 1, "val": 1}
+
+    async def propose(context: ReflectionContext) -> CandidateMap:
+        return {
+            **context.candidate,
+            INSTRUCTIONS: ComponentValue(name=INSTRUCTIONS, text="improved"),
+        }
+
+    coding = _FakeEvaluator(repo)
+    config = EngineConfig(
+        engine="coding_agent",
+        max_metric_calls=12,
+        max_iterations=1,
+        engine_config={"propose": propose, "minibatch_size": 2, "concurrency": 1},
+    )
+    await get_engine("coding_agent", config).run(
+        _task(repo, coding), config, BudgetTracker(12)
+    )
+
+    # The engine's own limit governs its minibatches; validation uses the task's.
+    assert coding.max_active["train"] == 1
+    assert coding.max_active["val"] == 2
 
 
 @pytest.mark.asyncio

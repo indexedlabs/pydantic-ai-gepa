@@ -97,6 +97,9 @@ class _CommitScorer:
         self.seed = candidate_from_commit(repo, base_commit, symbols)
         self._commits: dict[tuple[tuple[str, str], ...], str] = {}
         self._commit_lock = asyncio.Lock()
+        # One limit across every caller: the GEPA graph scores each case
+        # through a separate adapter call.
+        self._evaluator_slots = asyncio.Semaphore(max(1, concurrency))
 
     async def commit_for(self, candidate: CandidateMap) -> str:
         key = tuple(sorted((name, value.text) for name, value in candidate.items()))
@@ -123,10 +126,9 @@ class _CommitScorer:
     ) -> list[CommitScore]:
         active = current_rollout_capability()
         meter = meter or (active.meter if active is not None else None)
-        semaphore = asyncio.Semaphore(max(1, self.concurrency))
 
         async def score(case: Case[Any, Any, Any]) -> CommitScore:
-            async with semaphore:
+            async with self._evaluator_slots:
                 with rollout_spend(meter) if meter is not None else nullcontext():
                     async with _rollout_scope():
                         try:
@@ -138,13 +140,15 @@ class _CommitScorer:
                                 raise
                             # An infrastructure failure, not a measured 0.0:
                             # the evaluation becomes non-selectable.
+                            output = RolloutOutput.from_error(error, kind="system")
+                            output.selectable = False
                             return CommitScore(
                                 MetricResult(
                                     score=0.0,
                                     feedback=f"Commit evaluator failed: {error}",
                                     side_info=dict(_FAILED_CASE_SIDE_INFO),
                                 ),
-                                RolloutOutput.from_error(error, kind="system"),
+                                output,
                             )
             if not (
                 isinstance(result, MetricResult)
@@ -156,7 +160,14 @@ class _CommitScorer:
                     "A CommitEvaluator must return a MetricResult with a finite "
                     "numeric score."
                 )
-            return CommitScore(result, RolloutOutput.from_success(commit))
+            output = RolloutOutput.from_success(commit)
+            info = result.side_info or {}
+            # An evaluator-declared infrastructure failure is ineligible too.
+            output.selectable = not (
+                info.get("selectable") is False
+                or info.get("infrastructure_valid") is False
+            )
+            return CommitScore(result, output)
 
         return list(
             await gather_cancelling_on_provider_stop(*(score(case) for case in cases))
@@ -236,7 +247,8 @@ class StringSymbolTask(OptimizationTask):
     ) -> list[CommitScore]:
         """Score ``commit`` on each case, one evaluator call per case.
 
-        Calls run concurrently (up to ``concurrency``), each as one metered
+        Calls run concurrently, at most ``concurrency`` at a time across all
+        callers (including the GEPA graph's per-case calls), each as one metered
         rollout: ``current_rollout_capability()`` inside the evaluator returns
         ``meter`` or, when it is None, the enclosing evaluation's meter. An
         evaluator exception scores that case 0.0 with a failed output and

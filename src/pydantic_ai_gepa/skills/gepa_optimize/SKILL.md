@@ -783,13 +783,13 @@ best_sha = await task.commit_for(result.best_candidate)
 - `candidate_from_commit(commit_from_candidate(...))` returns the candidate.
   `ComponentValue` strips text, so a base value's surrounding whitespace is
   kept around the new text.
-- The evaluator is called once per case, concurrently (up to `concurrency`)
-  and often on the same SHA, so it must be reentrant: materialize each SHA once
+- The evaluator is called once per case, concurrently (at most `concurrency`
+  at a time across all engine calls) and often on the same SHA, so it must be reentrant: materialize each SHA once
   behind an `asyncio.Lock` (or per call), never at one fixed path. Attach
   `pydantic_ai_gepa.spend.current_rollout_capability()` to its model calls so
   `max_token_cost` and pipeline caps meter them. An exception scores that
   case 0.0 and marks the evaluation non-selectable, as the CLI does for a
-  failed rollout.
+  failed rollout; the `gepa` engine never promotes such a candidate.
 - Proposals must keep to the declared `py:<path>:<NAME>` keys; an undeclared
   key raises `StringSymbolError`.
 - Candidate commits are unreferenced and `git gc` eventually prunes them.

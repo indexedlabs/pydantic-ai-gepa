@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import random
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
@@ -10,6 +11,7 @@ from typing import Any, TypeAlias, cast
 
 from pydantic_evals import Case
 
+from .._concurrency import gather_cancelling_on_provider_stop
 from ..acceptance import compare_candidate_samples
 from ..evaluation import EvaluationRecord, evaluate_candidate_dataset
 from ..gepa_graph.models import CandidateMap
@@ -506,7 +508,9 @@ class CodingAgentEngine:
         engine_budget.spend(len(minibatch))
         task_adapter = getattr(task, "create_adapter", None)
         if task_adapter is not None:
-            return await _adapter_records(task_adapter(), candidate, minibatch)
+            return await _adapter_records(
+                task_adapter(), candidate, minibatch, concurrency
+            )
         return await evaluate_candidate_dataset(
             agent=task.agent,
             metric=task.metric,
@@ -732,18 +736,33 @@ def _validation_event_data(entry: _CandidatePoolEntry, *, stage: str) -> dict[st
 
 
 async def _adapter_records(
-    adapter: Any, candidate: CandidateMap, cases: Sequence[Case[Any, Any, Any]]
+    adapter: Any,
+    candidate: CandidateMap,
+    cases: Sequence[Case[Any, Any, Any]],
+    concurrency: int,
 ) -> list[EvaluationRecord]:
-    """Evaluate a minibatch through a task-supplied adapter as dataset records."""
+    """Evaluate a minibatch through a task-supplied adapter as dataset records.
+
+    Cases go one per adapter call, at most ``concurrency`` at a time, as the
+    agent path and the GEPA graph's evaluator do.
+    """
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+
+    async def one(case: Case[Any, Any, Any]) -> Any:
+        async with semaphore:
+            return await adapter.evaluate([case], candidate, True)
+
     try:
-        batch = await adapter.evaluate(cases, candidate, True)
+        batches = await gather_cancelling_on_provider_stop(
+            *(one(case) for case in cases)
+        )
     finally:
         adapter.close()
-    trajectories = list(batch.trajectories or [None] * len(cases))
     records: list[EvaluationRecord] = []
-    for index, (case, output, score, trajectory) in enumerate(
-        zip(cases, batch.outputs, batch.scores, trajectories, strict=True)
-    ):
+    for index, (case, batch) in enumerate(zip(cases, batches)):
+        (output,) = batch.outputs
+        (score,) = batch.scores
+        trajectory = batch.trajectories[0] if batch.trajectories else None
         feedback = getattr(trajectory, "metric_feedback", None)
         side_info = getattr(trajectory, "metric_side_info", None)
         payload: dict[str, Any] = {"output": output, "score": score}

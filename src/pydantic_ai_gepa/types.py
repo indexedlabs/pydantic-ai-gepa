@@ -146,6 +146,9 @@ class RolloutOutput(Generic[OutputT]):
     usage: _usage.RunUsage | None = None
     trace_id: str | None = None
     trace_completeness: Literal["root-only", "full"] | None = None
+    selectable: bool = True
+    """False marks an infrastructure-invalid rollout: the GEPA graph never
+    promotes a candidate whose validation includes one."""
 
     @classmethod
     def from_success(
