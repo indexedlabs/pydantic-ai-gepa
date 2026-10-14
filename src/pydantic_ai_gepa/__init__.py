@@ -46,9 +46,16 @@ from .engines import (
     EngineResult,
     OptimizationEngine,
     OptimizationTask,
+    StringSymbolTask,
     get_engine,
     list_engines,
     register_engine,
+)
+from .string_symbols import (
+    StringSymbolError,
+    candidate_from_commit,
+    commit_from_candidate,
+    verify_string_symbol_commit,
 )
 from .input_type import (
     BoundInputSpec,
@@ -146,6 +153,11 @@ __all__ = [
     "is_provider_stop_error",
     "is_provider_stop_message",
     "OptimizationTask",
+    "StringSymbolTask",
+    "StringSymbolError",
+    "candidate_from_commit",
+    "commit_from_candidate",
+    "verify_string_symbol_commit",
     "EngineConfig",
     "EngineResult",
     "EngineEvent",

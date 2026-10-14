@@ -28,6 +28,9 @@ from ..skills.models import SkillCapability
 from ..spend import _pipeline_meter, rollout_spend, use_rollout_kind
 from ..types import MetricResult, RolloutOutput
 
+SELECTION_SIDE_INFO_KEYS = ("scores", "selectable", "infrastructure_valid")
+"""Metric side-info keys selection may read from a withheld validation case."""
+
 Metric = Callable[
     [Case[Any, Any, Any], RolloutOutput[Any]],
     MetricResult | Awaitable[MetricResult],
@@ -178,6 +181,48 @@ class OptimizationTask:
         # and means an exhausted budget cannot trigger an invisible evaluator call.
         if budget is not None:
             budget.spend(len(cases))
+        with (
+            rollout_spend(meter) if meter is not None else nullcontext(),
+            use_rollout_kind("validation"),
+        ):
+            records, selection_records = await self._evaluate_cases(
+                candidate, cases, capture_traces=capture_traces
+            )
+        score = (
+            sum(record.score for record in records) / len(records) if records else 0.0
+        )
+        objectives, per_case_objectives, selectable = _objective_scores(
+            selection_records
+        )
+        result = CandidateEvaluation(
+            score=score,
+            records=records,
+            side_info=_aggregate_side_info(records),
+            num_cases=len(records),
+            objective_scores=objectives,
+            per_case_objective_scores=per_case_objectives,
+            selectable=selectable,
+            per_case_scores={record.case_id: record.score for record in records},
+        )
+        if cache_key is not None:
+            async with self._evaluation_cache_lock:
+                self._evaluation_cache.setdefault(cache_key, result)
+        return result
+
+    async def _evaluate_cases(
+        self,
+        candidate: CandidateMap,
+        cases: Sequence[Case[Any, Any, Any]],
+        *,
+        capture_traces: bool,
+    ) -> tuple[list[EvaluationRecord], list[EvaluationRecord]]:
+        """Run ``candidate`` on ``cases`` and return its records and selection records.
+
+        Records carry what reflection may see. Under a withheld validation
+        evaluation they hold no feedback, so selection records separately keep
+        the metric's ``scores``/``selectable`` metadata for objective selection.
+        Subclasses that score candidates without an agent override this seam.
+        """
         selection_records: dict[str, EvaluationRecord] = {}
         case_ids = {id(case): case.name or f"case-{i}" for i, case in enumerate(cases)}
 
@@ -198,7 +243,7 @@ class OptimizationTask:
                 payload={
                     "side_info": {
                         key: info[key]
-                        for key in ("scores", "selectable", "infrastructure_valid")
+                        for key in SELECTION_SIDE_INFO_KEYS
                         if key in info
                     }
                 },
@@ -206,44 +251,23 @@ class OptimizationTask:
             return result
 
         withheld = validation_active()
-        with (
-            rollout_spend(meter) if meter is not None else nullcontext(),
-            use_rollout_kind("validation"),
-        ):
-            records = await evaluate_candidate_dataset(
-                agent=self.agent,
-                metric=selection_metric if withheld else self.metric,
-                dataset=cases,
-                candidate=candidate,
-                concurrency=self.concurrency,
-                input_type=self.input_type,
-                case_factory=self.case_factory,
-                skills_fs=self.skills_fs,
-                skills_capabilities=self.skills_capabilities,
-                capture_traces=capture_traces,
-            )
-        score = (
-            sum(record.score for record in records) / len(records) if records else 0.0
+        records = await evaluate_candidate_dataset(
+            agent=self.agent,
+            metric=selection_metric if withheld else self.metric,
+            dataset=cases,
+            candidate=candidate,
+            concurrency=self.concurrency,
+            input_type=self.input_type,
+            case_factory=self.case_factory,
+            skills_fs=self.skills_fs,
+            skills_capabilities=self.skills_capabilities,
+            capture_traces=capture_traces,
         )
-        objectives, per_case_objectives, selectable = _objective_scores(
-            [selection_records.get(record.case_id, record) for record in records]
-            if withheld
-            else records
-        )
-        result = CandidateEvaluation(
-            score=score,
-            records=records,
-            side_info=_aggregate_side_info(records),
-            num_cases=len(records),
-            objective_scores=objectives,
-            per_case_objective_scores=per_case_objectives,
-            selectable=selectable,
-            per_case_scores={record.case_id: record.score for record in records},
-        )
-        if cache_key is not None:
-            async with self._evaluation_cache_lock:
-                self._evaluation_cache.setdefault(cache_key, result)
-        return result
+        if not withheld:
+            return records, records
+        return records, [
+            selection_records.get(record.case_id, record) for record in records
+        ]
 
     async def validation_case_count(self) -> int:
         """Return the validation evaluation size without exposing its cases."""

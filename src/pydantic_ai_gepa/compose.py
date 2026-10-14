@@ -296,6 +296,14 @@ class _TrustedEngineTaskView(_EngineTaskView):
     def case_factory(self) -> Any:
         return self.__task.case_factory
 
+    @property
+    def create_adapter(self) -> Any:
+        """Forward a task-supplied graph adapter factory, if the task has one.
+
+        Only trusted engines see it: the adapter returns per-case feedback.
+        """
+        return getattr(self.__task, "create_adapter", None)
+
     async def val_loader(self) -> Any:
         return await self.__task.val_loader()
 

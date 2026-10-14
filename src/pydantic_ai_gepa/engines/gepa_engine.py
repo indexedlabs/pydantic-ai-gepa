@@ -68,18 +68,25 @@ class GepaEngine:
             "gepa_usage_limits", _usage.UsageLimits
         )
 
-        adapter = create_adapter(
-            agent=task.agent,
-            metric=task.metric,
-            input_type=task.input_type,
-            skills_fs=task.skills_fs,
-            skills_capabilities=task.skills_capabilities,
-            case_factory=task.case_factory,
-            cache_manager=None,
-            optimize_tools=self._option("optimize_tools", False),
-            optimize_output_type=self._option("optimize_output_type", False),
-            agent_usage_limits=agent_usage_limits,
-            gepa_usage_limits=gepa_usage_limits,
+        # A task that scores candidates without an agent (StringSymbolTask)
+        # supplies its own graph adapter.
+        task_adapter = getattr(task, "create_adapter", None)
+        adapter = (
+            task_adapter()
+            if task_adapter is not None
+            else create_adapter(
+                agent=task.agent,
+                metric=task.metric,
+                input_type=task.input_type,
+                skills_fs=task.skills_fs,
+                skills_capabilities=task.skills_capabilities,
+                case_factory=task.case_factory,
+                cache_manager=None,
+                optimize_tools=self._option("optimize_tools", False),
+                optimize_output_type=self._option("optimize_output_type", False),
+                agent_usage_limits=agent_usage_limits,
+                gepa_usage_limits=gepa_usage_limits,
+            )
         )
         gepa_config = self._build_config(
             config=config,

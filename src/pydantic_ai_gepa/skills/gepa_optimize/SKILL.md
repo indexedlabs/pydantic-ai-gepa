@@ -745,6 +745,43 @@ Tag each span with a stage attribute such as `stage=classify`, `research`,
 `resolve`, or `extract`. The reflector's structured trace tools load this
 same file and can then filter failures by stage.
 
+### Text engines on a commit's string constants (Python API)
+
+When a Git candidate's editable surface is top-level string constants (the
+`[acceptance.python_string_symbols]` shape), the in-process `gepa` and
+`coding_agent` engines and `optimize_omni` can optimize it directly:
+
+```python
+from pydantic_ai_gepa import EngineConfig, MetricResult, StringSymbolTask, get_engine
+from pydantic_ai_gepa.engines import BudgetTracker
+
+async def evaluate(commit: str, cases) -> list[MetricResult]:
+    ...  # check out `commit` in your own worktree, return one MetricResult per case
+
+task = StringSymbolTask(
+    repo=".", base_commit="HEAD", symbols={"prompts.py": ["INSTRUCTIONS"]},
+    evaluator=evaluate, trainset=train, valset=validation,
+)
+config = EngineConfig(engine="gepa", max_metric_calls=60)
+result = await get_engine("gepa", config).run(task, config, BudgetTracker(60))
+best_sha = await task.commit_for(result.best_candidate)
+```
+
+- Components are keyed `py:<path>:<NAME>`; paths are relative to `repo`.
+  Version 1 accepts only `NAME = "..."` / `NAME: T = "..."` at module level
+  (implicit concatenation included), bound exactly once. Anything else
+  (f-strings, bytes, expressions, `X.__doc__`, nested blocks) is refused.
+- `commit_from_candidate` rewrites only those constants' source spans and
+  commits on top of the base with plumbing and a private index; your working
+  tree, index and branches are untouched, and commits are unsigned. Each
+  candidate maps to one memoized commit; the seed is the base commit itself.
+- Every commit passes `verify_string_symbol_commit`: it descends from the base,
+  changes only declared files, matches the trusted-scoring masked AST, and
+  keeps every byte outside the constants (comments included).
+- `candidate_from_commit(commit_from_candidate(...))` returns the candidate.
+  `ComponentValue` strips text, so a base value's surrounding whitespace is
+  kept around the new text.
+
 ## Standard loop
 
 Prefer the managed loop when you want a real max-iteration optimization run:

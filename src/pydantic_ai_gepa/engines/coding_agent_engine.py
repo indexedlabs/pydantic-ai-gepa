@@ -504,6 +504,9 @@ class CodingAgentEngine:
         # are rejected by preflight.
         budget.spend(len(minibatch))
         engine_budget.spend(len(minibatch))
+        task_adapter = getattr(task, "create_adapter", None)
+        if task_adapter is not None:
+            return await _adapter_records(task_adapter(), candidate, minibatch)
         return await evaluate_candidate_dataset(
             agent=task.agent,
             metric=task.metric,
@@ -726,6 +729,38 @@ def _validation_event_data(entry: _CandidatePoolEntry, *, stage: str) -> dict[st
         "validation_score": entry.evaluation.score,
         "selectable": entry.evaluation.selectable,
     }
+
+
+async def _adapter_records(
+    adapter: Any, candidate: CandidateMap, cases: Sequence[Case[Any, Any, Any]]
+) -> list[EvaluationRecord]:
+    """Evaluate a minibatch through a task-supplied adapter as dataset records."""
+    try:
+        batch = await adapter.evaluate(cases, candidate, True)
+    finally:
+        adapter.close()
+    trajectories = list(batch.trajectories or [None] * len(cases))
+    records: list[EvaluationRecord] = []
+    for index, (case, output, score, trajectory) in enumerate(
+        zip(cases, batch.outputs, batch.scores, trajectories, strict=True)
+    ):
+        feedback = getattr(trajectory, "metric_feedback", None)
+        side_info = getattr(trajectory, "metric_side_info", None)
+        payload: dict[str, Any] = {"output": output, "score": score}
+        payload["feedback"] = feedback
+        if side_info is not None:
+            payload["metric_side_info"] = side_info
+        if trajectory is not None:
+            payload["trajectory"] = trajectory
+        records.append(
+            EvaluationRecord(
+                case_id=case.name or f"case-{index}",
+                score=float(score),
+                feedback=feedback,
+                payload=payload,
+            )
+        )
+    return records
 
 
 def _format_failure_report(
