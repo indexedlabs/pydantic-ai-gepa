@@ -353,7 +353,9 @@ class CodingAgentEngine:
             proposals += 1
 
             proposal_samples: list[float] = []
+            proposal_batches: list[list[EvaluationRecord]] = []
             comparison_result = None
+            infrastructure_invalid = False
             initial_repetitions = min(acceptance_repetitions, len(baseline_samples))
             for _ in range(len(baseline_samples)):
                 try:
@@ -382,12 +384,18 @@ class CodingAgentEngine:
                 ):
                     stop_reason = "budget_overshoot"
                     break
+                proposal_batches.append(proposal_records)
                 proposal_samples.append(_mean_score(proposal_records))
                 if len(proposal_samples) < initial_repetitions:
                     continue
+                matched_baseline = baseline_batches[: len(proposal_batches)]
+                eligible = _eligible_case_ids([*matched_baseline, *proposal_batches])
+                if not eligible:
+                    infrastructure_invalid = True
+                    break
                 comparison_result = compare_candidate_samples(
-                    baseline_samples[: len(proposal_samples)],
-                    proposal_samples,
+                    [_mean_score(batch, eligible) for batch in matched_baseline],
+                    [_mean_score(batch, eligible) for batch in proposal_batches],
                     confidence=acceptance_confidence,
                     min_delta=acceptance_min_delta,
                     max_looks=acceptance_max_repetitions - acceptance_repetitions + 1,
@@ -395,6 +403,22 @@ class CodingAgentEngine:
                 if comparison_result.verdict != "inconclusive":
                     break
 
+            if infrastructure_invalid:
+                # No case was scored on every matched repetition: that is an
+                # infrastructure failure, not evidence against the proposal.
+                history.append(
+                    EngineEvent(
+                        kind="infrastructure_invalid",
+                        data={
+                            "iteration": iterations,
+                            "parent_index": parent.index,
+                            "minibatch_case_ids": [
+                                record.case_id for record in selection_records
+                            ],
+                        },
+                    )
+                )
+                continue
             if comparison_result is None:
                 if stop_reason in {"budget_overshoot", "budget_exhausted"}:
                     break
@@ -650,9 +674,27 @@ def _affordable_repetitions(
     return min(requested, max(0, paired_repetitions))
 
 
-def _mean_score(records: Sequence[EvaluationRecord]) -> float:
-    """Return the mean score for an evaluated minibatch."""
+def _mean_score(
+    records: Sequence[EvaluationRecord], case_ids: set[str] | None = None
+) -> float:
+    """Return the mean score for an evaluated minibatch, optionally a subset."""
+    if case_ids is not None:
+        records = [record for record in records if record.case_id in case_ids]
     return sum(record.score for record in records) / len(records) if records else 0.0
+
+
+def _eligible_case_ids(batches: Sequence[Sequence[EvaluationRecord]]) -> set[str]:
+    """Cases scored in every matched batch: a non-selectable rollout output
+    (an infrastructure failure) is never acceptance evidence."""
+    eligible: set[str] | None = None
+    for batch in batches:
+        ids = {
+            record.case_id
+            for record in batch
+            if getattr(record.payload.get("output"), "selectable", True)
+        }
+        eligible = ids if eligible is None else eligible & ids
+    return eligible or set()
 
 
 def _copy_candidate(candidate: CandidateMap) -> CandidateMap:

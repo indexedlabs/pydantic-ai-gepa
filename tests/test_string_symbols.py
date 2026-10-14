@@ -1037,3 +1037,68 @@ async def test_agent_task_reflection_without_traces_renders_its_records(
     assert "t-0: wrong answer" in prompt and "t-1: wrong answer" in prompt
     assert "agent question 0" in prompt
     assert len(prompt) < 20_000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine", ["gepa", "coding_agent"])
+@pytest.mark.parametrize(
+    ("seed_fails", "proposal_fails", "proposal_score", "validated"),
+    [
+        # The seed's failed case must not make an inferior proposal look better.
+        ("train-1", None, 0.5, False),
+        # A failed case must not hide a genuine improvement.
+        (None, "train-1", 1.0, True),
+        # No case scored on both sides: no evidence either way.
+        ("train-0", "train-1", 1.0, False),
+    ],
+)
+async def test_failed_training_cases_are_not_acceptance_evidence(
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    engine: str,
+    seed_fails: str | None,
+    proposal_fails: str | None,
+    proposal_score: float,
+    validated: bool,
+) -> None:
+    _improving_proposal(monkeypatch)
+    validation_calls: list[tuple[bool, str]] = []
+
+    async def evaluator(commit: str, case: Case[Any, Any, Any]) -> MetricResult:
+        text = candidate_from_commit(repo, commit, SYMBOLS)[INSTRUCTIONS].text
+        improved = "improved" in text
+        name = case.name or ""
+        if name.startswith("val-"):
+            validation_calls.append((improved, name))
+        if name == (proposal_fails if improved else seed_fails):
+            raise RuntimeError("judge unavailable")
+        return MetricResult(
+            score=proposal_score if improved else 0.75, feedback=f"{name}: improve"
+        )
+
+    async def propose(context: ReflectionContext) -> CandidateMap:
+        return {
+            **context.candidate,
+            INSTRUCTIONS: ComponentValue(name=INSTRUCTIONS, text="Say improved."),
+        }
+
+    config = (
+        _gepa_config()
+        if engine == "gepa"
+        else EngineConfig(
+            engine="coding_agent",
+            max_metric_calls=40,
+            max_iterations=1,
+            engine_config={"propose": propose, "minibatch_size": 2},
+        )
+    )
+
+    result = await get_engine(engine, config).run(
+        _task(repo, evaluator), config, BudgetTracker(config.max_metric_calls)
+    )
+
+    assert any(improved for improved, _ in validation_calls) is validated
+    if validated:
+        assert result.best_score == 1.0
+    if engine == "coding_agent" and seed_fails and proposal_fails:
+        assert any(event.kind == "infrastructure_invalid" for event in result.history)
