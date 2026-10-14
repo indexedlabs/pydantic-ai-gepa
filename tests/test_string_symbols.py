@@ -1704,3 +1704,22 @@ def test_reflection_media_follows_serialization_aliases() -> None:
     assert _serialize_for_reflection(Swapped(raw_photo=image, photo="x")) == {
         "photo": image
     }
+
+
+def test_reflection_media_matches_serialized_mapping_keys() -> None:
+    from enum import Enum
+
+    from pydantic_ai_gepa.adapters.agent_adapter import _serialize_for_reflection
+
+    class Slot(str, Enum):
+        PHOTO = "photo"
+
+    image = BinaryContent(data=b"\x89PNG", media_type="image/png")
+
+    class Photos(BaseModel):
+        by_slot: dict[Slot, BinaryContent]
+        by_index: dict[int, BinaryContent]
+
+    assert _serialize_for_reflection(
+        Photos(by_slot={Slot.PHOTO: image}, by_index={1: image})
+    ) == {"by_slot": {"photo": image}, "by_index": {"1": image}}

@@ -22,6 +22,7 @@ from uuid import uuid4
 import logfire
 
 from pydantic import BaseModel, RootModel, TypeAdapter
+from pydantic_core import to_jsonable_python
 from pydantic_ai import capture_run_messages, usage as _usage
 from pydantic_ai.agent import AgentRunResult
 from pydantic_ai.messages import (
@@ -228,8 +229,9 @@ def _restore_media(original: Any, dumped: Any, depth: int = 0) -> Any:
         }
         return _restore_mapping(values, dumped, depth)
     if isinstance(original, Mapping):
-        by_key = {str(key): value for key, value in original.items()}
-        if len(by_key) != len(original):
+        # Match keys as the JSON dump wrote them (an Enum key by its value).
+        by_key = {_json_key(key): value for key, value in original.items()}
+        if None in by_key or len(by_key) != len(original):
             return dumped
         return _restore_mapping(by_key, dumped, depth)
     if isinstance(original, (list, tuple)):
@@ -240,6 +242,18 @@ def _restore_media(original: Any, dumped: Any, depth: int = 0) -> Any:
             for item, entry in zip(original, dumped)
         ]
     return dumped
+
+
+def _json_key(key: Any) -> str | None:
+    try:
+        encoded = to_jsonable_python(key)
+    except Exception:
+        return None
+    if isinstance(encoded, str):
+        return encoded
+    if isinstance(encoded, (bool, int, float)):
+        return json.dumps(encoded)
+    return None
 
 
 def _restore_mapping(values: Mapping[str, Any], dumped: Any, depth: int) -> Any:
