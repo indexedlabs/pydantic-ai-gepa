@@ -71,6 +71,7 @@ def masked_string_symbols(source: str, symbols: list[str]) -> str:
     """
     tree = ast.parse(source)
     pending = set(symbols)
+    bare: dict[str, ast.AnnAssign] = {}
     for node in tree.body:
         names = []
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -85,22 +86,29 @@ def masked_string_symbols(source: str, symbols: list[str]) -> str:
             names = [
                 target.id for target in node.targets if isinstance(target, ast.Name)
             ]
-        elif (
-            isinstance(node, ast.AnnAssign)
-            and isinstance(node.target, ast.Name)
-            and node.value is not None
-        ):
-            # A bare ``X: str`` holds no value; mask the assignment that does.
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            if node.value is None:
+                # A bare ``X: str`` holds no value: prefer the assignment that
+                # does, and fall back to it only if none follows.
+                bare.setdefault(node.target.id, node)
+                continue
             names = [node.target.id]
         if not pending.intersection(names):
             continue
-        for child in ast.walk(node):
-            if isinstance(child, ast.Constant) and isinstance(child.value, str):
-                child.value = "<instruction>"
+        _mask_strings(node)
         pending.difference_update(names)
+    for name in pending.intersection(bare):
+        _mask_strings(bare[name])
+        pending.remove(name)
     if pending:
         raise ValueError
     return ast.dump(tree, include_attributes=False)
+
+
+def _mask_strings(node: ast.AST) -> None:
+    for child in ast.walk(node):
+        if isinstance(child, ast.Constant) and isinstance(child.value, str):
+            child.value = "<instruction>"
 
 
 def normalize_string_symbols(

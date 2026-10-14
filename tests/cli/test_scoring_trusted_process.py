@@ -378,6 +378,15 @@ def test_mask_matches_indexed_first_declaration_and_docstring_rules():
         _masked('def f():\n    pass\ndef f():\n    "later doc"', ["f.__doc__"])
 
 
+def test_mask_prefers_the_value_after_a_bare_annotation():
+    # The value-bearing assignment is the declared string, not the annotation.
+    baseline = 'X: str\nX = "first"\n'
+    assert _masked(baseline, ["X"]) == _masked('X: str\nX = "edited"\n', ["X"])
+    assert _masked(baseline, ["X"]) != _masked('X: int\nX = "first"\n', ["X"])
+    # An annotation-only symbol still exists, as before: its strings are masked.
+    assert _masked('X: Literal["a"]\n', ["X"]) == _masked('X: Literal["b"]\n', ["X"])
+
+
 @pytest.mark.parametrize("attack", ["import", "loaded_module"])
 def test_candidate_import_guard_refuses_result(git_repo, private, monkeypatch, attack):
     (git_repo / "forbidden.py").write_text('raise RuntimeError("candidate executed")')

@@ -408,8 +408,8 @@ The explicit text files (only `.md` and `.txt`) and Python symbol mappings must
 partition `component_files`. Python symbols name top-level functions, async
 functions, classes, assignments with Name targets, or annotated assignments.
 A named symbol masks every string constant in its AST node; `X.__doc__` masks
-only X's existing docstring. A bare annotation (`X: str`) holds no value and
-is skipped in favor of the assignment that does. Every declared symbol must exist. All remaining AST
+only X's existing docstring. A bare annotation (`X: str`) holds no value, so a
+later assignment to X is what is masked; an annotation-only X masks its annotation. Every declared symbol must exist. All remaining AST
 structure must equal the pinned scorer's copy. Candidate source is parsed only.
 
 This mode requires scalar git candidates, both trusted/pinned flags, nonempty

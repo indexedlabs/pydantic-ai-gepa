@@ -806,10 +806,30 @@ class InstructionProposalGenerator:
                     "## No execution traces exist for this run",
                     "",
                     f"{total_records} reflection records: {success_records} succeeded, {failed_records} failed.",
-                    "There are no span files and no trace tools for this run. The reflection records above — scores, evaluator feedback, and any per-component evidence — are the complete evidence. Do not search for traces.jsonl or attempt trace analysis; reason directly from the records.",
+                    "There are no span files and no trace tools for this run. The reflection records below — scores, evaluator feedback, and any per-component evidence — are the complete evidence. Do not search for traces.jsonl or attempt trace analysis; reason directly from the records.",
                     "",
                 ]
             )
+            # Without span files these records are the only evidence, so they
+            # are rendered in full rather than summarized as counts.
+            if isinstance(reflective_data, SharedReflectiveDataset):
+                lines.extend(
+                    self._format_trace_sections(
+                        reflective_data.records, label="Example"
+                    )
+                )
+            else:
+                for (
+                    component_name,
+                    component_records,
+                ) in reflective_data.records_by_component.items():
+                    lines.append(f"### Records for `{component_name}`")
+                    lines.append("")
+                    lines.extend(
+                        self._format_trace_sections(
+                            component_records, label=f"{component_name} example"
+                        )
+                    )
 
         lines.extend(
             [
@@ -1232,19 +1252,27 @@ class InstructionProposalGenerator:
 
             summary_lines: list[str] = []
             summary_fields = (
+                "case",
+                "inputs",
+                "expected_output",
+                "case_metadata",
                 "score",
                 "success",
                 "feedback",
                 "assistant_response",
                 "error",
+                "error_message",
             )
             for field in summary_fields:
                 value = record.get(field)
                 if value not in (None, ""):
                     formatted_label = field.replace("_", " ").title()
-                    summary_lines.append(
-                        f"- **{formatted_label}:** {self._format_scalar(value)}"
+                    rendered = (
+                        json.dumps(value, default=str)
+                        if isinstance(value, (dict, list))
+                        else self._format_scalar(value)
                     )
+                    summary_lines.append(f"- **{formatted_label}:** {rendered}")
 
             if summary_lines:
                 lines.extend(summary_lines)

@@ -776,7 +776,9 @@ async def _adapter_records(
         payload: dict[str, Any] = {"output": output, "score": score}
         payload["feedback"] = feedback
         if side_info is not None:
-            payload["metric_side_info"] = side_info
+            # Same key as the agent path, so ReflectionContext.side_info
+            # carries the per-case evidence.
+            payload["side_info"] = side_info
         if trajectory is not None:
             payload["trajectory"] = trajectory
         records.append(

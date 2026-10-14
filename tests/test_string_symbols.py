@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -10,6 +11,8 @@ from typing import Any
 
 import pytest
 from pydantic_ai import Agent
+from pydantic_ai.messages import ModelResponse, TextPart
+from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_evals import Case
 
@@ -802,7 +805,70 @@ async def test_optimize_omni_runs_text_and_coding_engines_on_a_git_candidate(
     )
 
     assert contexts and "say improved" in contexts[0].report
+    assert contexts[0].side_info["cases"][0]["side_info"] == {
+        "scores": {"quality": 0.25}
+    }
     assert "improved" in result.best.best_candidate[INSTRUCTIONS].text
     assert result.test_score == 1.0
     sha = await task.commit_for(result.best.best_candidate)
     verify_string_symbol_commit(repo, task.base_commit, sha, SYMBOLS)
+
+
+@pytest.mark.asyncio
+async def test_real_reflector_sees_training_evidence_but_not_held_out_cases(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    prompts: list[str] = []
+
+    async def reflector(messages: Any, info: Any) -> ModelResponse:
+        for message in messages:
+            for part in message.parts:
+                content = getattr(part, "content", None)
+                if isinstance(content, str):
+                    prompts.append(content)
+                elif isinstance(content, list):
+                    prompts.extend(item for item in content if isinstance(item, str))
+        return ModelResponse(
+            parts=[
+                TextPart(
+                    content=json.dumps(
+                        {
+                            "reasoning": {
+                                "pattern_discovery": "Cases ask for improved.",
+                                "creative_hypothesis": "Say improved.",
+                                "experimental_approach": "Add the word.",
+                            },
+                            "updated_components": [
+                                {
+                                    "component_name": INSTRUCTIONS,
+                                    "optimized_value": "Say improved.",
+                                }
+                            ],
+                        }
+                    )
+                )
+            ]
+        )
+
+    task = _task(repo, _FakeEvaluator(repo))
+    config = EngineConfig(
+        engine="gepa",
+        max_metric_calls=20,
+        max_iterations=1,
+        engine_config={
+            "reflection_minibatch_size": 2,
+            "reflection_config": ReflectionConfig(model=FunctionModel(reflector)),
+        },
+    )
+
+    result = await get_engine("gepa", config).run(task, config, BudgetTracker(20))
+
+    prompt = "\n".join(prompts)
+    assert result.best_score == 1.0
+    assert "question 0" in prompt and "question 1" in prompt
+    assert "train-0: say improved" in prompt
+    assert "quality" in prompt
+    assert "held 0" not in prompt and "val-0" not in prompt
+    assert "No execution traces exist for this run" in prompt
+    assert "run_python_repl" not in prompt

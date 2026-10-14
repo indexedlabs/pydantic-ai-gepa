@@ -272,7 +272,9 @@ async def _reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteratio
                 components=components_to_update,
                 model=reflection_model,
                 model_settings=deps.model_settings,
-                component_toolsets=component_toolsets if component_toolsets else None,
+                # Always the explicit list: an empty one tells the proposer
+                # there are no trace files, so it renders the records instead.
+                component_toolsets=component_toolsets,
                 capabilities=reflector_capabilities,
             )
         else:
@@ -285,9 +287,7 @@ async def _reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteratio
                     components=components_to_update,
                     model=reflection_model,
                     model_settings=deps.model_settings,
-                    component_toolsets=(
-                        component_toolsets if component_toolsets else None
-                    ),
+                    component_toolsets=component_toolsets,
                     capabilities=reflector_capabilities,
                 )
 
