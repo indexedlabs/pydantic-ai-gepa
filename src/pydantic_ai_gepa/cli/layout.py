@@ -20,7 +20,7 @@ Layout overview::
                 traces/<case_id>/...
                 pareto.jsonl           # append-only Pareto history
 
-See pydanticaigepa-spec-973 and pydanticaigepa-dec-xd6 for the contract this
+See pydantic-ai-gepa-managed-run and dec-pydantic-ai-gepa-git-native-candidates-are-identified-by-commit for the contract this
 file implements.
 """
 

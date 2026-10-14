@@ -1,18 +1,18 @@
 """`gepa eval` — score the current baseline (default) or an explicit candidate.
 
-External-reflection mode (per pydanticaigepa-spec-973) keeps the coding agent
+External-reflection mode (per pydantic-ai-gepa-managed-run) keeps the coding agent
 as the reflector. The library's job is to:
 
   * sample a fresh minibatch (or reuse one),
   * evaluate either the current confirmed component baseline, an explicit
     ``--candidate-file``, or the current git tree,
   * enforce stage-and-confirm when the baseline is what's being evaluated and
-    new component slots were discovered (per pydanticaigepa-dec-0ky),
+    new component slots were discovered (per dec-pydantic-ai-gepa-new-components-are-staged-until-confirmed),
   * append a ParetoRow + write a per-case failure report under
     ``.gepa/runs/<run_id>/reports/``,
   * enforce ``--max-iterations`` as a hard cap for single-path evals (per
-    pydanticaigepa-dec-xd6); lane evals treat it as advisory — lane-run
-    budget stops are enforced at select (pydanticaigepa-dec-msy).
+    dec-pydantic-ai-gepa-git-native-candidates-are-identified-by-commit); lane evals treat it as advisory — lane-run
+    budget stops are enforced at select (pydantic-ai-gepa-evaluation-acceptance-selection).
 
 The coding agent reads the report, edits component slots or source code, and
 re-runs ``gepa eval`` — there is no separate ``propose`` verb because the
@@ -360,7 +360,7 @@ def _trace_file_path(
     root: Path | None = None,
 ) -> Path:
     # eval_id guarantees uniqueness: identical candidate trees evaluated by
-    # concurrent lanes share an iteration ordinal and candidate_id (dec-msy).
+    # concurrent lanes share an iteration ordinal and candidate_id (pydantic-ai-gepa-evaluation-acceptance-selection).
     return (
         run_dir(run_id, root)
         / "traces"
@@ -449,14 +449,14 @@ def run_eval_once(
 ) -> EvalOutcome:
     """Evaluate one baseline/candidate and append the standard run artifacts.
 
-    ``lane`` marks the eval as belonging to a reflection lane (spec-1do): the
+    ``lane`` marks the eval as belonging to a reflection lane (pydantic-ai-gepa-parallel-lanes-and-events): the
     pareto row records it, and the ``max_iterations`` check becomes advisory —
     for lane runs the budget stop is enforced at select, not per-eval
-    (pydanticaigepa-dec-msy).
+    (pydantic-ai-gepa-evaluation-acceptance-selection).
 
     Lane evals also pass ``workspace_root`` (the primary Python project owning
     the ``.gepa`` workspace — config, dataset, ledger, and artifacts all
-    resolve there per pydanticaigepa-dec-780) and ``candidate_root`` (the
+    resolve there per dec-pydantic-ai-gepa-lanes-are-isolated-worktrees-driven-by-events) and ``candidate_root`` (the
     corresponding Python project inside the lane worktree — candidate
     identity, cwd, and module imports resolve there).
     """
@@ -632,7 +632,7 @@ def run_eval_once(
             raise typer.Exit(code=70)
         # Lane runs check-then-append without a lock, so a per-eval hard stop
         # here would race; the lockstep select step enforces the budget instead
-        # (pydanticaigepa-dec-msy). Warn and continue.
+        # (pydantic-ai-gepa-evaluation-acceptance-selection). Warn and continue.
         typer.echo(
             f"Eval budget reached ({prior_count}/{max_iterations}); "
             "continuing — lane-run budgets are enforced at `gepa run select`.",
@@ -1174,7 +1174,7 @@ def eval_(
     max_iterations: int = typer.Option(
         100,
         "--max-iterations",
-        help="Hard cap on eval rows in this run (per pydanticaigepa-dec-xd6). Exits 70 when exceeded; advisory only for lane evals (dec-msy).",
+        help="Hard cap on eval rows in this run (per dec-pydantic-ai-gepa-git-native-candidates-are-identified-by-commit). Exits 70 when exceeded; advisory only for lane evals (pydantic-ai-gepa-evaluation-acceptance-selection).",
     ),
     threshold: float = typer.Option(
         DEFAULT_FAILURE_THRESHOLD,

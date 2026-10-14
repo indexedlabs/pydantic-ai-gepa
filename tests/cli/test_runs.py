@@ -79,7 +79,7 @@ def test_minibatch_list_ids(tmp_path: Path) -> None:
     assert len(store.list_ids()) == 2
 
 
-# ---------- lane-aware ledger (task ae6 / dec-msy) ----------
+# ---------- lane-aware ledger (task ae6 / pydantic-ai-gepa-evaluation-acceptance-selection) ----------
 
 
 def _ledger_row(candidate_id: str = "cand", lane: str | None = None) -> ParetoRow:

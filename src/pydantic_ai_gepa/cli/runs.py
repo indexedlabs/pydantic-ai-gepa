@@ -2,7 +2,7 @@
 
 Each `gepa eval` invocation reads/writes through `MinibatchStore` and
 `ParetoLog`. The Pareto row schema records the tuple required by
-pydanticaigepa-dec-xd6 — `(candidate_id, commit_sha, component_overrides_id,
+dec-pydantic-ai-gepa-git-native-candidates-are-identified-by-commit — `(candidate_id, commit_sha, component_overrides_id,
 minibatch_id, per_case_scores, mean_score, status, summary, timestamp)` — so
 historical runs can be reconstructed by checking out the commit and replaying
 the component overrides file.
@@ -260,7 +260,7 @@ def new_eval_id() -> str:
 
     Report and trace artifacts are keyed by ``(eval_id, candidate_id)`` rather
     than the global iteration ordinal so concurrent lane evals of identical
-    candidate trees can never collide on filenames (pydanticaigepa-dec-msy).
+    candidate trees can never collide on filenames (pydantic-ai-gepa-evaluation-acceptance-selection).
     """
     return uuid.uuid4().hex[:8]
 
@@ -287,7 +287,7 @@ class ParetoLog:
         # One unbuffered O_APPEND write per row: concurrent writers never
         # interleave bytes within a row, and a killed writer can only ever
         # leave one trailing partial line (which readers tolerate below) —
-        # never poison the rows that follow (spec-1do: the append is the sole
+        # never poison the rows that follow (pydantic-ai-gepa-parallel-lanes-and-events: the append is the sole
         # budget authority; row count must equal completed evals).
         # Defensive newline: if a previous writer was killed mid-row (the
         # file does not end in a newline), terminate its partial line first
@@ -353,7 +353,7 @@ class ParetoLog:
 
         A torn partial row from a killed writer does not count — the eval did
         not complete, so it did not finalize its budget spend. This is the
-        single budget count source (pydanticaigepa-dec-msy).
+        single budget count source (pydantic-ai-gepa-evaluation-acceptance-selection).
         """
         count = 0
         for line in self._read_lines():

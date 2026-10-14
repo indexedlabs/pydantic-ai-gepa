@@ -384,7 +384,7 @@ def test_eval_gepa_toml_skills_reach_model_request(
     assert "load_skill_file" in tool_names
 
 
-# ---------- lane-aware ledger (task ae6 / dec-msy) ----------
+# ---------- lane-aware ledger (task ae6 / pydantic-ai-gepa-evaluation-acceptance-selection) ----------
 
 
 def _summary_of(result: Result) -> dict:
@@ -448,7 +448,7 @@ def test_eval_artifact_names_are_collision_free(
 def test_eval_trace_names_are_collision_free(
     repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Same as the report-path test, but for trace files (spec-1do verifies
+    """Same as the report-path test, but for trace files (pydantic-ai-gepa-parallel-lanes-and-events verifies
     no report/trace filename collisions)."""
     from pydantic_ai_gepa.cli import eval as eval_module
 
@@ -505,7 +505,7 @@ def test_eval_single_path_budget_cap_still_hard(repo: Path, tmp_path: Path) -> N
 
 def test_eval_lane_budget_cap_is_advisory(repo: Path, tmp_path: Path) -> None:
     """In a lane run the per-eval cap is advisory (warning only); enforcement
-    moves to select (task-vso / dec-msy)."""
+    moves to select (pydantic-ai-gepa-evaluation-acceptance-selection)."""
     from pydantic_ai_gepa.cli.eval import run_eval_once
 
     cand_path = _candidate_file(tmp_path, {"instructions": "Override text."})

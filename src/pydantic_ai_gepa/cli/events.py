@@ -1,17 +1,17 @@
 """Managed-run event bus: one JSON file per event, `gepa next` / `gepa ack`.
 
-Implements pydanticaigepa-spec-fmc. Producers create one file per event under
+Implements pydantic-ai-gepa-parallel-lanes-and-events. Producers create one file per event under
 ``runs/<run_id>/events/`` with exclusive create — the filename *is* the event
 id (``<zero-padded ms timestamp>-<producer id>-<per-producer seq>``), so
 uniqueness holds by construction with no shared read-modify-write
-(pydanticaigepa-dec-f1s). The consumer cursor lives in
+(dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable). The consumer cursor lives in
 ``runs/<run_id>/cursor.json`` and holds the highest acked event id; delivery
 order is lexicographic id order.
 
-Every ``gepa next`` first runs a reaper pass (pydanticaigepa-dec-pm3): given a
+Every ``gepa next`` first runs a reaper pass (dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable): given a
 lane-scan result it synthesizes ``lane_stalled`` / ``selection_due`` events
 idempotently keyed by (lane, lease epoch). Lane-state scanning lands with the
-lane lifecycle (pydanticaigepa-task-xcb); :func:`scan_lanes` is the stubbed
+lane lifecycle; :func:`scan_lanes` is the stubbed
 seam the real scanner will replace.
 
 CLI exit codes (also documented in each verb's help text): 0 event delivered
@@ -60,7 +60,7 @@ EVENT_TYPES: tuple[str, ...] = (
     "run_done",
 )
 
-# Payload key sets per the spec-fmc Interface block. Event payloads carry
+# Payload key sets per the pydantic-ai-gepa-parallel-lanes-and-events Interface block. Event payloads carry
 # paths and scalars only — trace or diff content never goes inline.
 EVENT_PAYLOAD_FIELDS: dict[str, frozenset[str]] = {
     "lane_ready": frozenset({"packet_path", "worktree_path"}),
@@ -84,7 +84,7 @@ CURSOR_FILENAME = "cursor.json"
 
 REAPER_PRODUCER_ID = "reaper"
 
-# `gepa next` / `gepa ack` exit codes — distinct per spec-fmc.
+# `gepa next` / `gepa ack` exit codes — distinct per pydantic-ai-gepa-parallel-lanes-and-events.
 EXIT_DELIVERED = 0
 EXIT_NONE_PENDING = 3
 EXIT_TIMEOUT = 4
@@ -224,7 +224,7 @@ def cursor_path(run_id: str, root: Path | None = None) -> Path:
 def _read_event(path: Path, *, root: Path | None = None) -> Event | None:
     """Read one event file; unparseable files quarantine as ``None``.
 
-    The filename *is* the event id (spec-fmc Interface block) — an embedded
+    The filename *is* the event id (pydantic-ai-gepa-parallel-lanes-and-events Interface block) — an embedded
     ``id`` field that disagrees with the filename is corruption, so the
     filename wins unconditionally. Producer tmpfiles (``.emit-*.tmp``) and
     any other non-conforming names are not events.
@@ -430,7 +430,7 @@ def emit(
         record = {"id": event_id, **body}
         # Write to a sibling tmp file first, then exclusive-link into place:
         # a producer killed mid-write leaves an ignored tmpfile, never a
-        # torn event file that would wedge every consumer (dec-f1s).
+        # torn event file that would wedge every consumer (dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable).
         fd, tmp_name = tempfile.mkstemp(dir=str(path), prefix=".emit-", suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -459,7 +459,7 @@ def next_event(run_id: str, root: Path | None = None) -> Event | None:
     base = events_dir(run_id, root)
     if not base.is_dir():
         return None
-    # Filenames are ids (spec-fmc), so acked events are skipped by name
+    # Filenames are ids (pydantic-ai-gepa-parallel-lanes-and-events), so acked events are skipped by name
     # without parsing — the poll path stays O(pending), not O(total).
     for name in sorted(p.name for p in harness_record.list_paths(base, root=root)):
         if cursor is not None and name <= cursor:
@@ -541,7 +541,7 @@ class LaneScan:
 def scan_lanes(run_id: str, root: Path | None = None) -> LaneScan:
     """Scan lane leases, heartbeat freshness, and recorded pids.
 
-    Delegates to the lane-lifecycle scanner (pydanticaigepa-task-xcb) when the
+    Delegates to the lane-lifecycle scanner when the
     run has lanes; single-path runs (and runs without lane state) scan as
     empty. Imported lazily to avoid a module cycle (lanes imports this module
     for ``emit``).
@@ -560,7 +560,7 @@ def _claim_reaper_key(events_path: Path, key: str, *, root: Path | None = None) 
     The dedupe key is a filesystem fact, not a read: exclusive-creating a
     sentinel file per key makes synthesis idempotent across CONCURRENT
     consumer verbs (gepa next / run status / select all reap), where a
-    scan-then-emit check would race (spec-fmc: no duplicate for the same
+    scan-then-emit check would race (pydantic-ai-gepa-parallel-lanes-and-events: no duplicate for the same
     (lane, lease epoch) "no matter how many passes run").
     """
     sentinels = events_path / ".reaped"

@@ -34,7 +34,7 @@
 - Component files are the explicit byte-passing boundary. Their relative paths
   are both the allowlist and component IDs passed to a pinned agent.
 - The local Mighty store does not contain `indexed-task-0n5`; this work is
-  tracked locally as `pydanticaigepa-task-5jw`.
+  tracked in this repository's own history instead.
 
 ## Review fixes
 

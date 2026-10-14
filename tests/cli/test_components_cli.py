@@ -156,7 +156,7 @@ def test_set_reads_from_stdin(repo: Path) -> None:
 
 
 def test_set_rejects_inline_content_flag(repo: Path) -> None:
-    """The content-file rule (dec-dmk) means there is no inline --content flag."""
+    """The content-file rule (dec-pydantic-ai-gepa-cli-inputs-with-content-come-from-a-file) means there is no inline --content flag."""
     result = _run(
         "components",
         "set",
