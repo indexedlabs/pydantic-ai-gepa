@@ -212,14 +212,14 @@ def _restore_media(original: Any, dumped: Any, depth: int = 0) -> Any:
         return _restore_media(original.root, dumped, depth + 1)
     if isinstance(original, BaseModel):
         values: dict[str, Any] = dict(original.model_extra or {})
-        fields = type(original).model_fields
-        for name, info in fields.items():
-            value = getattr(original, name)
-            values[name] = value
-            # The dump may key a field by its alias (serialize_by_alias).
-            for alias in (info.serialization_alias, info.alias):
-                if alias and alias not in fields:
-                    values.setdefault(alias, value)
+        # Key each field the way model_dump() emitted it: by its alias under
+        # serialize_by_alias, and not at all when excluded.
+        by_alias = bool(type(original).model_config.get("serialize_by_alias"))
+        for name, info in type(original).model_fields.items():
+            if info.exclude is True:
+                continue
+            key = (info.serialization_alias or info.alias or name) if by_alias else name
+            values[key] = getattr(original, name)
         return _restore_mapping(values, dumped, depth)
     if dataclasses.is_dataclass(original) and not isinstance(original, type):
         values = {
@@ -263,8 +263,8 @@ def _serialize_for_reflection(obj: Any) -> Any:
     if isinstance(obj, BaseModel):
         dumped = obj.model_dump(mode="json")
         # The dump applies every exclusion and serializer (and may be a list
-        # or scalar). Media it still contains is rebuilt from its JSON form so
-        # it stays attachable instead of base64 text.
+        # or scalar). Where it still holds an untouched media dump, the original
+        # media object is swapped back so it stays attachable, not base64 text.
         return _restore_media(obj, dumped) if _contains_media(obj) else dumped
     if hasattr(obj, "__dataclass_fields__"):
         if _contains_media(obj):

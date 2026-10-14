@@ -1693,3 +1693,14 @@ def test_reflection_media_follows_serialization_aliases() -> None:
     )
 
     assert serialized == {"photo": photo, "nested": {"picture": photo}}
+
+    image = BinaryContent(data=b"\x89PNG", media_type="image/png")
+
+    class Swapped(BaseModel):
+        model_config = ConfigDict(serialize_by_alias=True)
+        raw_photo: BinaryContent = Field(serialization_alias="photo")
+        photo: str = Field(exclude=True)
+
+    assert _serialize_for_reflection(Swapped(raw_photo=image, photo="x")) == {
+        "photo": image
+    }

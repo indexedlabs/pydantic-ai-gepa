@@ -62,6 +62,8 @@ async def evaluate_step(ctx: StepContext[GepaState, GepaDeps, None]) -> None:
     if any(not output.selectable for output in results.outputs):
         # An infrastructure-invalid validation is not a score: leave the
         # candidate unvalidated so it is never promoted or put on a front.
+        # It is discarded, not retried (the graph never re-validates and
+        # dedupes proposals), so evaluators must retry transient faults.
         logfire.info(
             "EvaluateStep withheld a non-selectable candidate",
             candidate_idx=candidate.idx,
