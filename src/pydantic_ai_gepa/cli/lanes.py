@@ -1,6 +1,6 @@
 """Reflection lanes: worktree-backed candidate slots for managed runs.
 
-Implements pydanticaigepa-spec-1do. A lane is a git worktree plus a per-lane
+Implements pydantic-ai-gepa-parallel-lanes-and-events. A lane is a git worktree plus a per-lane
 state slice under ``runs/<run_id>/lanes/<lane>/`` — the container for exactly
 one in-flight candidate, from branch-off through reflection, background
 evaluation, and verdict.
@@ -9,14 +9,14 @@ Key contracts:
 
 - Lane processes locate the workspace explicitly — absolute ``--gepa-dir`` /
   run id / lane id from packet fields or flags, ``GEPA_DIR`` env fallback; no
-  workspace path is derived from cwd (pydanticaigepa-dec-780).
+  workspace path is derived from cwd (dec-pydantic-ai-gepa-lanes-are-isolated-worktrees-driven-by-events).
 - ``gepa lane continue`` auto-commits all worktree changes onto
   ``gepa/lane/<lane>/<iteration>`` before evaluating, so lane candidates are
-  always clean commits (pydanticaigepa-dec-tlz).
+  always clean commits (dec-pydantic-ai-gepa-lanes-are-isolated-worktrees-driven-by-events).
 - Lane evals run the repeated-evaluation acceptance policy as a detached
   background process that records its pid and heartbeat in lane state and
   emits a ``verdict`` event on resolution; budget checks are advisory per-eval
-  and enforced at select (pydanticaigepa-dec-msy).
+  and enforced at select (dec-pydantic-ai-gepa-the-pareto-ledger-is-the-sole-budget-authority).
 - Per-lane state is written only by that lane's own eval process or lifecycle
   verbs — never by other lanes. Verdicts travel via the event stream and lane
   state only; background evals never write shared run state.
@@ -101,7 +101,7 @@ def lane_ids(count: int) -> list[str]:
 
 
 def lane_branch(run_id: str, lane: str, iteration: int) -> str:
-    """Run-scoped lane branch (dec-jh6): lane refs from different runs never
+    """Run-scoped lane branch (dec-pydantic-ai-gepa-lanes-are-isolated-worktrees-driven-by-events): lane refs from different runs never
     collide, and an abandoned run can never poison a future one."""
     return f"{LANE_BRANCH_PREFIX}/{run_id}/{lane}/{iteration}"
 
@@ -277,7 +277,7 @@ class LaneState:
 
 @contextmanager
 def _lane_lock(workspace_root: Path, run_id: str, lane: str) -> Any:
-    """Exclusive flock on the lane's state dir (dec-l95).
+    """Exclusive flock on the lane's state dir (dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable).
 
     Lease claims, the leased -> evaluating handoff, resets, and select's
     re-fan all hold this lock, so concurrent verbs serialize on the
@@ -796,7 +796,7 @@ def _auto_commit_worktree(
     """Commit all worktree changes onto the lane branch; return the HEAD sha.
 
     Lane candidates are always clean commits because continue auto-commits
-    (dec-tlz).
+    (dec-pydantic-ai-gepa-lanes-are-isolated-worktrees-driven-by-events).
     """
     current_branch = _git(worktree, "rev-parse", "--abbrev-ref", "HEAD")
     if current_branch != branch:
@@ -1890,7 +1890,7 @@ def lane_continue(
     progress + heartbeat into lane state and emits a `verdict` event on
     resolution.
 
-    Lease discipline (dec-l95): continue requires a lease — an unexpired one
+    Lease discipline (dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable): continue requires a lease — an unexpired one
     from `gepa lane lease`, or it auto-claims one for a paused/stalled lane.
     A lane already evaluating rejects a second continue; a leased lane rejects
     any continue that does not consume its lease. The claim and the handoff
@@ -2326,7 +2326,7 @@ def lane_reset(
 
 
 def scan_lane_states(workspace_root: Path, run_id: str, run_state: Any) -> LaneScan:
-    """Scan lane leases, heartbeat freshness, and recorded pids (dec-pm3).
+    """Scan lane leases, heartbeat freshness, and recorded pids (dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable).
 
     This is the real scanner behind the event bus's lazy reaper: a lane is
     stalled when its eval pid is dead, its heartbeat is stale, or its
@@ -2350,7 +2350,7 @@ def scan_lane_states(workspace_root: Path, run_id: str, run_state: Any) -> LaneS
                 )
             else:
                 heartbeat_stale = True
-            # spec-1do: eval death is stale heartbeat PLUS dead pid — a stale
+            # pydantic-ai-gepa-parallel-lanes-and-events: eval death is stale heartbeat PLUS dead pid — a stale
             # heartbeat with a live pid is a slow eval, not a dead one (the
             # documented response to lane_stalled is `lane reset`, which
             # SIGTERMs the pid; false positives would kill healthy evals).
@@ -2381,7 +2381,7 @@ def scan_lane_states(workspace_root: Path, run_id: str, run_state: Any) -> LaneS
     if resolved:
         # The straggler clock starts at fan-out/re-fan, not from
         # run_state.updated_at — unrelated verb saves refresh that field and
-        # would otherwise starve the timeout indefinitely (spec-er3).
+        # would otherwise starve the timeout indefinitely (dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable).
         started_raw = run_state.iteration_started_at or run_state.updated_at
         started = _parse_iso(started_raw)
         elapsed = (now - started).total_seconds()
@@ -2398,7 +2398,7 @@ def scan_lane_states(workspace_root: Path, run_id: str, run_state: Any) -> LaneS
 def reaper_pass_for_run(workspace_root: Path, run_state: Any) -> list[str]:
     """Run the lazy reaper with the real lane scanner for a lane run.
 
-    Stalled lanes are transitioned in state (dec-l95), not just reported on
+    Stalled lanes are transitioned in state (dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable), not just reported on
     the bus: the lane board shows `stalled`, and the status machine rows
     leased/evaluating → stalled become reachable outside select.
     """
@@ -2438,7 +2438,7 @@ def fan_out_lanes(run_state: Any, workspace_root: Path) -> None:
 
     Fan-out failure is rolled back — worktrees, branches, lane states, and
     lane_ready events created so far are removed — so a crash mid-fan-out
-    never leaves a zombie run (dec-jh6).
+    never leaves a zombie run (dec-pydantic-ai-gepa-lanes-are-isolated-worktrees-driven-by-events).
     """
     base_sha = run_state.reflection_baseline_commit_sha
     if not base_sha:

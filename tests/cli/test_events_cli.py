@@ -1,4 +1,4 @@
-"""Tests for the managed-run event bus (`gepa next` / `gepa ack`, spec-fmc)."""
+"""Tests for the managed-run event bus (`gepa next` / `gepa ack`, pydantic-ai-gepa-parallel-lanes-and-events)."""
 
 from __future__ import annotations
 
@@ -439,7 +439,7 @@ def test_partial_event_file_does_not_wedge_bus(tmp_path: Path) -> None:
 
 
 def test_embedded_id_mismatch_loses_to_filename(tmp_path: Path) -> None:
-    """The filename is the id (spec-fmc); a mismatched embedded id never
+    """The filename is the id (pydantic-ai-gepa-parallel-lanes-and-events); a mismatched embedded id never
     hijacks delivery order."""
     ensure_layout(tmp_path)
     run = new_run_id()
@@ -539,7 +539,7 @@ def test_invalid_lane_id_rejected() -> None:
 def test_reaper_sentinel_dedupes_concurrent_passes(tmp_path: Path) -> None:
     """Two concurrent reaper passes over the same scan emit exactly one
     lane_stalled — the dedupe key is an exclusive-create sentinel, not a
-    read (spec-fmc: no duplicate no matter how many passes run)."""
+    read (pydantic-ai-gepa-parallel-lanes-and-events: no duplicate no matter how many passes run)."""
     import threading
 
     ensure_layout(tmp_path)

@@ -1,8 +1,8 @@
 """`gepa components` — inspect and mutate optimizable components.
 
 The four verbs in this group implement the surface described by
-pydanticaigepa-spec-973 and enforce the content-file rule from
-pydanticaigepa-dec-dmk: ``set`` and ``confirm`` accept text only via
+pydantic-ai-gepa-managed-run and enforce the content-file rule from
+dec-pydantic-ai-gepa-cli-inputs-with-content-come-from-a-file: ``set`` and ``confirm`` accept text only via
 ``--content-file`` (or ``-`` for stdin), never inline.
 """
 
@@ -174,7 +174,7 @@ def set_(
 ) -> None:
     """Write a new confirmed value for a slot.
 
-    Per pydanticaigepa-dec-dmk, content comes from a file or stdin — never
+    Per dec-pydantic-ai-gepa-cli-inputs-with-content-come-from-a-file, content comes from a file or stdin — never
     inline — to avoid shell-escape bugs on multi-line text.
     """
     text = read_content_file(content_file)

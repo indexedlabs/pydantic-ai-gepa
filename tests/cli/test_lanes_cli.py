@@ -1,4 +1,4 @@
-"""End-to-end coverage for reflection lanes (spec-1do, task-xcb)."""
+"""End-to-end coverage for reflection lanes (pydantic-ai-gepa-parallel-lanes-and-events)."""
 
 from __future__ import annotations
 
@@ -253,7 +253,7 @@ def test_packet_is_self_contained(git_repo: Path) -> None:
     invocation = packet["continue_invocation"]
     assert "lane continue lane-1" in invocation
     assert f"--run-id {run['run_id']}" in invocation
-    # The invocation carries the absolute workspace explicitly (dec-780).
+    # The invocation carries the absolute workspace explicitly (dec-pydantic-ai-gepa-lanes-are-isolated-worktrees-driven-by-events).
     assert f"--gepa-dir {git_repo}/.gepa" in invocation
     assert packet["continue_cwd"] == packet["candidate_project_root"]
     assert packet["continue_argv"][0] == sys.executable
@@ -892,7 +892,7 @@ def test_run_status_renders_lane_board_and_reaps(git_repo: Path) -> None:
     payload = json.loads(first.output)
     lanes = {lane["lane"]: lane for lane in payload["lanes"]}
     assert set(lanes) == {"lane-1", "lane-2"}
-    # The reaper transitions the dead-pid lane's STATE to stalled (dec-l95),
+    # The reaper transitions the dead-pid lane's STATE to stalled (dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable),
     # not just an event on the bus.
     assert lanes["lane-1"]["status"] == "stalled"
     assert lanes["lane-1"]["eval_pid"] is None
@@ -927,7 +927,7 @@ def test_lane_verb_requires_explicit_absolute_workspace(git_repo: Path) -> None:
 
 
 def test_second_lane_run_rejected(git_repo: Path) -> None:
-    """One active lane run per workspace (dec-jh6): a second `run start
+    """One active lane run per workspace (dec-pydantic-ai-gepa-lanes-are-isolated-worktrees-driven-by-events): a second `run start
     --lanes` while the first is active is refused before any fan-out."""
     _start_lane_run(git_repo, lanes=1)
     result = _run("run", "start", "--lanes", "1", "--size", "1")
@@ -939,7 +939,7 @@ def test_second_lane_run_rejected(git_repo: Path) -> None:
 
 
 def test_lane_verbs_reject_done_runs(git_repo: Path) -> None:
-    """Lane verbs refuse to run on completed runs (spec-1do: lanes are
+    """Lane verbs refuse to run on completed runs (pydantic-ai-gepa-parallel-lanes-and-events: lanes are
     re-fanned at select or removed when the run completes)."""
     result = _run(
         "run",
@@ -1163,7 +1163,7 @@ def test_foreground_continue_evaluates_worktree_not_primary(git_repo: Path) -> N
 
 
 def test_stale_heartbeat_with_live_pid_is_not_stalled(git_repo: Path) -> None:
-    """spec-1do: eval death = stale heartbeat PLUS dead pid. A slow but alive
+    """pydantic-ai-gepa-parallel-lanes-and-events: eval death = stale heartbeat PLUS dead pid. A slow but alive
     eval is never reaped (the documented response kills the pid)."""
     run = _start_lane_run(git_repo, lanes=1)
     run_id = str(run["run_id"])

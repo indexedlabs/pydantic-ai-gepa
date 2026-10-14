@@ -135,7 +135,7 @@ class RunState:
     # opaque to the optimizer apart from the documented identity fields.
     run_start_baseline: dict[str, Any] | None = None
     accepted_promotion_count: int = 0
-    # Lane-run fields (spec-1do). All defaulted so run state files written
+    # Lane-run fields (pydantic-ai-gepa-parallel-lanes-and-events). All defaulted so run state files written
     # before lanes existed load unchanged.
     lanes: int = 0
     heartbeat_interval_secs: float = 10.0
@@ -150,9 +150,9 @@ class RunState:
     # accounting never depends on emitting forbidden gate rows.
     gate_consumed_iterations: int = 0
     # Set at fan-out/re-fan: the straggler-timeout clock starts here, immune
-    # to unrelated run-state saves refreshing updated_at (spec-er3).
+    # to unrelated run-state saves refreshing updated_at (dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable).
     iteration_started_at: str | None = None
-    # Select-phase resumption markers (spec-er3). ``select_phase`` is the
+    # Select-phase resumption markers (dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable). ``select_phase`` is the
     # in-flight marker: non-None while a `gepa run select` is between phase
     # checkpoints; ``select_context`` carries the resumption record (pid,
     # winner, per-lane progress) so an interrupted select resumes idempotently.
@@ -1743,7 +1743,7 @@ def _write_final_report(
         lines.append(
             f"- budget_overshoot: {overshoot} eval row(s) beyond "
             f"--max-iterations (in-flight lane evals; bounded by "
-            f"lanes x --acceptance-max-repetitions, pydanticaigepa-dec-msy)"
+            f"lanes x --acceptance-max-repetitions, dec-pydantic-ai-gepa-the-pareto-ledger-is-the-sole-budget-authority)"
         )
     if (state.last_comparison or {}).get("reason_code") == "lane_state_invalid":
         # A malformed verdict set cannot nominate even a previously scored
@@ -2238,12 +2238,12 @@ def start(
         if active_candidate_source != "git":
             public_echo(
                 "--lanes requires git candidate mode (component-mode lanes share "
-                "one process-global agent and are out of scope, spec-1do).",
+                "one process-global agent and are out of scope, pydantic-ai-gepa-parallel-lanes-and-events).",
                 err=True,
             )
             raise typer.Exit(code=2)
         # Lane branches are always cut from a clean commit; a dirty primary
-        # tree is rejected (spec-1do constraint). The journal is tracked
+        # tree is rejected (pydantic-ai-gepa-parallel-lanes-and-events constraint). The journal is tracked
         # bookkeeping the CLI itself appends to — exclude it like select does
         # (one dirtiness definition across verbs).
         from .lanes import ensure_worktrees_ignored
@@ -2265,7 +2265,7 @@ def start(
                 err=True,
             )
             raise typer.Exit(code=1)
-        # One active lane run per workspace (dec-jh6): an existing lane run
+        # One active lane run per workspace (dec-pydantic-ai-gepa-lanes-are-isolated-worktrees-driven-by-events): an existing lane run
         # that never reached `done` still owns its lane refs and events.
         from .layout import is_run_id
 
@@ -2682,7 +2682,7 @@ def select(
     """Commit one lockstep lane iteration: pick the winner and re-fan lanes.
 
     Select is the single sequential authority for lane runs
-    (pydanticaigepa-spec-er3). It consumes the memoized lane verdicts (never
+    (dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable). It consumes the memoized lane verdicts (never
     re-deriving them), invalidates stragglers, promotes the best accepted lane
     to the run's best, journals every non-promoted lane before deleting its
     branch, emits merge_opportunity for accepted lanes with disjoint diffs
@@ -2721,7 +2721,7 @@ def status(
         "run": _public_state(state, outcomes=[], final_report=final_path)
     }
     if state.lanes > 0:
-        # Consumer verbs run the lazy reaper first (dec-pm3).
+        # Consumer verbs run the lazy reaper first (dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable).
         from .lanes import load_all_lane_states, reaper_pass_for_run
 
         workspace_root = repo_root()

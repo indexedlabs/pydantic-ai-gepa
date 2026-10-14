@@ -29,7 +29,7 @@ def test_bundled_skill_is_importable_resource() -> None:
 
 
 def test_bundled_skill_documents_parallel_lanes() -> None:
-    """The installed skill must document the lanes workflow (task-80f) —
+    """The installed skill must document the lanes workflow —
     this is the file `gepa init --install-skill` drops into user repos, so
     drift here means agents never learn the protocol."""
     source = (

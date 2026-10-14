@@ -1,6 +1,6 @@
 """Shared I/O helpers for the gepa CLI.
 
-The content-file rule (pydanticaigepa-dec-dmk) means every text-content input
+The content-file rule (dec-pydantic-ai-gepa-cli-inputs-with-content-come-from-a-file) means every text-content input
 goes through ``--*-file PATH`` (or ``-`` for stdin), and every text-content
 output can be sent to ``--output-file PATH`` (or stdout). These helpers
 centralize that convention.

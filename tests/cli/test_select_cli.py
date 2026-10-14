@@ -1,4 +1,4 @@
-"""End-to-end coverage for `gepa run select` (spec-er3, task-vso).
+"""End-to-end coverage for `gepa run select` (dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable).
 
 Fixtures mirror test_lanes_cli.py: a git-native workspace whose evaluate
 callable reads one output file per case, so each lane's score (and diff
@@ -255,7 +255,7 @@ def _run_id(run: dict[str, object]) -> str:
 
 
 def test_select_promotes_winner_journals_losers_and_refans(git_repo: Path) -> None:
-    """spec-er3: accepted +0.33 / accepted +0.67 / rejected -> best promoted;
+    """dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable: accepted +0.33 / accepted +0.67 / rejected -> best promoted;
     losers journaled with diff summary, verdict, delta; branches deleted;
     lanes re-branched off the new best; baseline re-measured once."""
     run = _start_lane_run(git_repo, lanes=3)
@@ -655,7 +655,7 @@ def test_legacy_promotion_preserves_unknown_best_mean(git_repo: Path) -> None:
 def test_select_consumes_memoized_verdicts_without_comparing(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """spec-er3: verdicts are computed once per lane eval and memoized; select
+    """dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable: verdicts are computed once per lane eval and memoized; select
     consumes them from lane state and never re-derives them."""
     import pydantic_ai_gepa.acceptance as acceptance_mod
     import pydantic_ai_gepa.cli.lanes as lanes_mod
@@ -702,7 +702,7 @@ def test_select_refan_resets_iteration_started_at(git_repo: Path) -> None:
 
 
 def test_straggler_terminated_journaled_and_refanned(git_repo: Path) -> None:
-    """spec-er3 + dec-4tw: a lane still evaluating when select runs (after the
+    """dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable: a lane still evaluating when select runs (after the
     straggler timeout) is terminated, its partial result and diff journaled,
     and the lane reset in the re-fan — never compared, never promoted."""
     run = _start_lane_run(git_repo, 2, "--straggler-timeout-secs", "0")
@@ -772,7 +772,7 @@ def test_straggler_terminated_journaled_and_refanned(git_repo: Path) -> None:
 
 
 def test_cross_branch_point_lane_invalidated(git_repo: Path) -> None:
-    """spec-er3: a lane whose candidate does not descend from the frozen
+    """dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable: a lane whose candidate does not descend from the frozen
     baseline commit is invalidated to stalled — never silently compared,
     never promoted, even with the best delta."""
     run = _start_lane_run(git_repo, 2, "--straggler-timeout-secs", "0")
@@ -821,7 +821,7 @@ def test_cross_branch_point_lane_invalidated(git_repo: Path) -> None:
 
 
 def test_concurrent_select_rejected(git_repo: Path) -> None:
-    """spec-er3: a second select invocation while one is in flight is rejected."""
+    """dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable: a second select invocation while one is in flight is rejected."""
     run = _start_lane_run(git_repo, lanes=1)
     run_id = _run_id(run)
     lane_1 = _drive_lane(git_repo, run_id, "lane-1", {"out_case-2.txt": "b\n"})
@@ -858,7 +858,7 @@ def test_concurrent_select_rejected(git_repo: Path) -> None:
 def test_select_killed_after_promotion_resumes_exactly_once(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """spec-er3: select killed after promotion but before re-fan resumes from
+    """dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable: select killed after promotion but before re-fan resumes from
     the recorded phase and completes the remaining phases exactly once."""
     import pydantic_ai_gepa.cli.select as select_mod
 
@@ -917,7 +917,7 @@ def test_select_killed_after_promotion_resumes_exactly_once(
 
 
 def test_merge_opportunity_for_disjoint_accepted_lanes(git_repo: Path) -> None:
-    """spec-er3: two accepted lanes whose diffs touch disjoint file sets emit
+    """dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable: two accepted lanes whose diffs touch disjoint file sets emit
     merge_opportunity; select never auto-merges."""
     run = _start_lane_run(git_repo, lanes=2)
     run_id = _run_id(run)
@@ -954,7 +954,7 @@ def test_merge_opportunity_for_disjoint_accepted_lanes(git_repo: Path) -> None:
 
 
 def test_budget_exhausted_marks_done_with_overshoot(git_repo: Path) -> None:
-    """spec-er3 + dec-msy: the budget stop is enforced at select; overshoot is
+    """dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable + dec-pydantic-ai-gepa-the-pareto-ledger-is-the-sole-budget-authority: the budget stop is enforced at select; overshoot is
     recorded in the final report and run_done is emitted."""
     run = _start_lane_run(git_repo, 2, "--max-iterations", "9")
     run_id = _run_id(run)
@@ -1132,7 +1132,7 @@ def test_select_later_rebaseline_failure_discards_partial_samples(
 
 
 def test_no_accepted_lane_means_no_promotion(git_repo: Path) -> None:
-    """spec-er3: with no accepted lane there is no promotion; all lanes are
+    """dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable: with no accepted lane there is no promotion; all lanes are
     journaled as losers and re-fanned onto the unchanged best."""
     run = _start_lane_run(git_repo, lanes=2)
     run_id = _run_id(run)
@@ -1228,7 +1228,7 @@ def test_pre_select_state_loads_with_select_defaults(git_repo: Path) -> None:
 
 
 def test_select_lock_serializes_concurrent_selects(git_repo: Path) -> None:
-    """spec-er3: select never runs concurrently with itself — two fresh
+    """dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable: select never runs concurrently with itself — two fresh
     invocations serialize on the flock, so the second resumes/finishes
     idempotently rather than double-executing phases."""
     import threading
@@ -1265,7 +1265,7 @@ def test_select_lock_serializes_concurrent_selects(git_repo: Path) -> None:
 
 
 def test_budget_low_emitted_near_budget_floor(git_repo: Path) -> None:
-    """dec-d0d: select emits budget_low when remaining evals fall below
+    """dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable: select emits budget_low when remaining evals fall below
     lanes x acceptance max-repetitions."""
     run = _start_lane_run(git_repo, 2, "--max-iterations", "11")
     run_id = _run_id(run)
