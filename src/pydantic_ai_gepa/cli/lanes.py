@@ -16,7 +16,7 @@ Key contracts:
 - Lane evals run the repeated-evaluation acceptance policy as a detached
   background process that records its pid and heartbeat in lane state and
   emits a ``verdict`` event on resolution; budget checks are advisory per-eval
-  and enforced at select (pydantic-ai-gepa-evaluation-acceptance-selection).
+  and enforced at select (dec-pydantic-ai-gepa-the-pareto-ledger-is-the-sole-budget-authority).
 - Per-lane state is written only by that lane's own eval process or lifecycle
   verbs — never by other lanes. Verdicts travel via the event stream and lane
   state only; background evals never write shared run state.

@@ -1743,7 +1743,7 @@ def _write_final_report(
         lines.append(
             f"- budget_overshoot: {overshoot} eval row(s) beyond "
             f"--max-iterations (in-flight lane evals; bounded by "
-            f"lanes x --acceptance-max-repetitions, pydantic-ai-gepa-evaluation-acceptance-selection)"
+            f"lanes x --acceptance-max-repetitions, dec-pydantic-ai-gepa-the-pareto-ledger-is-the-sole-budget-authority)"
         )
     if (state.last_comparison or {}).get("reason_code") == "lane_state_invalid":
         # A malformed verdict set cannot nominate even a previously scored

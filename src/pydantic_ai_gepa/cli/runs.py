@@ -2,7 +2,7 @@
 
 Each `gepa eval` invocation reads/writes through `MinibatchStore` and
 `ParetoLog`. The Pareto row schema records the tuple required by
-dec-pydantic-ai-gepa-git-native-candidates-are-identified-by-commit — `(candidate_id, commit_sha, component_overrides_id,
+dec-pydantic-ai-gepa-the-pareto-ledger-is-the-sole-budget-authority — `(candidate_id, commit_sha, component_overrides_id,
 minibatch_id, per_case_scores, mean_score, status, summary, timestamp)` — so
 historical runs can be reconstructed by checking out the commit and replaying
 the component overrides file.
@@ -260,7 +260,7 @@ def new_eval_id() -> str:
 
     Report and trace artifacts are keyed by ``(eval_id, candidate_id)`` rather
     than the global iteration ordinal so concurrent lane evals of identical
-    candidate trees can never collide on filenames (pydantic-ai-gepa-evaluation-acceptance-selection).
+    candidate trees can never collide on filenames (dec-pydantic-ai-gepa-the-pareto-ledger-is-the-sole-budget-authority).
     """
     return uuid.uuid4().hex[:8]
 
@@ -353,7 +353,7 @@ class ParetoLog:
 
         A torn partial row from a killed writer does not count — the eval did
         not complete, so it did not finalize its budget spend. This is the
-        single budget count source (pydantic-ai-gepa-evaluation-acceptance-selection).
+        single budget count source (dec-pydantic-ai-gepa-the-pareto-ledger-is-the-sole-budget-authority).
         """
         count = 0
         for line in self._read_lines():

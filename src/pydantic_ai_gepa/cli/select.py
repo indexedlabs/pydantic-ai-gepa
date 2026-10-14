@@ -36,7 +36,7 @@ phase on the next invocation:
 
 ``finalize`` replaces re-fan when the pareto ledger reaches
 ``--max-iterations``: lane-run budget enforcement lives at select, not
-per-eval (pydantic-ai-gepa-evaluation-acceptance-selection). Held-out runs charge a harness-computed
+per-eval (dec-pydantic-ai-gepa-the-pareto-ledger-is-the-sole-budget-authority). Held-out runs charge a harness-computed
 upper acceptance schedule per consumed verdict rather than trusting
 reflector-written rows. The run is marked done, any overshoot (one in-flight
 lane iteration plus its admitted selection work) is recorded in the final report,
@@ -1443,7 +1443,7 @@ def _phase_journal(
         # Per-lane checkpoint: a kill here resumes with the next loser.
         state = _checkpoint(state, workspace_root, "journal", ctx)
 
-    # Budget enforcement (pydantic-ai-gepa-evaluation-acceptance-selection): the pareto ledger is the sole budget
+    # Budget enforcement (dec-pydantic-ai-gepa-the-pareto-ledger-is-the-sole-budget-authority): the pareto ledger is the sole budget
     # authority; the stop condition for lane runs is checked here, not per-eval.
     rows = ParetoLog(run_id, workspace_root).count_budget_rows()
     ctx["budget_rows"] = rows

@@ -702,7 +702,7 @@ def test_select_refan_resets_iteration_started_at(git_repo: Path) -> None:
 
 
 def test_straggler_terminated_journaled_and_refanned(git_repo: Path) -> None:
-    """dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable + dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable: a lane still evaluating when select runs (after the
+    """dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable: a lane still evaluating when select runs (after the
     straggler timeout) is terminated, its partial result and diff journaled,
     and the lane reset in the re-fan — never compared, never promoted."""
     run = _start_lane_run(git_repo, 2, "--straggler-timeout-secs", "0")
@@ -954,7 +954,7 @@ def test_merge_opportunity_for_disjoint_accepted_lanes(git_repo: Path) -> None:
 
 
 def test_budget_exhausted_marks_done_with_overshoot(git_repo: Path) -> None:
-    """dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable + pydantic-ai-gepa-evaluation-acceptance-selection: the budget stop is enforced at select; overshoot is
+    """dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable + dec-pydantic-ai-gepa-the-pareto-ledger-is-the-sole-budget-authority: the budget stop is enforced at select; overshoot is
     recorded in the final report and run_done is emitted."""
     run = _start_lane_run(git_repo, 2, "--max-iterations", "9")
     run_id = _run_id(run)

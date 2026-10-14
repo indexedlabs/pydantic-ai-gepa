@@ -224,5 +224,6 @@ def test_skill_md_shipped_with_package() -> None:
     text = skill.read_text(encoding="utf-8")
     assert "name: gepa-optimize" in text
     assert "content-file" in text.lower()
-    # No NEVER STOP language (per dec-pydantic-ai-gepa-git-native-candidates-are-identified-by-commit).
+    # No NEVER STOP language: the library guarantees the loop terminates
+    # predictably via --max-iterations instead of autonomy prose.
     assert "NEVER STOP" not in text
