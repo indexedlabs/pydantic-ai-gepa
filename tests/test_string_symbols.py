@@ -274,6 +274,7 @@ def test_symbols_in_a_subdirectory_project_are_relative_to_it(repo: Path) -> Non
         ("X = 'a'\nmatch 1:\n    case 1 as X:\n        pass\n", "X", "more than once"),
         ("X = 'a'\nmatch {}:\n    case {**X}:\n        pass\n", "X", "more than once"),
         ("X = 'a'\ndel X\n", "X", "more than once"),
+        ("X = 'a'\nfrom os.path import *\n", "X", "wildcard import"),
         ("X = 'a'\nY: (X := 'fixed')\n", "X", "more than once"),
         ("X: (X := 'fixed') = 'seed'\n", "X", "more than once"),
         ("X = (\n    'a'  # note\n    'b'\n)\n", "X", "comment"),
@@ -342,6 +343,20 @@ def test_scope_verification_rejects_changes_outside_declared_strings(
 
     with pytest.raises(StringSymbolError):
         verify_string_symbol_commit(repo, base, sha, SYMBOLS)
+
+
+def test_scope_verification_checks_unchanged_declared_files(repo: Path) -> None:
+    (repo / "bad.py").write_text("Y = 123\n")
+    base = _commit(repo, "bad declared file")
+    (repo / "prompts.py").write_text(PROMPTS.replace("Be terse.", "Be brief."))
+    sha = _commit(repo, "edit good file")
+    symbols = {**SYMBOLS, "bad.py": ["Y"]}
+
+    with pytest.raises(StringSymbolError, match="plain string constant"):
+        verify_string_symbol_commit(repo, base, sha, symbols)
+    # A no-op commit still checks the declared surface exists.
+    with pytest.raises(StringSymbolError, match="not a file"):
+        verify_string_symbol_commit(repo, sha, sha, {"absent.py": ["X"]})
 
 
 def test_scope_verification_accepts_a_declared_string_edit(repo: Path) -> None:

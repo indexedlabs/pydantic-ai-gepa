@@ -227,8 +227,8 @@ def verify_string_symbol_commit(
     """Refuse a commit that differs from its base beyond the declared strings.
 
     The commit must descend from the base; only declared files may change,
-    keeping their mode; each declared symbol must still be a plain string
-    constant; the masked ASTs must match (the trusted text scoring check);
+    keeping their mode; every declared symbol, changed or not, must be a
+    plain string constant at both commits; the masked ASTs must match (the trusted text scoring check);
     and every byte outside the declared constants must be unchanged, so
     comments and formatting elsewhere are frozen too.
     """
@@ -238,6 +238,14 @@ def verify_string_symbol_commit(
     sha = git.commit(commit)
     if not git.is_ancestor(base, sha):
         raise StringSymbolError("Commit does not descend from its base commit.")
+    # Every declared symbol must be a plain string on both sides, changed or not.
+    sources: dict[str, tuple[bytes, bytes]] = {}
+    for relative, names in declared.items():
+        before = git.blob(base, relative)[1]
+        after = git.blob(sha, relative)[1]
+        _string_spans(before, relative, names)
+        _string_spans(after, relative, names)
+        sources[relative] = (before, after)
     for status, old_mode, new_mode, path in git.changes(base, sha):
         relative = git.relative(path)
         if (
@@ -250,9 +258,10 @@ def verify_string_symbol_commit(
             raise StringSymbolError(
                 f"Commit changes {path} outside the declared string symbols."
             )
+    for relative, (before, after) in sources.items():
+        if before == after:
+            continue
         names = declared[relative]
-        before = git.blob(base, relative)[1]
-        after = git.blob(sha, relative)[1]
         before_spans = _string_spans(before, relative, names)
         after_spans = _string_spans(after, relative, names)
         try:
@@ -386,6 +395,12 @@ def _string_spans(source: bytes, path: str, names: Sequence[str]) -> dict[str, _
         if isinstance(node, (ast.Global, ast.Nonlocal))
         for name in node.names
     }
+    if "*" in bindings:
+        # A star import's names are unknowable here and may rebind any symbol.
+        raise StringSymbolError(
+            f"{path} has a module-level wildcard import, which may rebind "
+            f"{', '.join(names)}; {_SELECTION_DOC}."
+        )
     spans: dict[str, _Span] = {}
     for name in names:
         statements = bindings.get(name, [])

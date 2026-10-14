@@ -466,6 +466,49 @@ async def test_merge_step_rejects_when_merged_scores_lower() -> None:
 
 
 @pytest.mark.asyncio
+async def test_merge_step_rejects_a_non_selectable_subsample() -> None:
+    state = _make_state()
+    ancestor_idx, parent1_idx, parent2_idx = _build_lineage(state)
+    validation_items = await _validation_instances(state)
+    subsample = validation_items[:3]
+    merged_candidate = CandidateProgram(
+        idx=len(state.candidates),
+        components={
+            "instructions": ComponentValue(
+                name="instructions", text="Parent1 instructions", version=3
+            ),
+            "tools": ComponentValue(name="tools", text="Parent2 tools", version=3),
+        },
+        creation_type="merge",
+        parent_indices=[parent1_idx, parent2_idx],
+        discovered_at_iteration=3,
+        discovered_at_evaluation=10,
+    )
+    # Scores that would be accepted, but one rollout is infrastructure-invalid.
+    results = _evaluation_results(subsample, [1.0, 1.0, 0.0])
+    failed = RolloutOutput.from_error(RuntimeError("judge down"), kind="system")
+    failed.selectable = False
+    results.outputs[2] = failed
+    evaluator = _StubEvaluator(results)
+    builder = _StubMergeBuilder(
+        pair=(parent1_idx, parent2_idx),
+        ancestor_idx=ancestor_idx,
+        merged_candidate=merged_candidate,
+        subsample=subsample,
+    )
+    ctx = _ctx(state, _make_deps(merge_builder=builder, evaluator=evaluator))
+    state.iteration = 3
+    evaluations_before = state.total_evaluations
+
+    next_node = await merge_step(ctx)
+
+    assert next_node == "continue"
+    assert evaluator.calls == 1
+    assert len(state.candidates) == 3
+    assert state.total_evaluations == evaluations_before + 3
+
+
+@pytest.mark.asyncio
 async def test_merge_step_skips_when_duplicate_detected() -> None:
     state = _make_state()
     ancestor_idx, parent1_idx, parent2_idx = _build_lineage(state)

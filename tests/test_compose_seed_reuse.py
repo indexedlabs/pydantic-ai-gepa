@@ -806,3 +806,52 @@ async def test_sequential_proposer_cannot_mutate_the_incumbent_away_from_its_sco
     assert result.best_index == 1
     assert result.best.best_candidate == _candidate("candidate-0")
     assert result.best.best_score == 0.5
+
+
+@pytest.mark.asyncio
+async def test_gepa_reuses_a_non_selectable_seed_for_agent_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The graph's selectability guard reads RolloutOutput.selectable, which
+    # agent adapters never clear, so re-scoring an ineligible agent seed would
+    # only waste a validation pass.
+    async def propose_texts(self: Any, **kwargs: Any) -> ProposalResult:
+        return ProposalResult(
+            texts={"instructions": "improved"}, component_metadata={}, reasoning=None
+        )
+
+    monkeypatch.setattr(InstructionProposalGenerator, "propose_texts", propose_texts)
+    task, calls = _counting_task(lambda text: 0.4, val_cases=3)
+    seed = await task.seed_candidate()
+    seed_evaluation = await task.evaluate(seed)
+    ineligible = CandidateEvaluation(
+        score=seed_evaluation.score,
+        records=[],
+        side_info={},
+        num_cases=seed_evaluation.num_cases,
+        selectable=False,
+        per_case_scores=dict(seed_evaluation.per_case_scores),
+    )
+    calls.clear()
+    config = EngineConfig(
+        engine="gepa",
+        max_metric_calls=10,
+        max_iterations=1,
+        engine_config={
+            "reflection_minibatch_size": 2,
+            "reflection_config": ReflectionConfig(model=TestModel()),
+        },
+    )
+    engine = get_engine("gepa", config)
+
+    await engine.run(
+        _engine_task_view(task, engine, seed, seed_evaluation=ineligible),
+        config,
+        BudgetTracker(10),
+    )
+
+    assert not [
+        name
+        for name, text in calls
+        if name.startswith("val-") and text == "candidate-0"
+    ]

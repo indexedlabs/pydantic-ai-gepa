@@ -134,7 +134,13 @@ class GepaEngine:
         # seed from this slice's budget.
         seed_scorer = getattr(task, "seed_evaluation", None)
         seed_evaluation = await seed_scorer() if seed_scorer is not None else None
-        if seed_evaluation is not None:
+        # Per-case scores cannot carry ineligibility. A task-supplied adapter
+        # marks ineligible rollouts itself, so re-score its ineligible seed and
+        # let the graph's validation guard apply; agent adapters cannot, so
+        # their reuse is unchanged.
+        if seed_evaluation is not None and (
+            seed_evaluation.selectable or task_adapter is None
+        ):
             deps.seed_validation_scores = await _matching_seed_scores(
                 state, seed_evaluation
             )
@@ -270,10 +276,6 @@ async def _matching_seed_scores(
     the graph's own seed evaluation rather than trusting mismatched ids.
     """
     scores = seed_evaluation.per_case_scores
-    if not seed_evaluation.selectable:
-        # Per-case scores cannot carry ineligibility; let the graph re-score
-        # the seed so its own validation guard applies.
-        return None
     if not scores or len(scores) != seed_evaluation.num_cases:
         return None
     loader = state.validation_set
