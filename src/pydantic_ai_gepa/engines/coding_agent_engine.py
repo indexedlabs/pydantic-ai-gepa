@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import random
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
@@ -10,9 +11,12 @@ from typing import Any, TypeAlias, cast
 
 from pydantic_evals import Case
 
+from .._concurrency import gather_cancelling_on_provider_stop
 from ..acceptance import compare_candidate_samples
 from ..evaluation import EvaluationRecord, evaluate_candidate_dataset
 from ..gepa_graph.models import CandidateMap
+from ..inspection import InspectionAborted
+from ..spend import _pipeline_meter
 from .base import (
     BudgetExhausted,
     BudgetTracker,
@@ -179,6 +183,7 @@ class CodingAgentEngine:
         ):
             if (
                 config.stop_at_score is not None
+                and best_entry.evaluation.selectable
                 and best_entry.evaluation.score >= config.stop_at_score
             ):
                 stop_reason = "stop_at_score"
@@ -258,10 +263,12 @@ class CodingAgentEngine:
             iterations += 1
             selection_score = _mean_score(selection_records)
 
+            # An infrastructure-invalid case is not a failure to fix.
             failures = [
                 record
                 for record in selection_records
                 if record.score < failure_threshold
+                and getattr(record.payload.get("output"), "selectable", True)
             ]
             if not failures:
                 history.append(
@@ -270,6 +277,13 @@ class CodingAgentEngine:
                         data={
                             "iteration": iterations,
                             "mean_score": selection_score,
+                            "infrastructure_invalid_case_ids": [
+                                record.case_id
+                                for record in selection_records
+                                if not getattr(
+                                    record.payload.get("output"), "selectable", True
+                                )
+                            ],
                             "minibatch_case_ids": [
                                 record.case_id for record in selection_records
                             ],
@@ -336,12 +350,18 @@ class CodingAgentEngine:
                 stop_reason = "budget_exhausted"
                 break
 
+            # Infrastructure failures are not quality evidence for the proposer.
+            evidence = [
+                record
+                for record in selection_records
+                if getattr(record.payload.get("output"), "selectable", True)
+            ]
             context = ReflectionContext(
                 candidate=_copy_candidate(parent.candidate),
                 minibatch_records=failures,
-                report=_format_failure_report(selection_records, failure_threshold),
+                report=_format_failure_report(evidence, failure_threshold),
                 iteration=iterations,
-                side_info=_aggregate_side_info(selection_records),
+                side_info=_aggregate_side_info(evidence),
             )
             proposal_started = perf_counter()
             proposal = await self._propose(context)
@@ -350,7 +370,9 @@ class CodingAgentEngine:
             proposals += 1
 
             proposal_samples: list[float] = []
+            proposal_batches: list[list[EvaluationRecord]] = []
             comparison_result = None
+            infrastructure_invalid = False
             initial_repetitions = min(acceptance_repetitions, len(baseline_samples))
             for _ in range(len(baseline_samples)):
                 try:
@@ -365,6 +387,9 @@ class CodingAgentEngine:
                 except BudgetExhausted:
                     stop_reason = "budget_exhausted"
                     break
+                except InspectionAborted:
+                    # The caller inspects the intercepted request; never wrap it.
+                    raise
                 except Exception as exc:
                     raise RuntimeError(
                         "Coding-agent proposal evaluation failed."
@@ -379,12 +404,18 @@ class CodingAgentEngine:
                 ):
                     stop_reason = "budget_overshoot"
                     break
+                proposal_batches.append(proposal_records)
                 proposal_samples.append(_mean_score(proposal_records))
                 if len(proposal_samples) < initial_repetitions:
                     continue
+                matched_baseline = baseline_batches[: len(proposal_batches)]
+                eligible = _eligible_case_ids([*matched_baseline, *proposal_batches])
+                if not eligible:
+                    infrastructure_invalid = True
+                    break
                 comparison_result = compare_candidate_samples(
-                    baseline_samples[: len(proposal_samples)],
-                    proposal_samples,
+                    [_mean_score(batch, eligible) for batch in matched_baseline],
+                    [_mean_score(batch, eligible) for batch in proposal_batches],
                     confidence=acceptance_confidence,
                     min_delta=acceptance_min_delta,
                     max_looks=acceptance_max_repetitions - acceptance_repetitions + 1,
@@ -392,6 +423,22 @@ class CodingAgentEngine:
                 if comparison_result.verdict != "inconclusive":
                     break
 
+            if infrastructure_invalid:
+                # No case was scored on every matched repetition: that is an
+                # infrastructure failure, not evidence against the proposal.
+                history.append(
+                    EngineEvent(
+                        kind="infrastructure_invalid",
+                        data={
+                            "iteration": iterations,
+                            "parent_index": parent.index,
+                            "minibatch_case_ids": [
+                                record.case_id for record in selection_records
+                            ],
+                        },
+                    )
+                )
+                continue
             if comparison_result is None:
                 if stop_reason in {"budget_overshoot", "budget_exhausted"}:
                     break
@@ -481,7 +528,11 @@ class CodingAgentEngine:
         return EngineResult(
             engine=self.name,
             best_candidate=_copy_candidate(best_entry.candidate),
-            best_score=best_entry.evaluation.score,
+            best_score=(
+                best_entry.evaluation.score
+                if best_entry.evaluation.selectable
+                else None
+            ),
             num_metric_calls=budget.spent - starting_spend,
             history=history,
         )
@@ -504,6 +555,11 @@ class CodingAgentEngine:
         # are rejected by preflight.
         budget.spend(len(minibatch))
         engine_budget.spend(len(minibatch))
+        task_adapter = getattr(task, "create_adapter", None)
+        if task_adapter is not None:
+            return await _adapter_records(
+                task_adapter(), candidate, minibatch, concurrency
+            )
         return await evaluate_candidate_dataset(
             agent=task.agent,
             metric=task.metric,
@@ -638,9 +694,27 @@ def _affordable_repetitions(
     return min(requested, max(0, paired_repetitions))
 
 
-def _mean_score(records: Sequence[EvaluationRecord]) -> float:
-    """Return the mean score for an evaluated minibatch."""
+def _mean_score(
+    records: Sequence[EvaluationRecord], case_ids: set[str] | None = None
+) -> float:
+    """Return the mean score for an evaluated minibatch, optionally a subset."""
+    if case_ids is not None:
+        records = [record for record in records if record.case_id in case_ids]
     return sum(record.score for record in records) / len(records) if records else 0.0
+
+
+def _eligible_case_ids(batches: Sequence[Sequence[EvaluationRecord]]) -> set[str]:
+    """Cases scored in every matched batch: a non-selectable rollout output
+    (an infrastructure failure) is never acceptance evidence."""
+    eligible: set[str] | None = None
+    for batch in batches:
+        ids = {
+            record.case_id
+            for record in batch
+            if getattr(record.payload.get("output"), "selectable", True)
+        }
+        eligible = ids if eligible is None else eligible & ids
+    return eligible or set()
 
 
 def _copy_candidate(candidate: CandidateMap) -> CandidateMap:
@@ -713,8 +787,11 @@ def _best_validation_entry(
     """Return the highest aggregate selectable validation candidate."""
 
     selectable = [entry for entry in pool if entry.evaluation.selectable]
-    candidates = selectable or list(pool)
-    return max(candidates, key=lambda entry: (entry.evaluation.score, -entry.index))
+    if not selectable:
+        # No eligible validation: keep the seed rather than promote a rejected
+        # proposal; the result then reports no score.
+        return pool[0]
+    return max(selectable, key=lambda entry: (entry.evaluation.score, -entry.index))
 
 
 def _validation_event_data(entry: _CandidatePoolEntry, *, stage: str) -> dict[str, Any]:
@@ -726,6 +803,60 @@ def _validation_event_data(entry: _CandidatePoolEntry, *, stage: str) -> dict[st
         "validation_score": entry.evaluation.score,
         "selectable": entry.evaluation.selectable,
     }
+
+
+async def _adapter_records(
+    adapter: Any,
+    candidate: CandidateMap,
+    cases: Sequence[Case[Any, Any, Any]],
+    concurrency: int,
+) -> list[EvaluationRecord]:
+    """Evaluate a minibatch through a task-supplied adapter as dataset records.
+
+    Cases go one per adapter call, at most ``concurrency`` at a time, as the
+    agent path and the GEPA graph's evaluator do.
+    """
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+    # Meter training rollouts like validation ones: under a composed run the
+    # evaluator's model calls belong to the pipeline's spend.
+    meter = _pipeline_meter.get()
+    if meter is not None and getattr(adapter, "spend_meter", None) is None:
+        adapter.spend_meter = meter
+
+    async def one(case: Case[Any, Any, Any]) -> Any:
+        async with semaphore:
+            return await adapter.evaluate([case], candidate, True)
+
+    try:
+        batches = await gather_cancelling_on_provider_stop(
+            *(one(case) for case in cases)
+        )
+    finally:
+        adapter.close()
+    records: list[EvaluationRecord] = []
+    for index, (case, batch) in enumerate(zip(cases, batches)):
+        (output,) = batch.outputs
+        (score,) = batch.scores
+        trajectory = batch.trajectories[0] if batch.trajectories else None
+        feedback = getattr(trajectory, "metric_feedback", None)
+        side_info = getattr(trajectory, "metric_side_info", None)
+        payload: dict[str, Any] = {"output": output, "score": score}
+        payload["feedback"] = feedback
+        if side_info is not None:
+            # Same key as the agent path, so ReflectionContext.side_info
+            # carries the per-case evidence.
+            payload["side_info"] = side_info
+        if trajectory is not None:
+            payload["trajectory"] = trajectory
+        records.append(
+            EvaluationRecord(
+                case_id=case.name or f"case-{index}",
+                score=float(score),
+                feedback=feedback,
+                payload=payload,
+            )
+        )
+    return records
 
 
 def _format_failure_report(

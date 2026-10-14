@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import ast
 import json
 from pathlib import Path
 from typing import Any
 
+from ..string_symbols import masked_string_symbols as _masked
 from .layout import GepaConfig, gepa_dir, git_root, valid_string_symbol
 from .safe_git import safe_repository
 from .scoring_sandbox import (
@@ -44,36 +44,6 @@ def require_text_scope(config: GepaConfig) -> None:
         raise ScoringSandboxError(
             "Trusted in-process scoring requires an explicit text-only component scope and trusted pinned scalar scoring."
         )
-
-
-def _masked(source: str, symbols: list[str]) -> str:
-    tree = ast.parse(source)
-    pending = set(symbols)
-    for node in tree.body:
-        names = []
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names = [node.name]
-            doc_symbol = node.name + ".__doc__"
-            if doc_symbol in pending:
-                if ast.get_docstring(node) is None:
-                    raise ValueError
-                node.body[0] = ast.Expr(value=ast.Constant(value="<docstring>"))
-                pending.remove(doc_symbol)
-        elif isinstance(node, ast.Assign):
-            names = [
-                target.id for target in node.targets if isinstance(target, ast.Name)
-            ]
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            names = [node.target.id]
-        if not pending.intersection(names):
-            continue
-        for child in ast.walk(node):
-            if isinstance(child, ast.Constant) and isinstance(child.value, str):
-                child.value = "<instruction>"
-        pending.difference_update(names)
-    if pending:
-        raise ValueError
-    return ast.dump(tree, include_attributes=False)
 
 
 def candidate_baseline(scorer_project: Path, meter: Any) -> str:

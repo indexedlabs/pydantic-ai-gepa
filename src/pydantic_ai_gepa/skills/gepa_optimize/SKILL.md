@@ -408,7 +408,8 @@ The explicit text files (only `.md` and `.txt`) and Python symbol mappings must
 partition `component_files`. Python symbols name top-level functions, async
 functions, classes, assignments with Name targets, or annotated assignments.
 A named symbol masks every string constant in its AST node; `X.__doc__` masks
-only X's existing docstring. Every declared symbol must exist. All remaining AST
+only X's existing docstring. A bare annotation (`X: str`) is X's first
+declaration, so it is what is masked. Every declared symbol must exist. All remaining AST
 structure must equal the pinned scorer's copy. Candidate source is parsed only.
 
 This mode requires scalar git candidates, both trusted/pinned flags, nonempty
@@ -744,6 +745,69 @@ with trace_path.open("a", encoding="utf-8") as trace_file:
 Tag each span with a stage attribute such as `stage=classify`, `research`,
 `resolve`, or `extract`. The reflector's structured trace tools load this
 same file and can then filter failures by stage.
+
+### Text engines on a commit's string constants (Python API)
+
+When a Git candidate's editable surface is top-level string constants (the
+`[acceptance.python_string_symbols]` shape), the in-process `gepa` and
+`coding_agent` engines and `optimize_omni` can optimize it directly:
+
+```python
+from pydantic_ai_gepa import (
+    EngineConfig, MetricResult, ReflectionConfig, StringSymbolTask, get_engine,
+)
+from pydantic_ai_gepa.engines import BudgetTracker
+
+async def evaluate(commit: str, case) -> MetricResult:
+    ...  # score one case on `commit`; calls overlap, often on the same SHA
+
+task = StringSymbolTask(
+    repo=".", base_commit="HEAD", symbols={"prompts.py": ["INSTRUCTIONS"]},
+    evaluator=evaluate, trainset=train, valset=validation,
+)
+config = EngineConfig(
+    engine="gepa",
+    max_metric_calls=60,
+    engine_config={"reflection_config": ReflectionConfig(model="openai:gpt-5")},
+)
+result = await get_engine("gepa", config).run(task, config, BudgetTracker(60))
+best_sha = await task.commit_for(result.best_candidate)
+```
+
+- Components are keyed `py:<path>:<NAME>`; paths are relative to `repo`.
+  Version 1 accepts only `NAME = "..."` / `NAME: T = "..."` at module level
+  (implicit concatenation included), bound exactly once in module scope
+  (`del`, `except … as`, `match` captures, walrus, `global` and a bare
+  `X: T` annotation count). Anything
+  else (f-strings, bytes, expressions, `X.__doc__`, nested blocks, wildcard imports, comments
+  between concatenated parts) is refused.
+- `commit_from_candidate` rewrites only those constants' source spans and
+  commits on top of the base with plumbing and a private index; your working
+  tree, index and branches are untouched, and commits are unsigned. Each
+  candidate maps to one memoized commit; the seed is the base commit itself.
+- Every commit passes `verify_string_symbol_commit`: it descends from the base,
+  changes only declared files, matches the trusted-scoring masked AST, and
+  keeps every byte outside the constants (comments included).
+- `candidate_from_commit(commit_from_candidate(...))` returns the candidate.
+  `ComponentValue` strips text, so a base value's surrounding whitespace is
+  kept around the new text.
+- The evaluator is called once per case, concurrently (at most `concurrency`
+  at a time across all engine calls) and often on the same SHA, so it must be reentrant: materialize each SHA once
+  behind an `asyncio.Lock` (or per call), never at one fixed path. Attach
+  `pydantic_ai_gepa.spend.current_rollout_capability()` to its model calls so
+  `max_token_cost` and pipeline caps meter them. An exception scores that
+  case 0.0 and marks the evaluation non-selectable, as the CLI does for a
+  failed rollout (its `RolloutOutput.selectable` is False). The `gepa` engine
+  never promotes such a candidate, training comparisons and reflection leave
+  those cases out, and a fair vote discards that candidate; Omni still
+  raises when the frozen seed or incumbent baseline is non-selectable. When
+  the candidate itself breaks a case, return a low-score `MetricResult` with
+  feedback instead of raising; keep exceptions for infrastructure faults and
+  retry transient ones inside the evaluator.
+- Proposals must keep to the declared `py:<path>:<NAME>` keys; an undeclared
+  key raises `StringSymbolError`.
+- Candidate commits are unreferenced and `git gc` eventually prunes them.
+  Point a ref at the one you keep: `git update-ref refs/heads/<name> <sha>`.
 
 ## Standard loop
 

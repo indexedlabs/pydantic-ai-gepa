@@ -68,18 +68,43 @@ class GepaEngine:
             "gepa_usage_limits", _usage.UsageLimits
         )
 
-        adapter = create_adapter(
-            agent=task.agent,
-            metric=task.metric,
-            input_type=task.input_type,
-            skills_fs=task.skills_fs,
-            skills_capabilities=task.skills_capabilities,
-            case_factory=task.case_factory,
-            cache_manager=None,
-            optimize_tools=self._option("optimize_tools", False),
-            optimize_output_type=self._option("optimize_output_type", False),
-            agent_usage_limits=agent_usage_limits,
-            gepa_usage_limits=gepa_usage_limits,
+        # A task that scores candidates without an agent (StringSymbolTask)
+        # supplies its own graph adapter.
+        task_adapter = getattr(task, "create_adapter", None)
+        ignored = [
+            name
+            for name in (
+                "optimize_tools",
+                "optimize_output_type",
+                "agent_usage_limits",
+                "gepa_usage_limits",
+            )
+            if self._engine_config.get(name)
+        ]
+        if reflection_config is not None and reflection_config.example_bank:
+            # Example banks feed the student agent; a task adapter ignores them.
+            ignored.append("reflection_config.example_bank")
+        if task_adapter is not None and ignored:
+            raise ValueError(
+                f"engine_config {ignored} apply to agent tasks only; this task "
+                "supplies its own adapter."
+            )
+        adapter = (
+            task_adapter()
+            if task_adapter is not None
+            else create_adapter(
+                agent=task.agent,
+                metric=task.metric,
+                input_type=task.input_type,
+                skills_fs=task.skills_fs,
+                skills_capabilities=task.skills_capabilities,
+                case_factory=task.case_factory,
+                cache_manager=None,
+                optimize_tools=self._option("optimize_tools", False),
+                optimize_output_type=self._option("optimize_output_type", False),
+                agent_usage_limits=agent_usage_limits,
+                gepa_usage_limits=gepa_usage_limits,
+            )
         )
         gepa_config = self._build_config(
             config=config,
@@ -112,7 +137,13 @@ class GepaEngine:
         # seed from this slice's budget.
         seed_scorer = getattr(task, "seed_evaluation", None)
         seed_evaluation = await seed_scorer() if seed_scorer is not None else None
-        if seed_evaluation is not None:
+        # Per-case scores cannot carry ineligibility. A task-supplied adapter
+        # marks ineligible rollouts itself, so re-score its ineligible seed and
+        # let the graph's validation guard apply; agent adapters cannot, so
+        # their reuse is unchanged.
+        if seed_evaluation is not None and (
+            seed_evaluation.selectable or task_adapter is None
+        ):
             deps.seed_validation_scores = await _matching_seed_scores(
                 state, seed_evaluation
             )

@@ -1303,3 +1303,25 @@ Get current weather for a location.
 The city name to get weather for.
 === end ===
 """)
+
+
+def test_trace_sections_render_records_with_non_json_keys() -> None:
+    from enum import Enum
+
+    class Category(Enum):
+        PRIMARY = "primary"
+
+    lines = InstructionProposalGenerator()._format_trace_sections(
+        [
+            {
+                "inputs": {"categories": {Category.PRIMARY: "example"}},
+                "messages": [{Category.PRIMARY: "message"}],
+                "run_usage": {(1, 2): 3},
+                "score": 0.0,
+            }
+        ],
+        label="Example",
+    )
+
+    text = "\n".join(str(line) for line in lines)
+    assert "example" in text and "message" in text and "(1, 2)" in text

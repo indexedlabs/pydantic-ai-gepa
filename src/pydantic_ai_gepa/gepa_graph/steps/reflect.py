@@ -121,7 +121,18 @@ async def _reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteratio
         state.last_accepted = False
         return "continue"
 
-    if _should_skip_perfect(parent_results.scores, state):
+    # Infrastructure-invalid cases are not failures to reflect on.
+    eligible_scores = [
+        score for _, score, output in parent_results if output.selectable
+    ]
+    if not eligible_scores:
+        logfire.info(
+            "ReflectStep skipping reflection: no selectable minibatch rollouts",
+            parent_idx=parent_idx,
+        )
+        state.last_accepted = False
+        return "continue"
+    if _should_skip_perfect(eligible_scores, state):
         logfire.info(
             "ReflectStep skipping reflection due to perfect minibatch",
             parent_idx=parent_idx,
@@ -272,7 +283,9 @@ async def _reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteratio
                 components=components_to_update,
                 model=reflection_model,
                 model_settings=deps.model_settings,
-                component_toolsets=component_toolsets if component_toolsets else None,
+                # Always the explicit list: an empty one tells the proposer
+                # there are no trace files, so it renders the records instead.
+                component_toolsets=component_toolsets,
                 capabilities=reflector_capabilities,
             )
         else:
@@ -285,9 +298,7 @@ async def _reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteratio
                     components=components_to_update,
                     model=reflection_model,
                     model_settings=deps.model_settings,
-                    component_toolsets=(
-                        component_toolsets if component_toolsets else None
-                    ),
+                    component_toolsets=component_toolsets,
                     capabilities=reflector_capabilities,
                 )
 
@@ -396,9 +407,21 @@ async def _reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteratio
         minibatch_average=new_avg,
     )
 
+    baseline_scores, new_scores = _eligible_pairs(parent_results, new_results)
+    if not baseline_scores:
+        # Every matched case had an infrastructure-invalid rollout on one
+        # side: there is no quality evidence to accept or reject on.
+        state.last_accepted = False
+        logfire.info(
+            "ReflectStep rejected candidate",
+            failure_reason="infrastructure_invalid",
+            parent_idx=parent_idx,
+            candidate_idx=new_candidate.idx,
+        )
+        return "continue"
     improved = _is_strict_improvement(
-        baseline_scores=parent_results.scores,
-        new_scores=new_results.scores,
+        baseline_scores=baseline_scores,
+        new_scores=new_scores,
     )
     decision_payload = dict(
         parent_idx=parent_idx,
@@ -950,6 +973,26 @@ def _create_candidate(
         discovered_at_evaluation=state.total_evaluations,
         example_bank=example_bank,
     )
+
+
+def _eligible_pairs(
+    baseline: EvaluationResults[str], new: EvaluationResults[str]
+) -> tuple[list[float], list[float]]:
+    """Matched minibatch scores, leaving out cases either side could not score.
+
+    A non-selectable rollout (``RolloutOutput.selectable``) is an
+    infrastructure failure, not a 0.0, so it is never acceptance evidence.
+    """
+    if list(baseline.data_ids) != list(new.data_ids):
+        # Not a matched pair (never expected): compare as before.
+        return list(baseline.scores), list(new.scores)
+    baseline_scores: list[float] = []
+    new_scores: list[float] = []
+    for (_, old_score, old_output), (_, new_score, new_output) in zip(baseline, new):
+        if old_output.selectable and new_output.selectable:
+            baseline_scores.append(old_score)
+            new_scores.append(new_score)
+    return baseline_scores, new_scores
 
 
 def _is_strict_improvement(

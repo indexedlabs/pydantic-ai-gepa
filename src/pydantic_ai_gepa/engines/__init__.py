@@ -21,6 +21,7 @@ from .gepa_engine import GepaEngine
 from .coding_agent_engine import CodingAgentEngine, Proposer, ReflectionContext
 from .best_of_n import BestOfNEngine
 from .autoresearch_engine import AutonomousResearchDriver, AutonomousResearchEngine
+from .string_symbol_task import CommitEvaluator, StringSymbolTask
 
 __all__ = [
     "BudgetExhausted",
@@ -30,6 +31,7 @@ __all__ = [
     "AutonomousResearchEngine",
     "CandidateEvaluation",
     "CodingAgentEngine",
+    "CommitEvaluator",
     "EngineConfig",
     "EngineEvent",
     "EngineFactory",
@@ -39,6 +41,7 @@ __all__ = [
     "OptimizationTask",
     "Proposer",
     "ReflectionContext",
+    "StringSymbolTask",
     "get_engine",
     "list_engines",
     "register_engine",

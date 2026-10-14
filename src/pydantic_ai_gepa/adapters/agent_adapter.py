@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import dataclasses
+import functools
+
 import asyncio
 import hashlib
 import inspect
@@ -18,7 +21,8 @@ from uuid import uuid4
 
 import logfire
 
-from pydantic import BaseModel
+from pydantic import BaseModel, RootModel, TypeAdapter
+from pydantic_core import to_jsonable_python
 from pydantic_ai import capture_run_messages, usage as _usage
 from pydantic_ai.agent import AgentRunResult
 from pydantic_ai.messages import (
@@ -147,6 +151,120 @@ def _truncate_text(value: str, limit: int = 2000) -> str:
     return f"{trimmed}... [truncated {omitted} chars]"
 
 
+_MEDIA_TYPES = (ImageUrl, AudioUrl, VideoUrl, DocumentUrl, BinaryContent)
+
+
+def _model_values(obj: BaseModel) -> list[Any]:
+    """Declared field values plus any ``extra="allow"`` values."""
+    values = [getattr(obj, name) for name in type(obj).model_fields]
+    values.extend((obj.model_extra or {}).values())
+    return values
+
+
+def _contains_media(obj: Any, depth: int = 0) -> bool:
+    """Whether ``obj`` holds media objects reflection should attach."""
+    if depth > 20:
+        return False
+    if isinstance(obj, _MEDIA_TYPES):
+        return True
+    if isinstance(obj, BaseModel):
+        return any(_contains_media(value, depth + 1) for value in _model_values(obj))
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        # fields() leaves out InitVar/ClassVar pseudo-fields, as asdict() does.
+        return any(
+            _contains_media(getattr(obj, field.name), depth + 1)
+            for field in dataclasses.fields(obj)
+        )
+    if isinstance(obj, Mapping):
+        return any(_contains_media(value, depth + 1) for value in obj.values())
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        return any(_contains_media(item, depth + 1) for item in obj)
+    return False
+
+
+@functools.cache
+def _media_adapter(media_type: type[Any]) -> TypeAdapter[Any]:
+    return TypeAdapter(media_type)
+
+
+def _restore_media(original: Any, dumped: Any, depth: int = 0) -> Any:
+    """Put ``original``'s media objects back where its JSON dump has them.
+
+    The dump stays the authority: it walks the dump and the source object in
+    parallel and swaps in a media object only at a position the source
+    really holds one, and only while the dump still has a media dict there.
+    Application data that merely looks like (or equals) a media dump is left
+    as data; excluded or serializer-changed values are never re-serialized.
+    """
+    if depth > 20:
+        return dumped
+    if isinstance(original, _MEDIA_TYPES):
+        # Only an untouched dump is restored: a serializer that changed the
+        # media (a redacted URL, reordered items) keeps its serialized form.
+        if isinstance(dumped, dict) and dumped.get("kind") == original.kind:
+            try:
+                own = _media_adapter(type(original)).dump_python(original, mode="json")
+            except Exception:
+                return dumped
+            if own == dumped:
+                return original
+        return dumped
+    if isinstance(original, RootModel):
+        return _restore_media(original.root, dumped, depth + 1)
+    if isinstance(original, BaseModel):
+        values: dict[str, Any] = dict(original.model_extra or {})
+        # Key each field the way model_dump() emitted it: by its alias under
+        # serialize_by_alias, and not at all when excluded.
+        by_alias = bool(type(original).model_config.get("serialize_by_alias"))
+        for name, info in type(original).model_fields.items():
+            if info.exclude is True:
+                continue
+            key = (info.serialization_alias or info.alias or name) if by_alias else name
+            values[key] = getattr(original, name)
+        return _restore_mapping(values, dumped, depth)
+    if dataclasses.is_dataclass(original) and not isinstance(original, type):
+        values = {
+            item.name: getattr(original, item.name)
+            for item in dataclasses.fields(original)
+        }
+        return _restore_mapping(values, dumped, depth)
+    if isinstance(original, Mapping):
+        # Match keys as the JSON dump wrote them (an Enum key by its value).
+        by_key = {_json_key(key): value for key, value in original.items()}
+        if None in by_key or len(by_key) != len(original):
+            return dumped
+        return _restore_mapping(by_key, dumped, depth)
+    if isinstance(original, (list, tuple)):
+        if not isinstance(dumped, list) or len(dumped) != len(original):
+            return dumped
+        return [
+            _restore_media(item, entry, depth + 1)
+            for item, entry in zip(original, dumped)
+        ]
+    return dumped
+
+
+def _json_key(key: Any) -> str | None:
+    try:
+        encoded = to_jsonable_python(key)
+    except Exception:
+        return None
+    if isinstance(encoded, str):
+        return encoded
+    if isinstance(encoded, (bool, int, float)):
+        return json.dumps(encoded)
+    return None
+
+
+def _restore_mapping(values: Mapping[str, Any], dumped: Any, depth: int) -> Any:
+    if not isinstance(dumped, dict):
+        return dumped
+    return {
+        key: _restore_media(values[key], entry, depth + 1) if key in values else entry
+        for key, entry in dumped.items()
+    }
+
+
 def _serialize_for_reflection(obj: Any) -> Any:
     """Serialize an object for inclusion in reflection records.
 
@@ -157,8 +275,17 @@ def _serialize_for_reflection(obj: Any) -> Any:
     if isinstance(obj, (ImageUrl, AudioUrl, VideoUrl, DocumentUrl, BinaryContent)):
         return obj
     if isinstance(obj, BaseModel):
-        return obj.model_dump(mode="json")
+        dumped = obj.model_dump(mode="json")
+        # The dump applies every exclusion and serializer (and may be a list
+        # or scalar). Where it still holds an untouched media dump, the original
+        # media object is swapped back so it stays attachable, not base64 text.
+        return _restore_media(obj, dumped) if _contains_media(obj) else dumped
     if hasattr(obj, "__dataclass_fields__"):
+        if _contains_media(obj):
+            return {
+                field.name: _serialize_for_reflection(getattr(obj, field.name))
+                for field in dataclasses.fields(obj)
+            }
         return asdict(obj)
     if isinstance(obj, Mapping):
         return {k: _serialize_for_reflection(v) for k, v in obj.items()}

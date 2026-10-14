@@ -410,6 +410,14 @@ def test_candidate_import_guard_refuses_result(git_repo, private, monkeypatch, a
     assert not list((private.parent / ".gepa-heldout/work").iterdir())
 
 
+def test_mask_treats_a_bare_annotation_as_the_first_declaration():
+    # Matches Indexed's first-declaration rule: the annotation is masked, so
+    # a later value edit is outside the declared scope.
+    baseline = 'X: str\nX = "first"\n'
+    assert _masked(baseline, ["X"]) != _masked('X: str\nX = "edited"\n', ["X"])
+    assert _masked('X: Literal["a"]\n', ["X"]) == _masked('X: Literal["b"]\n', ["X"])
+
+
 def test_untracked_file_refuses_score(git_repo, private, monkeypatch):
     sha = pin(git_repo, monkeypatch)
     (git_repo / "untracked.py").write_text("raise RuntimeError")

@@ -97,6 +97,10 @@ async def merge_step(ctx: StepContext[GepaState, GepaDeps, None]) -> IterationAc
         outputs=merged_results.outputs,
     )
 
+    if any(not output.selectable for output in merged_results.outputs):
+        state.total_evaluations += len(merged_results.data_ids)
+        return reject()
+
     parent1_scores = _get_subsample_scores(state, parent1_idx, subsample)
     parent2_scores = _get_subsample_scores(state, parent2_idx, subsample)
 
