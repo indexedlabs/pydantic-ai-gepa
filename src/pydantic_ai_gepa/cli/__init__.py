@@ -1,6 +1,6 @@
 """Typer-based `gepa` CLI for external-reflection mode.
 
-See pydanticaigepa-spec-973 for the surface contract and the related
+See pydantic-ai-gepa-managed-run for the surface contract and the related
 decisions (content-file enforcement, skill packaging, stage-and-confirm,
 git-SHA candidate identity).
 """

@@ -2,7 +2,7 @@
 
 The store is the single source of truth for *values* of optimizable components.
 *Identity* (the set of valid slot names) comes from the live agent via
-``introspect_agent``. See pydanticaigepa-spec-973 and pydanticaigepa-dec-0ky.
+``introspect_agent``. See pydantic-ai-gepa-managed-run and dec-pydantic-ai-gepa-new-components-are-staged-until-confirmed.
 
 Slot names contain colons (e.g. ``tool:foo:description``) which would split
 into subdirectories on disk, so we round-trip them through a filesystem-safe

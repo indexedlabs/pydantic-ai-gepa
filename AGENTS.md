@@ -1,8 +1,8 @@
 # Repository Guidelines
 
 ## Specs and tasks
-- Do not write to the v1 Mighty graph from this repo: no `mt prime`, `mt new`, `mt task`, `mt decision`, `mt comment` or `mt push`, and do not commit new `.mighty/loro` records.
-- Specs live in the Mighty Next graph and tasks in Linear (Indexed Labs); the orchestrator that dispatched you owns both. The v1 records under `.mighty/` (such as `.mighty/loro/` and `.mighty/config.json`) are a read-only historical record. `.mighty/checks/` is active configuration for the hosted review checks and is edited like any other file.
+- Specs and decisions for this library live in the Mighty Next graph, not in this repository. Before changing behavior, find the pages that own the code you are about to touch with `mighty invoke mighty.graph/governing --json '{"paths":["<repo-relative path>"]}'`, or browse the subtree starting at `specs/pydantic-ai-gepa/overview.md`. Tasks live in Linear (Indexed Labs); the orchestrator that dispatched you owns both.
+- The v1 records under `.mighty/` (such as `.mighty/loro/` and `.mighty/config.json`) are a read-only historical record; do not write to them (`mt` is no longer installed for this repo). `.mighty/checks/` is active configuration for the hosted review checks and is edited like any other file.
 
 ## Project Structure & Module Organization
 - Core library lives in `src/pydantic_ai_gepa/`, organized by responsibility (`runner.py` exposes the high-level optimization API, `components.py` handles candidate transforms, `cache.py` manages GEPA caching, etc.).

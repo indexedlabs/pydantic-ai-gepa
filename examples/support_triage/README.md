@@ -6,7 +6,7 @@ The agent routes a customer message to one of them; the dataset says which
 tool should have been called. As tool descriptions improve, routing accuracy
 goes up.
 
-Run it end-to-end via the `gepa` CLI (added by [pydanticaigepa-spec-973](cite:pydanticaigepa-spec-973)).
+Run it end-to-end via the `gepa` CLI (added by [pydantic-ai-gepa-managed-run](cite:pydantic-ai-gepa-managed-run)).
 **You** are the reflection model — the CLI scores the baseline and writes a
 per-case report; you read the report and edit slots or source code.
 

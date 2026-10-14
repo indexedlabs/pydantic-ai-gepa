@@ -1,9 +1,8 @@
-"""`gepa run select` — lockstep multi-way selection and re-fan (spec-er3).
+"""`gepa run select` — lockstep multi-way selection and re-fan (dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable).
 
 Select is the single sequential authority that turns N lane verdicts into at
 most one promoted candidate, advances the run's best, teaches the journal what
-lost and why, and re-fans lanes for the next iteration
-(pydanticaigepa-task-vso).
+lost and why, and re-fans lanes for the next iteration.
 
 Phase model — recorded in run state as ``select_phase`` with resumption
 progress in ``select_context``; every phase checkpoints before the next
@@ -11,7 +10,7 @@ begins, so a select killed mid-way resumes idempotently from the recorded
 phase on the next invocation:
 
 1. ``promote`` — invalidate stragglers (terminate the eval pid, journal the
-   partial result + diff summary, mark ``stalled``; pydanticaigepa-dec-4tw),
+   partial result + diff summary, mark ``stalled``; dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable),
    invalidate lanes whose candidate no longer descends from the frozen
    baseline commit, validate every training-accepted candidate on the held-out
    dataset, use aggregate score in scalar mode or the configured comparator in
@@ -37,12 +36,12 @@ phase on the next invocation:
 
 ``finalize`` replaces re-fan when the pareto ledger reaches
 ``--max-iterations``: lane-run budget enforcement lives at select, not
-per-eval (pydanticaigepa-dec-msy). Held-out runs charge a harness-computed
+per-eval (dec-pydantic-ai-gepa-the-pareto-ledger-is-the-sole-budget-authority). Held-out runs charge a harness-computed
 upper acceptance schedule per consumed verdict rather than trusting
 reflector-written rows. The run is marked done, any overshoot (one in-flight
 lane iteration plus its admitted selection work) is recorded in the final report,
 ``run_done`` is emitted, and lane worktrees are removed — a lane is re-fanned
-at select or removed when the run completes (spec-1do).
+at select or removed when the run completes (pydantic-ai-gepa-parallel-lanes-and-events).
 
 Journal writes and event emissions carry dedup keys, so re-executing a phase
 after a kill is exactly-once. Lane verdicts are consumed from lane state —
@@ -105,7 +104,7 @@ from .runs import ParetoLog, utc_now_iso
 
 SELECT_PRODUCER_ID = "select"
 
-# Phase ordering (spec-er3). ``finalize`` is the budget-exhausted terminal
+# Phase ordering (dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable). ``finalize`` is the budget-exhausted terminal
 # phase reached from ``journal`` instead of ``refan``.
 SELECT_PHASES = (
     "promote",
@@ -366,7 +365,7 @@ def _changed_files(workspace_root: Path, base_sha: str, head_sha: str) -> set[st
 
 
 def _terminate_eval_pid(pid: int, *, lane: str) -> None:
-    """Terminate a straggler's eval process: SIGTERM, then SIGKILL (dec-4tw)."""
+    """Terminate a straggler's eval process: SIGTERM, then SIGKILL (dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable)."""
     os.kill(pid, signal.SIGTERM)
     deadline = time.monotonic() + _PID_TERM_GRACE_SECS
     while _pid_alive(pid) and time.monotonic() < deadline:
@@ -404,7 +403,7 @@ def _mark_stalled(
 def _invalidate_straggler(
     workspace_root: Path, state: Any, lane_state: LaneState, *, reason: str
 ) -> None:
-    """Invalidate a lane that was not resolved when select ran (dec-4tw).
+    """Invalidate a lane that was not resolved when select ran (dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable).
 
     The eval process is terminated, the partial result and diff summary are
     journaled, and the lane is marked ``stalled``. A straggler is never
@@ -461,7 +460,7 @@ def _invalidate_cross_baseline(
     """Invalidate a lane whose branch point is not the frozen baseline commit.
 
     Lanes are never compared against baselines from a different branch point;
-    the lane is marked ``stalled``, never silently compared (spec-er3).
+    the lane is marked ``stalled``, never silently compared (dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable).
     """
     run_id = state.run_id
     pid = lane_state.eval_pid
@@ -515,7 +514,7 @@ def _emit_merge_opportunities(
 ) -> None:
     """Emit merge_opportunity for accepted lane pairs with disjoint diffs.
 
-    Auto-merge is prohibited (spec-er3): the event surfaces the branch pair
+    Auto-merge is prohibited (dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable): the event surfaces the branch pair
     plus a diff-stat path for the orchestrator to resolve with a real merge.
     """
     run_id = state.run_id
@@ -855,7 +854,7 @@ def _phase_promote(
                     f"Candidate import/checkout refused ({type(error).__name__}); never compared or promoted"
                 )
 
-    # 1. Straggler invalidation (dec-4tw): anything not awaiting_selection when
+    # 1. Straggler invalidation (dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable): anything not awaiting_selection when
     #    select runs is terminated, journaled, and stalled — never compared,
     #    never promoted. Idempotent: journaled lanes dedup, stalled markings
     #    repeat harmlessly.
@@ -1444,7 +1443,7 @@ def _phase_journal(
         # Per-lane checkpoint: a kill here resumes with the next loser.
         state = _checkpoint(state, workspace_root, "journal", ctx)
 
-    # Budget enforcement (dec-msy): the pareto ledger is the sole budget
+    # Budget enforcement (dec-pydantic-ai-gepa-the-pareto-ledger-is-the-sole-budget-authority): the pareto ledger is the sole budget
     # authority; the stop condition for lane runs is checked here, not per-eval.
     rows = ParetoLog(run_id, workspace_root).count_budget_rows()
     ctx["budget_rows"] = rows
@@ -1488,7 +1487,7 @@ def _phase_journal(
             "investigate eval accounting.",
             err=True,
         )
-    # budget_low early warning (dec-d0d): emitted once per iteration while
+    # budget_low early warning (dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable): emitted once per iteration while
     # remaining budget is below lanes x acceptance max-repetitions.
     remaining = state.max_iterations - rows
     if 0 < remaining < overshoot_bound:
@@ -1815,7 +1814,7 @@ def _phase_rebaseline(
     The baseline is measured against the new best tree: the primary checkout
     when it carries the new best, otherwise the first lane's freshly re-fanned
     worktree (identical content). Baseline evals are paid once per iteration,
-    not once per lane (spec-er3).
+    not once per lane (dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable).
 
     Scalar held-out runs reserve one screening row per lane and the maximum
     confirmation schedule before splitting rows among baseline and lanes.
@@ -1985,7 +1984,7 @@ def _phase_emit(
     if "iteration_started_at" not in ctx:
         # Reset once, immediately before the next iteration becomes visible.
         # Persist the timestamp in the resume context so an interrupted emit
-        # cannot extend the straggler window on every retry (spec-er3).
+        # cannot extend the straggler window on every retry (dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable).
         iteration_started_at = utc_now_iso()
         ctx["iteration_started_at"] = iteration_started_at
         state = replace(state, iteration_started_at=iteration_started_at)
@@ -2150,7 +2149,7 @@ def _preselect_check(workspace_root: Path, state: Any) -> None:
 
 @contextmanager
 def _select_lock(workspace_root: Path, run_id: str) -> Iterator[None]:
-    """Exclusive flock serializing select for a run (spec-er3: select never
+    """Exclusive flock serializing select for a run (dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable: select never
     runs concurrently with itself).
 
     Held for the whole verb: two fresh selects serialize instead of both
@@ -2279,7 +2278,7 @@ def _run_select_locked(workspace_root: Path, run_state: Any) -> Any:
             typer.echo(
                 f"Select already in flight for run {state.run_id} (phase "
                 f"{phase!r}, pid {pid}); a second concurrent select is "
-                "rejected (spec-er3).",
+                "rejected (dec-pydantic-ai-gepa-lane-selection-is-lockstep-and-durable).",
                 err=True,
             )
             raise typer.Exit(code=1)

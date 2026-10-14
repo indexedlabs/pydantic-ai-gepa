@@ -1,6 +1,6 @@
 # Engine-Pluggable Composable Optimization
 
-Design doc for `pydanticaigepa-spec-t9q`. This mirrors the `optimize_anything`
+Design doc for `pydantic-ai-gepa-engines-and-composition`. This mirrors the `optimize_anything`
 omni architecture from gepa-ai/gepa, adapted to pydantic-ai-gepa's agent-centric
 `CandidateMap` model.
 
