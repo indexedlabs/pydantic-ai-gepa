@@ -324,6 +324,8 @@ def introspect_agent(
       * ``tool:<name>:param:<path>`` — function tool parameter descriptions.
       * ``output:<name>:description`` — output tool descriptions (when present).
       * ``output:<name>:param:<path>`` — output tool parameter descriptions.
+      * ``tool:<name>:option:<path>@<n>`` / ``output:<name>:option:<path>@<n>`` —
+        described ``anyOf``/``oneOf`` options of a parameter, by position.
       * Signature input field descriptions (when the agent is a ``SignatureAgent``).
 
     This function ensures the tool optimization manager is installed so its

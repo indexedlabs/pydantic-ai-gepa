@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+
 import contextvars
 import logging
 from contextlib import contextmanager
@@ -56,6 +57,11 @@ def _output_description_key(tool_name: str) -> str:
 def _format_path(path: tuple[str, ...]) -> str:
     formatted: list[str] = []
     for segment in path:
+        if isinstance(segment, _OptionStep):
+            # A described anyOf/oneOf option of the previous field, by its
+            # position: ``title@0``. Options are only yielded beneath a field.
+            formatted[-1] = f"{formatted[-1]}@{segment}"
+            continue
         if segment == "[]":
             if not formatted:
                 formatted.append("[]")
@@ -66,12 +72,43 @@ def _format_path(path: tuple[str, ...]) -> str:
     return ".".join(formatted)
 
 
+def _path_key(kind: str, tool_name: str, path: tuple[str, ...]) -> str:
+    # Described options get their own namespace (``option:title@0``), so an
+    # option key can never collide with a property's ``param:`` key.
+    namespace = "option" if path and isinstance(path[-1], _OptionStep) else "param"
+    return f"{kind}:{tool_name}:{namespace}:{_format_path(path)}"
+
+
 def _parameter_key(tool_name: str, path: tuple[str, ...]) -> str:
-    return f"tool:{tool_name}:param:{_format_path(path)}"
+    return _path_key("tool", tool_name, path)
 
 
 def _output_parameter_key(tool_name: str, path: tuple[str, ...]) -> str:
-    return f"output:{tool_name}:param:{_format_path(path)}"
+    return _path_key("output", tool_name, path)
+
+
+class _OptionStep(str):
+    """A path step selecting an ``anyOf``/``oneOf`` entry by its position.
+
+    Positions, not const values, identify options: consts may repeat, and
+    free-text values (``"N/A"``) are not safe in component file names.
+    """
+
+
+def _const_options(schema: dict[str, Any]) -> Iterable[tuple[int, dict[str, Any]]]:
+    """Yield (position, option) for the const entries of a union schema.
+
+    Positions run across ``anyOf`` then ``oneOf``, so a field with both
+    keywords still gives every option its own position.
+    """
+    position = 0
+    for key in ("anyOf", "oneOf"):
+        options = schema.get(key)
+        if isinstance(options, list):
+            for option in options:
+                if isinstance(option, dict) and "const" in option:
+                    yield position, option
+                position += 1
 
 
 def _iter_schema_descriptions(
@@ -84,6 +121,14 @@ def _iter_schema_descriptions(
     description = schema.get("description")
     if isinstance(description, str) and description.strip() and path:
         yield path, description
+
+    # Described options, such as Literal[True] / Literal[False] each annotated
+    # with a description, are criteria a decision model reads; expose each one.
+    if path:
+        for index, option in _const_options(schema):
+            option_description = option.get("description")
+            if isinstance(option_description, str) and option_description.strip():
+                yield path + (_OptionStep(index),), option_description
 
     schema_type = schema.get("type")
     if schema_type == "object":
@@ -106,6 +151,12 @@ def _set_schema_description(
     for segment in path:
         if target is None:
             return False
+        if isinstance(segment, _OptionStep):
+            next_target = dict(_const_options(target)).get(int(segment))
+            if next_target is None:
+                return False
+            target = next_target
+            continue
         if segment == "[]":
             next_target = target.get("items")
             if not isinstance(next_target, dict):
