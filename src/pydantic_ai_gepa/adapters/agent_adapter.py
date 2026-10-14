@@ -211,10 +211,15 @@ def _restore_media(original: Any, dumped: Any, depth: int = 0) -> Any:
     if isinstance(original, RootModel):
         return _restore_media(original.root, dumped, depth + 1)
     if isinstance(original, BaseModel):
-        values: dict[str, Any] = {
-            name: getattr(original, name) for name in type(original).model_fields
-        }
-        values.update(original.model_extra or {})
+        values: dict[str, Any] = dict(original.model_extra or {})
+        fields = type(original).model_fields
+        for name, info in fields.items():
+            value = getattr(original, name)
+            values[name] = value
+            # The dump may key a field by its alias (serialize_by_alias).
+            for alias in (info.serialization_alias, info.alias):
+                if alias and alias not in fields:
+                    values.setdefault(alias, value)
         return _restore_mapping(values, dumped, depth)
     if dataclasses.is_dataclass(original) and not isinstance(original, type):
         values = {

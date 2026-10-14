@@ -1670,3 +1670,26 @@ async def test_composed_coding_engine_meters_training_evaluations(
     assert any(name.startswith("train-") for name, _ in capabilities)
     assert all(metered for _, metered in capabilities)
     assert result.spend_report.total_dollars == pytest.approx(0.01 * len(capabilities))
+
+
+def test_reflection_media_follows_serialization_aliases() -> None:
+    from pydantic import ConfigDict, Field
+
+    from pydantic_ai_gepa.adapters.agent_adapter import _serialize_for_reflection
+
+    photo = ImageUrl(url="https://example.com/a.png")
+
+    class Inner(BaseModel):
+        model_config = ConfigDict(serialize_by_alias=True)
+        image: ImageUrl = Field(serialization_alias="picture")
+
+    class Outer(BaseModel):
+        model_config = ConfigDict(serialize_by_alias=True)
+        image: ImageUrl = Field(serialization_alias="photo")
+        inner: Inner = Field(alias="nested")
+
+    serialized = _serialize_for_reflection(
+        Outer(image=photo, nested=Inner(image=photo))
+    )
+
+    assert serialized == {"photo": photo, "nested": {"picture": photo}}
