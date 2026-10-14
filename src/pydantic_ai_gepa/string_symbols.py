@@ -375,7 +375,11 @@ def _string_spans(source: bytes, path: str, names: Sequence[str]) -> dict[str, _
         encoding = tokenize.detect_encoding(io.BytesIO(source).readline)[0]
     except SyntaxError as error:
         raise StringSymbolError(f"{path} is not valid Python: {error}") from None
-    if encoding not in ("utf-8", "utf-8-sig"):
+    try:
+        canonical = codecs.lookup(encoding).name
+    except LookupError:
+        canonical = encoding
+    if canonical not in ("utf-8", "utf-8-sig"):
         # Rewritten literals are UTF-8; a coding cookie would misread them.
         raise StringSymbolError(
             f"{path} declares {encoding}; only UTF-8 sources are supported."

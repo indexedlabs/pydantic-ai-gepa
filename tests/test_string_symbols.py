@@ -1261,3 +1261,46 @@ async def test_omni_fair_vote_tolerates_a_comparison_time_failure(
     assert improved_validation_calls > 1
     assert not result.fair_votes[1].selectable
     assert _texts(result.best.best_candidate) == _texts(await task.seed_candidate())
+
+
+@pytest.mark.parametrize("cookie", ["utf8", "UTF8", "utf-8"])
+def test_utf8_coding_cookie_aliases_are_accepted(repo: Path, cookie: str) -> None:
+    (repo / "cookie.py").write_text(f"# coding: {cookie}\nX = 'café'\n")
+    base = _commit(repo, "cookie")
+    symbols = {"cookie.py": ["X"]}
+    x = string_symbol_component("cookie.py", "X")
+
+    sha = commit_from_candidate(repo, base, symbols, _candidate(**{x: "été"}), "c")
+
+    assert _texts(candidate_from_commit(repo, sha, symbols)) == {x: "été"}
+
+
+@pytest.mark.asyncio
+async def test_declared_failure_with_empty_scores_is_non_selectable(
+    repo: Path,
+) -> None:
+    async def evaluator(commit: str, case: Case[Any, Any, Any]) -> MetricResult:
+        if case.name == "b":
+            return MetricResult(
+                score=0.0,
+                side_info={
+                    "selectable": False,
+                    "infrastructure_valid": False,
+                    "scores": {},
+                },
+            )
+        return MetricResult(score=1.0, side_info={"scores": {"quality": 1.0}})
+
+    task = StringSymbolTask(
+        repo=repo,
+        base_commit="HEAD",
+        symbols=SYMBOLS,
+        evaluator=evaluator,
+        trainset=[Case(name="a", inputs="a"), Case(name="b", inputs="b")],
+    )
+
+    with validation_evaluation():
+        evaluation = await task.evaluate(await task.seed_candidate())
+
+    assert evaluation.selectable is False
+    assert evaluation.objective_scores == {"quality": 1.0}

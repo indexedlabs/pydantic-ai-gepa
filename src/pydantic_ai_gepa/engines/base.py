@@ -383,7 +383,7 @@ def _objective_scores(
         if failed:
             selectable = False
         raw_scores = info.get("scores")
-        if raw_scores is None:
+        if raw_scores is None or (failed and raw_scores == {}):
             # A non-selectable case (e.g. an evaluator crash) may carry no
             # objectives; it already disqualifies the evaluation, so it must not
             # also fail the identical-keys check.
