@@ -1155,3 +1155,104 @@ async def test_an_evaluator_crash_alone_does_not_trigger_reflection(
     assert proposals == []
     if engine == "coding_agent":
         assert any(event.kind == "clean_minibatch" for event in result.history)
+
+
+@pytest.mark.asyncio
+async def test_gepa_skips_reflection_without_selectable_rollouts(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proposals: list[Any] = []
+
+    async def propose_texts(self: Any, **kwargs: Any) -> ProposalResult:
+        proposals.append(kwargs)
+        return ProposalResult(texts={}, component_metadata={}, reasoning=None)
+
+    monkeypatch.setattr(InstructionProposalGenerator, "propose_texts", propose_texts)
+
+    async def evaluator(commit: str, case: Case[Any, Any, Any]) -> MetricResult:
+        if (case.name or "").startswith("train-"):
+            raise RuntimeError("judge unavailable")
+        return MetricResult(score=0.5)
+
+    base = _gepa_config()
+    config = base.model_copy(
+        update={"engine_config": {**base.engine_config, "skip_perfect_score": False}}
+    )
+
+    await get_engine("gepa", config).run(
+        _task(repo, evaluator), config, BudgetTracker(20)
+    )
+
+    assert proposals == []
+
+
+@pytest.mark.asyncio
+async def test_coding_proposer_sees_no_crash_in_a_mixed_minibatch(repo: Path) -> None:
+    contexts: list[ReflectionContext] = []
+
+    async def evaluator(commit: str, case: Case[Any, Any, Any]) -> MetricResult:
+        if case.name == "train-1":
+            raise RuntimeError("judge unavailable")
+        return MetricResult(
+            score=0.25, feedback=f"{case.name}: real failure", side_info={"k": 1}
+        )
+
+    async def propose(context: ReflectionContext) -> CandidateMap:
+        contexts.append(context)
+        return context.candidate
+
+    config = EngineConfig(
+        engine="coding_agent",
+        max_metric_calls=20,
+        max_iterations=1,
+        engine_config={"propose": propose, "minibatch_size": 2},
+    )
+
+    await get_engine("coding_agent", config).run(
+        _task(repo, evaluator), config, BudgetTracker(20)
+    )
+
+    (context,) = contexts
+    assert [record.case_id for record in context.minibatch_records] == ["train-0"]
+    assert "train-0: real failure" in context.report
+    assert "1 of 1 case(s) underperformed" in context.report
+    assert "judge unavailable" not in context.report
+    assert context.side_info["feedback"] == ["train-0: real failure"]
+
+
+@pytest.mark.asyncio
+async def test_omni_fair_vote_tolerates_a_comparison_time_failure(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _improving_proposal(monkeypatch)
+    improved_validation_calls = 0
+
+    async def evaluator(commit: str, case: Case[Any, Any, Any]) -> MetricResult:
+        nonlocal improved_validation_calls
+        text = candidate_from_commit(repo, commit, SYMBOLS)[INSTRUCTIONS].text
+        improved = "improved" in text
+        if improved and case.name == "val-1":
+            improved_validation_calls += 1
+            # The engine's own validation passes; the fair vote then fails.
+            if improved_validation_calls > 1:
+                raise RuntimeError("judge unavailable")
+        score = 1.0 if improved else 0.25
+        return MetricResult(score=score, side_info={"scores": {"quality": score}})
+
+    task = _task(repo, evaluator)
+    config = _gepa_config()
+
+    result = await optimize_omni(
+        task,
+        OmniPlan(
+            phase_one=[config],
+            phase_two=config,
+            phase_one_metric_calls=config.max_metric_calls,
+            phase_two_metric_calls=config.max_metric_calls,
+        ),
+    )
+
+    # The proposal's failed comparison sample disqualifies it; the seed wins.
+    assert improved_validation_calls > 1
+    assert not result.fair_votes[1].selectable
+    assert _texts(result.best.best_candidate) == _texts(await task.seed_candidate())

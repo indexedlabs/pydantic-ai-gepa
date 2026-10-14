@@ -341,12 +341,18 @@ class CodingAgentEngine:
                 stop_reason = "budget_exhausted"
                 break
 
+            # Infrastructure failures are not quality evidence for the proposer.
+            evidence = [
+                record
+                for record in selection_records
+                if getattr(record.payload.get("output"), "selectable", True)
+            ]
             context = ReflectionContext(
                 candidate=_copy_candidate(parent.candidate),
                 minibatch_records=failures,
-                report=_format_failure_report(selection_records, failure_threshold),
+                report=_format_failure_report(evidence, failure_threshold),
                 iteration=iterations,
-                side_info=_aggregate_side_info(selection_records),
+                side_info=_aggregate_side_info(evidence),
             )
             proposal_started = perf_counter()
             proposal = await self._propose(context)

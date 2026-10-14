@@ -122,9 +122,17 @@ async def _reflect_step(ctx: StepContext[GepaState, GepaDeps, None]) -> Iteratio
         return "continue"
 
     # Infrastructure-invalid cases are not failures to reflect on.
-    if _should_skip_perfect(
-        [score for _, score, output in parent_results if output.selectable], state
-    ):
+    eligible_scores = [
+        score for _, score, output in parent_results if output.selectable
+    ]
+    if not eligible_scores:
+        logfire.info(
+            "ReflectStep skipping reflection: no selectable minibatch rollouts",
+            parent_idx=parent_idx,
+        )
+        state.last_accepted = False
+        return "continue"
+    if _should_skip_perfect(eligible_scores, state):
         logfire.info(
             "ReflectStep skipping reflection due to perfect minibatch",
             parent_idx=parent_idx,

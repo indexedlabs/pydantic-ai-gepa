@@ -1581,11 +1581,21 @@ def _acceptance_for_candidate(
 def _votes(evaluations: Sequence[Sequence[CandidateEvaluation]]) -> list[FairVote]:
     for samples in evaluations:
         _require_matching_coordinates(samples)
-    if evaluations:
-        coordinate_sets = [
-            _coordinate_set(samples[0]) for samples in evaluations if samples
-        ]
-        if len(coordinate_sets) != len(evaluations) or any(
+    # A non-selectable sample (an infrastructure failure) can be missing
+    # coordinates; it already disqualifies its candidate, so only fully
+    # selectable candidates must agree.
+    eligible = [
+        samples
+        for samples in evaluations
+        if samples and all(sample.selectable for sample in samples)
+    ]
+    if evaluations and any(not samples for samples in evaluations):
+        raise ValueError(
+            "Matched fair-vote candidates must expose identical scalar and objective coordinates."
+        )
+    if eligible:
+        coordinate_sets = [_coordinate_set(samples[0]) for samples in eligible]
+        if any(
             coordinates != coordinate_sets[0] for coordinates in coordinate_sets[1:]
         ):
             raise ValueError(
@@ -1606,6 +1616,7 @@ def _votes(evaluations: Sequence[Sequence[CandidateEvaluation]]) -> list[FairVot
 
 
 def _require_matching_coordinates(samples: Sequence[CandidateEvaluation]) -> None:
+    samples = [sample for sample in samples if sample.selectable]
     if not samples:
         return
     first = _coordinate_set(samples[0])
