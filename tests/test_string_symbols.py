@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
-from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic_ai import Agent
 from pydantic_ai.models.test import TestModel
 from pydantic_evals import Case
 
@@ -33,6 +34,7 @@ from pydantic_ai_gepa.string_symbols import (
     string_symbol_component,
     verify_string_symbol_commit,
 )
+from pydantic_ai_gepa.spend import current_rollout_capability
 from pydantic_ai_gepa.types import MetricResult, ReflectionConfig
 
 PROMPTS = '''"""Prompts for the fixture agent."""
@@ -178,6 +180,34 @@ def test_a_bare_annotation_does_not_count_as_a_second_binding(repo: Path) -> Non
     assert _texts(candidate) == {"py:typed.py:X": "value"}
 
 
+def test_round_trip_keeps_a_u_prefix_and_handles_a_bom(repo: Path) -> None:
+    (repo / "legacy.py").write_bytes(
+        b'\xef\xbb\xbfX = u"seed"\nY = "\xc3\xa9t\xc3\xa9"\n'
+    )
+    base = _commit(repo, "legacy")
+    symbols = {"legacy.py": ["X", "Y"]}
+    x = string_symbol_component("legacy.py", "X")
+    y = string_symbol_component("legacy.py", "Y")
+    assert _texts(candidate_from_commit(repo, base, symbols)) == {x: "seed", y: "été"}
+
+    edited = _candidate(**{x: "improved", y: "hiver"})
+    sha = commit_from_candidate(repo, base, symbols, edited, "legacy edit")
+
+    assert _texts(candidate_from_commit(repo, sha, symbols)) == _texts(edited)
+    assert _git(repo, "show", f"{sha}:legacy.py").startswith("\ufeffX = u'improved'")
+
+
+def test_a_function_local_name_is_not_a_module_binding(repo: Path) -> None:
+    (repo / "local.py").write_text(
+        'X = "module"\n\n\ndef f():\n    X = "local"\n    return X\n'
+    )
+    base = _commit(repo, "local")
+
+    assert _texts(candidate_from_commit(repo, base, {"local.py": ["X"]})) == {
+        "py:local.py:X": "module"
+    }
+
+
 def test_symbols_in_a_subdirectory_project_are_relative_to_it(repo: Path) -> None:
     project = repo / "agent"
     project.mkdir()
@@ -208,6 +238,17 @@ def test_symbols_in_a_subdirectory_project_are_relative_to_it(repo: Path) -> Non
         ("if True:\n    X = 'nested'\n", "X", "top-level"),
         ("def X():\n    return 'doc'\n", "X", "plain string constant"),
         ("class E:\n    'doc'\n", "E.__doc__", "NAME = '...'"),
+        (
+            "X = 'a'\ntry:\n    pass\nexcept ValueError as X:\n    pass\n",
+            "X",
+            "more than once",
+        ),
+        ("X = 'a'\nmatch 1:\n    case 1 as X:\n        pass\n", "X", "more than once"),
+        ("X = 'a'\nmatch {}:\n    case {**X}:\n        pass\n", "X", "more than once"),
+        ("X = 'a'\ndel X\n", "X", "more than once"),
+        ("X = 'a'\ndef f(arg=(X := 'fixed')):\n    pass\n", "X", "more than once"),
+        ("X = 'a'\nY = [(X := i) for i in 'b']\n", "X", "more than once"),
+        ("X = 'a'\ndef f():\n    global X\n    X = 'b'\n", "X", "more than once"),
     ],
 )
 def test_refuses_symbols_that_are_not_plain_top_level_strings(
@@ -295,22 +336,23 @@ class _FakeEvaluator:
 
     def __init__(self, repo: Path) -> None:
         self.repo = repo
-        self.calls: list[tuple[str, list[str]]] = []
+        self.calls: list[tuple[str, str]] = []
+        self.in_flight: dict[str, int] = {}
+        self.max_overlap = 0
 
-    async def __call__(
-        self, commit: str, cases: Sequence[Case[Any, Any, Any]]
-    ) -> list[MetricResult]:
-        self.calls.append((commit, [case.name or "" for case in cases]))
+    async def __call__(self, commit: str, case: Case[Any, Any, Any]) -> MetricResult:
+        self.calls.append((commit, case.name or ""))
+        self.in_flight[commit] = self.in_flight.get(commit, 0) + 1
+        self.max_overlap = max(self.max_overlap, self.in_flight[commit])
+        await asyncio.sleep(0.01)
+        self.in_flight[commit] -= 1
         text = candidate_from_commit(self.repo, commit, SYMBOLS)[INSTRUCTIONS].text
         improved = "improved" in text
-        return [
-            MetricResult(
-                score=1.0 if improved else 0.25,
-                feedback=None if improved else f"{case.name}: say improved",
-                side_info={"scores": {"quality": 1.0 if improved else 0.25}},
-            )
-            for case in cases
-        ]
+        return MetricResult(
+            score=1.0 if improved else 0.25,
+            feedback=None if improved else f"{case.name}: say improved",
+            side_info={"scores": {"quality": 1.0 if improved else 0.25}},
+        )
 
 
 def _task(repo: Path, evaluator: _FakeEvaluator) -> StringSymbolTask:
@@ -336,7 +378,9 @@ async def test_task_seeds_from_and_evaluates_the_base_commit(repo: Path) -> None
 
     assert task.base_commit == base
     assert _texts(seed) == _texts(candidate_from_commit(repo, base, SYMBOLS))
-    assert evaluator.calls == [(base, ["val-0", "val-1"])]
+    assert sorted(evaluator.calls) == [(base, "val-0"), (base, "val-1")]
+    # Calls overlap on one SHA; the evaluator contract requires reentrancy.
+    assert evaluator.max_overlap == 2
     assert evaluation.score == 0.25
     assert evaluation.per_case_scores == {"val-0": 0.25, "val-1": 0.25}
     assert evaluation.objective_scores == {"quality": 0.25}
@@ -355,19 +399,82 @@ async def test_task_seeds_from_and_evaluates_the_base_commit(repo: Path) -> None
 
 @pytest.mark.asyncio
 async def test_task_rejects_a_misshapen_evaluator_result(repo: Path) -> None:
-    async def short(commit: str, cases: Sequence[Case[Any, Any, Any]]) -> list[Any]:
-        return [MetricResult(score=1.0)]
+    async def wrong(commit: str, case: Case[Any, Any, Any]) -> Any:
+        return 1.0
 
     task = StringSymbolTask(
         repo=repo,
         base_commit="HEAD",
         symbols=SYMBOLS,
-        evaluator=short,
+        evaluator=wrong,
         trainset=[Case(name="a", inputs="a"), Case(name="b", inputs="b")],
     )
 
-    with pytest.raises(ValueError, match="one MetricResult per case"):
+    with pytest.raises(ValueError, match="must return a MetricResult"):
         await task.evaluate(await task.seed_candidate())
+
+
+@pytest.mark.asyncio
+async def test_task_scores_an_evaluator_failure_as_a_failed_case(repo: Path) -> None:
+    async def flaky(commit: str, case: Case[Any, Any, Any]) -> MetricResult:
+        if case.name == "b":
+            raise RuntimeError("checkout broke")
+        return MetricResult(score=1.0)
+
+    task = StringSymbolTask(
+        repo=repo,
+        base_commit="HEAD",
+        symbols=SYMBOLS,
+        evaluator=flaky,
+        trainset=[Case(name="a", inputs="a"), Case(name="b", inputs="b")],
+    )
+
+    evaluation = await task.evaluate(await task.seed_candidate())
+
+    assert evaluation.per_case_scores == {"a": 1.0, "b": 0.0}
+    assert evaluation.records[1].feedback == "Commit evaluator failed: checkout broke"
+
+
+@pytest.mark.asyncio
+async def test_gepa_engine_meters_model_calls_inside_the_evaluator(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("pydantic_ai.models.ALLOW_MODEL_REQUESTS", False)
+    student = Agent(TestModel(custom_output_text="ok"))
+    calls: list[str] = []
+
+    async def evaluate(commit: str, case: Case[Any, Any, Any]) -> MetricResult:
+        capability = current_rollout_capability()
+        assert capability is not None
+        await student.run(str(case.inputs), capabilities=[capability])
+        calls.append(case.name or "")
+        return MetricResult(score=0.5)
+
+    task = StringSymbolTask(
+        repo=repo,
+        base_commit="HEAD",
+        symbols=SYMBOLS,
+        evaluator=evaluate,
+        trainset=[Case(name=f"val-{i}", inputs=f"held {i}") for i in range(2)],
+        concurrency=1,
+    )
+    config = EngineConfig(
+        engine="gepa",
+        max_metric_calls=10,
+        max_token_cost=0.10,
+        engine_config={
+            "price_fn": lambda response: 0.25,
+            "reflection_config": ReflectionConfig(model=TestModel()),
+        },
+    )
+
+    result = await get_engine("gepa", config).run(task, config, BudgetTracker(10))
+
+    spend = next(e.data for e in result.history if e.kind == "summary")["spend_report"]
+    assert spend["total_dollars"] >= 0.25
+    assert spend["stopped_by_cost"] is True
+    # The priced response stops the run inside the evaluator's agent call.
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -412,6 +519,7 @@ async def test_gepa_engine_optimizes_a_git_candidate_through_the_task(
     assert {record["commit"] for record in records} == {base}
     # One commit per distinct candidate, reused across per-case evaluations.
     commits = {commit for commit, _ in evaluator.calls}
+    assert evaluator.max_overlap > 1
     assert len(commits) == 2 and base in commits
 
     sha = await task.commit_for(result.best_candidate)

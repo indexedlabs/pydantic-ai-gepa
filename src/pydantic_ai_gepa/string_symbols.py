@@ -17,6 +17,7 @@ parenthesized implicit concatenation; anything else is refused.
 from __future__ import annotations
 
 import ast
+import codecs
 import os
 import subprocess
 import tempfile
@@ -188,7 +189,9 @@ def commit_from_candidate(
                 continue
             expected[key] = component.text
             value = _reframe(span.value, component.text)
-            edits.append((span.start, span.end, _literal(value).encode()))
+            # Keep a ``u`` prefix: the masked-AST scope check compares it.
+            literal = (span.kind or "") + _literal(value)
+            edits.append((span.start, span.end, literal.encode()))
         if edits:
             for start, end, literal in sorted(edits, reverse=True):
                 source = source[:start] + literal + source[end:]
@@ -242,8 +245,8 @@ def verify_string_symbol_commit(
         after_spans = _string_spans(after, relative, names)
         try:
             same_ast = masked_string_symbols(
-                before.decode(), list(names)
-            ) == masked_string_symbols(after.decode(), list(names))
+                before.decode("utf-8-sig"), list(names)
+            ) == masked_string_symbols(after.decode("utf-8-sig"), list(names))
         except (SyntaxError, ValueError, TypeError, RecursionError):
             same_ast = False
         if not same_ast or _outside(before, before_spans) != _outside(
@@ -259,6 +262,7 @@ class _Span:
     start: int
     end: int
     value: str
+    kind: str | None = None
 
 
 def _relative_python_path(path: object) -> bool:
@@ -272,28 +276,73 @@ def _relative_python_path(path: object) -> bool:
     )
 
 
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+
+def _scope_header(node: ast.AST) -> list[ast.AST]:
+    """Expressions of a def/class/lambda header, evaluated in the outer scope."""
+    header: list[ast.AST] = list(getattr(node, "decorator_list", []))
+    if isinstance(node, ast.ClassDef):
+        return [*header, *node.bases, *node.keywords]
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        arguments = node.args
+        header.extend(arguments.defaults)
+        header.extend(value for value in arguments.kw_defaults if value is not None)
+        if not isinstance(node, ast.Lambda):
+            parameters = [
+                *arguments.posonlyargs,
+                *arguments.args,
+                *arguments.kwonlyargs,
+                *(p for p in (arguments.vararg, arguments.kwarg) if p is not None),
+            ]
+            header.extend(p.annotation for p in parameters if p.annotation)
+            if node.returns is not None:
+                header.append(node.returns)
+    return header
+
+
 def _bound_names(node: ast.AST) -> set[str]:
-    """Names a module-level statement binds, ignoring nested scopes."""
+    """Names a module-level statement binds or deletes in module scope.
+
+    Nested function, class and lambda bodies are skipped, but their headers
+    run in module scope. Comprehensions leak only assignment expressions.
+    Over-counting is safe: it refuses a symbol rather than optimizing a
+    constant the module may rebind.
+    """
     names: set[str] = set()
     stack: list[ast.AST] = [node]
     while stack:
         current = stack.pop()
-        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names.add(current.name)
-            stack.extend(current.decorator_list)
-            continue
         if isinstance(
-            current,
-            (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
+            current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
         ):
+            if not isinstance(current, ast.Lambda):
+                names.add(current.name)
+            stack.extend(_scope_header(current))
+            continue
+        if isinstance(current, _COMPREHENSIONS):
+            names.update(
+                child.target.id
+                for child in ast.walk(current)
+                if isinstance(child, ast.NamedExpr)
+                and isinstance(child.target, ast.Name)
+            )
             continue
         if isinstance(current, ast.AnnAssign) and current.value is None:
             # A bare annotation (``X: str``) declares a type, not a value.
             continue
-        if isinstance(current, ast.Name) and isinstance(current.ctx, ast.Store):
+        if isinstance(current, ast.Name) and isinstance(
+            current.ctx, (ast.Store, ast.Del)
+        ):
             names.add(current.id)
         elif isinstance(current, ast.alias):
             names.add(current.asname or current.name.split(".")[0])
+        elif isinstance(current, ast.ExceptHandler) and current.name:
+            names.add(current.name)
+        elif isinstance(current, (ast.MatchAs, ast.MatchStar)) and current.name:
+            names.add(current.name)
+        elif isinstance(current, ast.MatchMapping) and current.rest:
+            names.add(current.rest)
         stack.extend(ast.iter_child_nodes(current))
     return names
 
@@ -311,12 +360,21 @@ def _string_spans(source: bytes, path: str, names: Sequence[str]) -> dict[str, _
     starts = [0]
     for line in source.splitlines(keepends=True):
         starts.append(starts[-1] + len(line))
+    if source.startswith(codecs.BOM_UTF8):
+        # The parser's first-line offsets exclude a UTF-8 byte-order mark.
+        starts[0] = len(codecs.BOM_UTF8)
+    rebound = {
+        name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Global, ast.Nonlocal))
+        for name in node.names
+    }
     spans: dict[str, _Span] = {}
     for name in names:
         statements = bindings.get(name, [])
         if not statements:
             raise StringSymbolError(f"{path}:{name} is not assigned at module level.")
-        if len(statements) > 1:
+        if len(statements) > 1 or name in rebound:
             raise StringSymbolError(
                 f"{path}:{name} is bound more than once at module level; "
                 f"{_SELECTION_DOC}."
@@ -357,7 +415,7 @@ def _string_spans(source: bytes, path: str, names: Sequence[str]) -> dict[str, _
                 f"{path}:{name}: could not locate the constant's source span "
                 "(only UTF-8 sources are supported)."
             )
-        spans[name] = _Span(start=start, end=end, value=value.value)
+        spans[name] = _Span(start=start, end=end, value=value.value, kind=value.kind)
     return spans
 
 

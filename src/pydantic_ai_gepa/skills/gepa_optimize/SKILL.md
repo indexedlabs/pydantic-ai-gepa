@@ -755,8 +755,8 @@ When a Git candidate's editable surface is top-level string constants (the
 from pydantic_ai_gepa import EngineConfig, MetricResult, StringSymbolTask, get_engine
 from pydantic_ai_gepa.engines import BudgetTracker
 
-async def evaluate(commit: str, cases) -> list[MetricResult]:
-    ...  # check out `commit` in your own worktree, return one MetricResult per case
+async def evaluate(commit: str, case) -> MetricResult:
+    ...  # score one case on `commit`; calls overlap, often on the same SHA
 
 task = StringSymbolTask(
     repo=".", base_commit="HEAD", symbols={"prompts.py": ["INSTRUCTIONS"]},
@@ -769,8 +769,9 @@ best_sha = await task.commit_for(result.best_candidate)
 
 - Components are keyed `py:<path>:<NAME>`; paths are relative to `repo`.
   Version 1 accepts only `NAME = "..."` / `NAME: T = "..."` at module level
-  (implicit concatenation included), bound exactly once. Anything else
-  (f-strings, bytes, expressions, `X.__doc__`, nested blocks) is refused.
+  (implicit concatenation included), bound exactly once in module scope
+  (`del`, `except … as`, `match` captures, walrus and `global` count). Anything
+  else (f-strings, bytes, expressions, `X.__doc__`, nested blocks) is refused.
 - `commit_from_candidate` rewrites only those constants' source spans and
   commits on top of the base with plumbing and a private index; your working
   tree, index and branches are untouched, and commits are unsigned. Each
@@ -781,6 +782,14 @@ best_sha = await task.commit_for(result.best_candidate)
 - `candidate_from_commit(commit_from_candidate(...))` returns the candidate.
   `ComponentValue` strips text, so a base value's surrounding whitespace is
   kept around the new text.
+- The evaluator is called once per case, concurrently (up to `concurrency`)
+  and often on the same SHA, so it must be reentrant: materialize each SHA once
+  behind an `asyncio.Lock` (or per call), never at one fixed path. Attach
+  `pydantic_ai_gepa.spend.current_rollout_capability()` to its model calls so
+  `max_token_cost` and pipeline caps meter them. An exception scores that
+  case 0.0.
+- Candidate commits are unreferenced and `git gc` eventually prunes them.
+  Point a ref at the one you keep: `git update-ref refs/heads/<name> <sha>`.
 
 ## Standard loop
 
