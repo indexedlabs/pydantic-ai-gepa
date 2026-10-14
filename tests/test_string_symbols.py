@@ -1441,3 +1441,45 @@ def test_reflection_serializes_dataclasses_with_init_vars(
 
     assert serialized == {"caption": "a cat", "photo": photo}
     assert "seed" not in serialized
+
+
+def test_materialization_runs_no_git_hooks(repo: Path) -> None:
+    base = _head(repo)
+    status = _git(repo, "status", "--porcelain")
+    hooks = repo / ".git" / "hooks"
+    hooks.mkdir(exist_ok=True)
+    for name in ("post-index-change", "post-commit", "pre-commit"):
+        hook = hooks / name
+        hook.write_text(f"#!/bin/sh\necho {name} >> README.md\n")
+        hook.chmod(0o755)
+
+    sha = commit_from_candidate(
+        repo, base, SYMBOLS, _candidate(**{INSTRUCTIONS: "Be brief."}), "hooks"
+    )
+
+    verify_string_symbol_commit(repo, base, sha, SYMBOLS)
+    assert (repo / "README.md").read_text() == "fixture\n"
+    # The fixture's own status must not fire the hook either.
+    no_hooks = f"core.hooksPath={os.devnull}"
+    assert _git(repo, "-c", no_hooks, "status", "--porcelain") == status
+    assert _head(repo) == base
+
+
+def test_reflection_never_sees_excluded_model_fields() -> None:
+    from pydantic import Field, SecretStr
+
+    from pydantic_ai_gepa.adapters.agent_adapter import _serialize_for_reflection
+
+    class Inputs(BaseModel):
+        photo: ImageUrl
+        token: str = Field(exclude=True)
+        password: SecretStr
+
+    photo = ImageUrl(url="https://example.com/a.png")
+    serialized = _serialize_for_reflection(
+        Inputs(photo=photo, token="tok-123", password=SecretStr("hunter2"))
+    )
+
+    assert serialized["photo"] == photo
+    assert "token" not in serialized
+    assert "hunter2" not in repr(serialized)

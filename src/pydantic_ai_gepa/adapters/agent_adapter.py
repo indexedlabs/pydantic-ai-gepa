@@ -186,13 +186,19 @@ def _serialize_for_reflection(obj: Any) -> Any:
     if isinstance(obj, (ImageUrl, AudioUrl, VideoUrl, DocumentUrl, BinaryContent)):
         return obj
     if isinstance(obj, BaseModel):
-        if _contains_media(obj):
-            # A JSON dump would turn media into base64 text; keep it attachable.
-            return {
-                name: _serialize_for_reflection(getattr(obj, name))
-                for name in type(obj).model_fields
-            }
-        return obj.model_dump(mode="json")
+        dumped = obj.model_dump(mode="json")
+        if not _contains_media(obj):
+            return dumped
+        # The dump applies the model's exclusions and serializers; only fields
+        # it kept that hold media are re-read, so images stay attachable
+        # instead of base64 text and excluded fields never appear.
+        fields = type(obj).model_fields
+        return {
+            name: _serialize_for_reflection(getattr(obj, name))
+            if name in fields and _contains_media(getattr(obj, name))
+            else value
+            for name, value in dumped.items()
+        }
     if hasattr(obj, "__dataclass_fields__"):
         if _contains_media(obj):
             return {

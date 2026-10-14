@@ -50,6 +50,9 @@ _REPOSITORY_ENV = frozenset(
         "GIT_WORK_TREE",
     }
 )
+# Hooks (e.g. post-index-change, which fires even for a private index) must
+# never run: materialization may not touch the caller's checkout.
+_GIT = ("git", "-c", f"core.hooksPath={os.devnull}")
 _FALLBACK_IDENTITY = ("pydantic-ai-gepa", "pydantic-ai-gepa@localhost")
 _SELECTION_DOC = "v1 supports only top-level NAME = '...' string assignments"
 
@@ -540,7 +543,7 @@ class _Git:
         check: bool = True,
     ) -> bytes:
         result = subprocess.run(
-            ["git", "-C", str(self.root), *args],
+            [*_GIT, "-C", str(self.root), *args],
             input=input,
             env=dict(env or self.env),
             capture_output=True,
@@ -586,7 +589,7 @@ class _Git:
     def is_ancestor(self, base: str, commit: str) -> bool:
         result = subprocess.run(
             [
-                "git",
+                *_GIT,
                 "-C",
                 str(self.root),
                 "merge-base",
