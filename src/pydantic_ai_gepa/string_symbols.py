@@ -372,6 +372,15 @@ def _bound_names(node: ast.AST) -> list[str]:
 def _string_spans(source: bytes, path: str, names: Sequence[str]) -> dict[str, _Span]:
     """Locate each name's single top-level string constant by AST position."""
     try:
+        encoding = tokenize.detect_encoding(io.BytesIO(source).readline)[0]
+    except SyntaxError as error:
+        raise StringSymbolError(f"{path} is not valid Python: {error}") from None
+    if encoding not in ("utf-8", "utf-8-sig"):
+        # Rewritten literals are UTF-8; a coding cookie would misread them.
+        raise StringSymbolError(
+            f"{path} declares {encoding}; only UTF-8 sources are supported."
+        )
+    try:
         tree = ast.parse(source, filename=path)
     except (SyntaxError, ValueError) as error:
         raise StringSymbolError(f"{path} is not valid Python: {error}") from None

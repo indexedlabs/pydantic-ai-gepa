@@ -275,6 +275,13 @@ class CodingAgentEngine:
                         data={
                             "iteration": iterations,
                             "mean_score": selection_score,
+                            "infrastructure_invalid_case_ids": [
+                                record.case_id
+                                for record in selection_records
+                                if not getattr(
+                                    record.payload.get("output"), "selectable", True
+                                )
+                            ],
                             "minibatch_case_ids": [
                                 record.case_id for record in selection_records
                             ],

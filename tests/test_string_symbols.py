@@ -289,6 +289,7 @@ def test_symbols_in_a_subdirectory_project_are_relative_to_it(repo: Path) -> Non
         ("X = 'a'\nmatch 1:\n    case 1 as X:\n        pass\n", "X", "more than once"),
         ("X = 'a'\nmatch {}:\n    case {**X}:\n        pass\n", "X", "more than once"),
         ("X = 'a'\ndel X\n", "X", "more than once"),
+        ("# -*- coding: latin-1 -*-\nX = 'plain'\n", "X", "only UTF-8"),
         ("X: str\nX = 'value'\n", "X", "more than once"),
         ("X: str\n", "X", "plain string constant"),
         ("X = 'a'\nt = {}\nt[(X := 'fixed')]: str\n", "X", "more than once"),
@@ -1154,7 +1155,11 @@ async def test_an_evaluator_crash_alone_does_not_trigger_reflection(
 
     assert proposals == []
     if engine == "coding_agent":
-        assert any(event.kind == "clean_minibatch" for event in result.history)
+        assert [
+            event.data["infrastructure_invalid_case_ids"]
+            for event in result.history
+            if event.kind == "clean_minibatch"
+        ] == [["train-1"]]
 
 
 @pytest.mark.asyncio
