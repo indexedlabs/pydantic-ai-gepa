@@ -11,7 +11,9 @@ permissions:
 
 jobs:
   lint-and-test:
-    runs-on: ubuntu-latest
+    # A fork pull request keeps a GitHub-hosted runner: its code never runs on
+    # a Mighty runner.
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || fromJSON('["self-hosted","mighty-ci-2x8"]') }}
 
     steps:
       - name: Checkout
