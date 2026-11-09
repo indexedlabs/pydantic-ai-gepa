@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   lint-and-test:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, mighty-ci-2x8]
 
     steps:
       - name: Checkout
